@@ -31,7 +31,7 @@ jobs:
           repository: unsuitable001/openetl
           ref: initial-implementation
           path: openetl
-          token: ${{ secrets.OPENETL_TOKEN }}
+          ssh-key: ${{ secrets.OPENETL_DEPLOY_KEY }}
       - uses: actions/setup-go@v6
         with:
           go-version-file: openetl-connectors/go.mod
