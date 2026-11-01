@@ -1,0 +1,47 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+permissions:
+  contents: read
+
+jobs:
+  go:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_USER: openetl
+          POSTGRES_PASSWORD: openetl
+          POSTGRES_DB: openetl
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U openetl" --health-interval 2s --health-timeout 5s --health-retries 15
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          path: openetl-connectors
+      # go.mod replaces the SDK with ../openetl/sdk/go.
+      - uses: actions/checkout@v5
+        with:
+          repository: unsuitable001/openetl
+          ref: initial-implementation
+          path: openetl
+          token: ${{ secrets.OPENETL_TOKEN }}
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: openetl-connectors/go.mod
+          cache-dependency-path: openetl-connectors/go.sum
+      - name: Format
+        working-directory: openetl-connectors
+        run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+      - name: Vet
+        working-directory: openetl-connectors
+        run: go vet -tags integration ./...
+      - name: Tests, against Postgres
+        working-directory: openetl-connectors
+        run: go test -race -tags integration ./...
