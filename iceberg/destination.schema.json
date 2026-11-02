@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Iceberg destination",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "catalog": {"type": "string", "enum": ["rest", "glue"], "default": "rest", "description": "The catalog: an Iceberg REST catalog, or AWS Glue."},
+    "uri": {"type": "string", "description": "The REST catalog's URI."},
+    "warehouse": {"type": "string", "description": "The REST catalog's warehouse, or Glue's location for new tables, such as s3://bucket/prefix."},
+    "namespace": {"type": "string", "default": "default", "description": "Used when the pipeline names no namespace. Created if missing."},
+    "token": {"type": "string", "x-secret": true, "description": "REST: a bearer token."},
+    "credential": {"type": "string", "x-secret": true, "description": "REST: OAuth2 client credentials, as client_id:client_secret."},
+    "region": {"type": "string", "description": "The AWS region of Glue and S3."},
+    "accessKeyId": {"type": "string", "x-secret": true, "description": "An AWS access key for Glue and S3. Without one, the AWS default credentials."},
+    "secretAccessKey": {"type": "string", "x-secret": true, "description": "The access key's secret."},
+    "s3Endpoint": {"type": "string", "description": "An S3-compatible endpoint, for stores other than AWS. Uses path-style addressing."},
+    "properties": {"type": "object", "additionalProperties": {"type": "string"}, "description": "More catalog and file IO properties, as Iceberg names them."}
+  }
+}

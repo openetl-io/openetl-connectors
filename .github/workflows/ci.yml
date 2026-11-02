@@ -48,6 +48,21 @@ jobs:
           docker exec ${{ job.services.postgres.id }} psql -U openetl -c "ALTER SYSTEM SET wal_level = logical"
           docker restart ${{ job.services.postgres.id }}
           until docker exec ${{ job.services.postgres.id }} pg_isready -U openetl; do sleep 1; done
-      - name: Tests, against Postgres
+      # The Iceberg destination's: an S3 store, and an Iceberg REST catalog
+      # keeping its tables in the store's iceberg bucket. Services can't take
+      # the store's command.
+      - name: Iceberg catalog
+        run: |
+          docker network create iceberg
+          docker run -d --name s3 --network iceberg -p 8333:8333 -e WEED_MASTER_VOLUME_GROWTH_COPY_1=1 \
+            chrislusf/seaweedfs:4.51 server -dir=/data -s3 -s3.port=8333 -master.volumeSizeLimitMB=64
+          docker run -d --name iceberg --network iceberg -p 8181:8181 \
+            -e CATALOG_WAREHOUSE=s3://iceberg/ -e CATALOG_IO__IMPL=org.apache.iceberg.aws.s3.S3FileIO \
+            -e CATALOG_S3_ENDPOINT=http://s3:8333 -e CATALOG_S3_PATH__STYLE__ACCESS=true \
+            -e AWS_REGION=us-east-1 -e AWS_ACCESS_KEY_ID=openetl -e AWS_SECRET_ACCESS_KEY=openetl \
+            apache/iceberg-rest-fixture:1.10.1
+          until curl -sf -X PUT http://127.0.0.1:8333/iceberg; do sleep 1; done
+          until curl -sf http://127.0.0.1:8181/v1/config; do sleep 1; done
+      - name: Tests, against Postgres and the Iceberg catalog
         working-directory: openetl-connectors
         run: go test -race -tags integration ./...
