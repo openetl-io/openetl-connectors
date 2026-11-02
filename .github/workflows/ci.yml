@@ -65,7 +65,27 @@ jobs:
           until curl -sf -X PUT http://127.0.0.1:8333/iceberg; do sleep 1; done
           until curl -sf http://127.0.0.1:8181/v1/config; do sleep 1; done
           until curl -sf http://127.0.0.1:5000/moto-api/; do sleep 1; done
-      - name: Tests, against Postgres and the Iceberg catalogs
+      # Kafka's: one KRaft node, and Karapace as the schema registry.
+      - name: Kafka and a schema registry
+        run: |
+          docker network create kafka
+          docker run -d --name kafka --network kafka -p 9092:9092 \
+            -e KAFKA_NODE_ID=1 -e KAFKA_PROCESS_ROLES=broker,controller \
+            -e KAFKA_LISTENERS=PLAINTEXT://:9092,INTERNAL://:29092,CONTROLLER://:9093 \
+            -e KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://127.0.0.1:9092,INTERNAL://kafka:29092 \
+            -e KAFKA_LISTENER_SECURITY_PROTOCOL_MAP=PLAINTEXT:PLAINTEXT,INTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT \
+            -e KAFKA_INTER_BROKER_LISTENER_NAME=INTERNAL -e KAFKA_CONTROLLER_LISTENER_NAMES=CONTROLLER \
+            -e KAFKA_CONTROLLER_QUORUM_VOTERS=1@localhost:9093 -e KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR=1 \
+            -e KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR=1 -e KAFKA_TRANSACTION_STATE_LOG_MIN_ISR=1 \
+            -e KAFKA_NUM_PARTITIONS=3 apache/kafka:4.3.2
+          until docker exec kafka /opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 > /dev/null 2>&1; do sleep 1; done
+          docker run -d --name registry --network kafka -p 8081:8081 --entrypoint python3 \
+            -e KARAPACE_KARAPACE_REGISTRY=true -e KARAPACE_BOOTSTRAP_URI=kafka:29092 -e KARAPACE_HOST=0.0.0.0 \
+            -e KARAPACE_PORT=8081 -e KARAPACE_ADVERTISED_HOSTNAME=registry -e KARAPACE_GROUP_ID=karapace \
+            -e KARAPACE_MASTER_ELIGIBILITY=true -e KARAPACE_TOPIC_NAME=_schemas -e KARAPACE_COMPATIBILITY=BACKWARD \
+            ghcr.io/aiven-open/karapace:6.2.4 -m karapace
+          until curl -sf http://127.0.0.1:8081/subjects; do sleep 1; done
+      - name: Tests, against Postgres, the Iceberg catalogs and Kafka
         working-directory: openetl-connectors
         env:
           OPENETL_TEST_GLUE_ENDPOINT: http://127.0.0.1:5000

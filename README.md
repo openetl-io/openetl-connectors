@@ -8,6 +8,8 @@ The official connectors for [openetl](https://github.com/unsuitable001/openetl).
 | Postgres destination | `destination-postgres` | Stage and apply, with a fence row; append, overwrite and merge, dedupe at apply |
 | Iceberg destination | `destination-iceberg` | Parquet data files committed through a REST or Glue catalog, one snapshot per table and epoch, with the catalog's compare-and-swap behind the fence; append, overwrite, and merge through equality deletes. Tables commit together on REST catalogs with multi-table commits. Glue is tested against moto, not real Glue. |
 | Parquet on S3 destination | `destination-s3` | Parquet files staged under the pipeline, copied to names from the pipeline, epoch and generation, with a marker per stream and epoch; append. Also `file://`. |
+| Kafka source | `source-kafka` | A stream per topic, read `read_committed` from each partition's offset (exact replay); bounded to the end it saw for scheduled pipelines, unbounded for continuous ones; JSON, Avro, Protobuf or text values, with a Confluent-compatible schema registry |
+| Kafka destination | `destination-kafka` | A transaction per epoch across topics, on a pool of three transactional producers, with the epoch's marker in the same transaction (exactly-once); a record per row, its key the primary key; JSON, Avro or Protobuf |
 
 ## Build
 
@@ -33,11 +35,14 @@ The Iceberg tests need an Iceberg REST catalog at `OPENETL_TEST_ICEBERG_URI` (de
 
 The S3 destination's tests run against `file://` by default, and with `-tags integration` against the S3 store too, in a bucket they create.
 
+The Kafka tests need a broker at `OPENETL_TEST_KAFKA_BROKERS` (default `127.0.0.1:9092`) and a Confluent-compatible schema registry at `OPENETL_TEST_SCHEMA_REGISTRY` (default `http://127.0.0.1:8081`). openetl's compose file runs Kafka and Karapace.
+
 ## Layout
 
 - `postgres/`: the Postgres source and destination, and their config schemas.
 - `iceberg/`: the Iceberg destination, and its config schema.
 - `s3/`: the Parquet on S3 destination, and its config schema.
+- `kafka/`: the Kafka source and destination, their formats, and their config schemas.
 - `cmd/<executable>/`: one `main` per connector, which hands the connector to `sdk.Serve`.
 
 ## License

@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Kafka source",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["brokers"],
+  "properties": {
+    "brokers": {"type": "array", "items": {"type": "string"}, "minItems": 1, "description": "Bootstrap brokers, as host:port."},
+    "tls": {"type": "boolean", "default": false, "description": "Connect over TLS. Implied by tlsCa and tlsCert."},
+    "tlsCa": {"type": "string", "description": "PEM certificates to trust, instead of the system's."},
+    "tlsCert": {"type": "string", "description": "A PEM client certificate, for mutual TLS."},
+    "tlsKey": {"type": "string", "x-secret": true, "description": "The client certificate's PEM key."},
+    "tlsServerName": {"type": "string", "description": "The name to verify the brokers' certificates against, if not their host."},
+    "tlsInsecureSkipVerify": {"type": "boolean", "default": false, "description": "Don't verify the brokers' certificates."},
+    "saslMechanism": {"type": "string", "enum": ["plain", "scram-sha-256", "scram-sha-512"], "description": "SASL authentication. Unset: none."},
+    "saslUsername": {"type": "string"},
+    "saslPassword": {"type": "string", "x-secret": true},
+    "schemaRegistryUrl": {"type": "string", "description": "A Confluent-compatible schema registry. Avro and Protobuf need one."},
+    "schemaRegistryUsername": {"type": "string"},
+    "schemaRegistryPassword": {"type": "string", "x-secret": true},
+    "format": {"type": "string", "enum": ["json", "avro", "protobuf", "string"], "default": "json", "description": "How values and keys are encoded. Avro and Protobuf use the schema registry's wire format; string reads each value as text."},
+    "topics": {"type": "array", "items": {"type": "string"}, "description": "The topics to offer as streams. Empty: every topic the credentials can describe, but internal ones."},
+    "topicPattern": {"type": "string", "description": "A regular expression topics must match to be offered."},
+    "startOffset": {"type": "string", "enum": ["earliest", "latest"], "default": "earliest", "description": "Where a partition's first read starts."},
+    "group": {"type": "string", "description": "The consumer group the read's offsets are committed to once checkpointed, for Kafka's tools. Default: openetl-<pipeline>."}
+  }
+}
