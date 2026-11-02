@@ -97,7 +97,7 @@ func (s *Source) Discover(ctx context.Context) (source.Catalog, error) {
 			return source.Catalog{}, fmt.Errorf("postgres: %s: %w", t.name, err)
 		}
 		b.release()
-		cs := source.CatalogStream{Name: t.name, Replay: source.Exact, Schema: b.declared}
+		cs := source.CatalogStream{Name: t.name, Replay: source.Exact, Schema: b.declared, SyncModes: []source.SyncMode{source.FullRefresh}}
 		for _, i := range t.key {
 			cs.PrimaryKey = append(cs.PrimaryKey, t.cols[i].name)
 		}
