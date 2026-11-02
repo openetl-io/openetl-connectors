@@ -9,6 +9,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"maps"
 	"os"
 	"strings"
 	"testing"
@@ -138,7 +139,7 @@ func TestCommitAppliesOnce(t *testing.T) {
 		t.Fatal("PreCommit made the target visible")
 	}
 	for range 2 {
-		if err := w.Commit(ctx, e, st); err != nil {
+		if _, err := w.Commit(ctx, e, st); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -213,7 +214,7 @@ func TestRecoverTrimsMarkers(t *testing.T) {
 			t.Fatal(err)
 		}
 		st := precommit(t, w, e)
-		if err := w.Commit(ctx, e, st); err != nil {
+		if _, err := w.Commit(ctx, e, st); err != nil {
 			t.Fatal(err)
 		}
 		return st
@@ -284,7 +285,7 @@ func TestStaleWriterIsFenced(t *testing.T) {
 	if r := recov(t, w2, 2, destination.Epoch{}, nil); r != destination.Applied {
 		t.Fatalf("Recover = %v", r)
 	}
-	if err := w1.Commit(ctx, e, st); !errors.Is(err, destination.ErrFenced) {
+	if _, err := w1.Commit(ctx, e, st); !errors.Is(err, destination.ErrFenced) {
 		t.Fatalf("stale Commit: %v, want fenced", err)
 	}
 	if _, err := w1.Recover(ctx, 1, destination.Epoch{}, nil); !errors.Is(err, destination.ErrFenced) {
@@ -333,7 +334,7 @@ func TestRecoverDropsStaleStaging(t *testing.T) {
 		t.Fatal(err)
 	}
 	st := precommit(t, w1, head)
-	if err := w1.Commit(ctx, head, st); err != nil {
+	if _, err := w1.Commit(ctx, head, st); err != nil {
 		t.Fatal(err)
 	}
 	stale, other := stage(w1, pipeline, 1, 2), stage(w2, "p2", 1, 1)
@@ -354,7 +355,7 @@ func TestRecoverDropsStaleStaging(t *testing.T) {
 	if !exists(other) || !exists(current) {
 		t.Error("Recover dropped another pipeline's staging, or its own generation's")
 	}
-	if err := w1.Commit(ctx, destination.Epoch{Generation: 1, N: 2}, staleSt); !errors.Is(err, destination.ErrFenced) {
+	if _, err := w1.Commit(ctx, destination.Epoch{Generation: 1, N: 2}, staleSt); !errors.Is(err, destination.ErrFenced) {
 		t.Errorf("committing dropped staging: %v, want fenced", err)
 	}
 }
@@ -373,7 +374,7 @@ func TestBatchWithoutColumns(t *testing.T) {
 	if err := w.Write(ctx, e, "empty", batch(t, []arrow.Field{idField}, `[{"id": 1}]`)); err != nil {
 		t.Fatal(err)
 	}
-	if err := w.Commit(ctx, e, precommit(t, w, e)); err != nil {
+	if _, err := w.Commit(ctx, e, precommit(t, w, e)); err != nil {
 		t.Fatal(err)
 	}
 	if n := env.count("SELECT count(*) FROM $schema.empty"); n != 4 {
@@ -401,7 +402,7 @@ func TestColumnsWiden(t *testing.T) {
 	if err := w.Write(ctx, e1, "nums", batch(t, ints, `[{"x": 1}]`)); err != nil {
 		t.Fatal(err)
 	}
-	if err := w.Commit(ctx, e1, precommit(t, w, e1)); err != nil {
+	if _, err := w.Commit(ctx, e1, precommit(t, w, e1)); err != nil {
 		t.Fatal(err)
 	}
 	// Widened within epoch 2, and across epochs.
@@ -411,7 +412,7 @@ func TestColumnsWiden(t *testing.T) {
 	if err := w.Write(ctx, e2, "nums", batch(t, floats, `[{"x": 2.5}]`)); err != nil {
 		t.Fatal(err)
 	}
-	if err := w.Commit(ctx, e2, precommit(t, w, e2)); err != nil {
+	if _, err := w.Commit(ctx, e2, precommit(t, w, e2)); err != nil {
 		t.Fatal(err)
 	}
 	typ := func() string {
@@ -476,51 +477,65 @@ func uid(n byte) string {
 }
 
 func TestDedupeAtApply(t *testing.T) {
-	env := newEnv(t)
-	ctx := t.Context()
-	w := env.openStreams(1, destination.ScopePipeline,
-		destination.Stream{Name: "events", Mode: destination.Append, Dedupe: true},
-		destination.Stream{Name: "logs", Mode: destination.Append})
-	recov(t, w, 1, destination.Epoch{}, nil)
-	fields := []arrow.Field{idField, rowID}
-	e1, e2 := destination.Epoch{Generation: 1, N: 1}, destination.Epoch{Generation: 1, N: 2}
-	// Repeats within an epoch, and of an earlier epoch's rows.
-	rows1 := `[{"id": 1, "_openetl_id": ` + uid(1) + `}, {"id": 2, "_openetl_id": ` + uid(2) + `}, {"id": 2, "_openetl_id": ` + uid(2) + `}]`
-	rows2 := `[{"id": 1, "_openetl_id": ` + uid(1) + `}, {"id": 3, "_openetl_id": ` + uid(3) + `}]`
-	for _, stream := range []string{"events", "logs"} {
-		if err := w.Write(ctx, e1, stream, batch(t, fields, rows1)); err != nil {
+	for _, scope := range []destination.Scope{destination.ScopePipeline, destination.ScopeStream} {
+		env := newEnv(t)
+		ctx := t.Context()
+		w := env.openStreams(1, scope,
+			destination.Stream{Name: "events", Mode: destination.Append, Dedupe: destination.DedupeTarget},
+			destination.Stream{Name: "pages", Mode: destination.Append, Dedupe: destination.DedupeEpoch},
+			destination.Stream{Name: "logs", Mode: destination.Append})
+		recov(t, w, 1, destination.Epoch{}, nil)
+		fields := []arrow.Field{idField, rowID}
+		e1, e2 := destination.Epoch{Generation: 1, N: 1}, destination.Epoch{Generation: 1, N: 2}
+		// Repeats within an epoch, and of an earlier epoch's rows.
+		rows1 := `[{"id": 1, "_openetl_id": ` + uid(1) + `}, {"id": 2, "_openetl_id": ` + uid(2) + `}, {"id": 2, "_openetl_id": ` + uid(2) + `}]`
+		rows2 := `[{"id": 1, "_openetl_id": ` + uid(1) + `}, {"id": 3, "_openetl_id": ` + uid(3) + `}]`
+		streams := []string{"events", "pages", "logs"}
+		for _, stream := range streams {
+			if err := w.Write(ctx, e1, stream, batch(t, fields, rows1)); err != nil {
+				t.Fatal(err)
+			}
+		}
+		st1 := precommit(t, w, e1)
+		c, err := w.Commit(ctx, e1, st1)
+		if err != nil {
 			t.Fatal(err)
 		}
-	}
-	if err := w.Commit(ctx, e1, precommit(t, w, e1)); err != nil {
-		t.Fatal(err)
-	}
-	for _, stream := range []string{"events", "logs"} {
-		if err := w.Write(ctx, e2, stream, batch(t, fields, rows2)); err != nil {
+		if want := map[string]uint64{"events": 1, "pages": 1}; !maps.Equal(c.Collapsed, want) {
+			t.Errorf("scope %d, epoch 1 collapsed %v, want %v", scope, c.Collapsed, want)
+		}
+		if c, err := w.Commit(ctx, e1, st1); err != nil || len(c.Collapsed) != 0 {
+			t.Errorf("scope %d: committing epoch 1 again collapsed %v (%v), want nothing", scope, c.Collapsed, err)
+		}
+		for _, stream := range streams {
+			if err := w.Write(ctx, e2, stream, batch(t, fields, rows2)); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if c, err = w.Commit(ctx, e2, precommit(t, w, e2)); err != nil {
 			t.Fatal(err)
 		}
-	}
-	if err := w.Commit(ctx, e2, precommit(t, w, e2)); err != nil {
-		t.Fatal(err)
-	}
-	if n := env.count("SELECT count(*) FROM $schema.events"); n != 3 {
-		t.Errorf("events has %d rows, want 3", n)
-	}
-	if n := env.count("SELECT count(*) FROM $schema.logs"); n != 5 {
-		t.Errorf("logs, which isn't deduped, has %d rows, want 5", n)
-	}
-	if n := env.count("SELECT count(*) FROM pg_indexes WHERE schemaname = '" + env.schema + "' AND tablename = 'events' AND indexdef LIKE '%(_openetl_id)'"); n != 1 {
-		t.Errorf("events has %d indexes on _openetl_id, want 1", n)
-	}
-	if n := env.count("SELECT count(*) FROM pg_indexes WHERE schemaname = '" + env.schema + "' AND tablename = 'logs'"); n != 0 {
-		t.Errorf("logs has %d indexes, want none", n)
+		if want := map[string]uint64{"events": 1}; !maps.Equal(c.Collapsed, want) {
+			t.Errorf("scope %d, epoch 2 collapsed %v, want %v", scope, c.Collapsed, want)
+		}
+		for table, want := range map[string]int{"events": 3, "pages": 4, "logs": 5} {
+			if n := env.count("SELECT count(*) FROM $schema." + table); n != want {
+				t.Errorf("scope %d: %s has %d rows, want %d", scope, table, n, want)
+			}
+		}
+		if n := env.count("SELECT count(*) FROM pg_indexes WHERE schemaname = '" + env.schema + "' AND tablename = 'events' AND indexdef LIKE '%(_openetl_id)'"); n != 1 {
+			t.Errorf("events has %d indexes on _openetl_id, want 1", n)
+		}
+		if n := env.count("SELECT count(*) FROM pg_indexes WHERE schemaname = '" + env.schema + "' AND tablename IN ('pages', 'logs')"); n != 0 {
+			t.Errorf("pages and logs have %d indexes, want none", n)
+		}
 	}
 }
 
 func TestRedoDedupesAsStaged(t *testing.T) {
 	env := newEnv(t)
 	ctx := t.Context()
-	w1 := env.openStreams(1, destination.ScopeStream, destination.Stream{Name: "events", Mode: destination.Append, Dedupe: true})
+	w1 := env.openStreams(1, destination.ScopeStream, destination.Stream{Name: "events", Mode: destination.Append, Dedupe: destination.DedupeTarget})
 	recov(t, w1, 1, destination.Epoch{}, nil)
 	e := destination.Epoch{Generation: 1, N: 1}
 	rows := `[{"id": 1, "_openetl_id": ` + uid(1) + `}, {"id": 1, "_openetl_id": ` + uid(1) + `}]`
@@ -541,7 +556,7 @@ func TestRedoDedupesAsStaged(t *testing.T) {
 
 func TestDedupeNeedsRowIDs(t *testing.T) {
 	env := newEnv(t)
-	w := env.openStreams(1, destination.ScopePipeline, destination.Stream{Name: "events", Mode: destination.Append, Dedupe: true})
+	w := env.openStreams(1, destination.ScopePipeline, destination.Stream{Name: "events", Mode: destination.Append, Dedupe: destination.DedupeTarget})
 	recov(t, w, 1, destination.Epoch{}, nil)
 	err := w.Write(t.Context(), destination.Epoch{Generation: 1, N: 1}, "events", batch(t, []arrow.Field{idField}, `[{"id": 1}]`))
 	if err == nil || !strings.Contains(err.Error(), "no _openetl_id") {

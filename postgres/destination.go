@@ -1,8 +1,8 @@
 // Package postgres has the Postgres source, which reads full snapshots of
 // tables, and the Postgres destination: append writes, staged into one table
 // per stream and epoch, and applied behind a fence row with a marker per
-// stream in _openetl_loads. Deduped streams insert one row per _openetl_id,
-// and only IDs the target doesn't have yet.
+// stream in _openetl_loads. Deduped streams insert one row per _openetl_id in
+// the epoch, and with DedupeTarget only IDs the target doesn't have yet.
 package postgres
 
 import (
@@ -112,6 +112,7 @@ type stagingTable struct {
 	name   string
 	target string
 	cols   []column
+	rows   uint64
 }
 
 // staged is the descriptor PreCommit returns.
@@ -125,8 +126,17 @@ type stagedStream struct {
 	Name    string `json:"name"`
 	Table   string `json:"table"`
 	Staging string `json:"staging"`
-	Dedupe  bool   `json:"dedupe,omitempty"`
+	// One row per _openetl_id in the epoch, and only IDs the target doesn't
+	// have yet.
+	Dedupe bool `json:"dedupe,omitempty"`
+	// One row per _openetl_id in the epoch.
+	DedupeEpoch bool `json:"dedupe_epoch,omitempty"`
+	// Staged rows, to count those the apply skips; 0 in descriptors from
+	// before it was counted.
+	Rows uint64 `json:"rows,omitempty"`
 }
+
+func (s stagedStream) deduped() bool { return s.Dedupe || s.DedupeEpoch }
 
 func (w *writer) ident(name string) string { return pgx.Identifier{w.schema, name}.Sanitize() }
 
@@ -150,7 +160,7 @@ func (w *writer) Write(ctx context.Context, e destination.Epoch, stream string, 
 	if batch.NumRows() == 0 {
 		return nil
 	}
-	if cfg.Dedupe && len(batch.Schema().FieldIndices(idColumn)) == 0 {
+	if cfg.Dedupe != destination.DedupeNone && len(batch.Schema().FieldIndices(idColumn)) == 0 {
 		return fmt.Errorf("postgres: stream %q is deduped at apply, but its batches have no %s", stream, idColumn)
 	}
 	cols, err := columnsOf(batch.Schema())
@@ -176,8 +186,11 @@ func (w *writer) Write(ctx context.Context, e destination.Epoch, stream string, 
 
 	n := int(batch.NumRows())
 	if len(cols) == 0 {
-		_, err := w.pool.Exec(ctx, "INSERT INTO "+w.ident(st.name)+" SELECT FROM generate_series(1, $1)", n)
-		return err
+		if _, err := w.pool.Exec(ctx, "INSERT INTO "+w.ident(st.name)+" SELECT FROM generate_series(1, $1)", n); err != nil {
+			return err
+		}
+		st.rows += uint64(n) //nolint:gosec // a batch's rows
+		return nil
 	}
 	names := make([]string, len(cols))
 	for i, c := range cols {
@@ -202,6 +215,7 @@ func (w *writer) Write(ctx context.Context, e destination.Epoch, stream string, 
 	if err != nil {
 		return fmt.Errorf("postgres: stage %s: %w", stream, err)
 	}
+	st.rows += uint64(n) //nolint:gosec // a batch's rows
 	return nil
 }
 
@@ -276,23 +290,28 @@ func (w *writer) PreCommit(_ context.Context, e destination.Epoch) (destination.
 	byStream := w.staging[e.N]
 	for _, s := range w.cfg.Streams {
 		if st := byStream[s.Name]; st != nil {
-			desc.Streams = append(desc.Streams, stagedStream{Name: s.Name, Table: st.target, Staging: st.name, Dedupe: s.Dedupe})
+			desc.Streams = append(desc.Streams, stagedStream{
+				Name: s.Name, Table: st.target, Staging: st.name, Rows: st.rows,
+				Dedupe: s.Dedupe == destination.DedupeTarget, DedupeEpoch: s.Dedupe == destination.DedupeEpoch,
+			})
 		}
 	}
 	delete(w.staging, e.N)
 	return json.Marshal(desc)
 }
 
-func (w *writer) Commit(ctx context.Context, _ destination.Epoch, s destination.Staged) error {
+func (w *writer) Commit(ctx context.Context, _ destination.Epoch, s destination.Staged) (destination.Committed, error) {
 	var desc staged
 	if err := json.Unmarshal(s, &desc); err != nil {
-		return fmt.Errorf("postgres: staged descriptor: %w", err)
+		return destination.Committed{}, fmt.Errorf("postgres: staged descriptor: %w", err)
 	}
-	return w.apply(ctx, desc, desc.Streams)
+	c := destination.Committed{Collapsed: map[string]uint64{}}
+	return c, w.apply(ctx, desc, desc.Streams, c.Collapsed)
 }
 
 // apply applies each stream that has no marker yet, then drops its staging.
-func (w *writer) apply(ctx context.Context, desc staged, streams []stagedStream) error {
+// It adds the rows each deduped stream skipped to collapsed.
+func (w *writer) apply(ctx context.Context, desc staged, streams []stagedStream, collapsed map[string]uint64) error {
 	todo, err := w.unapplied(ctx, desc, streams)
 	if err != nil || len(todo) == 0 {
 		return err
@@ -305,19 +324,20 @@ func (w *writer) apply(ctx context.Context, desc staged, streams []stagedStream)
 	}
 	if w.cfg.Scope == destination.ScopeStream {
 		for _, s := range todo {
-			if err := w.applyTx(ctx, desc, []stagedStream{s}, cols, "FOR SHARE"); err != nil {
+			if err := w.applyTx(ctx, desc, []stagedStream{s}, cols, "FOR SHARE", collapsed); err != nil {
 				return err
 			}
 		}
-	} else if err := w.applyTx(ctx, desc, todo, cols, "FOR UPDATE"); err != nil {
+	} else if err := w.applyTx(ctx, desc, todo, cols, "FOR UPDATE", collapsed); err != nil {
 		return err
 	}
 	w.dropStaging(ctx, todo)
 	return nil
 }
 
-func (w *writer) applyTx(ctx context.Context, desc staged, streams []stagedStream, cols map[string][]string, lock string) error {
-	return pgx.BeginFunc(ctx, w.pool, func(tx pgx.Tx) error {
+func (w *writer) applyTx(ctx context.Context, desc staged, streams []stagedStream, cols map[string][]string, lock string, collapsed map[string]uint64) error {
+	skipped := map[string]uint64{}
+	err := pgx.BeginFunc(ctx, w.pool, func(tx pgx.Tx) error {
 		var fence uint64
 		err := tx.QueryRow(ctx, "SELECT generation FROM "+w.ident("_openetl_fence")+" WHERE pipeline = $1 "+lock, w.cfg.Pipeline).Scan(&fence)
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -338,8 +358,12 @@ func (w *writer) applyTx(ctx context.Context, desc staged, streams []stagedStrea
 			if done {
 				continue
 			}
-			if _, err := tx.Exec(ctx, w.insert(s, cols[s.Name])); err != nil {
+			tag, err := tx.Exec(ctx, w.insert(s, cols[s.Name]))
+			if err != nil {
 				return fmt.Errorf("postgres: apply %s: %w", s.Name, err)
+			}
+			if n := uint64(tag.RowsAffected()); s.deduped() && s.Rows > n { //nolint:gosec // a row count
+				skipped[s.Name] = s.Rows - n
 			}
 			if _, err := tx.Exec(ctx, "INSERT INTO "+w.ident("_openetl_loads")+" (pipeline, stream, generation, epoch) VALUES ($1, $2, $3, $4)",
 				w.cfg.Pipeline, s.Name, desc.Generation, desc.Epoch); err != nil {
@@ -348,18 +372,29 @@ func (w *writer) applyTx(ctx context.Context, desc staged, streams []stagedStrea
 		}
 		return nil
 	})
+	if err == nil {
+		for name, n := range skipped {
+			collapsed[name] += n
+		}
+	}
+	return err
 }
 
 // insert copies a stream's staging into its target. A deduped stream inserts
-// one row per _openetl_id, and only IDs the target doesn't have.
+// one row per _openetl_id, and with Dedupe only IDs the target doesn't have.
 func (w *writer) insert(s stagedStream, cols []string) string {
 	list := quoteAll(cols)
-	if !s.Dedupe {
-		return "INSERT INTO " + w.ident(s.Table) + " (" + list + ") SELECT " + list + " FROM " + w.ident(s.Staging)
-	}
+	into := "INSERT INTO " + w.ident(s.Table) + " (" + list + ") "
 	id := pgx.Identifier{idColumn}.Sanitize()
-	return "INSERT INTO " + w.ident(s.Table) + " (" + list + ") SELECT DISTINCT ON (" + id + ") " + list +
-		" FROM " + w.ident(s.Staging) + " s WHERE NOT EXISTS (SELECT 1 FROM " + w.ident(s.Table) + " t WHERE t." + id + " = s." + id + ")"
+	switch {
+	case s.Dedupe:
+		return into + "SELECT DISTINCT ON (" + id + ") " + list + " FROM " + w.ident(s.Staging) +
+			" s WHERE NOT EXISTS (SELECT 1 FROM " + w.ident(s.Table) + " t WHERE t." + id + " = s." + id + ")"
+	case s.DedupeEpoch:
+		return into + "SELECT DISTINCT ON (" + id + ") " + list + " FROM " + w.ident(s.Staging)
+	default:
+		return into + "SELECT " + list + " FROM " + w.ident(s.Staging)
+	}
 }
 
 func quoteAll(names []string) string {
@@ -549,7 +584,7 @@ func (w *writer) Recover(ctx context.Context, gen uint64, e destination.Epoch, s
 		w.dropStaging(ctx, desc.Streams)
 		r = destination.Applied
 	case present == len(missing):
-		if err := w.apply(ctx, desc, missing); err != nil {
+		if err := w.apply(ctx, desc, missing, map[string]uint64{}); err != nil {
 			return 0, err
 		}
 		r = destination.Redone
