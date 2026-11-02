@@ -473,6 +473,62 @@ func TestOverwriteReplacesWhenTheReadEnds(t *testing.T) {
 	env.wantIDs("items")
 }
 
+// Against moto's Glue at OPENETL_TEST_GLUE_ENDPOINT, with the data files in
+// the S3 store; skipped without it.
+func TestGlue(t *testing.T) {
+	endpoint := os.Getenv("OPENETL_TEST_GLUE_ENDPOINT")
+	if endpoint == "" {
+		t.Skip("set OPENETL_TEST_GLUE_ENDPOINT to a Glue endpoint, such as moto's")
+	}
+	newEnv(t) // the bucket
+	ns := "g_" + strings.ToLower(rand.Text())[:10]
+	cfg, _ := json.Marshal(map[string]any{
+		"catalog": "glue", "region": "us-east-1", "namespace": ns, "warehouse": "s3://iceberg/glue",
+		"accessKeyId": "openetl", "secretAccessKey": "openetl", "s3Endpoint": s3(),
+		"properties": map[string]string{"glue.endpoint": endpoint},
+	})
+	d, err := NewDestination(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	env := &env{t: t, d: d, ns: ns}
+	w := env.open(1, destination.ScopeStream, appends("users")...)
+	recov(t, w, 1, destination.Epoch{}, nil)
+	e1, e2 := destination.Epoch{Generation: 1, N: 1}, destination.Epoch{Generation: 1, N: 2}
+	write(t, w, e1, "users", 1, 2)
+	commit(t, w, e1, precommit(t, w, e1))
+	write(t, w, e2, "users", 3)
+	st := precommit(t, w, e2)
+	w2 := env.open(2, destination.ScopeStream, appends("users")...)
+	if r := recov(t, w2, 2, e2, st); r != destination.Redone {
+		t.Fatalf("recover: %v, want redone", r)
+	}
+	if _, err := w.Commit(t.Context(), e2, st); !errors.Is(err, destination.ErrFenced) {
+		t.Fatalf("stale commit: %v, want fenced", err)
+	}
+	env.wantIDs("users", 1, 2, 3)
+
+	// Glue's VersionId is the compare-and-swap: a stale commit that checked
+	// the table before recovery applied the epoch fails.
+	w3 := env.open(3, destination.ScopeStream, appends("users")...)
+	recov(t, w3, 3, destination.Epoch{}, nil)
+	e3 := destination.Epoch{Generation: 3, N: 3}
+	write(t, w3, e3, "users", 4)
+	st3 := precommit(t, w3, e3)
+	w4 := env.open(4, destination.ScopeStream, appends("users")...)
+	var once sync.Once
+	testHookBeforeCommit = func(cur *writer) {
+		if cur.cfg.Generation == 3 {
+			once.Do(func() { recov(t, w4, 4, e3, st3) })
+		}
+	}
+	t.Cleanup(func() { testHookBeforeCommit = nil })
+	if _, err := w3.Commit(t.Context(), e3, st3); !errors.Is(err, destination.ErrFenced) {
+		t.Errorf("stale commit after recovery: %v, want fenced", err)
+	}
+	env.wantIDs("users", 1, 2, 3, 4)
+}
+
 func TestGlueNeedsStreamScope(t *testing.T) {
 	d, err := NewDestination([]byte(`{"catalog": "glue", "region": "us-east-1"}`))
 	if err != nil {

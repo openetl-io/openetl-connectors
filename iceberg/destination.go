@@ -340,7 +340,7 @@ func (w *writer) ensure(ctx context.Context, name string, sc *arrow.Schema) (*ta
 		}
 		// A transaction without changes commits nothing.
 		tbl, err = tx.Commit(ctx)
-		if errors.Is(err, table.ErrCommitFailed) && attempt < commitRetries {
+		if err != nil && conflict(err) && attempt < commitRetries {
 			continue
 		}
 		if err != nil {
@@ -574,7 +574,7 @@ func (w *writer) apply(ctx context.Context, desc staged, streams []stagedStream)
 		if err == nil {
 			return nil
 		}
-		if !errors.Is(err, table.ErrCommitFailed) || attempt >= commitRetries {
+		if !conflict(err) || attempt >= commitRetries {
 			return fmt.Errorf("iceberg: commit epoch %d-g%d: %w", desc.Epoch, desc.Generation, err)
 		}
 		select {
@@ -583,6 +583,12 @@ func (w *writer) apply(ctx context.Context, desc staged, streams []stagedStream)
 			return ctx.Err()
 		}
 	}
+}
+
+// conflict reports whether a commit lost to another. Catalogs that check
+// requirements themselves, such as Glue's, return a failed one unwrapped.
+func conflict(err error) bool {
+	return errors.Is(err, table.ErrCommitFailed) || strings.Contains(err.Error(), "requirement failed")
 }
 
 // testHookBeforeCommit runs between checking the tables and committing.
@@ -751,7 +757,7 @@ func (w *writer) raiseFence(ctx context.Context, ns []string, names []string, ge
 			if _, err = tx.Commit(ctx); err == nil {
 				break
 			}
-			if !errors.Is(err, table.ErrCommitFailed) || attempt >= commitRetries {
+			if !conflict(err) || attempt >= commitRetries {
 				return fmt.Errorf("iceberg: raise the fence of %s: %w", strings.Join(ident, "."), err)
 			}
 		}
