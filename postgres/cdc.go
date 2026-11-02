@@ -43,7 +43,9 @@ const (
 	statusEvery = 10 * time.Second
 	// A log quiet for this long is asked where it is.
 	idleAfter = time.Second
-	lagEvery  = time.Minute
+	// How often the read reports its progress, and logs it.
+	progressEvery = 10 * time.Second
+	logLagEvery   = time.Minute
 )
 
 // A record version's _openetl_seq: its transaction's commit LSN, then its
@@ -139,6 +141,7 @@ type relation struct {
 type txn struct {
 	xid    uint32
 	commit pglogrepl.LSN
+	at     time.Time
 	// Rows emitted so far.
 	n uint64
 	// Keys it changed in tables whose snapshot isn't read yet.
@@ -178,6 +181,10 @@ type cdcReader struct {
 	// The slot's confirmed position, and what checkpoints have committed.
 	confirmed pglogrepl.LSN
 	acked     atomic.Uint64
+	// Where the server last said its log ends, and when the transaction read
+	// last committed.
+	serverEnd  pglogrepl.LSN
+	lastCommit time.Time
 	txn       *txn
 	chunk     *chunk
 	// Transactions read lately that changed keys of tables whose snapshot
@@ -407,7 +414,7 @@ func (r *cdcReader) createSlot(ctx context.Context) (pglogrepl.LSN, error) {
 
 func (r *cdcReader) run(ctx context.Context) error {
 	nextStatus := time.Now()
-	nextLag := time.Now().Add(lagEvery)
+	nextProgress, nextLog := time.Now(), time.Now().Add(logLagEvery)
 	quietSince := time.Now()
 	// The next status asks the server where it is.
 	ask := false
@@ -433,9 +440,15 @@ func (r *cdcReader) run(ctx context.Context) error {
 		if acked := pglogrepl.LSN(r.acked.Load()); acked > r.confirmed {
 			r.confirmed, nextStatus = acked, time.Time{}
 		}
-		if now.After(nextLag) {
-			r.logLag(ctx)
-			nextLag = now.Add(lagEvery)
+		if !nextProgress.After(now) {
+			logLag := !nextLog.After(now)
+			if err := r.progress(ctx, logLag); err != nil {
+				return err
+			}
+			nextProgress = now.Add(progressEvery)
+			if logLag {
+				nextLog = now.Add(logLagEvery)
+			}
 		}
 		if !nextStatus.After(now) {
 			if err := r.status(ctx, ask); err != nil {
@@ -475,6 +488,7 @@ func (r *cdcReader) run(ctx context.Context) error {
 					return err
 				}
 				quietSince = time.Now()
+				r.serverEnd = max(r.serverEnd, k.ServerWALEnd)
 				if r.txn == nil && k.ServerWALEnd > r.pos {
 					r.pos = k.ServerWALEnd
 					if err := r.passed(); err != nil {
@@ -490,6 +504,7 @@ func (r *cdcReader) run(ctx context.Context) error {
 					return err
 				}
 				quietSince = time.Now()
+				r.serverEnd = max(r.serverEnd, x.ServerWALEnd)
 				if err := r.message(ctx, x.WALData); err != nil {
 					return err
 				}
@@ -514,11 +529,44 @@ func (r *cdcReader) status(ctx context.Context, ask bool) error {
 	return nil
 }
 
-func (r *cdcReader) logLag(ctx context.Context) {
-	var lag *int64
-	if err := r.conn.QueryRow(ctx, "SELECT pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn)::bigint FROM pg_replication_slots WHERE slot_name = $1", r.slot).Scan(&lag); err == nil && lag != nil {
-		slog.Info("replication slot lag", "slot", r.slot, "bytes", *lag)
+// progress reports how far the slot is behind the log, how much more WAL it
+// can hold before max_slot_wal_keep_size invalidates it, and how old the
+// transaction being read is.
+func (r *cdcReader) progress(ctx context.Context, log bool) error {
+	var behind, safe *int64
+	if err := r.conn.QueryRow(ctx, "SELECT pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn)::bigint, safe_wal_size FROM pg_replication_slots WHERE slot_name = $1", r.slot).Scan(&behind, &safe); err != nil {
+		slog.Debug("reading the replication slot's lag failed", "slot", r.slot, "err", err)
+		return nil
 	}
+	p := source.Progress{Lag: r.lag()}
+	if behind != nil && *behind >= 0 {
+		p.LagBytes = new(uint64(*behind))
+	}
+	if safe != nil && *safe >= 0 {
+		p.RetentionLeftBytes = new(uint64(*safe))
+	}
+	if log && behind != nil {
+		slog.Info("replication slot lag", "slot", r.slot, "bytes", *behind)
+	}
+	if pr, ok := r.out.(source.Progresser); ok {
+		return pr.Progress(p)
+	}
+	return nil
+}
+
+// lag is how old the change being read is: zero once the read has reached
+// where the server last said its log ends, and unknown before the first
+// transaction otherwise.
+func (r *cdcReader) lag() *time.Duration {
+	switch {
+	case r.txn != nil:
+		return new(max(time.Since(r.txn.at), 0))
+	case r.pos >= r.serverEnd:
+		return new(time.Duration(0))
+	case !r.lastCommit.IsZero():
+		return new(max(time.Since(r.lastCommit), 0))
+	}
+	return nil
 }
 
 func (r *cdcReader) message(ctx context.Context, data []byte) error {
@@ -530,7 +578,7 @@ func (r *cdcReader) message(ctx context.Context, data []byte) error {
 	case *pglogrepl.RelationMessage:
 		return r.relation(ctx, m)
 	case *pglogrepl.BeginMessage:
-		r.txn = &txn{xid: m.Xid, commit: m.FinalLSN}
+		r.txn = &txn{xid: m.Xid, commit: m.FinalLSN, at: m.CommitTime}
 	case *pglogrepl.CommitMessage:
 		if r.txn == nil {
 			return errors.New("postgres: replication: a commit without a begin")
@@ -538,6 +586,7 @@ func (r *cdcReader) message(ctx context.Context, data []byte) error {
 		if len(r.txn.keys) > 0 {
 			r.recent = append(r.recent, r.txn)
 		}
+		r.lastCommit = r.txn.at
 		r.txn = nil
 		r.pos = m.TransactionEndLSN
 		return r.passed()

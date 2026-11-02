@@ -461,6 +461,35 @@ func TestCDCAcknowledges(t *testing.T) {
 	}
 }
 
+// The read reports how far its slot is behind, how much more WAL the slot
+// may hold, and how old the change being read is.
+func TestCDCReportsProgress(t *testing.T) {
+	e := newSourceEnv(t)
+	e.exec("CREATE TABLE $schema.users (id int PRIMARY KEY, name text)")
+	e.exec("ALTER SYSTEM SET max_slot_wal_keep_size = '1GB'")
+	e.exec("SELECT pg_reload_conf()")
+	t.Cleanup(func() {
+		ctx := context.WithoutCancel(t.Context())
+		_, _ = e.conn.Exec(ctx, "ALTER SYSTEM RESET max_slot_wal_keep_size")
+		_, _ = e.conn.Exec(ctx, "SELECT pg_reload_conf()")
+	})
+	s, pipeline := e.cdcSource("")
+	f := follow(t, s, pipeline, map[string]string{"users": ""})
+	e.exec("INSERT INTO $schema.users VALUES (1, 'a')")
+	f.await(t, "a progress report", func() bool { return len(f.reports()) > 0 })
+	if err := f.stop(); err != nil {
+		t.Fatal(err)
+	}
+	p := f.reports()[0]
+	if p.Stream != "" || p.LagBytes == nil || p.Lag == nil || *p.Lag < 0 || p.LagRecords != nil || p.RetentionLeft != nil {
+		t.Errorf("progress %+v", p)
+	}
+	// The limit counts from the slot's segment, and one more is kept.
+	if p.RetentionLeftBytes == nil || *p.RetentionLeftBytes == 0 || *p.RetentionLeftBytes > 1<<30+16<<20 {
+		t.Errorf("retention left %+v, want up to 1 GB and a 16 MB segment", p)
+	}
+}
+
 // A read takes the slot from a connection that still holds it; a slot
 // that's gone while a stream has a position in it is lost.
 func TestCDCSlotTakeoverAndLoss(t *testing.T) {

@@ -63,9 +63,10 @@ func (e *sourceEnv) source(extra string) *Source {
 
 // capture records what a source emits, in order.
 type capture struct {
-	mu      sync.Mutex
-	log     []string
-	batches map[string][]arrow.RecordBatch
+	mu       sync.Mutex
+	log      []string
+	batches  map[string][]arrow.RecordBatch
+	progress []source.Progress
 }
 
 func (c *capture) Rows(stream string, _ []json.RawMessage) error {
@@ -95,6 +96,19 @@ func (c *capture) Complete(stream string, next []byte) error {
 	defer c.mu.Unlock()
 	c.log = append(c.log, fmt.Sprintf("%s complete%s", stream, next))
 	return nil
+}
+
+func (c *capture) Progress(p source.Progress) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.progress = append(c.progress, p)
+	return nil
+}
+
+func (c *capture) reports() []source.Progress {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return slices.Clone(c.progress)
 }
 
 func (c *capture) release() {
