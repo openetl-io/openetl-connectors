@@ -21,4 +21,5 @@ var DestinationCapabilities = destination.Capabilities{
 	DefaultCommitInterval: 10 * time.Second,
 	MinCommitInterval:     time.Second,
 	MaxIdentifierLength:   63,
+	WriteModes:            []destination.WriteMode{destination.Append, destination.Overwrite, destination.Merge},
 }

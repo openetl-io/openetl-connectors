@@ -382,12 +382,12 @@ func TestBatchWithoutColumns(t *testing.T) {
 	}
 }
 
-func TestOnlyAppend(t *testing.T) {
+func TestMergeNeedsAKey(t *testing.T) {
 	env := newEnv(t)
 	_, err := env.d.Open(t.Context(), destination.OpenConfig{Pipeline: "p1", Generation: 1, Scope: destination.ScopePipeline,
-		Streams: []destination.Stream{{Name: "users", Mode: destination.Merge, PrimaryKey: []string{"id"}}}})
+		Streams: []destination.Stream{{Name: "users", Mode: destination.Merge}}})
 	if err == nil {
-		t.Fatal("Open accepted a merge stream")
+		t.Fatal("Open accepted a merge stream without a primary key")
 	}
 }
 
