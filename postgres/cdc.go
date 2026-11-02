@@ -185,8 +185,8 @@ type cdcReader struct {
 	// last committed.
 	serverEnd  pglogrepl.LSN
 	lastCommit time.Time
-	txn       *txn
-	chunk     *chunk
+	txn        *txn
+	chunk      *chunk
 	// Transactions read lately that changed keys of tables whose snapshot
 	// isn't read yet; a later chunk's snapshot may not have seen them.
 	recent []*txn
