@@ -9,6 +9,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
@@ -31,20 +32,35 @@ type SourceConfig struct {
 	ChunkRows int `json:"chunkRows"`
 	// Approximate bytes of values per Arrow batch. Default 4 MiB.
 	BatchBytes int `json:"batchBytes"`
+	// The publication that tables read with cdc are in. Created, or given
+	// the tables it lacks, if the user may. Default "openetl".
+	Publication string `json:"publication"`
+	// The replication slot tables read with cdc are read through. Default:
+	// one named after the pipeline, openetl_<pipeline>.
+	Slot string `json:"slot"`
+	// Rows per chunk of a cdc table's snapshot, which is held in memory
+	// until the log catches up with it. Default 10000.
+	SnapshotChunkRows int `json:"snapshotChunkRows"`
 }
 
-// Source reads full snapshots of tables. A table with a primary key is read
-// in key order, a chunk per query, so a resumed read yields exactly the rows
-// after its last chunk. A table without one is read in a single query.
+// Source reads tables: a full refresh reads a table's rows, and cdc reads
+// its changes through a logical replication slot (cdc.go). A table with a
+// primary key is read in key order, a chunk per query, so a resumed read
+// yields exactly the rows after its last chunk. A table without one is read
+// in a single query.
 type Source struct {
 	cfg  SourceConfig
 	conn *pgx.ConnConfig
+
+	mu sync.Mutex
+	// The cdc read running, which Committed acknowledges on.
+	reader *cdcReader
 }
 
 var _ source.Source = (*Source)(nil)
 
 func NewSource(config []byte) (*Source, error) {
-	cfg := SourceConfig{Schema: "public", ChunkRows: 100_000, BatchBytes: 4 << 20}
+	cfg := SourceConfig{Schema: "public", ChunkRows: 100_000, BatchBytes: 4 << 20, Publication: "openetl", SnapshotChunkRows: 10_000}
 	dec := json.NewDecoder(bytes.NewReader(config))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&cfg); err != nil {
@@ -53,15 +69,19 @@ func NewSource(config []byte) (*Source, error) {
 	switch {
 	case cfg.DSN.IsZero():
 		return nil, errors.New("postgres: config needs a dsn")
-	case cfg.ChunkRows <= 0 || cfg.BatchBytes <= 0:
-		return nil, errors.New("postgres: chunkRows and batchBytes must be positive")
+	case cfg.ChunkRows <= 0 || cfg.BatchBytes <= 0 || cfg.SnapshotChunkRows <= 0:
+		return nil, errors.New("postgres: chunkRows, batchBytes and snapshotChunkRows must be positive")
+	case cfg.Publication == "":
+		return nil, errors.New("postgres: publication can't be empty")
+	case len(cfg.Slot) > 63 || strings.Trim(cfg.Slot, "abcdefghijklmnopqrstuvwxyz0123456789_") != "":
+		return nil, errors.New("postgres: slot names are up to 63 lowercase letters, digits and underscores")
 	}
 	cc, err := pgx.ParseConfig(cfg.DSN.Reveal())
 	if err != nil {
 		return nil, fmt.Errorf("postgres: dsn: %w", err)
 	}
 	// Text values, and the keys that resume a read, are spelled in these.
-	for k, v := range map[string]string{"DateStyle": "ISO, YMD", "TimeZone": "UTC", "IntervalStyle": "iso_8601", "extra_float_digits": "3"} {
+	for k, v := range map[string]string{"DateStyle": "ISO, YMD", "TimeZone": "UTC", "IntervalStyle": "iso_8601", "extra_float_digits": "3", "bytea_output": "hex"} {
 		cc.RuntimeParams[k] = v
 	}
 	return &Source{cfg: cfg, conn: cc}, nil
@@ -72,6 +92,9 @@ type table struct {
 	cols []sourceColumn
 	// Indexes into cols, in key order.
 	key []int
+	// pg_class.relreplident: what the log says of an update's or delete's
+	// old row.
+	replident byte
 }
 
 type sourceColumn struct {
@@ -98,6 +121,11 @@ func (s *Source) Discover(ctx context.Context) (source.Catalog, error) {
 		}
 		b.release()
 		cs := source.CatalogStream{Name: t.name, Replay: source.Exact, Schema: b.declared, SyncModes: []source.SyncMode{source.FullRefresh}}
+		// The log names an update's or delete's row by its primary key, or
+		// with replica identity full by all of it.
+		if len(t.key) > 0 && (t.replident == 'd' || t.replident == 'f') {
+			cs.SyncModes = append(cs.SyncModes, source.CDC)
+		}
 		for _, i := range t.key {
 			cs.PrimaryKey = append(cs.PrimaryKey, t.cols[i].name)
 		}
@@ -108,7 +136,7 @@ func (s *Source) Discover(ctx context.Context) (source.Catalog, error) {
 
 // tables lists the configured tables, in name order.
 func (s *Source) tables(ctx context.Context, conn *pgx.Conn) ([]table, error) {
-	rows, err := conn.Query(ctx, `SELECT c.relname, a.attname, a.atttypid, a.atttypmod,
+	rows, err := conn.Query(ctx, `SELECT c.relname, c.relreplident::text, a.attname, a.atttypid, a.atttypmod,
 			coalesce((SELECT k.ord FROM unnest(i.indkey::int2[]) WITH ORDINALITY AS k(attnum, ord) WHERE k.attnum = a.attnum), 0)
 		FROM pg_class c
 		JOIN pg_namespace n ON n.oid = c.relnamespace
@@ -136,15 +164,15 @@ func (s *Source) tables(ctx context.Context, conn *pgx.Conn) ([]table, error) {
 		}
 	}
 	for rows.Next() {
-		var name string
+		var name, replident string
 		var c sourceColumn
 		var pos int64
-		if err := rows.Scan(&name, &c.name, &c.oid, &c.typmod, &pos); err != nil {
+		if err := rows.Scan(&name, &replident, &c.name, &c.oid, &c.typmod, &pos); err != nil {
 			return nil, fmt.Errorf("postgres: list tables: %w", err)
 		}
 		if len(out) == 0 || out[len(out)-1].name != name {
 			finish()
-			out = append(out, table{name: name})
+			out = append(out, table{name: name, replident: replident[0]})
 			keyPos = keyPos[:0]
 		}
 		t := &out[len(out)-1]
@@ -198,6 +226,7 @@ func (s *Source) Read(ctx context.Context, req source.ReadRequest, out source.Em
 	if err != nil {
 		return err
 	}
+	var cdc []source.ConfiguredStream
 	for _, cs := range req.Streams {
 		i := 0
 		for i < len(tables) && tables[i].name != cs.Name {
@@ -205,6 +234,10 @@ func (s *Source) Read(ctx context.Context, req source.ReadRequest, out source.Em
 		}
 		if i == len(tables) {
 			return fmt.Errorf("postgres: unknown stream %q", cs.Name)
+		}
+		if cs.SyncMode == source.CDC {
+			cdc = append(cdc, cs)
+			continue
 		}
 		var st sourceState
 		if cs.State != nil {
@@ -216,7 +249,10 @@ func (s *Source) Read(ctx context.Context, req source.ReadRequest, out source.Em
 			return err
 		}
 	}
-	return nil
+	if len(cdc) == 0 {
+		return nil
+	}
+	return s.readCDC(ctx, conn, req, cdc, tables, out)
 }
 
 func (s *Source) readTable(ctx context.Context, conn *pgx.Conn, t table, st sourceState, out source.Emitter) error {

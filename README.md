@@ -4,8 +4,8 @@ The official connectors for [openetl](https://github.com/unsuitable001/openetl).
 
 | Connector | Executable | Notes |
 |---|---|---|
-| Postgres source | `source-postgres` | Full-refresh snapshots in primary-key chunks, typed Arrow |
-| Postgres destination | `destination-postgres` | Stage and apply, with a fence row; append, dedupe at apply |
+| Postgres source | `source-postgres` | Full refresh in primary-key chunks, typed Arrow; CDC through a logical replication slot (pgoutput), with read-only snapshots in chunks |
+| Postgres destination | `destination-postgres` | Stage and apply, with a fence row; append, overwrite and merge, dedupe at apply |
 
 ## Build
 
@@ -24,6 +24,8 @@ go test ./...
 # Against a Postgres (default postgres://openetl:openetl@localhost:5432/openetl):
 OPENETL_TEST_POSTGRES_DSN=… go test -tags integration ./...
 ```
+
+The CDC tests need the server to run with `wal_level = logical`, and a user that may create replication slots and publications.
 
 ## Layout
 

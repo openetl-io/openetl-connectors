@@ -17,9 +17,11 @@ import (
 )
 
 var (
-	opField      = arrow.Field{Name: opColumn, Type: arrow.BinaryTypes.String}
-	seqField     = arrow.Field{Name: seqColumn, Type: arrow.PrimitiveTypes.Int64, Nullable: true}
-	deletedField = arrow.Field{Name: deletedColumn, Type: arrow.FixedWidthTypes.Boolean}
+	opField        = arrow.Field{Name: opColumn, Type: arrow.BinaryTypes.String}
+	seqField       = arrow.Field{Name: seqColumn, Type: arrow.PrimitiveTypes.Int64, Nullable: true}
+	deletedField   = arrow.Field{Name: deletedColumn, Type: arrow.FixedWidthTypes.Boolean}
+	unchangedField = arrow.Field{Name: unchangedColumn, Type: arrow.ListOf(arrow.BinaryTypes.String), Nullable: true}
+	docField       = arrow.Field{Name: "doc", Type: arrow.BinaryTypes.String, Nullable: true}
 )
 
 func (e *env) exec(q string) {
@@ -82,6 +84,51 @@ func endRead(t *testing.T, rt destination.ReadTracker, e destination.Epoch, stre
 }
 
 const users = "SELECT string_agg(id || ':' || coalesce(name, '-'), ',' ORDER BY id) FROM $schema.users"
+
+// A column an update didn't send takes its value from the key's latest
+// earlier version in the epoch that sent it, or else keeps the target's. The
+// target's _openetl_unchanged lists the columns it never received.
+func TestMergeKeepsUnchangedColumns(t *testing.T) {
+	env := newEnv(t)
+	w := env.openStreams(1, destination.ScopePipeline, destination.Stream{Name: "users", Mode: destination.Merge, PrimaryKey: []string{"id"}})
+	recov(t, w, 1, destination.Epoch{}, nil)
+	fields := []arrow.Field{idField, nameField, docField, opField, seqField, deletedField, unchangedField}
+	const rows = `SELECT string_agg(id || ':' || name || ':' || coalesce(doc, '-') || ':' || coalesce(_openetl_unchanged::text, '-') || ':' || _openetl_deleted, ',' ORDER BY id) FROM $schema.users`
+	e1 := destination.Epoch{Generation: 1, N: 1}
+	write(t, w, e1, "users", batch(t, fields, `[
+		{"id": 1, "name": "a", "doc": "big1", "_openetl_op": "insert", "_openetl_seq": 1, "_openetl_deleted": false},
+		{"id": 2, "name": "b", "_openetl_op": "update", "_openetl_seq": 1, "_openetl_deleted": false, "_openetl_unchanged": ["doc"]},
+		{"id": 1, "name": "a2", "_openetl_op": "update", "_openetl_seq": 2, "_openetl_deleted": false, "_openetl_unchanged": ["doc"]},
+		{"id": 3, "name": "c", "doc": null, "_openetl_op": "insert", "_openetl_seq": 1, "_openetl_deleted": false},
+		{"id": 3, "name": "c2", "_openetl_op": "update", "_openetl_seq": 2, "_openetl_deleted": false, "_openetl_unchanged": ["doc"]}]`))
+	commit(t, w, e1)
+	if got := env.text(rows); got != `1:a2:big1:-:false,2:b:-:["doc"]:false,3:c2:-:-:false` {
+		t.Fatalf("after epoch 1: %s", got)
+	}
+
+	e2 := destination.Epoch{Generation: 1, N: 2}
+	write(t, w, e2, "users", batch(t, fields, `[
+		{"id": 1, "name": "a3", "_openetl_op": "update", "_openetl_seq": 3, "_openetl_deleted": false, "_openetl_unchanged": ["doc"]},
+		{"id": 2, "name": "b2", "_openetl_op": "update", "_openetl_seq": 2, "_openetl_deleted": false, "_openetl_unchanged": ["doc"]},
+		{"id": 3, "name": "c3", "doc": "big3", "_openetl_op": "update", "_openetl_seq": 3, "_openetl_deleted": false},
+		{"id": 3, "name": "c4", "_openetl_op": "update", "_openetl_seq": 4, "_openetl_deleted": false, "_openetl_unchanged": ["doc"]}]`))
+	commit(t, w, e2)
+	if got := env.text(rows); got != `1:a3:big1:-:false,2:b2:-:["doc"]:false,3:c4:big3:-:false` {
+		t.Fatalf("after epoch 2: %s", got)
+	}
+
+	e3 := destination.Epoch{Generation: 1, N: 3}
+	write(t, w, e3, "users", batch(t, fields, `[
+		{"id": 1, "_openetl_op": "delete", "_openetl_seq": 4, "_openetl_deleted": true},
+		{"id": 2, "name": "b3", "doc": "big2", "_openetl_op": "update", "_openetl_seq": 3, "_openetl_deleted": false}]`))
+	commit(t, w, e3)
+	if got := env.text(rows); got != `1:a3:big1:-:true,2:b3:big2:-:false,3:c4:big3:-:false` {
+		t.Errorf("after epoch 3: %s", got)
+	}
+	if typ := env.text(`SELECT format_type(atttypid, atttypmod) FROM pg_attribute WHERE attrelid = '$schema.users'::regclass AND attname = '_openetl_unchanged'`); typ != "jsonb" {
+		t.Errorf("_openetl_unchanged is %s", typ)
+	}
+}
 
 // Each key keeps its latest version: within an epoch by _openetl_seq, across
 // epochs unless the stored one is newer. A delete keeps the row's columns,

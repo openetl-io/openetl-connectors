@@ -10,6 +10,7 @@ import (
 	"math"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/apache/arrow-go/v18/arrow"
@@ -62,6 +63,7 @@ func (e *sourceEnv) source(extra string) *Source {
 
 // capture records what a source emits, in order.
 type capture struct {
+	mu      sync.Mutex
 	log     []string
 	batches map[string][]arrow.RecordBatch
 }
@@ -71,6 +73,8 @@ func (c *capture) Rows(stream string, _ []json.RawMessage) error {
 }
 
 func (c *capture) Records(stream string, b arrow.RecordBatch) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	if c.batches == nil {
 		c.batches = map[string][]arrow.RecordBatch{}
 	}
@@ -80,11 +84,15 @@ func (c *capture) Records(stream string, b arrow.RecordBatch) error {
 }
 
 func (c *capture) ResumePoint(stream string, state []byte) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.log = append(c.log, fmt.Sprintf("%s@%s", stream, state))
 	return nil
 }
 
 func (c *capture) Complete(stream string, next []byte) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.log = append(c.log, fmt.Sprintf("%s complete%s", stream, next))
 	return nil
 }
@@ -99,6 +107,8 @@ func (c *capture) release() {
 
 // column returns a stream's values in one column, as Arrow prints them.
 func (c *capture) column(stream, name string) []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	var out []string
 	for _, b := range c.batches[stream] {
 		idx := b.Schema().FieldIndices(name)

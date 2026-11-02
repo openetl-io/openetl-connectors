@@ -1,5 +1,6 @@
-// Package postgres has the Postgres source, which reads full snapshots of
-// tables, and the Postgres destination: append, overwrite and merge writes,
+// Package postgres has the Postgres source, which reads tables in full or
+// their changes through a replication slot, and the Postgres destination:
+// append, overwrite and merge writes,
 // staged into one table per stream and epoch, and applied behind a fence row
 // with a marker per stream in _openetl_loads. Deduped streams insert one row
 // per _openetl_id in the epoch, and with DedupeTarget only IDs the target
@@ -185,6 +186,9 @@ const (
 	opColumn      = "_openetl_op"
 	seqColumn     = "_openetl_seq"
 	deletedColumn = "_openetl_deleted"
+	// A changelog's: the columns an update didn't send, as a JSON array,
+	// whose values are null. In a merge's target, those it never received.
+	unchangedColumn = "_openetl_unchanged"
 	// The engine names renamed columns' source names in each schema's
 	// metadata: a JSON object from destination name to source name.
 	sourceNamesKey = "openetl.source_names"
@@ -468,6 +472,8 @@ type prepared struct {
 	// Overwrite: the read table's columns once it can take the staging's;
 	// none if the read has no table.
 	read []string
+	// Merge: the columns an update in the staging didn't send.
+	unchanged []string
 }
 
 // apply applies each stream that has no marker yet, then drops its staging.
@@ -545,7 +551,7 @@ func (w *writer) applyTx(ctx context.Context, desc staged, streams []stagedStrea
 // inserted.
 func (w *writer) applyStream(ctx context.Context, tx pgx.Tx, s stagedStream, p prepared) (uint64, error) {
 	if s.Mode == modeMerge {
-		for _, q := range w.merge(s, p.cols) {
+		for _, q := range w.merge(s, p.cols, p.unchanged) {
 			if _, err := tx.Exec(ctx, q); err != nil {
 				return 0, err
 			}
@@ -592,8 +598,10 @@ func (w *writer) insert(s stagedStream, cols []string) string {
 // merge upserts each key's latest staged version, by _openetl_seq and then
 // staging order, unless the target's is newer. A delete keeps the row's
 // other columns as they were, with its metadata columns updated, or with
-// hard deletes removes the row.
-func (w *writer) merge(s stagedStream, cols []string) []string {
+// hard deletes removes the row. A column in unchanged that the latest
+// version didn't send takes its value from the key's latest staged version
+// that did, or else keeps the target's.
+func (w *writer) merge(s stagedStream, cols, unchanged []string) []string {
 	q := func(c string) string { return pgx.Identifier{c}.Sanitize() }
 	hasSeq, hasOp := slices.Contains(cols, seqColumn), slices.Contains(cols, opColumn)
 	list, key := quoteAll(cols), quoteAll(s.Key)
@@ -602,6 +610,12 @@ func (w *writer) merge(s stagedStream, cols []string) []string {
 		order += ", " + q(seqColumn) + " DESC NULLS LAST"
 	}
 	latest := "WITH s AS (SELECT DISTINCT ON (" + key + ") " + list + " FROM " + w.ident(s.Staging) + " ORDER BY " + order + ", ctid DESC) "
+	if len(unchanged) > 0 {
+		latest = w.latestResolved(s, cols, unchanged, hasSeq)
+	}
+	sent := func(rel, c string) string {
+		return "NOT coalesce(" + rel + "." + q(unchangedColumn) + " ? " + quoteLiteral(c) + ", false)"
+	}
 	isDelete := func(rel string) string { return rel + "." + q(opColumn) + " = 'delete'" }
 	// Unless the target's version is newer; a missing sequence doesn't
 	// stop an update.
@@ -617,7 +631,14 @@ func (w *writer) merge(s stagedStream, cols []string) []string {
 			continue
 		}
 		v := "EXCLUDED." + q(c)
-		if hasOp && !s.HardDeletes && !slices.Contains(metadataColumns, c) {
+		switch {
+		case c == unchangedColumn:
+			// The columns neither ever sent.
+			v = "CASE WHEN EXCLUDED." + q(c) + " IS NULL OR t." + q(c) + " IS NULL THEN NULL ELSE (SELECT jsonb_agg(u) FROM jsonb_array_elements_text(EXCLUDED." + q(c) + ") u WHERE t." + q(c) + " ? u) END"
+		case slices.Contains(unchanged, c):
+			v = "CASE WHEN " + sent("EXCLUDED", c) + " THEN " + v + " ELSE t." + q(c) + " END"
+		}
+		if hasOp && !s.HardDeletes && (!slices.Contains(metadataColumns, c) || c == unchangedColumn) {
 			v = "CASE WHEN " + isDelete("EXCLUDED") + " THEN t." + q(c) + " ELSE " + v + " END"
 		}
 		sets = append(sets, q(c)+" = "+v)
@@ -640,6 +661,40 @@ func (w *writer) merge(s stagedStream, cols []string) []string {
 	}
 	del := latest + "DELETE FROM " + w.ident(s.Table) + " t USING s WHERE " + strings.Join(on, " AND ") + " AND " + isDelete("s") + " AND " + newer("s")
 	return []string{upsert, del}
+}
+
+// latestResolved is merge's CTE of each key's latest staged version, whose
+// unchanged columns come from the key's latest earlier version that sent
+// them, if any; its _openetl_unchanged then leaves them out.
+func (w *writer) latestResolved(s stagedStream, cols, unchanged []string, hasSeq bool) string {
+	q := func(c string) string { return pgx.Identifier{c}.Sanitize() }
+	key := quoteAll(s.Key)
+	order, before, latestFirst := key, "e.ctid < l._openetl_ctid", "e.ctid DESC"
+	if hasSeq {
+		order += ", " + q(seqColumn) + " DESC NULLS LAST"
+		before = "(e." + q(seqColumn) + ", e.ctid) < (l." + q(seqColumn) + ", l._openetl_ctid)"
+		latestFirst = "e." + q(seqColumn) + " DESC, " + latestFirst
+	}
+	match := make([]string, len(s.Key))
+	for i, k := range s.Key {
+		match[i] = "e." + q(k) + " = l." + q(k)
+	}
+	sel := make([]string, len(cols))
+	for i, c := range cols {
+		sel[i] = "l." + q(c)
+	}
+	from, remaining := "l", "l."+q(unchangedColumn)
+	for i, c := range unchanged {
+		p, lit := "p"+strconv.Itoa(i), quoteLiteral(c)
+		from += " LEFT JOIN LATERAL (SELECT true AS found, e." + q(c) + " AS v FROM " + w.ident(s.Staging) + " e" +
+			" WHERE l." + q(unchangedColumn) + " ? " + lit + " AND " + strings.Join(match, " AND ") + " AND " + before +
+			" AND NOT coalesce(e." + q(unchangedColumn) + " ? " + lit + ", false) ORDER BY " + latestFirst + " LIMIT 1) " + p + " ON true"
+		sel[slices.Index(cols, c)] = "CASE WHEN " + p + ".found THEN " + p + ".v ELSE l." + q(c) + " END AS " + q(c)
+		remaining = "(" + remaining + " - CASE WHEN " + p + ".found THEN " + lit + " ELSE '' END)"
+	}
+	sel[slices.Index(cols, unchangedColumn)] = "nullif(" + remaining + ", '[]') AS " + q(unchangedColumn)
+	return "WITH l AS (SELECT DISTINCT ON (" + key + ") *, ctid AS _openetl_ctid FROM " + w.ident(s.Staging) + " ORDER BY " + order + ", ctid DESC), " +
+		"s AS (SELECT " + strings.Join(sel, ", ") + " FROM " + from + ") "
 }
 
 // replace makes the read's rows the target's, and drops the read's table.
@@ -734,6 +789,17 @@ func (w *writer) prepare(ctx context.Context, desc staged, s stagedStream) (prep
 	if s.Mode == modeMerge {
 		if err := w.ensureKey(ctx, s.Table, s.Key); err != nil {
 			return p, err
+		}
+		if slices.Contains(p.cols, unchangedColumn) {
+			u := pgx.Identifier{unchangedColumn}.Sanitize()
+			rows, err := w.pool.Query(ctx, "SELECT DISTINCT c FROM "+w.ident(s.Staging)+", jsonb_array_elements_text("+u+") c WHERE "+u+" IS NOT NULL ORDER BY c")
+			if err != nil {
+				return p, err
+			}
+			if p.unchanged, err = pgx.CollectRows(rows, pgx.RowTo[string]); err != nil {
+				return p, err
+			}
+			p.unchanged = slices.DeleteFunc(p.unchanged, func(c string) bool { return !slices.Contains(p.cols, c) || slices.Contains(s.Key, c) })
 		}
 	}
 	return p, nil

@@ -9,6 +9,9 @@
     "schema": {"type": "string", "default": "public"},
     "tables": {"type": "array", "items": {"type": "string"}, "description": "The tables to offer as streams. Empty: every table in the schema."},
     "chunkRows": {"type": "integer", "minimum": 1, "default": 100000, "description": "Rows per query on a table with a primary key; each chunk ends at a resume point."},
-    "batchBytes": {"type": "integer", "minimum": 1, "default": 4194304, "description": "Approximate bytes of values per Arrow batch."}
+    "batchBytes": {"type": "integer", "minimum": 1, "default": 4194304, "description": "Approximate bytes of values per Arrow batch."},
+    "publication": {"type": "string", "minLength": 1, "default": "openetl", "description": "The publication that tables read with cdc are in. Created, or given the tables it lacks, if the user may."},
+    "slot": {"type": "string", "pattern": "^[a-z0-9_]{1,63}$", "description": "The replication slot tables read with cdc are read through. Default: one named after the pipeline, openetl_<pipeline>."},
+    "snapshotChunkRows": {"type": "integer", "minimum": 1, "default": 10000, "description": "Rows per chunk of a cdc table's snapshot, which is held in memory until the log catches up with it."}
   }
 }
