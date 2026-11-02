@@ -1,12 +1,13 @@
-// Package iceberg has the Iceberg destination: append and overwrite writes
-// into Iceberg tables through a REST or Glue catalog. Writes stream each
-// stream's batches into Parquet data files under its table's location, which
-// PreCommit lists in the staged descriptor. Commit adds them in one snapshot
-// per table, with the epoch's marker in the snapshot summary and in a table
-// property, on the snapshot it checked the fence and the marker on: the
-// catalog refuses the commit if another landed first. Overwrite keeps a
+// Package iceberg has the Iceberg destination: append, overwrite and merge
+// writes into Iceberg tables through a REST or Glue catalog. Writes stream
+// each stream's batches into Parquet data files under its table's location,
+// which PreCommit lists in the staged descriptor. Commit adds them in one
+// snapshot per table, with the epoch's marker in the snapshot summary and in
+// a table property, on the snapshot it checked the fence and the marker on:
+// the catalog refuses the commit if another landed first. Overwrite keeps a
 // read's files out of the table until the read ends, then replaces the
-// table's files with them.
+// table's files with them. Merge reads its files back at Commit, and adds
+// equality deletes of the keys they change with the keys' new rows.
 package iceberg
 
 import (
@@ -163,7 +164,10 @@ func (d *Destination) Check(ctx context.Context) error {
 func (d *Destination) Open(ctx context.Context, cfg destination.OpenConfig) (destination.Writer, error) {
 	for _, s := range cfg.Streams {
 		if !DestinationCapabilities.SupportsMode(s.Mode) {
-			return nil, fmt.Errorf("iceberg: stream %q: only append and overwrite writes are supported", s.Name)
+			return nil, fmt.Errorf("iceberg: stream %q: only append, overwrite and merge writes are supported", s.Name)
+		}
+		if s.Mode == destination.Merge && len(s.PrimaryKey) == 0 {
+			return nil, fmt.Errorf("iceberg: stream %q merges, and has no primary key", s.Name)
 		}
 	}
 	if cfg.Scope == destination.ScopePipeline && d.cfg.Catalog == "glue" {
@@ -184,6 +188,7 @@ func (d *Destination) Open(ctx context.Context, cfg destination.OpenConfig) (des
 		streams: map[string]destination.Stream{},
 		tables:  map[string]*table.Table{},
 		names:   map[string]string{},
+		keys:    map[string][]string{},
 		parts:   map[uint64]map[string]*epochFiles{},
 		ended:   map[uint64][]string{},
 		reads:   map[string]*read{},
@@ -210,6 +215,8 @@ type writer struct {
 	tables  map[string]*table.Table
 	schemas map[string]*arrow.Schema
 	names   map[string]string
+	// Merge: each stream's key under destination names.
+	keys map[string][]string
 
 	// Only Write, StartReads, EndRead, PreCommit and Recover use these.
 	parts  map[uint64]map[string]*epochFiles
@@ -234,7 +241,10 @@ type staged struct {
 	Streams    []stagedStream `json:"streams"`
 }
 
-const modeOverwrite = "overwrite"
+const (
+	modeOverwrite = "overwrite"
+	modeMerge     = "merge"
+)
 
 type stagedStream struct {
 	Name  string `json:"name"`
@@ -249,6 +259,10 @@ type stagedStream struct {
 	Read    int64    `json:"read,omitempty"`
 	Earlier []string `json:"earlier,omitempty"`
 	Ended   bool     `json:"ended,omitempty"`
+	// Merge: the key's columns, and whether a delete removes the row. The
+	// files are read back at Commit, and no snapshot holds them.
+	Key         []string `json:"key,omitempty"`
+	HardDeletes bool     `json:"hard_deletes,omitempty"`
 }
 
 // applies reports whether committing the stream changes its table, and
@@ -473,6 +487,13 @@ func (w *writer) Write(ctx context.Context, e destination.Epoch, stream string, 
 	if _, ok := w.starts[stream]; cfg.Mode == destination.Overwrite && !ok {
 		return fmt.Errorf("iceberg: stream %q overwrites, but its read has no start", stream)
 	}
+	if _, ok := w.keys[stream]; cfg.Mode == destination.Merge && !ok {
+		key, err := keyColumns(batch.Schema(), cfg.PrimaryKey)
+		if err != nil {
+			return fmt.Errorf("iceberg: stream %q: %w", stream, err)
+		}
+		w.keys[stream] = key
+	}
 	tbl, err := w.tableFor(ctx, stream, batch.Schema())
 	if err != nil {
 		return err
@@ -533,6 +554,9 @@ func (w *writer) PreCommit(_ context.Context, e destination.Epoch) (destination.
 			continue
 		}
 		ss := stagedStream{Name: s.Name, Table: w.name(s.Name), Files: files}
+		if s.Mode == destination.Merge {
+			ss.Mode, ss.Key, ss.HardDeletes = modeMerge, w.keys[s.Name], s.Deletes == destination.HardDelete
+		}
 		if s.Mode == destination.Overwrite {
 			r := w.reads[s.Name]
 			if r == nil {
@@ -557,6 +581,25 @@ func (w *writer) Commit(ctx context.Context, _ destination.Epoch, s destination.
 	}
 	return destination.Committed{}, w.apply(ctx, desc, desc.Streams)
 }
+
+// pending is a table's transaction, with the files it wrote, which no
+// snapshot holds unless it commits, and a merge's staged files, which it
+// makes unneeded once it does.
+type pending struct {
+	tx      *table.Transaction
+	ns      []string
+	table   string
+	written []string
+	staged  []string
+}
+
+func (w *writer) discard(ps []pending) {
+	for _, p := range ps {
+		w.dropFiles(p.ns, p.table, p.written)
+	}
+}
+
+func (w *writer) committed(p pending) { w.dropFiles(p.ns, p.table, p.staged) }
 
 // apply commits each stream that changes its table and has no marker yet:
 // all in one catalog transaction, or with stream scope one per table. A
@@ -594,31 +637,54 @@ func conflict(err error) bool {
 // testHookBeforeCommit runs between checking the tables and committing.
 var testHookBeforeCommit func(*writer)
 
-func (w *writer) commit(ctx context.Context, txs []*table.Transaction) error {
+// commit commits txs. It drops the files of those the catalog refused or
+// that it never sent, but not of one whose outcome it doesn't know.
+func (w *writer) commit(ctx context.Context, txs []pending) error {
 	if w.cfg.Scope == destination.ScopePipeline && len(txs) > 1 {
 		m, err := catalog.NewMultiTableTransaction(w.cat)
 		if err != nil {
+			w.discard(txs)
 			return err
 		}
-		for _, tx := range txs {
-			if err := m.AddTransaction(tx); err != nil {
+		for _, p := range txs {
+			if err := m.AddTransaction(p.tx); err != nil {
+				w.discard(txs)
 				return err
 			}
 		}
-		return m.Commit(ctx)
-	}
-	for _, tx := range txs {
-		if _, err := tx.Commit(ctx); err != nil {
+		if err := m.Commit(ctx); err != nil {
+			if conflict(err) {
+				w.discard(txs)
+			}
 			return err
 		}
+		for _, p := range txs {
+			w.committed(p)
+		}
+		return nil
+	}
+	for i, p := range txs {
+		if _, err := p.tx.Commit(ctx); err != nil {
+			if conflict(err) {
+				w.discard(txs[i : i+1])
+			}
+			w.discard(txs[i+1:])
+			return err
+		}
+		w.committed(p)
 	}
 	return nil
 }
 
 // prepare loads each stream's table, and returns a transaction for each one
 // still to apply, on the snapshot it checked.
-func (w *writer) prepare(ctx context.Context, desc staged, streams []stagedStream) ([]*table.Transaction, error) {
-	var txs []*table.Transaction
+func (w *writer) prepare(ctx context.Context, desc staged, streams []stagedStream) (txs []pending, err error) {
+	defer func() {
+		if err != nil {
+			w.discard(txs)
+			txs = nil
+		}
+	}()
 	for _, s := range streams {
 		files, ok := s.applies()
 		if !ok {
@@ -644,41 +710,66 @@ func (w *writer) prepare(ctx context.Context, desc staged, streams []stagedStrea
 		if applied(tbl.Properties(), w.cfg.Pipeline, desc) {
 			continue
 		}
-		tx, err := w.transaction(ctx, tbl, desc, s, files)
+		tx, written, err := w.transaction(ctx, tbl, desc, s, files)
 		if err != nil {
-			return nil, fmt.Errorf("iceberg: %s: %w", strings.Join(ident, "."), err)
+			w.dropFiles(desc.Namespace, s.Table, written)
+			return txs, fmt.Errorf("iceberg: %s: %w", strings.Join(ident, "."), err)
 		}
-		txs = append(txs, tx)
+		p := pending{tx: tx, ns: desc.Namespace, table: s.Table, written: written}
+		if s.Mode == modeMerge {
+			p.staged = s.Files
+		}
+		txs = append(txs, p)
 	}
 	return txs, nil
 }
 
-func (w *writer) transaction(ctx context.Context, tbl *table.Table, desc staged, s stagedStream, paths []string) (*table.Transaction, error) {
+// transaction stages the stream's epoch in a transaction on tbl. It returns
+// the files it wrote, also on failure.
+func (w *writer) transaction(ctx context.Context, tbl *table.Table, desc staged, s stagedStream, paths []string) (*table.Transaction, []string, error) {
 	// Without it, a table that sets commit.retry.num-retries has iceberg-go
 	// replay the commit on top of a conflicting one.
 	tx := tbl.NewTransaction()
 	if err := tx.AssertRefSnapshotID(""); err != nil {
-		return nil, err
-	}
-	fs, err := tbl.FS(ctx)
-	if err != nil {
-		return nil, err
-	}
-	files := make([]ice.DataFile, len(paths))
-	for i, p := range paths {
-		if files[i], err = table.FileToDataFile(ctx, fs, p, tbl.Schema(), tbl.Spec(), 0, tbl.Properties()); err != nil {
-			return nil, fmt.Errorf("staged file %s: %w", p, err)
-		}
+		return nil, nil, err
 	}
 	marker := ice.Properties{
 		pipelineKey: w.cfg.Pipeline, streamKey: s.Name,
 		generationKey: strconv.FormatUint(desc.Generation, 10), epochKey: strconv.FormatUint(desc.Epoch, 10),
 	}
+	var written []string
+	var err error
+	if s.Mode == modeMerge {
+		written, err = w.mergeInto(ctx, tx, tbl, s, marker)
+	} else {
+		err = w.addFiles(ctx, tx, tbl, s, paths, marker)
+	}
+	if err != nil {
+		return nil, written, err
+	}
+	if err := tx.SetProperties(ice.Properties{loadedKey(w.cfg.Pipeline): fmt.Sprintf("%d:%d", desc.Epoch, desc.Generation)}); err != nil {
+		return nil, written, err
+	}
+	return tx, written, nil
+}
+
+// addFiles stages an append or an overwrite of the staged files in tx.
+func (w *writer) addFiles(ctx context.Context, tx *table.Transaction, tbl *table.Table, s stagedStream, paths []string, marker ice.Properties) error {
+	fs, err := tbl.FS(ctx)
+	if err != nil {
+		return err
+	}
+	files := make([]ice.DataFile, len(paths))
+	for i, p := range paths {
+		if files[i], err = table.FileToDataFile(ctx, fs, p, tbl.Schema(), tbl.Spec(), 0, tbl.Properties()); err != nil {
+			return fmt.Errorf("staged file %s: %w", p, err)
+		}
+	}
 	var current []ice.DataFile
 	if s.Mode == modeOverwrite && tbl.CurrentSnapshot() != nil {
 		tasks, err := tbl.Scan().PlanFiles(ctx)
 		if err != nil {
-			return nil, fmt.Errorf("plan its files: %w", err)
+			return fmt.Errorf("plan its files: %w", err)
 		}
 		for _, t := range tasks {
 			current = append(current, t.File)
@@ -690,13 +781,7 @@ func (w *writer) transaction(ctx context.Context, tbl *table.Table, desc staged,
 	case len(files) > 0:
 		err = tx.AddDataFiles(ctx, files, marker, table.WithoutAutoNameMapping())
 	}
-	if err != nil {
-		return nil, err
-	}
-	if err := tx.SetProperties(ice.Properties{loadedKey(w.cfg.Pipeline): fmt.Sprintf("%d:%d", desc.Epoch, desc.Generation)}); err != nil {
-		return nil, err
-	}
-	return tx, nil
+	return err
 }
 
 func (w *writer) checkFence(props ice.Properties, gen uint64) error {
@@ -809,6 +894,9 @@ func (w *writer) Recover(ctx context.Context, gen uint64, e destination.Epoch, s
 			return 0, fmt.Errorf("iceberg: load %s: %w", st.Table, err)
 		}
 		if tbl != nil && applied(tbl.Properties(), w.cfg.Pipeline, desc) {
+			if st.Mode == modeMerge {
+				w.dropFiles(desc.Namespace, st.Table, st.Files)
+			}
 			continue
 		}
 		missing = append(missing, st)

@@ -17,5 +17,5 @@ var DestinationCapabilities = destination.Capabilities{
 	Scopes:                []destination.Scope{destination.ScopePipeline, destination.ScopeStream},
 	DefaultCommitInterval: time.Minute,
 	MinCommitInterval:     time.Second,
-	WriteModes:            []destination.WriteMode{destination.Append, destination.Overwrite},
+	WriteModes:            []destination.WriteMode{destination.Append, destination.Overwrite, destination.Merge},
 }

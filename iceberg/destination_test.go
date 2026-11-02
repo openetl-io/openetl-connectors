@@ -527,6 +527,22 @@ func TestGlue(t *testing.T) {
 		t.Errorf("stale commit after recovery: %v, want fenced", err)
 	}
 	env.wantIDs("users", 1, 2, 3, 4)
+
+	w5 := env.open(5, destination.ScopeStream, merges(destination.SoftDelete, "accounts")...)
+	recov(t, w5, 5, destination.Epoch{}, nil)
+	fields := []arrow.Field{idField, nameField, opField, seqField, deletedField}
+	e5, e6 := destination.Epoch{Generation: 5, N: 5}, destination.Epoch{Generation: 5, N: 6}
+	writeRows(t, w5, e5, "accounts", fields, `[
+		{"id": 1, "name": "a", "_openetl_op": "insert", "_openetl_seq": 1, "_openetl_deleted": false},
+		{"id": 2, "name": "b", "_openetl_op": "insert", "_openetl_seq": 1, "_openetl_deleted": false}]`)
+	commitEpoch(t, w5, e5)
+	writeRows(t, w5, e6, "accounts", fields, `[
+		{"id": 1, "name": "a2", "_openetl_op": "update", "_openetl_seq": 2, "_openetl_deleted": false},
+		{"id": 2, "_openetl_op": "delete", "_openetl_seq": 2, "_openetl_deleted": true}]`)
+	commitEpoch(t, w5, e6)
+	if got := env.rows("accounts", "id", "name", deletedColumn); got != "1:a2:false,2:b:true" {
+		t.Errorf("accounts: %s", got)
+	}
 }
 
 func TestGlueNeedsStreamScope(t *testing.T) {
