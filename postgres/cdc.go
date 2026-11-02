@@ -511,6 +511,10 @@ func (r *cdcReader) run(ctx context.Context) error {
 			}
 		case *pgproto3.ErrorResponse:
 			return classify(pgconn.ErrorResponseToPgError(m))
+		// The server may send these at any time, on any connection.
+		case *pgproto3.NoticeResponse:
+			slog.Info("the server sent a notice on the replication connection", "slot", r.slot, "severity", m.Severity, "message", m.Message)
+		case *pgproto3.ParameterStatus, *pgproto3.NotificationResponse:
 		default:
 			return fmt.Errorf("postgres: replication: unexpected %T", msg)
 		}
