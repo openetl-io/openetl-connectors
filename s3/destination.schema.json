@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Parquet on S3 destination",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["url"],
+  "properties": {
+    "url": {"type": "string", "description": "Where the tables go: s3://bucket/prefix, or file:// and an absolute path. Each stream's table is a directory of Parquet files under it."},
+    "region": {"type": "string", "description": "The bucket's AWS region."},
+    "endpoint": {"type": "string", "description": "An S3-compatible endpoint, for stores other than AWS. Uses path-style addressing."},
+    "accessKeyId": {"type": "string", "x-secret": true, "description": "An AWS access key. Without one, the AWS default credentials."},
+    "secretAccessKey": {"type": "string", "x-secret": true, "description": "The access key's secret."},
+    "compression": {"type": "string", "enum": ["zstd", "snappy", "gzip", "none"], "default": "zstd", "description": "The Parquet files' compression."},
+    "fileSize": {"type": "integer", "minimum": 1048576, "default": 268435456, "description": "Bytes a file reaches before the next one starts."}
+  }
+}
