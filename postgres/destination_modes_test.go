@@ -256,6 +256,9 @@ func TestMergeIntoAnExistingTable(t *testing.T) {
 	if _, err := w.Commit(t.Context(), e2, precommit(t, w, e2)); err == nil || !strings.Contains(err.Error(), "needs one row per primary key") {
 		t.Errorf("merging into a table with repeated keys: %v", err)
 	}
+	if n := env.count("SELECT count(*) FROM pg_indexes WHERE schemaname = '" + env.schema + "' AND tablename = 'logs'"); n != 0 {
+		t.Errorf("the failed build left %d indexes on logs", n)
+	}
 }
 
 // The target keeps its rows until the read ends, then has exactly the

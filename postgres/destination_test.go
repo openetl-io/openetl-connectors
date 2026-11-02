@@ -532,6 +532,56 @@ func TestDedupeAtApply(t *testing.T) {
 	}
 }
 
+// A concurrent build that was cut off leaves its index invalid; the next
+// apply drops it and builds it again.
+func TestDedupeRebuildsAnInvalidIndex(t *testing.T) {
+	env := newEnv(t)
+	ctx := t.Context()
+	events := destination.Stream{Name: "events", Mode: destination.Append, Dedupe: destination.DedupeTarget}
+	w := env.openStreams(1, destination.ScopeStream, events)
+	recov(t, w, 1, destination.Epoch{}, nil)
+	fields := []arrow.Field{idField, rowID}
+	e1 := destination.Epoch{Generation: 1, N: 1}
+	if err := w.Write(ctx, e1, "events", batch(t, fields, `[{"id": 1, "_openetl_id": `+uid(1)+`}]`)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Commit(ctx, e1, precommit(t, w, e1)); err != nil {
+		t.Fatal(err)
+	}
+	index := pgx.Identifier{indexName("events")}.Sanitize()
+	for _, q := range []string{
+		"DROP INDEX $schema." + index,
+		"INSERT INTO $schema.events (id, _openetl_id) VALUES (1, '02020202-0202-0202-0202-020202020202')",
+	} {
+		if _, err := env.conn.Exec(ctx, strings.ReplaceAll(q, "$schema", pgx.Identifier{env.schema}.Sanitize())); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := env.conn.Exec(ctx, "CREATE UNIQUE INDEX CONCURRENTLY "+index+" ON "+pgx.Identifier{env.schema, "events"}.Sanitize()+" (id)"); err == nil {
+		t.Fatal("a unique index over repeats built")
+	}
+	if n := env.count("SELECT count(*) FROM pg_index WHERE indexrelid = to_regclass('$schema." + index + "') AND NOT indisvalid"); n != 1 {
+		t.Fatalf("%d invalid indexes", n)
+	}
+
+	w2 := env.openStreams(2, destination.ScopeStream, events)
+	recov(t, w2, 2, destination.Epoch{}, nil)
+	e2 := destination.Epoch{Generation: 2, N: 2}
+	if err := w2.Write(ctx, e2, "events", batch(t, fields, `[{"id": 1, "_openetl_id": `+uid(1)+`}, {"id": 3, "_openetl_id": `+uid(3)+`}]`)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w2.Commit(ctx, e2, precommit(t, w2, e2)); err != nil {
+		t.Fatal(err)
+	}
+	if n := env.count("SELECT count(*) FROM pg_index i JOIN pg_indexes x ON x.indexname = '" + indexName("events") + "' AND x.schemaname = '" + env.schema + "'" +
+		" WHERE i.indexrelid = to_regclass('$schema." + index + "') AND i.indisvalid AND NOT i.indisunique AND x.indexdef LIKE '%(_openetl_id)'"); n != 1 {
+		t.Errorf("the index on _openetl_id wasn't built again")
+	}
+	if n := env.count("SELECT count(*) FROM $schema.events"); n != 3 {
+		t.Errorf("events has %d rows, want 3", n)
+	}
+}
+
 func TestRedoDedupesAsStaged(t *testing.T) {
 	env := newEnv(t)
 	ctx := t.Context()

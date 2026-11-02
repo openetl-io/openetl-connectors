@@ -802,6 +802,13 @@ func (w *writer) prepare(ctx context.Context, desc staged, s stagedStream) (prep
 			p.unchanged = slices.DeleteFunc(p.unchanged, func(c string) bool { return !slices.Contains(p.cols, c) || slices.Contains(s.Key, c) })
 		}
 	}
+	// The apply joins the staging with the target, and the planner knows
+	// nothing of a table just copied into.
+	if s.Staging != "" && (s.Dedupe || s.Mode == modeMerge) {
+		if _, err := w.pool.Exec(ctx, "ANALYZE "+w.ident(s.Staging)); err != nil {
+			return p, fmt.Errorf("postgres: analyze the staging of %s: %w", s.Name, err)
+		}
+	}
 	return p, nil
 }
 
@@ -821,19 +828,42 @@ func (w *writer) ensureRead(ctx context.Context, s stagedStream, cols []column) 
 	return w.ensureTable(ctx, s.Read, cols)
 }
 
+// ensureIndex builds the index without blocking the table's writers. A
+// concurrent build that was cut off leaves the index invalid, so it drops
+// such an index and builds it again.
 func (w *writer) ensureIndex(ctx context.Context, table, name string, unique bool, cols []string) error {
 	if w.indexed[name] {
 		return nil
+	}
+	var valid bool
+	err := w.pool.QueryRow(ctx, "SELECT indisvalid FROM pg_index WHERE indexrelid = to_regclass($1)", w.ident(name)).Scan(&valid)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return err
+	}
+	if err == nil && !valid {
+		if err := w.dropIndex(ctx, name); err != nil {
+			return err
+		}
 	}
 	kind := "INDEX"
 	if unique {
 		kind = "UNIQUE INDEX"
 	}
-	if _, err := w.pool.Exec(ctx, "CREATE "+kind+" IF NOT EXISTS "+pgx.Identifier{name}.Sanitize()+" ON "+w.ident(table)+" ("+quoteAll(cols)+")"); err != nil {
+	if _, err := w.pool.Exec(ctx, "CREATE "+kind+" CONCURRENTLY IF NOT EXISTS "+pgx.Identifier{name}.Sanitize()+" ON "+w.ident(table)+" ("+quoteAll(cols)+")"); err != nil {
+		// Writes would keep the invalid index up to date until the next
+		// build drops it; this build failing on repeats is certainly ours.
+		if pe := (*pgconn.PgError)(nil); errors.As(err, &pe) && pe.Code == "23505" {
+			_ = w.dropIndex(context.WithoutCancel(ctx), name)
+		}
 		return err
 	}
 	w.indexed[name] = true
 	return nil
+}
+
+func (w *writer) dropIndex(ctx context.Context, name string) error {
+	_, err := w.pool.Exec(ctx, "DROP INDEX CONCURRENTLY IF EXISTS "+w.ident(name))
+	return err
 }
 
 // ensureKey gives a merge target a unique index on its key, unless it has
