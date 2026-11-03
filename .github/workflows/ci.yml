@@ -35,7 +35,15 @@ jobs:
       - uses: actions/setup-go@v6
         with:
           go-version-file: openetl-connectors/go.mod
-          cache-dependency-path: openetl-connectors/go.sum
+          cache: false
+      # Restores the last cache when go.sum changes; setup-go's starts over.
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: go-${{ hashFiles('openetl-connectors/go.sum') }}
+          restore-keys: go-
       - name: Format
         working-directory: openetl-connectors
         run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
