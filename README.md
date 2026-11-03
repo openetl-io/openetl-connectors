@@ -10,6 +10,8 @@ The official connectors for [openetl](https://github.com/unsuitable001/openetl).
 | Parquet on S3 destination | `destination-s3` | Parquet files staged under the pipeline, copied to names from the pipeline, epoch and generation, with a marker per stream and epoch; append. Also `file://`. |
 | Kafka source | `source-kafka` | A stream per topic, read `read_committed` from each partition's offset (exact replay); bounded to the end it saw for scheduled pipelines, unbounded for continuous ones; JSON, Avro, Protobuf or text values, with a Confluent-compatible schema registry |
 | Kafka destination | `destination-kafka` | A transaction per epoch across topics, on a pool of three transactional producers, with the epoch's marker in the same transaction (exactly-once); a record per row, its key the primary key; JSON, Avro or Protobuf |
+| Kinesis source | `source-kinesis` | A stream per Kinesis stream, polled from each shard's sequence number (exact replay within retention), a parent shard read to its end before its children; bounded to where each shard caught up for scheduled pipelines, unbounded for continuous ones; Kafka's formats |
+| Kinesis destination | `destination-kinesis` | `PutRecords`, delivered and acknowledged by the epoch's end (at-least-once); a record per row, its partition key the primary key or `_openetl_id`; JSON, Avro or Protobuf |
 
 ## Build
 
@@ -37,12 +39,16 @@ The S3 destination's tests run against `file://` by default, and with `-tags int
 
 The Kafka tests need a broker at `OPENETL_TEST_KAFKA_BROKERS` (default `127.0.0.1:9092`) and a Confluent-compatible schema registry at `OPENETL_TEST_SCHEMA_REGISTRY` (default `http://127.0.0.1:8081`). openetl's compose file runs Kafka and Karapace.
 
+The Kinesis tests need a Kinesis endpoint at `OPENETL_TEST_KINESIS_ENDPOINT` (default `http://127.0.0.1:4568`), such as kinesis-mock's, which openetl's compose file runs, and the schema registry.
+
 ## Layout
 
 - `postgres/`: the Postgres source and destination, and their config schemas.
 - `iceberg/`: the Iceberg destination, and its config schema.
 - `s3/`: the Parquet on S3 destination, and its config schema.
-- `kafka/`: the Kafka source and destination, their formats, and their config schemas.
+- `kafka/`: the Kafka source and destination, and their config schemas.
+- `kinesis/`: the Kinesis source and destination, and their config schemas.
+- `records/`: the record layout and formats Kafka and Kinesis share: JSON, and Avro and Protobuf with a schema registry.
 - `cmd/<executable>/`: one `main` per connector, which hands the connector to `sdk.Serve`.
 
 ## License

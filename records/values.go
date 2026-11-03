@@ -257,7 +257,7 @@ func colOf(f arrow.Field) (Col, error) {
 	return c, nil
 }
 
-// at is row i's value, nil for null.
+// At is row i's value, nil for null.
 func (c *Col) At(a arrow.Array, i int) (any, error) {
 	if a.IsNull(i) {
 		return nil, nil

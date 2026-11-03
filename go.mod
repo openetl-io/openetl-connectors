@@ -10,7 +10,9 @@ require (
 	github.com/aws/aws-sdk-go-v2 v1.45.1
 	github.com/aws/aws-sdk-go-v2/config v1.33.1
 	github.com/aws/aws-sdk-go-v2/credentials v1.20.1
+	github.com/aws/aws-sdk-go-v2/service/kinesis v1.52.0
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.109.1
+	github.com/aws/smithy-go v1.28.1
 	github.com/bufbuild/protocompile v0.14.1
 	github.com/google/uuid v1.6.0
 	github.com/jackc/pglogrepl v0.0.0-20261003132456-662581bb6bb6
@@ -60,7 +62,6 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/sso v1.35.1 // indirect
 	github.com/aws/aws-sdk-go-v2/service/ssooidc v1.40.1 // indirect
 	github.com/aws/aws-sdk-go-v2/service/sts v1.47.1 // indirect
-	github.com/aws/smithy-go v1.28.1 // indirect
 	github.com/bits-and-blooms/bitset v1.24.4 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/cncf/xds/go v0.0.0-20260202195803-dba9d589def2 // indirect

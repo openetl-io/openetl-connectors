@@ -159,3 +159,33 @@ func KeyColumns(sc *arrow.Schema, key []string) ([]string, error) {
 	}
 	return out, nil
 }
+
+// KeyText is a key's values as text: one column's text, or a JSON array of
+// several.
+func KeyText(cols []Col, vals []any) (string, error) {
+	if len(cols) == 1 {
+		if s, ok := vals[0].(string); ok {
+			return s, nil
+		}
+		b, err := cols[0].appendJSON(nil, vals[0])
+		if err != nil {
+			return "", err
+		}
+		var s string
+		if len(b) > 0 && b[0] == '"' && json.Unmarshal(b, &s) == nil {
+			return s, nil
+		}
+		return string(b), nil
+	}
+	b := []byte{'['}
+	for i := range cols {
+		if i > 0 {
+			b = append(b, ',')
+		}
+		var err error
+		if b, err = cols[i].appendJSON(b, vals[i]); err != nil {
+			return "", err
+		}
+	}
+	return string(append(b, ']')), nil
+}

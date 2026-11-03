@@ -85,7 +85,15 @@ jobs:
             -e KARAPACE_MASTER_ELIGIBILITY=true -e KARAPACE_TOPIC_NAME=_schemas -e KARAPACE_COMPATIBILITY=BACKWARD \
             ghcr.io/aiven-open/karapace:6.2.4 -m karapace
           until curl -sf http://127.0.0.1:8081/subjects; do sleep 1; done
-      - name: Tests, against Postgres, the Iceberg catalogs and Kafka
+      # Kinesis's: kinesis-mock, on plain HTTP.
+      - name: Kinesis
+        run: |
+          docker run -d --name kinesis -p 4568:4568 -e KINESIS_MOCK_PLAIN_PORT=4568 \
+            -e CREATE_STREAM_DURATION=100ms -e SPLIT_SHARD_DURATION=100ms -e MERGE_SHARDS_DURATION=100ms \
+            -e SHARD_LIMIT=100000 -e ON_DEMAND_STREAM_COUNT_LIMIT=10000 -e LOG_LEVEL=WARN \
+            ghcr.io/etspaceman/kinesis-mock:0.6.2
+          until curl -sf http://127.0.0.1:4568/healthcheck; do sleep 1; done
+      - name: Tests, against Postgres, the Iceberg catalogs, Kafka and Kinesis
         working-directory: openetl-connectors
         env:
           OPENETL_TEST_GLUE_ENDPOINT: http://127.0.0.1:5000
