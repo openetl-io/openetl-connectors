@@ -16,6 +16,7 @@ import (
 	"github.com/twmb/franz-go/pkg/kgo"
 	"github.com/twmb/franz-go/pkg/sr"
 
+	"github.com/unsuitable001/openetl-connectors/records"
 	sdk "github.com/unsuitable001/openetl/sdk/go"
 	"github.com/unsuitable001/openetl/sdk/go/destination"
 	protocolv1 "github.com/unsuitable001/openetl/sdk/go/protocol/v1"
@@ -64,7 +65,7 @@ func NewDestination(config []byte) (*Destination, error) {
 	if err := decodeConfig(config, &cfg); err != nil {
 		return nil, err
 	}
-	if err := cfg.validate(formatJSON, formatAvro, formatProtobuf); err != nil {
+	if err := cfg.validate(records.JSON, records.Avro, records.Protobuf); err != nil {
 		return nil, sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_CONFIG_INVALID, err)
 	}
 	return &Destination{cfg: cfg}, nil
@@ -95,7 +96,7 @@ func check(ctx context.Context, c *Connection) error {
 	if _, err := kadm.NewClient(cl).ListBrokers(ctx); err != nil {
 		return classify(fmt.Errorf("kafka: list brokers: %w", err))
 	}
-	reg, err := c.registry()
+	reg, err := c.Registry()
 	if err != nil || reg == nil {
 		return err
 	}
@@ -133,7 +134,7 @@ func (d *Destination) Open(ctx context.Context, cfg destination.OpenConfig) (des
 	if cfg.Scope != destination.ScopePipeline {
 		return nil, sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_CONFIG_INVALID, errors.New("kafka: an epoch is one transaction across topics; set delivery.commit.scope to pipeline"))
 	}
-	reg, err := d.cfg.registry()
+	reg, err := d.cfg.Registry()
 	if err != nil {
 		return nil, err
 	}
@@ -308,10 +309,10 @@ func (w *writer) ensureTopic(ctx context.Context, topic string, configs map[stri
 type streamEncoder struct {
 	schema   *arrow.Schema
 	topic    string
-	cols     []col
+	cols     []records.Col
 	key      []int
-	keyEnc   rowEncoder
-	valueEnc rowEncoder
+	keyEnc   records.Encoder
+	valueEnc records.Encoder
 	id, op   int
 }
 
@@ -330,76 +331,48 @@ func (w *writer) encoder(ctx context.Context, stream string, sc *arrow.Schema) (
 	if e := w.encs[stream]; e != nil && e.schema.Equal(sc) {
 		return e, nil
 	}
-	table, ok := sc.Metadata().GetValue(tableKey)
+	table, ok := sc.Metadata().GetValue(records.TableKey)
 	if !ok {
-		table = avroName(stream)
+		table = records.AvroName(stream)
 	}
 	e := &streamEncoder{schema: sc, topic: w.topic(table), id: -1, op: -1}
 	if err := w.ensureTopic(ctx, e.topic, nil); err != nil {
 		return nil, err
 	}
-	cols, err := colsOf(sc)
+	cols, err := records.Cols(sc)
 	if err != nil {
 		return nil, fmt.Errorf("kafka: stream %q: %w", stream, err)
 	}
 	e.cols = cols
 	for i := range cols {
-		switch cols[i].name {
+		switch cols[i].Name() {
 		case idColumn:
 			e.id = i
 		case opColumn:
 			e.op = i
 		}
 	}
-	names, err := keyColumns(sc, w.streams[stream].PrimaryKey)
+	names, err := records.KeyColumns(sc, w.streams[stream].PrimaryKey)
 	if err != nil {
 		return nil, fmt.Errorf("kafka: stream %q: %w", stream, err)
 	}
-	var keyCols []col
+	var keyCols []records.Col
 	for _, n := range names {
 		i := sc.FieldIndices(n)[0]
 		e.key = append(e.key, i)
 		keyCols = append(keyCols, cols[i])
 	}
 	f := w.d.cfg.Format
-	if e.valueEnc, err = newRowEncoder(ctx, f, w.reg, e.topic+"-value", table, cols); err != nil {
-		return nil, err
+	if e.valueEnc, err = records.NewEncoder(ctx, f, w.reg, e.topic+"-value", table, cols); err != nil {
+		return nil, fmt.Errorf("kafka: stream %q: %w", stream, err)
 	}
 	if len(keyCols) > 0 {
-		if e.keyEnc, err = newRowEncoder(ctx, f, w.reg, e.topic+"-key", table+"_key", keyCols); err != nil {
-			return nil, err
+		if e.keyEnc, err = records.NewEncoder(ctx, f, w.reg, e.topic+"-key", table+"_key", keyCols); err != nil {
+			return nil, fmt.Errorf("kafka: stream %q: %w", stream, err)
 		}
 	}
 	w.encs[stream] = e
 	return e, nil
-}
-
-const sourceNamesKey = "openetl.source_names"
-
-// keyColumns returns the destination names of a stream's primary key, which
-// the catalog gives by source name.
-func keyColumns(sc *arrow.Schema, key []string) ([]string, error) {
-	renamed := map[string]string{}
-	if v, ok := sc.Metadata().GetValue(sourceNamesKey); ok {
-		var names map[string]string
-		if err := json.Unmarshal([]byte(v), &names); err != nil {
-			return nil, fmt.Errorf("its %s metadata: %w", sourceNamesKey, err)
-		}
-		for dst, src := range names {
-			renamed[src] = dst
-		}
-	}
-	out := make([]string, len(key))
-	for i, k := range key {
-		out[i] = k
-		if dst, ok := renamed[k]; ok {
-			out[i] = dst
-		}
-		if len(sc.FieldIndices(out[i])) == 0 {
-			return nil, fmt.Errorf("its key has %q, which its batches don't have", k)
-		}
-	}
-	return out, nil
 }
 
 // txn returns epoch e's slot, with its transaction begun.
@@ -444,19 +417,19 @@ func (w *writer) Write(ctx context.Context, e destination.Epoch, stream string, 
 	}
 	for i := range int(batch.NumRows()) {
 		for j := range enc.cols {
-			if vals[j], err = enc.cols[j].at(batch.Column(j), i); err != nil {
+			if vals[j], err = enc.cols[j].At(batch.Column(j), i); err != nil {
 				return fmt.Errorf("kafka: stream %q: %w", stream, err)
 			}
 		}
 		rec := &kgo.Record{Topic: enc.topic}
-		if rec.Value, err = enc.valueEnc.encode(vals); err != nil {
+		if rec.Value, err = enc.valueEnc.Encode(vals); err != nil {
 			return fmt.Errorf("kafka: stream %q: %w", stream, err)
 		}
 		if enc.keyEnc != nil {
 			for j, k := range enc.key {
 				keyVals[j] = vals[k]
 			}
-			if rec.Key, err = enc.keyEnc.encode(keyVals); err != nil {
+			if rec.Key, err = enc.keyEnc.Encode(keyVals); err != nil {
 				return fmt.Errorf("kafka: stream %q: key: %w", stream, err)
 			}
 		}

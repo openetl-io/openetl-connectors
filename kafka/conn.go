@@ -17,8 +17,8 @@ import (
 	"github.com/twmb/franz-go/pkg/kgo"
 	"github.com/twmb/franz-go/pkg/sasl/plain"
 	"github.com/twmb/franz-go/pkg/sasl/scram"
-	"github.com/twmb/franz-go/pkg/sr"
 
+	"github.com/unsuitable001/openetl-connectors/records"
 	sdk "github.com/unsuitable001/openetl/sdk/go"
 )
 
@@ -36,37 +36,15 @@ type Connection struct {
 	SASLMechanism string     `json:"saslMechanism"`
 	SASLUsername  string     `json:"saslUsername"`
 	SASLPassword  sdk.Secret `json:"saslPassword"`
-	// Avro and Protobuf need one.
-	SchemaRegistryURL      string     `json:"schemaRegistryUrl"`
-	SchemaRegistryUsername string     `json:"schemaRegistryUsername"`
-	SchemaRegistryPassword sdk.Secret `json:"schemaRegistryPassword"`
-	// json (default), avro or protobuf; the source also reads string.
-	Format string `json:"format"`
+	records.Config
 }
-
-const (
-	formatJSON     = "json"
-	formatAvro     = "avro"
-	formatProtobuf = "protobuf"
-	formatString   = "string"
-)
 
 func (c *Connection) validate(formats ...string) error {
 	if len(c.Brokers) == 0 {
 		return errors.New("kafka: brokers is empty")
 	}
-	if c.Format == "" {
-		c.Format = formatJSON
-	}
-	ok := false
-	for _, f := range formats {
-		ok = ok || f == c.Format
-	}
-	if !ok {
-		return fmt.Errorf("kafka: format %q is none of %v", c.Format, formats)
-	}
-	if (c.Format == formatAvro || c.Format == formatProtobuf) && c.SchemaRegistryURL == "" {
-		return fmt.Errorf("kafka: format %s needs schemaRegistryUrl", c.Format)
+	if err := c.Config.Validate(formats...); err != nil {
+		return fmt.Errorf("kafka: %w", err)
 	}
 	switch c.SASLMechanism {
 	case "", "plain", "scram-sha-256", "scram-sha-512":
@@ -131,22 +109,6 @@ func (c *Connection) client(more ...kgo.Opt) (*kgo.Client, error) {
 	cl, err := kgo.NewClient(append(opts, more...)...)
 	if err != nil {
 		return nil, fmt.Errorf("kafka: client: %w", err)
-	}
-	return cl, nil
-}
-
-// registry is nil without a schema registry URL.
-func (c *Connection) registry() (*sr.Client, error) {
-	if c.SchemaRegistryURL == "" {
-		return nil, nil
-	}
-	opts := []sr.ClientOpt{sr.URLs(c.SchemaRegistryURL), sr.UserAgent("openetl")}
-	if c.SchemaRegistryUsername != "" {
-		opts = append(opts, sr.BasicAuth(c.SchemaRegistryUsername, c.SchemaRegistryPassword.Reveal()))
-	}
-	cl, err := sr.NewClient(opts...)
-	if err != nil {
-		return nil, fmt.Errorf("kafka: schema registry: %w", err)
 	}
 	return cl, nil
 }

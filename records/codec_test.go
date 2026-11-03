@@ -1,4 +1,4 @@
-package kafka
+package records
 
 import (
 	"encoding/json"
@@ -16,10 +16,10 @@ import (
 )
 
 func meta(ext string) arrow.Metadata {
-	return arrow.NewMetadata([]string{extensionNameKey}, []string{ext})
+	return arrow.NewMetadata([]string{ExtensionNameKey}, []string{ext})
 }
 
-var tableMeta = arrow.NewMetadata([]string{tableKey}, []string{"items"})
+var tableMeta = arrow.NewMetadata([]string{TableKey}, []string{"items"})
 
 // row is one row of every type the destination writes.
 func row(t *testing.T) arrow.RecordBatch {
@@ -31,8 +31,8 @@ func row(t *testing.T) arrow.RecordBatch {
 		{Name: "at", Type: &arrow.TimestampType{Unit: arrow.Microsecond, TimeZone: "UTC"}, Nullable: true},
 		{Name: "local", Type: &arrow.TimestampType{Unit: arrow.Microsecond}, Nullable: true},
 		{Name: "day", Type: arrow.FixedWidthTypes.Date32, Nullable: true},
-		{Name: "uid", Type: &arrow.FixedSizeBinaryType{ByteWidth: 16}, Nullable: true, Metadata: meta(uuidExtension)},
-		{Name: "doc", Type: arrow.BinaryTypes.String, Nullable: true, Metadata: meta(jsonExtension)},
+		{Name: "uid", Type: &arrow.FixedSizeBinaryType{ByteWidth: 16}, Nullable: true, Metadata: meta(UUIDExtension)},
+		{Name: "doc", Type: arrow.BinaryTypes.String, Nullable: true, Metadata: meta(JSONExtension)},
 		{Name: "tags", Type: arrow.ListOf(arrow.BinaryTypes.String), Nullable: true},
 		{Name: "ok", Type: arrow.FixedWidthTypes.Boolean, Nullable: true},
 		{Name: "score", Type: arrow.PrimitiveTypes.Float64, Nullable: true},
@@ -60,15 +60,15 @@ func row(t *testing.T) arrow.RecordBatch {
 	return b.NewRecordBatch()
 }
 
-func values(t *testing.T, batch arrow.RecordBatch) ([]col, []any) {
+func values(t *testing.T, batch arrow.RecordBatch) ([]Col, []any) {
 	t.Helper()
-	cols, err := colsOf(batch.Schema())
+	cols, err := Cols(batch.Schema())
 	if err != nil {
 		t.Fatal(err)
 	}
 	vals := make([]any, len(cols))
 	for i := range cols {
-		if vals[i], err = cols[i].at(batch.Column(i), 0); err != nil {
+		if vals[i], err = cols[i].At(batch.Column(i), 0); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -94,17 +94,17 @@ func TestFormatsRoundTrip(t *testing.T) {
 		"uid": "6ba7b810-9dad-11d1-80b4-00c04fd430c8", "tags": []any{"x", "y"}, "ok": true,
 		"score": "NaN", "raw": "AAEC", "missing": nil,
 	}
-	for _, format := range []string{formatJSON, formatAvro, formatProtobuf} {
+	for _, format := range []string{JSON, Avro, Protobuf} {
 		t.Run(format, func(t *testing.T) {
-			enc, err := newRowEncoder(t.Context(), format, reg, "items_"+format+"-value", "items", cols)
+			enc, err := NewEncoder(t.Context(), format, reg, "items_"+format+"-value", "items", cols)
 			if err != nil {
 				t.Fatal(err)
 			}
-			b, err := enc.encode(vals)
+			b, err := enc.Encode(vals)
 			if err != nil {
 				t.Fatal(err)
 			}
-			out, err := newDecoder(format, reg).decode(t.Context(), b)
+			out, err := NewDecoder(format, reg).Decode(t.Context(), b)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -114,14 +114,14 @@ func TestFormatsRoundTrip(t *testing.T) {
 			}
 			for k, v := range want {
 				g := got[k]
-				if format == formatProtobuf && k == "id" {
+				if format == Protobuf && k == "id" {
 					// Protobuf's JSON spells 64-bit integers as strings.
 					g = map[bool]any{true: float64(7)}[g == "7"]
 				}
-				if format == formatProtobuf && k == "price" {
+				if format == Protobuf && k == "price" {
 					g = map[bool]any{true: 19.99}[g == "19.99"]
 				}
-				if format == formatProtobuf && k == "local" {
+				if format == Protobuf && k == "local" {
 					// Protobuf's timestamps are all in UTC.
 					v = "2026-11-02T10:30:00.123456Z"
 				}
@@ -131,7 +131,7 @@ func TestFormatsRoundTrip(t *testing.T) {
 			}
 			// Protobuf carries JSON as text.
 			wantDoc := `{"a":[1,2]}`
-			if format == formatProtobuf {
+			if format == Protobuf {
 				wantDoc = mustJSON(t, wantDoc)
 			}
 			if doc := mustJSON(t, got["doc"]); doc != wantDoc {

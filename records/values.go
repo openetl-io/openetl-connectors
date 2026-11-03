@@ -1,4 +1,4 @@
-package kafka
+package records
 
 import (
 	"encoding/base64"
@@ -17,11 +17,11 @@ import (
 )
 
 const (
-	extensionNameKey = "ARROW:extension:name"
-	jsonExtension    = "arrow.json"
-	uuidExtension    = "arrow.uuid"
+	ExtensionNameKey = "ARROW:extension:name"
+	JSONExtension    = "arrow.json"
+	UUIDExtension    = "arrow.uuid"
 	// The engine names each stream's table in its schema's metadata.
-	tableKey = "openetl.table"
+	TableKey = "openetl.table"
 )
 
 type kind int
@@ -47,20 +47,20 @@ const (
 	kInterval
 )
 
-// col reads one column's values as Go values, which each format encodes:
+// Col reads one column's values as Go values, which each format encodes:
 // bool, int32, int64, uint64, float32, float64, string, []byte, decimal,
 // time.Time (dates and timestamps), time.Duration (times of day), uuid as
 // a string, json.RawMessage, []any, []any for a struct's fields in order,
 // and interval.
-type col struct {
+type Col struct {
 	name  string
 	kind  kind
 	scale int32
 	prec  int32
 	// Timestamps: in UTC rather than naive, and in nanoseconds.
 	zoned, nanos bool
-	elem         *col
-	fields       []col
+	elem         *Col
+	fields       []Col
 	value        func(a arrow.Array, i int) (any, error)
 }
 
@@ -87,8 +87,8 @@ func storage(a arrow.Array) arrow.Array {
 	return a
 }
 
-func colsOf(sc *arrow.Schema) ([]col, error) {
-	cols := make([]col, sc.NumFields())
+func Cols(sc *arrow.Schema) ([]Col, error) {
+	cols := make([]Col, sc.NumFields())
 	for i, f := range sc.Fields() {
 		c, err := colOf(f)
 		if err != nil {
@@ -99,21 +99,21 @@ func colsOf(sc *arrow.Schema) ([]col, error) {
 	return cols, nil
 }
 
-func colOf(f arrow.Field) (col, error) {
-	c := col{name: f.Name}
+func colOf(f arrow.Field) (Col, error) {
+	c := Col{name: f.Name}
 	dt := f.Type
 	ext := ""
 	if et, ok := dt.(arrow.ExtensionType); ok {
 		ext, dt = et.ExtensionName(), et.StorageType()
-	} else if v, ok := f.Metadata.GetValue(extensionNameKey); ok {
+	} else if v, ok := f.Metadata.GetValue(ExtensionNameKey); ok {
 		ext = v
 	}
 	switch {
-	case ext == jsonExtension && isString(dt):
+	case ext == JSONExtension && isString(dt):
 		c.kind = kJSON
 		c.value = func(a arrow.Array, i int) (any, error) { return json.RawMessage(str(a, i)), nil }
 		return c, nil
-	case ext == uuidExtension && dt.ID() == arrow.FIXED_SIZE_BINARY:
+	case ext == UUIDExtension && dt.ID() == arrow.FIXED_SIZE_BINARY:
 		c.kind = kUUID
 		c.value = func(a arrow.Array, i int) (any, error) {
 			u, err := uuid.FromBytes(storage(a).(*array.FixedSizeBinary).Value(i))
@@ -222,7 +222,7 @@ func colOf(f arrow.Field) (col, error) {
 			vals := l.ListValues()
 			out := make([]any, 0, end-start)
 			for j := int(start); j < int(end); j++ {
-				v, err := e.at(vals, j)
+				v, err := e.At(vals, j)
 				if err != nil {
 					return nil, err
 				}
@@ -243,7 +243,7 @@ func colOf(f arrow.Field) (col, error) {
 			s := storage(a).(*array.Struct)
 			out := make([]any, len(c.fields))
 			for j := range c.fields {
-				v, err := c.fields[j].at(s.Field(j), i)
+				v, err := c.fields[j].At(s.Field(j), i)
 				if err != nil {
 					return nil, err
 				}
@@ -258,7 +258,7 @@ func colOf(f arrow.Field) (col, error) {
 }
 
 // at is row i's value, nil for null.
-func (c *col) at(a arrow.Array, i int) (any, error) {
+func (c *Col) At(a arrow.Array, i int) (any, error) {
 	if a.IsNull(i) {
 		return nil, nil
 	}
@@ -276,7 +276,7 @@ func isString(dt arrow.DataType) bool {
 func str(a arrow.Array, i int) string { return storage(a).(interface{ Value(int) string }).Value(i) }
 
 // appendJSON appends v, a value of c, as JSON.
-func (c *col) appendJSON(b []byte, v any) ([]byte, error) {
+func (c *Col) appendJSON(b []byte, v any) ([]byte, error) {
 	if v == nil {
 		return append(b, "null"...), nil
 	}
@@ -294,17 +294,17 @@ func (c *col) appendJSON(b []byte, v any) ([]byte, error) {
 	case kFloat64:
 		return appendFloat(b, v.(float64), 64), nil
 	case kString, kUUID:
-		return appendJSONString(b, v.(string)), nil
+		return AppendJSONString(b, v.(string)), nil
 	case kBytes:
-		return appendJSONString(b, base64.StdEncoding.EncodeToString(v.([]byte))), nil
+		return AppendJSONString(b, base64.StdEncoding.EncodeToString(v.([]byte))), nil
 	case kDecimal:
 		return append(b, v.(decimal).String()...), nil
 	case kDate:
-		return appendJSONString(b, v.(time.Time).Format(time.DateOnly)), nil
+		return AppendJSONString(b, v.(time.Time).Format(time.DateOnly)), nil
 	case kTime:
-		return appendJSONString(b, timeOfDay(v.(time.Duration))), nil
+		return AppendJSONString(b, timeOfDay(v.(time.Duration))), nil
 	case kTimestamp:
-		return appendJSONString(b, timestampText(v.(time.Time), c.zoned)), nil
+		return AppendJSONString(b, timestampText(v.(time.Time), c.zoned)), nil
 	case kJSON:
 		raw := v.(json.RawMessage)
 		if !json.Valid(raw) {
@@ -332,13 +332,13 @@ func (c *col) appendJSON(b []byte, v any) ([]byte, error) {
 	return append(b, "null"...), nil
 }
 
-func appendJSONObject(b []byte, cols []col, vals []any) ([]byte, error) {
+func appendJSONObject(b []byte, cols []Col, vals []any) ([]byte, error) {
 	b = append(b, '{')
 	for j := range cols {
 		if j > 0 {
 			b = append(b, ',')
 		}
-		b = appendJSONString(b, cols[j].name)
+		b = AppendJSONString(b, cols[j].name)
 		b = append(b, ':')
 		var err error
 		if b, err = cols[j].appendJSON(b, vals[j]); err != nil {
@@ -362,7 +362,7 @@ func appendFloat(b []byte, f float64, bits int) []byte {
 	return strconv.AppendFloat(b, f, 'g', -1, bits)
 }
 
-func appendJSONString(b []byte, s string) []byte {
+func AppendJSONString(b []byte, s string) []byte {
 	const hex = "0123456789abcdef"
 	b = append(b, '"')
 	for i := 0; i < len(s); {

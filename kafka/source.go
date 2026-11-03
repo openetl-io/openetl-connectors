@@ -20,6 +20,7 @@ import (
 	"github.com/twmb/franz-go/pkg/kgo"
 	"github.com/twmb/franz-go/pkg/sr"
 
+	"github.com/unsuitable001/openetl-connectors/records"
 	sdk "github.com/unsuitable001/openetl/sdk/go"
 	protocolv1 "github.com/unsuitable001/openetl/sdk/go/protocol/v1"
 	"github.com/unsuitable001/openetl/sdk/go/source"
@@ -58,8 +59,8 @@ type Source struct {
 	cfg     SourceConfig
 	pattern *regexp.Regexp
 	reg     *sr.Client
-	values  *decoder
-	keys    *decoder
+	values  *records.Decoder
+	keys    *records.Decoder
 
 	mu       sync.Mutex
 	pipeline string
@@ -78,7 +79,7 @@ func NewSource(config []byte) (*Source, error) {
 		return nil, err
 	}
 	invalid := func(err error) error { return sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_CONFIG_INVALID, err) }
-	if err := cfg.validate(formatJSON, formatAvro, formatProtobuf, formatString); err != nil {
+	if err := cfg.validate(records.JSON, records.Avro, records.Protobuf, records.String); err != nil {
 		return nil, invalid(err)
 	}
 	if cfg.StartOffset != "earliest" && cfg.StartOffset != "latest" {
@@ -92,13 +93,13 @@ func NewSource(config []byte) (*Source, error) {
 		}
 		s.pattern = p
 	}
-	reg, err := cfg.registry()
+	reg, err := cfg.Registry()
 	if err != nil {
 		return nil, err
 	}
 	s.reg = reg
-	s.values = newDecoder(cfg.Format, reg)
-	s.keys = newDecoder(cfg.Format, reg)
+	s.values = records.NewDecoder(cfg.Format, reg)
+	s.keys = records.NewDecoder(cfg.Format, reg)
 	return s, nil
 }
 
@@ -150,47 +151,19 @@ func (s *Source) declared(ctx context.Context, topic string) (*arrow.Schema, err
 		{Name: offsetColumn, Type: arrow.PrimitiveTypes.Int64},
 		{Name: timestampColumn, Type: &arrow.TimestampType{Unit: arrow.Microsecond, TimeZone: "UTC"}},
 		{Name: keyColumn, Type: arrow.BinaryTypes.String, Nullable: true},
-		{Name: headersColumn, Type: arrow.BinaryTypes.String, Nullable: true, Metadata: arrow.NewMetadata([]string{extensionNameKey}, []string{jsonExtension})},
+		{Name: headersColumn, Type: arrow.BinaryTypes.String, Nullable: true, Metadata: arrow.NewMetadata([]string{records.ExtensionNameKey}, []string{records.JSONExtension})},
 	}
 	own := map[string]bool{}
 	for _, f := range fields {
 		own[f.Name] = true
 	}
-	add := func(name string, t arrow.DataType, md arrow.Metadata) {
-		if !own[name] {
-			fields = append(fields, arrow.Field{Name: name, Type: t, Nullable: true, Metadata: md})
-		}
+	values, err := records.ValueFields(ctx, s.reg, s.cfg.Format, topic+"-value")
+	if err != nil {
+		return nil, fmt.Errorf("kafka: %w", err)
 	}
-	if s.reg != nil && (s.cfg.Format == formatAvro || s.cfg.Format == formatProtobuf) {
-		ss, err := s.reg.SchemaByVersion(ctx, topic+"-value", -1)
-		var re *sr.ResponseError
-		switch {
-		case errors.As(err, &re) && re.StatusCode == 404:
-		case err != nil:
-			return nil, fmt.Errorf("kafka: the schema of %s-value: %w", topic, err)
-		case s.cfg.Format == formatAvro && ss.Type == sr.TypeAvro:
-			a, err := parseAvro(ctx, s.reg, ss.Schema)
-			if err != nil {
-				return nil, fmt.Errorf("kafka: the schema of %s-value: %w", topic, err)
-			}
-			if a.root.Type == "record" {
-				for _, f := range a.root.Fields {
-					t, md := avroArrow(&f.Type)
-					add(f.Name, t, md)
-				}
-			}
-		case s.cfg.Format == formatProtobuf && ss.Type == sr.TypeProtobuf:
-			fd, err := protoFile(ctx, s.reg, ss.Schema)
-			if err != nil {
-				return nil, fmt.Errorf("kafka: the schema of %s-value: %w", topic, err)
-			}
-			if fd.Messages().Len() > 0 {
-				fs := fd.Messages().Get(0).Fields()
-				for i := range fs.Len() {
-					t, md := protoArrow(fs.Get(i))
-					add(string(fs.Get(i).Name()), t, md)
-				}
-			}
+	for _, f := range values {
+		if !own[f.Name] {
+			fields = append(fields, f)
 		}
 	}
 	return arrow.NewSchema(fields, nil), nil
@@ -504,38 +477,29 @@ func (s *Source) row(ctx context.Context, rec *kgo.Record) (json.RawMessage, err
 	b := make([]byte, 0, len(rec.Value)+128)
 	b = append(b, '{')
 	if rec.Value != nil {
-		v, err := s.values.decode(ctx, rec.Value)
+		v, err := s.values.Decode(ctx, rec.Value)
 		if err != nil {
 			return nil, sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_DATA_INVALID, fmt.Errorf("kafka: %s partition %d offset %d: %w", rec.Topic, rec.Partition, rec.Offset, err))
 		}
-		if len(v) > 0 && v[0] == '{' {
-			if inner := strings.TrimSpace(string(v[1 : len(v)-1])); inner != "" {
-				b = append(b, inner...)
-				b = append(b, ',')
-			}
-		} else {
-			b = append(b, `"value":`...)
-			b = append(b, v...)
-			b = append(b, ',')
-		}
+		b = records.AppendFields(b, v)
 	}
-	b = appendJSONString(b, partitionColumn)
+	b = records.AppendJSONString(b, partitionColumn)
 	b = append(b, ':')
 	b = strconv.AppendInt(b, int64(rec.Partition), 10)
 	b = append(b, ',')
-	b = appendJSONString(b, offsetColumn)
+	b = records.AppendJSONString(b, offsetColumn)
 	b = append(b, ':')
 	b = strconv.AppendInt(b, rec.Offset, 10)
 	b = append(b, ',')
-	b = appendJSONString(b, timestampColumn)
+	b = records.AppendJSONString(b, timestampColumn)
 	b = append(b, ':')
-	b = appendJSONString(b, rec.Timestamp.UTC().Format(time.RFC3339Nano))
+	b = records.AppendJSONString(b, rec.Timestamp.UTC().Format(time.RFC3339Nano))
 	b = append(b, ',')
-	b = appendJSONString(b, keyColumn)
+	b = records.AppendJSONString(b, keyColumn)
 	b = append(b, ':')
 	b = append(b, s.key(ctx, rec.Key)...)
 	b = append(b, ',')
-	b = appendJSONString(b, headersColumn)
+	b = records.AppendJSONString(b, headersColumn)
 	b = append(b, ':')
 	if len(rec.Headers) == 0 {
 		b = append(b, "null"...)
@@ -559,14 +523,14 @@ func (s *Source) key(ctx context.Context, k []byte) []byte {
 	if k == nil {
 		return []byte("null")
 	}
-	v, err := s.keys.decode(ctx, k)
+	v, err := s.keys.Decode(ctx, k)
 	if err != nil {
-		return jsonText(k)
+		return records.JSONText(k)
 	}
 	if len(v) > 0 && v[0] == '"' {
 		return v
 	}
-	return appendJSONString(nil, string(v))
+	return records.AppendJSONString(nil, string(v))
 }
 
 // Committed commits the checkpoint's offsets to the consumer group, so

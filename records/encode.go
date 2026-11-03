@@ -1,4 +1,4 @@
-package kafka
+package records
 
 import (
 	"context"
@@ -22,10 +22,10 @@ import (
 	protocolv1 "github.com/unsuitable001/openetl/sdk/go/protocol/v1"
 )
 
-// rowEncoder encodes one part of a row, its key or its value, as an object
+// Encoder encodes one part of a row, its key or its value, as an object
 // of cols in a format.
-type rowEncoder interface {
-	encode(vals []any) ([]byte, error)
+type Encoder interface {
+	Encode(vals []any) ([]byte, error)
 }
 
 var confluent sr.ConfluentHeader
@@ -34,23 +34,23 @@ var confluent sr.ConfluentHeader
 // can declare it json.
 const jsonProp = "openetl.type"
 
-// newRowEncoder builds the encoder for cols, registering its schema under
+// NewEncoder builds the encoder for cols, registering its schema under
 // subject for the formats that need one. name names the record or message.
-func newRowEncoder(ctx context.Context, format string, reg *sr.Client, subject, name string, cols []col) (rowEncoder, error) {
+func NewEncoder(ctx context.Context, format string, reg *sr.Client, subject, name string, cols []Col) (Encoder, error) {
 	switch format {
-	case formatJSON:
+	case JSON:
 		return jsonEncoder(cols), nil
-	case formatAvro:
+	case Avro:
 		return newAvroEncoder(ctx, reg, subject, name, cols)
-	case formatProtobuf:
+	case Protobuf:
 		return newProtoEncoder(ctx, reg, subject, name, cols)
 	}
-	return nil, fmt.Errorf("kafka: format %q can't be written", format)
+	return nil, fmt.Errorf("format %q can't be written", format)
 }
 
-type jsonEncoder []col
+type jsonEncoder []Col
 
-func (e jsonEncoder) encode(vals []any) ([]byte, error) { return appendJSONObject(nil, e, vals) }
+func (e jsonEncoder) Encode(vals []any) ([]byte, error) { return appendJSONObject(nil, e, vals) }
 
 // register registers s under subject and returns its ID. A schema the
 // registry's compatibility setting refuses is SCHEMA_DRIFT.
@@ -59,16 +59,16 @@ func register(ctx context.Context, reg *sr.Client, subject string, s sr.Schema) 
 	if err != nil {
 		var re *sr.ResponseError
 		if errors.As(err, &re) && (re.StatusCode == http.StatusConflict || re.ErrorCode == 409) {
-			return 0, sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_SCHEMA_DRIFT, fmt.Errorf("kafka: the schema registry refuses the new schema of %s: %w", subject, err))
+			return 0, sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_SCHEMA_DRIFT, fmt.Errorf("the schema registry refuses the new schema of %s: %w", subject, err))
 		}
-		return 0, fmt.Errorf("kafka: register %s: %w", subject, err)
+		return 0, fmt.Errorf("register %s: %w", subject, err)
 	}
 	return ss.ID, nil
 }
 
-// avroName makes s an Avro or Protobuf name: letters, digits and _, not
+// AvroName makes s an Avro or Protobuf name: letters, digits and _, not
 // starting with a digit.
-func avroName(s string) string {
+func AvroName(s string) string {
 	var b strings.Builder
 	for _, r := range s {
 		if r == '_' || (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') {
@@ -87,10 +87,10 @@ func avroName(s string) string {
 type avroEncoder struct {
 	id     int
 	schema *avro.Schema
-	cols   []col
+	cols   []Col
 }
 
-func newAvroEncoder(ctx context.Context, reg *sr.Client, subject, name string, cols []col) (*avroEncoder, error) {
+func newAvroEncoder(ctx context.Context, reg *sr.Client, subject, name string, cols []Col) (*avroEncoder, error) {
 	fields := make([]any, len(cols))
 	for i := range cols {
 		t, err := avroType(&cols[i], name+"_"+cols[i].name)
@@ -99,13 +99,13 @@ func newAvroEncoder(ctx context.Context, reg *sr.Client, subject, name string, c
 		}
 		fields[i] = map[string]any{"name": cols[i].name, "type": nullable(t), "default": nil}
 	}
-	text, err := json.Marshal(map[string]any{"type": "record", "name": avroName(name), "fields": fields})
+	text, err := json.Marshal(map[string]any{"type": "record", "name": AvroName(name), "fields": fields})
 	if err != nil {
 		return nil, err
 	}
 	schema, err := avro.Parse(string(text))
 	if err != nil {
-		return nil, fmt.Errorf("kafka: Avro schema of %s: %w", subject, err)
+		return nil, fmt.Errorf("Avro schema of %s: %w", subject, err)
 	}
 	id, err := register(ctx, reg, subject, sr.Schema{Schema: string(text), Type: sr.TypeAvro})
 	if err != nil {
@@ -122,7 +122,7 @@ func nullable(t any) any {
 }
 
 // avroType is c's Avro type; name names the records it defines.
-func avroType(c *col, name string) (any, error) {
+func avroType(c *Col, name string) (any, error) {
 	switch c.kind {
 	case kNull:
 		return "null", nil
@@ -162,7 +162,7 @@ func avroType(c *col, name string) (any, error) {
 	case kUUID:
 		return map[string]any{"type": "string", "logicalType": "uuid"}, nil
 	case kInterval:
-		return map[string]any{"type": "record", "name": avroName(name), "fields": []any{
+		return map[string]any{"type": "record", "name": AvroName(name), "fields": []any{
 			map[string]any{"name": "months", "type": "int"},
 			map[string]any{"name": "days", "type": "int"},
 			map[string]any{"name": "nanoseconds", "type": "long"},
@@ -182,12 +182,12 @@ func avroType(c *col, name string) (any, error) {
 			}
 			fields[i] = map[string]any{"name": c.fields[i].name, "type": nullable(t), "default": nil}
 		}
-		return map[string]any{"type": "record", "name": avroName(name), "fields": fields}, nil
+		return map[string]any{"type": "record", "name": AvroName(name), "fields": fields}, nil
 	}
 	return nil, fmt.Errorf("column %q: no Avro type", c.name)
 }
 
-func (e *avroEncoder) encode(vals []any) ([]byte, error) {
+func (e *avroEncoder) Encode(vals []any) ([]byte, error) {
 	rec, err := avroRecord(e.cols, vals)
 	if err != nil {
 		return nil, err
@@ -196,7 +196,7 @@ func (e *avroEncoder) encode(vals []any) ([]byte, error) {
 	return e.schema.AppendEncode(b, rec)
 }
 
-func avroRecord(cols []col, vals []any) (map[string]any, error) {
+func avroRecord(cols []Col, vals []any) (map[string]any, error) {
 	rec := make(map[string]any, len(cols))
 	for i := range cols {
 		v, err := avroValue(&cols[i], vals[i])
@@ -208,7 +208,7 @@ func avroRecord(cols []col, vals []any) (map[string]any, error) {
 	return rec, nil
 }
 
-func avroValue(c *col, v any) (any, error) {
+func avroValue(c *Col, v any) (any, error) {
 	if v == nil {
 		return nil, nil
 	}
@@ -245,21 +245,21 @@ func avroValue(c *col, v any) (any, error) {
 type protoEncoder struct {
 	id   int
 	md   protoreflect.MessageDescriptor
-	cols []col
+	cols []Col
 }
 
 // protoSchema is a proto3 file with one message, name, holding cols. Field
 // numbers follow the columns' order, which only ever grows at the end.
-func protoSchema(name string, cols []col) (string, error) {
+func protoSchema(name string, cols []Col) (string, error) {
 	var b strings.Builder
 	b.WriteString("syntax = \"proto3\";\n\npackage openetl;\n\nimport \"google/protobuf/timestamp.proto\";\n\n")
-	if err := protoMessage(&b, avroName(name), cols, ""); err != nil {
+	if err := protoMessage(&b, AvroName(name), cols, ""); err != nil {
 		return "", err
 	}
 	return b.String(), nil
 }
 
-func protoMessage(b *strings.Builder, name string, cols []col, indent string) error {
+func protoMessage(b *strings.Builder, name string, cols []Col, indent string) error {
 	fmt.Fprintf(b, "%smessage %s {\n", indent, name)
 	for i := range cols {
 		c := &cols[i]
@@ -281,7 +281,7 @@ func protoMessage(b *strings.Builder, name string, cols []col, indent string) er
 }
 
 // protoType is c's field type, and any message it defines for it.
-func protoType(c *col, indent string) (string, string, error) {
+func protoType(c *Col, indent string) (string, string, error) {
 	switch c.kind {
 	case kBool:
 		return "bool", "", nil
@@ -331,14 +331,14 @@ func compileProto(ctx context.Context, files map[string]string, root string) (pr
 	return fds[0], nil
 }
 
-func newProtoEncoder(ctx context.Context, reg *sr.Client, subject, name string, cols []col) (*protoEncoder, error) {
+func newProtoEncoder(ctx context.Context, reg *sr.Client, subject, name string, cols []Col) (*protoEncoder, error) {
 	text, err := protoSchema(name, cols)
 	if err != nil {
 		return nil, err
 	}
 	fd, err := compileProto(ctx, map[string]string{"schema.proto": text}, "schema.proto")
 	if err != nil {
-		return nil, fmt.Errorf("kafka: Protobuf schema of %s: %w", subject, err)
+		return nil, fmt.Errorf("Protobuf schema of %s: %w", subject, err)
 	}
 	id, err := register(ctx, reg, subject, sr.Schema{Schema: text, Type: sr.TypeProtobuf})
 	if err != nil {
@@ -347,7 +347,7 @@ func newProtoEncoder(ctx context.Context, reg *sr.Client, subject, name string, 
 	return &protoEncoder{id: id, md: fd.Messages().Get(0), cols: cols}, nil
 }
 
-func (e *protoEncoder) encode(vals []any) ([]byte, error) {
+func (e *protoEncoder) Encode(vals []any) ([]byte, error) {
 	m := dynamicpb.NewMessage(e.md)
 	if err := protoFill(m, e.cols, vals); err != nil {
 		return nil, err
@@ -356,7 +356,7 @@ func (e *protoEncoder) encode(vals []any) ([]byte, error) {
 	return proto.MarshalOptions{Deterministic: true}.MarshalAppend(b, m)
 }
 
-func protoFill(m protoreflect.Message, cols []col, vals []any) error {
+func protoFill(m protoreflect.Message, cols []Col, vals []any) error {
 	fields := m.Descriptor().Fields()
 	for i := range cols {
 		if vals[i] == nil {
@@ -389,7 +389,7 @@ func protoFill(m protoreflect.Message, cols []col, vals []any) error {
 
 // protoValue is v as a field's value; newMsg makes the field's message for
 // kinds that are one.
-func protoValue(c *col, v any, newMsg func() protoreflect.Value) (protoreflect.Value, error) {
+func protoValue(c *Col, v any, newMsg func() protoreflect.Value) (protoreflect.Value, error) {
 	switch c.kind {
 	case kBool:
 		return protoreflect.ValueOfBool(v.(bool)), nil

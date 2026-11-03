@@ -1,4 +1,4 @@
-package kafka
+package records
 
 import (
 	"bytes"
@@ -23,9 +23,9 @@ import (
 	"google.golang.org/protobuf/types/dynamicpb"
 )
 
-// decoder turns a record's value or key into JSON: an object's fields, or
+// Decoder turns a record's value or key into JSON: an object's fields, or
 // any other JSON value.
-type decoder struct {
+type Decoder struct {
 	format string
 	reg    *sr.Client
 
@@ -39,23 +39,23 @@ type avroSchema struct {
 	root   *avro.SchemaNode
 }
 
-func newDecoder(format string, reg *sr.Client) *decoder {
-	return &decoder{format: format, reg: reg, avros: map[int]*avroSchema{}, protos: map[int]protoreflect.FileDescriptor{}}
+func NewDecoder(format string, reg *sr.Client) *Decoder {
+	return &Decoder{format: format, reg: reg, avros: map[int]*avroSchema{}, protos: map[int]protoreflect.FileDescriptor{}}
 }
 
-var errNotRegistry = errors.New("kafka: not in the schema registry's wire format")
+var errNotRegistry = errors.New("not in the schema registry's wire format")
 
 // decode returns b as JSON. A string format, or a key that isn't in the
 // value's format, gives a JSON string.
-func (d *decoder) decode(ctx context.Context, b []byte) (json.RawMessage, error) {
+func (d *Decoder) Decode(ctx context.Context, b []byte) (json.RawMessage, error) {
 	switch d.format {
-	case formatJSON:
+	case JSON:
 		b = bytes.TrimSpace(b)
 		if !json.Valid(b) {
-			return nil, errors.New("kafka: not JSON")
+			return nil, errors.New("not JSON")
 		}
 		return b, nil
-	case formatAvro:
+	case Avro:
 		id, rest, err := confluent.DecodeID(b)
 		if err != nil {
 			return nil, errNotRegistry
@@ -66,17 +66,17 @@ func (d *decoder) decode(ctx context.Context, b []byte) (json.RawMessage, error)
 		}
 		var v any
 		if _, err := s.schema.Decode(rest, &v); err != nil {
-			return nil, fmt.Errorf("kafka: Avro with schema %d: %w", id, err)
+			return nil, fmt.Errorf("Avro with schema %d: %w", id, err)
 		}
 		return json.Marshal(avroJSON(s.root, v))
-	case formatProtobuf:
+	case Protobuf:
 		id, rest, err := confluent.DecodeID(b)
 		if err != nil {
 			return nil, errNotRegistry
 		}
 		index, rest, err := confluent.DecodeIndex(rest, 64)
 		if err != nil {
-			return nil, fmt.Errorf("kafka: Protobuf message indexes: %w", err)
+			return nil, fmt.Errorf("Protobuf message indexes: %w", err)
 		}
 		fd, err := d.proto(ctx, id)
 		if err != nil {
@@ -84,23 +84,23 @@ func (d *decoder) decode(ctx context.Context, b []byte) (json.RawMessage, error)
 		}
 		md, err := messageAt(fd, index)
 		if err != nil {
-			return nil, fmt.Errorf("kafka: schema %d: %w", id, err)
+			return nil, fmt.Errorf("schema %d: %w", id, err)
 		}
 		m := dynamicpb.NewMessage(md)
 		if err := proto.Unmarshal(rest, m); err != nil {
-			return nil, fmt.Errorf("kafka: Protobuf with schema %d: %w", id, err)
+			return nil, fmt.Errorf("Protobuf with schema %d: %w", id, err)
 		}
 		return protojson.MarshalOptions{UseProtoNames: true, EmitUnpopulated: true}.Marshal(m)
 	}
-	return jsonText(b), nil
+	return JSONText(b), nil
 }
 
-// jsonText is b as a JSON string: its text, or base64 if it isn't UTF-8.
-func jsonText(b []byte) json.RawMessage {
+// JSONText is b as a JSON string: its text, or base64 if it isn't UTF-8.
+func JSONText(b []byte) json.RawMessage {
 	if !utf8.Valid(b) {
-		return appendJSONString(nil, base64.StdEncoding.EncodeToString(b))
+		return AppendJSONString(nil, base64.StdEncoding.EncodeToString(b))
 	}
-	return appendJSONString(nil, string(b))
+	return AppendJSONString(nil, string(b))
 }
 
 func messageAt(fd protoreflect.FileDescriptor, index []int) (protoreflect.MessageDescriptor, error) {
@@ -119,7 +119,7 @@ func messageAt(fd protoreflect.FileDescriptor, index []int) (protoreflect.Messag
 	return md, nil
 }
 
-func (d *decoder) avro(ctx context.Context, id int) (*avroSchema, error) {
+func (d *Decoder) avro(ctx context.Context, id int) (*avroSchema, error) {
 	d.mu.Lock()
 	s := d.avros[id]
 	d.mu.Unlock()
@@ -128,11 +128,11 @@ func (d *decoder) avro(ctx context.Context, id int) (*avroSchema, error) {
 	}
 	sc, err := d.reg.SchemaByID(ctx, id)
 	if err != nil {
-		return nil, fmt.Errorf("kafka: schema %d: %w", id, err)
+		return nil, fmt.Errorf("schema %d: %w", id, err)
 	}
 	s, err = parseAvro(ctx, d.reg, sc)
 	if err != nil {
-		return nil, fmt.Errorf("kafka: schema %d: %w", id, err)
+		return nil, fmt.Errorf("schema %d: %w", id, err)
 	}
 	d.mu.Lock()
 	d.avros[id] = s
@@ -163,7 +163,7 @@ func parseAvro(ctx context.Context, reg *sr.Client, sc sr.Schema) (*avroSchema, 
 	return &avroSchema{schema: s, root: s.Root().ExpandReferences()}, nil
 }
 
-func (d *decoder) proto(ctx context.Context, id int) (protoreflect.FileDescriptor, error) {
+func (d *Decoder) proto(ctx context.Context, id int) (protoreflect.FileDescriptor, error) {
 	d.mu.Lock()
 	fd := d.protos[id]
 	d.mu.Unlock()
@@ -172,11 +172,11 @@ func (d *decoder) proto(ctx context.Context, id int) (protoreflect.FileDescripto
 	}
 	sc, err := d.reg.SchemaByID(ctx, id)
 	if err != nil {
-		return nil, fmt.Errorf("kafka: schema %d: %w", id, err)
+		return nil, fmt.Errorf("schema %d: %w", id, err)
 	}
 	fd, err = protoFile(ctx, d.reg, sc)
 	if err != nil {
-		return nil, fmt.Errorf("kafka: schema %d: %w", id, err)
+		return nil, fmt.Errorf("schema %d: %w", id, err)
 	}
 	d.mu.Lock()
 	d.protos[id] = fd
@@ -367,7 +367,7 @@ func avroArrow(node *avro.SchemaNode) (arrow.DataType, arrow.Metadata) {
 		return arrow.BinaryTypes.String, arrow.Metadata{}
 	case "uuid":
 		if node.Type == "string" {
-			return &arrow.FixedSizeBinaryType{ByteWidth: 16}, arrow.NewMetadata([]string{extensionNameKey}, []string{uuidExtension})
+			return &arrow.FixedSizeBinaryType{ByteWidth: 16}, arrow.NewMetadata([]string{ExtensionNameKey}, []string{UUIDExtension})
 		}
 	}
 	switch node.Type {
@@ -390,7 +390,7 @@ func avroArrow(node *avro.SchemaNode) (arrow.DataType, arrow.Metadata) {
 }
 
 func jsonField() (arrow.DataType, arrow.Metadata) {
-	return arrow.BinaryTypes.String, arrow.NewMetadata([]string{extensionNameKey}, []string{jsonExtension})
+	return arrow.BinaryTypes.String, arrow.NewMetadata([]string{ExtensionNameKey}, []string{JSONExtension})
 }
 
 // protoArrow is the Arrow type a Protobuf field declares, for the catalog.

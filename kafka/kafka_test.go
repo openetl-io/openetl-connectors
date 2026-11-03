@@ -22,6 +22,7 @@ import (
 	"github.com/twmb/franz-go/pkg/kadm"
 	"github.com/twmb/franz-go/pkg/kgo"
 
+	"github.com/unsuitable001/openetl-connectors/records"
 	"github.com/unsuitable001/openetl/sdk/go/destination"
 	protocolv1 "github.com/unsuitable001/openetl/sdk/go/protocol/v1"
 	"github.com/unsuitable001/openetl/sdk/go/source"
@@ -79,11 +80,11 @@ func openWriter(t *testing.T, d *Destination, pipeline string, gen uint64, strea
 // the engine adds.
 func rows(t *testing.T, table string, from, to int) arrow.RecordBatch {
 	t.Helper()
-	md := arrow.NewMetadata([]string{tableKey}, []string{table})
+	md := arrow.NewMetadata([]string{records.TableKey}, []string{table})
 	sc := arrow.NewSchema([]arrow.Field{
 		{Name: "id", Type: arrow.PrimitiveTypes.Int64},
 		{Name: "name", Type: arrow.BinaryTypes.String, Nullable: true},
-		{Name: idColumn, Type: &arrow.FixedSizeBinaryType{ByteWidth: 16}, Metadata: meta(uuidExtension)},
+		{Name: idColumn, Type: &arrow.FixedSizeBinaryType{ByteWidth: 16}, Metadata: arrow.NewMetadata([]string{records.ExtensionNameKey}, []string{records.UUIDExtension})},
 		{Name: opColumn, Type: arrow.BinaryTypes.String},
 	}, &md)
 	b := array.NewRecordBuilder(memory.DefaultAllocator, sc)
@@ -547,7 +548,7 @@ func TestSourcePositionLost(t *testing.T) {
 // What the destination writes in Avro and Protobuf, the source reads back
 // with the registry's schemas, and declares their types.
 func TestRegistryFormats(t *testing.T) {
-	for _, format := range []string{formatAvro, formatProtobuf} {
+	for _, format := range []string{records.Avro, records.Protobuf} {
 		t.Run(format, func(t *testing.T) {
 			extra := map[string]any{"format": format, "schemaRegistryUrl": registryURL()}
 			d := newDest(t, extra)
@@ -591,25 +592,4 @@ func TestRegistryFormats(t *testing.T) {
 			wantIDs(t, got, 0, 10)
 		})
 	}
-}
-
-func TestRegistryRefusesAnIncompatibleSchema(t *testing.T) {
-	d := newDest(t, map[string]any{"format": formatAvro, "schemaRegistryUrl": registryURL()})
-	reg, err := d.cfg.registry()
-	if err != nil {
-		t.Fatal(err)
-	}
-	subject := uniq("drift") + "-value"
-	if _, err := newRowEncoder(t.Context(), formatAvro, reg, subject, "t", []col{{name: "id", kind: kInt64}}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := newRowEncoder(t.Context(), formatAvro, reg, subject, "t", []col{{name: "id", kind: kInt64}, {name: "extra", kind: kString}}); err != nil {
-		t.Errorf("an added column: %v", err)
-	}
-	_, err = newRowEncoder(t.Context(), formatAvro, reg, subject, "t", []col{{name: "id", kind: kBool}})
-	var coded interface{ ErrorCode() protocolv1.ErrorCode }
-	if !errors.As(err, &coded) || coded.ErrorCode() != protocolv1.ErrorCode_ERROR_CODE_SCHEMA_DRIFT {
-		t.Errorf("a changed type: %v", err)
-	}
-
 }
