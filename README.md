@@ -50,6 +50,7 @@ The Kinesis tests need a Kinesis endpoint at `OPENETL_TEST_KINESIS_ENDPOINT` (de
 - `kinesis/`: the Kinesis source and destination, and their config schemas.
 - `records/`: the record layout and formats Kafka and Kinesis share: JSON, and Avro and Protobuf with a schema registry.
 - `cmd/<executable>/`: one `main` per connector, which hands the connector to `sdk.Serve`.
+- `connectors.yaml`: each connector's author and logo, which packaging a release passes to `openetl connector package` (`--author`, `--logo`) for its descriptor. A test checks that every connector in `cmd/` has them.
 
 ## License
 

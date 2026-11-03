@@ -1,0 +1,29 @@
+# What each connector's descriptor says about it, which the openetl UI shows.
+# Packaging a release passes these to `openetl connector package` as --author
+# and --logo. Logos are the projects' own marks, at the projects' own URLs;
+# AWS publishes no linkable icons for S3 or Kinesis, so those take its mark.
+
+source-postgres:
+  author: OpenETL
+  logo: https://wiki.postgresql.org/images/a/a4/PostgreSQL_logo.3colors.svg
+destination-postgres:
+  author: OpenETL
+  logo: https://wiki.postgresql.org/images/a/a4/PostgreSQL_logo.3colors.svg
+destination-iceberg:
+  author: OpenETL
+  logo: https://iceberg.apache.org/assets/images/favicon-96x96.png
+destination-s3:
+  author: OpenETL
+  logo: https://a0.awsstatic.com/libra-css/images/site/touch-icon-ipad-144-smile.png
+source-kafka:
+  author: OpenETL
+  logo: https://kafka.apache.org/logos/kafka-logo-no-text.png
+destination-kafka:
+  author: OpenETL
+  logo: https://kafka.apache.org/logos/kafka-logo-no-text.png
+source-kinesis:
+  author: OpenETL
+  logo: https://a0.awsstatic.com/libra-css/images/site/touch-icon-ipad-144-smile.png
+destination-kinesis:
+  author: OpenETL
+  logo: https://a0.awsstatic.com/libra-css/images/site/touch-icon-ipad-144-smile.png
