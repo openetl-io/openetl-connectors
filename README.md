@@ -41,6 +41,14 @@ The Kafka tests need a broker at `OPENETL_TEST_KAFKA_BROKERS` (default `127.0.0.
 
 The Kinesis tests need a Kinesis endpoint at `OPENETL_TEST_KINESIS_ENDPOINT` (default `http://127.0.0.1:4568`), such as kinesis-mock's, which openetl's compose file runs, and the schema registry.
 
+## Release
+
+```sh
+go run ./tools/package --version 0.1.0
+```
+
+builds every connector in `connectors.yaml` for each platform into `dist/`, and writes each one's descriptor with `openetl connector package` (from `../openetl/bin/openetl`, or `--openetl`): its executables by download URL and digest, its author and logo, and its release. The descriptors and executables are the release's assets, and `openetl connector apply -f dist/source-postgres.yaml` pins a version. Name connectors to package only those, and give `--tag` a `{connector}` to version them separately (`--tag '{connector}/v{version}'`). A connector's entry in `connectors.yaml` is its executable's name, `{kind}-{name}`, which is how the platform names it; the tool checks that each executable reports that kind.
+
 ## Layout
 
 - `postgres/`: the Postgres source and destination, and their config schemas.
@@ -50,7 +58,8 @@ The Kinesis tests need a Kinesis endpoint at `OPENETL_TEST_KINESIS_ENDPOINT` (de
 - `kinesis/`: the Kinesis source and destination, and their config schemas.
 - `records/`: the record layout and formats Kafka and Kinesis share: JSON, and Avro and Protobuf with a schema registry.
 - `cmd/<executable>/`: one `main` per connector, which hands the connector to `sdk.Serve`.
-- `connectors.yaml`: each connector's author and logo, which packaging a release passes to `openetl connector package` (`--author`, `--logo`) for its descriptor. A test checks that every connector in `cmd/` has them.
+- `connectors.yaml`: each connector's author and logo, for its descriptor. A test checks that every connector in `cmd/` has them.
+- `tools/package/`: builds and packages connectors for a release (see Release).
 
 ## License
 
