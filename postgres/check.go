@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"strings"
 
 	"github.com/jackc/pgx/v5"
@@ -81,10 +82,14 @@ func denied(format string, args ...any) error {
 	return sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_PERMISSION_DENIED, fmt.Errorf(format, args...))
 }
 
-// classify gives the server's refusals their taxonomy codes.
+// classify gives the server's refusals their taxonomy codes, and failures
+// to reach it TRANSIENT.
 func classify(err error) error {
 	pe, ok := errors.AsType[*pgconn.PgError](err)
 	if !ok {
+		if _, ok := errors.AsType[net.Error](err); ok && !errors.Is(err, context.Canceled) {
+			return sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_TRANSIENT, err)
+		}
 		return err
 	}
 	switch {

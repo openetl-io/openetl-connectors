@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"strconv"
 	"sync"
 	"time"
@@ -121,8 +122,16 @@ func classify(err error) error {
 		return fmt.Errorf("%w: %w", destination.ErrFenced, err)
 	case errors.As(err, &ke) && ke.Retriable:
 		return sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_TRANSIENT, err)
+	case unreachable(err):
+		return sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_TRANSIENT, err)
 	}
 	return err
+}
+
+// unreachable: no broker answered.
+func unreachable(err error) bool {
+	_, ok := errors.AsType[net.Error](err)
+	return ok && !errors.Is(err, context.Canceled)
 }
 
 func (d *Destination) Open(ctx context.Context, cfg destination.OpenConfig) (destination.Writer, error) {

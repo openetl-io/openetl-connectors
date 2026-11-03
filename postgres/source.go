@@ -106,7 +106,7 @@ type sourceColumn struct {
 func (s *Source) Discover(ctx context.Context) (source.Catalog, error) {
 	conn, err := pgx.ConnectConfig(ctx, s.conn)
 	if err != nil {
-		return source.Catalog{}, fmt.Errorf("postgres: connect: %w", err)
+		return source.Catalog{}, classify(fmt.Errorf("postgres: connect: %w", err))
 	}
 	defer func() { _ = conn.Close(context.WithoutCancel(ctx)) }()
 	tables, err := s.tables(ctx, conn)
@@ -219,7 +219,7 @@ type sourceState struct {
 func (s *Source) Read(ctx context.Context, req source.ReadRequest, out source.Emitter) error {
 	conn, err := pgx.ConnectConfig(ctx, s.conn)
 	if err != nil {
-		return fmt.Errorf("postgres: connect: %w", err)
+		return classify(fmt.Errorf("postgres: connect: %w", err))
 	}
 	defer func() { _ = conn.Close(context.WithoutCancel(ctx)) }()
 	tables, err := s.tables(ctx, conn)

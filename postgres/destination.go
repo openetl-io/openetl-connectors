@@ -82,11 +82,11 @@ func (d *Destination) Open(ctx context.Context, cfg destination.OpenConfig) (des
 	}
 	pool, err := pgxpool.NewWithConfig(ctx, d.pool)
 	if err != nil {
-		return nil, fmt.Errorf("postgres: connect: %w", err)
+		return nil, classify(fmt.Errorf("postgres: connect: %w", err))
 	}
 	if err := pool.Ping(ctx); err != nil {
 		pool.Close()
-		return nil, fmt.Errorf("postgres: connect: %w", err)
+		return nil, classify(fmt.Errorf("postgres: connect: %w", err))
 	}
 	w := &writer{
 		pool:    pool,

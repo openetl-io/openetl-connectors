@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -109,6 +110,9 @@ func check(ctx context.Context, c *Connection) error {
 
 // classify gives Kinesis's errors their taxonomy codes.
 func classify(err error) error {
+	if _, ok := errors.AsType[net.Error](err); ok && !errors.Is(err, context.Canceled) {
+		return sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_TRANSIENT, err)
+	}
 	var ae smithy.APIError
 	if err == nil || !errors.As(err, &ae) {
 		return err

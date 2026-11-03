@@ -14,6 +14,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/url"
 	"path"
 	"slices"
@@ -36,6 +37,7 @@ import (
 
 	sdk "github.com/unsuitable001/openetl/sdk/go"
 	"github.com/unsuitable001/openetl/sdk/go/destination"
+	protocolv1 "github.com/unsuitable001/openetl/sdk/go/protocol/v1"
 )
 
 type DestinationConfig struct {
@@ -146,7 +148,8 @@ func (d *Destination) bucket(ctx context.Context) (*blob.Bucket, error) {
 }
 
 // Check writes a file under the URL and deletes it.
-func (d *Destination) Check(ctx context.Context) error {
+func (d *Destination) Check(ctx context.Context) (err error) {
+	defer func() { err = classify(err) }()
 	b, err := d.bucket(ctx)
 	if err != nil {
 		return err
@@ -281,7 +284,8 @@ func (p *part) abort() {
 	_ = p.fw.Close()
 }
 
-func (w *writer) Write(_ context.Context, e destination.Epoch, stream string, batch arrow.RecordBatch) error {
+func (w *writer) Write(_ context.Context, e destination.Epoch, stream string, batch arrow.RecordBatch) (err error) {
+	defer func() { err = classify(err) }()
 	if !slices.ContainsFunc(w.cfg.Streams, func(s destination.Stream) bool { return s.Name == stream }) {
 		return fmt.Errorf("s3: unknown stream %q", stream)
 	}
@@ -335,7 +339,8 @@ func (w *writer) close(ef *epochFiles) error {
 
 // PreCommit closes the epoch's files. They are durable once closed, and
 // outside every table until Commit copies them in.
-func (w *writer) PreCommit(_ context.Context, e destination.Epoch) (destination.Staged, error) {
+func (w *writer) PreCommit(_ context.Context, e destination.Epoch) (_ destination.Staged, err error) {
+	defer func() { err = classify(err) }()
 	desc := staged{Generation: e.Generation, Epoch: e.N}
 	byStream := w.parts[e.N]
 	delete(w.parts, e.N)
@@ -369,7 +374,8 @@ func (w *writer) descriptor(e destination.Epoch, s destination.Staged) (staged, 
 	return d, nil
 }
 
-func (w *writer) Commit(ctx context.Context, e destination.Epoch, s destination.Staged) (destination.Committed, error) {
+func (w *writer) Commit(ctx context.Context, e destination.Epoch, s destination.Staged) (_ destination.Committed, err error) {
+	defer func() { err = classify(err) }()
 	d, err := w.descriptor(e, s)
 	if err != nil {
 		return destination.Committed{}, err
@@ -420,7 +426,8 @@ func (w *writer) dropStaged(d staged) {
 	}
 }
 
-func (w *writer) Recover(ctx context.Context, gen uint64, e destination.Epoch, s destination.Staged) (destination.Recovery, error) {
+func (w *writer) Recover(ctx context.Context, gen uint64, e destination.Epoch, s destination.Staged) (_ destination.Recovery, err error) {
+	defer func() { err = classify(err) }()
 	r, err := w.recover(ctx, e, s)
 	if err != nil {
 		return 0, err
@@ -527,4 +534,12 @@ func (w *writer) Close(context.Context) error {
 	}
 	w.cancel()
 	return w.b.Close()
+}
+
+// classify makes failures to reach the store TRANSIENT.
+func classify(err error) error {
+	if _, ok := errors.AsType[net.Error](err); ok && !errors.Is(err, context.Canceled) {
+		return sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_TRANSIENT, err)
+	}
+	return err
 }
