@@ -213,8 +213,10 @@ type topicRead struct {
 	moved map[int32]time.Time
 	hwm   map[int32]int64
 	// The newest record's time.
-	last     time.Time
-	complete bool
+	last time.Time
+	// The topic's retention.ms; 0 if unknown or unlimited.
+	retention time.Duration
+	complete  bool
 }
 
 func positionLost(err error) error {
@@ -247,6 +249,7 @@ func (s *Source) Read(ctx context.Context, req source.ReadRequest, out source.Em
 	if err := s.position(ctx, adm, reads, topics); err != nil {
 		return err
 	}
+	retentions(ctx, adm, reads, topics)
 	bounded := !req.Continuous
 	if bounded {
 		ends, err := adm.ListCommittedOffsets(ctx, topics...)
@@ -321,7 +324,7 @@ func (s *Source) Read(ctx context.Context, req source.ReadRequest, out source.Em
 		if progress != nil && time.Since(lastProgress) > progressEvery {
 			lastProgress = time.Now()
 			for _, t := range topics {
-				if err := progress.Progress(reads[t].progress()); err != nil {
+				if err := progress.Progress(reads[t].progress(time.Now())); err != nil {
 					return err
 				}
 			}
@@ -457,7 +460,34 @@ func (s *Source) newPartitions(ctx context.Context, adm *kadm.Client, consumer *
 	return nil
 }
 
-func (r *topicRead) progress() source.Progress {
+// retentions reads the topics' retention.ms. Credentials that may not
+// describe topics' configs leave it unknown.
+func retentions(ctx context.Context, adm *kadm.Client, reads map[string]*topicRead, topics []string) {
+	rcs, err := adm.DescribeTopicConfigs(ctx, topics...)
+	if err != nil {
+		return
+	}
+	for _, rc := range rcs {
+		r := reads[rc.Name]
+		if r == nil || rc.Err != nil {
+			continue
+		}
+		for _, c := range rc.Configs {
+			if c.Key != "retention.ms" || c.Value == nil {
+				continue
+			}
+			if ms, err := strconv.ParseInt(*c.Value, 10, 64); err == nil && ms > 0 {
+				r.retention = time.Duration(ms) * time.Millisecond
+			}
+		}
+	}
+}
+
+// progress is the read's lag, and the retention left: the topic's
+// retention less the age of the newest record read, since the records
+// after it are newer, or all of it once caught up. Retention by size isn't
+// counted.
+func (r *topicRead) progress(now time.Time) source.Progress {
 	var lag uint64
 	for p, o := range r.next {
 		if h, ok := r.hwm[p]; ok && h > o {
@@ -466,9 +496,17 @@ func (r *topicRead) progress() source.Progress {
 	}
 	behind := time.Duration(0)
 	if lag > 0 && !r.last.IsZero() {
-		behind = time.Since(r.last)
+		behind = now.Sub(r.last)
 	}
-	return source.Progress{Stream: r.name, LagRecords: &lag, Lag: &behind}
+	p := source.Progress{Stream: r.name, LagRecords: &lag, Lag: &behind}
+	if r.retention > 0 && (lag == 0 || !r.last.IsZero()) {
+		left := r.retention
+		if lag > 0 {
+			left = max(0, r.retention-behind)
+		}
+		p.RetentionLeft = &left
+	}
+	return p
 }
 
 // row is a record as a JSON object: its value's fields, or its value as
