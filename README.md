@@ -1,6 +1,6 @@
 # openetl-connectors
 
-The official connectors for [openetl](https://github.com/unsuitable001/openetl). Each is an external connector: an executable that serves the connector protocol on a Unix socket, which the openetl runner starts as a subprocess.
+The official connectors for [openetl](https://github.com/unsuitable001/openetl). Each package, such as `postgres`, has a source role, a destination role or both, and each role is an external connector: an executable that serves the connector protocol on a Unix socket, which the openetl runner starts as a subprocess.
 
 | Connector | Executable | Notes |
 |---|---|---|
@@ -43,13 +43,18 @@ The Kinesis tests need a Kinesis endpoint at `OPENETL_TEST_KINESIS_ENDPOINT` (de
 
 ## Release
 
+Each package directory has an `openetl-connector.yaml`: its name, metadata, and how each role is built. The `openetl` CLI does the rest, so nothing here is specific to this repository:
+
 ```sh
-go run ./tools/package --version 0.1.0
+openetl connector validate --require author,logo,description,license postgres kafka kinesis iceberg s3
+openetl connector package --tag postgres/v0.2.0
 ```
 
-builds every connector in `connectors.yaml` for each platform into `dist/`, and writes each one's descriptor with `openetl connector package` (from `../openetl/bin/openetl`, or `--openetl`): its executables by download URL and digest, its author and logo, and its release. The descriptors and executables are the release's assets, and `openetl connector apply -f dist/source-postgres.yaml` pins a version. Name connectors to package only those, and give `--tag` a `{connector}` to version them separately (`--tag '{connector}/v{version}'`). A connector's entry in `connectors.yaml` is its executable's name, `{kind}-{name}`, which is how the platform names it; the tool checks that each executable reports that kind.
+`package` picks the directory whose package is `postgres`, builds each role for every platform into `dist/` (`postgres-source-linux-amd64` and the like), and writes `dist/postgres.connector.yaml`, whose binaries point at the `postgres/v0.2.0` release's assets. The executables and the descriptor are that release's assets, and `openetl connector apply -f postgres.connector.yaml` pins the version. Tags are per package: `postgres/v0.2.0`, `kafka/v0.1.3`.
 
 ## Layout
+
+Each package directory holds its `openetl-connector.yaml`.
 
 - `postgres/`: the Postgres source and destination, and their config schemas.
 - `iceberg/`: the Iceberg destination, and its config schema.
@@ -58,8 +63,6 @@ builds every connector in `connectors.yaml` for each platform into `dist/`, and 
 - `kinesis/`: the Kinesis source and destination, and their config schemas.
 - `records/`: the record layout and formats Kafka and Kinesis share: JSON, and Avro and Protobuf with a schema registry.
 - `cmd/<executable>/`: one `main` per connector, which hands the connector to `sdk.Serve`.
-- `connectors.yaml`: each connector's author and logo, for its descriptor. A test checks that every connector in `cmd/` has them.
-- `tools/package/`: builds and packages connectors for a release (see Release).
 
 ## License
 

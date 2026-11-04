@@ -50,6 +50,13 @@ jobs:
       - name: Vet
         working-directory: openetl-connectors
         run: go vet -tags integration ./...
+      # Each package's openetl-connector.yaml, checked by the openetl CLI.
+      - name: Packages
+        working-directory: openetl
+        run: |
+          go build -o "$RUNNER_TEMP/openetl" ./cmd/openetl
+          cd ../openetl-connectors
+          "$RUNNER_TEMP/openetl" connector validate --require author,logo,description,license postgres kafka kinesis iceberg s3
       # Services take no server flags, and CDC needs logical replication.
       - name: Logical replication
         run: |

@@ -1,0 +1,13 @@
+name: postgres
+description: Postgres tables, in full, incrementally or by CDC, and Postgres as a destination
+license: MIT
+repository: https://github.com/unsuitable001/openetl-connectors
+docs: https://github.com/unsuitable001/openetl-connectors#readme
+logo: https://wiki.postgresql.org/images/a/a4/PostgreSQL_logo.3colors.svg
+tags: [database, cdc]
+author: OpenETL
+roles:
+  source:
+    build: { go: ../cmd/source-postgres }
+  destination:
+    build: { go: ../cmd/destination-postgres }
