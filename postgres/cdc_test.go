@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/jackc/pglogrepl"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -241,15 +242,24 @@ func TestCDCDiscovers(t *testing.T) {
 		t.Fatal(err)
 	}
 	modes := map[string][]source.SyncMode{}
+	// A stream read with CDC declares its seq's type, which its batches
+	// carry.
+	seqs := map[string]arrow.DataType{}
 	for _, s := range cat.Streams {
-		modes[s.Name] = s.SyncModes
+		modes[s.Name], seqs[s.Name] = s.SyncModes, s.Seq
 	}
 	if m := modes["keyed"]; !slices.Equal(m, []source.SyncMode{source.FullRefresh, source.Incremental, source.CDC}) {
 		t.Errorf("keyed reads %v", m)
 	}
+	if !arrow.TypeEqual(seqs["keyed"], seqType) {
+		t.Errorf("keyed declares seq %v, want %v", seqs["keyed"], seqType)
+	}
 	for _, name := range []string{"loose", "nothing"} {
 		if m := modes[name]; !slices.Equal(m, []source.SyncMode{source.FullRefresh, source.Incremental}) {
 			t.Errorf("%s reads %v", name, m)
+		}
+		if seqs[name] != nil {
+			t.Errorf("%s declares seq %v", name, seqs[name])
 		}
 	}
 }

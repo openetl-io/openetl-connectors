@@ -129,7 +129,7 @@ func (s *Source) Discover(ctx context.Context) (source.Catalog, error) {
 		// The log names an update's or delete's row by its primary key, or
 		// with replica identity full by all of it.
 		if len(t.key) > 0 && (t.replident == 'd' || t.replident == 'f') {
-			cs.SyncModes = append(cs.SyncModes, source.CDC)
+			cs.SyncModes, cs.Seq = append(cs.SyncModes, source.CDC), seqType
 		}
 		for _, i := range t.key {
 			cs.PrimaryKey = append(cs.PrimaryKey, t.cols[i].name)
