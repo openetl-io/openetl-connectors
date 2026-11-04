@@ -4,7 +4,7 @@ The official connectors for [openetl](https://github.com/unsuitable001/openetl).
 
 | Connector | Executable | Notes |
 |---|---|---|
-| Postgres source | `source-postgres` | Full refresh in primary-key chunks, typed Arrow; CDC through a logical replication slot (pgoutput), with read-only snapshots in chunks |
+| Postgres source | `source-postgres` | Full refresh in primary-key chunks, typed Arrow; incremental by a cursor column the pipeline names (integer, numeric, date, timestamp, timestamptz, text or varchar), in (cursor, key) chunks up to the cursor's highest value when the read starts, each read from the last one's highest value on, so rows at it are read again and rows with a NULL cursor never are; CDC through a logical replication slot (pgoutput), with read-only snapshots in chunks |
 | Postgres destination | `destination-postgres` | Stage and apply, with a fence row; append, overwrite and merge, dedupe at apply |
 | Iceberg destination | `destination-iceberg` | Parquet data files committed through a REST or Glue catalog, one snapshot per table and epoch, with the catalog's compare-and-swap behind the fence; append, overwrite, and merge through equality deletes. Tables commit together on REST catalogs with multi-table commits. Glue is tested against moto, not real Glue. |
 | Parquet on S3 destination | `destination-s3` | Parquet files staged under the pipeline, copied to names from the pipeline, epoch and generation, with a marker per stream and epoch; append. Also `file://`. |

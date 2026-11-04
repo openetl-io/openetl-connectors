@@ -57,9 +57,17 @@ func TestSourceConformance(t *testing.T) {
 		Config:         cfg(dsn()),
 		BadCredentials: cfg(badPassword(t)),
 		Unreachable:    cfg(closedPort),
+		AddRecords: func(ctx context.Context, stream string) (int, error) {
+			if stream != "events" {
+				return 0, fmt.Errorf("can't add records to %s", stream)
+			}
+			_, err := e.conn.Exec(ctx, "INSERT INTO "+pgx.Identifier{e.schema, "events"}.Sanitize()+
+				" SELECT i, timestamptz '2026-02-01 00:00Z' + i * interval '1 minute', '{}' FROM generate_series(1001, 1010) i")
+			return 10, err
+		},
 		Streams: []conformance.Stream{
 			{Name: "users", Mode: source.FullRefresh},
-			{Name: "events", Mode: source.FullRefresh},
+			{Name: "events", Mode: source.Incremental, Cursor: "at"},
 			{Name: "kinds", Mode: source.FullRefresh},
 			{Name: "orders", Mode: source.CDC},
 		},

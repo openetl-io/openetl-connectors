@@ -244,11 +244,11 @@ func TestCDCDiscovers(t *testing.T) {
 	for _, s := range cat.Streams {
 		modes[s.Name] = s.SyncModes
 	}
-	if m := modes["keyed"]; !slices.Equal(m, []source.SyncMode{source.FullRefresh, source.CDC}) {
+	if m := modes["keyed"]; !slices.Equal(m, []source.SyncMode{source.FullRefresh, source.Incremental, source.CDC}) {
 		t.Errorf("keyed reads %v", m)
 	}
 	for _, name := range []string{"loose", "nothing"} {
-		if m := modes[name]; !slices.Equal(m, []source.SyncMode{source.FullRefresh}) {
+		if m := modes[name]; !slices.Equal(m, []source.SyncMode{source.FullRefresh, source.Incremental}) {
 			t.Errorf("%s reads %v", name, m)
 		}
 	}

@@ -15,6 +15,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	sdk "github.com/unsuitable001/openetl/sdk/go"
 	"github.com/unsuitable001/openetl/sdk/go/source"
@@ -43,11 +44,12 @@ type SourceConfig struct {
 	SnapshotChunkRows int `json:"snapshotChunkRows"`
 }
 
-// Source reads tables: a full refresh reads a table's rows, and cdc reads
-// its changes through a logical replication slot (cdc.go). A table with a
-// primary key is read in key order, a chunk per query, so a resumed read
-// yields exactly the rows after its last chunk. A table without one is read
-// in a single query.
+// Source reads tables: a full refresh reads a table's rows, an incremental
+// read the rows from a cursor column's floor on, and cdc reads its changes
+// through a logical replication slot (cdc.go). A table with a primary key is
+// read in key order, or (cursor, key) order, a chunk per query, so a resumed
+// read yields exactly the rows after its last chunk. A table without one is
+// read in a single query.
 type Source struct {
 	cfg  SourceConfig
 	conn *pgx.ConnConfig
@@ -121,6 +123,9 @@ func (s *Source) Discover(ctx context.Context) (source.Catalog, error) {
 		}
 		b.release()
 		cs := source.CatalogStream{Name: t.name, Replay: source.Exact, Schema: b.declared, SyncModes: []source.SyncMode{source.FullRefresh}}
+		if slices.ContainsFunc(t.cols, func(c sourceColumn) bool { return cursorTypes[c.oid] }) {
+			cs.SyncModes = append(cs.SyncModes, source.Incremental)
+		}
 		// The log names an update's or delete's row by its primary key, or
 		// with replica identity full by all of it.
 		if len(t.key) > 0 && (t.replident == 'd' || t.replident == 'f') {
@@ -210,10 +215,22 @@ func hasTable(ts []table, name string) bool {
 }
 
 type sourceState struct {
-	// The primary key of the last row read, spelled as text.
+	// The primary key of the last row read, spelled as text; in an
+	// incremental read, its cursor value first.
 	After []string `json:"after,omitempty"`
 	// Set once a table without a primary key has been read.
 	Done bool `json:"done,omitempty"`
+	// An incremental read's cursor floor, inclusive, and the highest value
+	// it reads, set when it starts, as text. A completed read's Until is the
+	// next read's Since.
+	Since *string `json:"since,omitempty"`
+	Until *string `json:"until,omitempty"`
+}
+
+// The column types an incremental read can order by.
+var cursorTypes = map[uint32]bool{
+	pgtype.Int2OID: true, pgtype.Int4OID: true, pgtype.Int8OID: true, pgtype.NumericOID: true, pgtype.DateOID: true,
+	pgtype.TimestampOID: true, pgtype.TimestamptzOID: true, pgtype.TextOID: true, pgtype.VarcharOID: true,
 }
 
 func (s *Source) Read(ctx context.Context, req source.ReadRequest, out source.Emitter) error {
@@ -245,7 +262,12 @@ func (s *Source) Read(ctx context.Context, req source.ReadRequest, out source.Em
 				return fmt.Errorf("postgres: %s state: %w", cs.Name, err)
 			}
 		}
-		if err := s.readTable(ctx, conn, tables[i], st, out); err != nil {
+		if cs.SyncMode == source.Incremental {
+			err = s.readIncremental(ctx, conn, tables[i], cs.Cursor, st, out)
+		} else {
+			err = s.readTable(ctx, conn, tables[i], st, out)
+		}
+		if err != nil {
 			return err
 		}
 	}
@@ -313,6 +335,116 @@ func (s *Source) readTable(ctx context.Context, conn *pgx.Conn, t table, st sour
 			return out.Complete(t.name, nil)
 		}
 	}
+}
+
+// readIncremental reads the rows whose cursor is from the state's floor up
+// to the cursor's highest value when the read started, in (cursor, key)
+// order. It completes with that value as the next read's floor, so the rows
+// that hold it are read again then. Rows with a NULL cursor aren't read.
+func (s *Source) readIncremental(ctx context.Context, conn *pgx.Conn, t table, cursor string, st sourceState, out source.Emitter) error {
+	ci := slices.IndexFunc(t.cols, func(c sourceColumn) bool { return c.name == cursor })
+	switch {
+	case cursor == "":
+		return configInvalid("postgres: %s is read incrementally, which needs a cursor column", t.name)
+	case ci < 0:
+		return configInvalid("postgres: %s has no column %q for a cursor", t.name, cursor)
+	case !cursorTypes[t.cols[ci].oid]:
+		return configInvalid("postgres: %s.%s can't be a cursor: that takes an integer, numeric, date, timestamp, timestamptz, text or varchar column", t.name, cursor)
+	}
+	b, err := newBatcher(memory.DefaultAllocator, t.cols)
+	if err != nil {
+		return fmt.Errorf("postgres: %s: %w", t.name, err)
+	}
+	defer b.release()
+	ident := pgx.Identifier{s.cfg.Schema, t.name}.Sanitize()
+	cols := make([]string, len(t.cols))
+	for i, c := range t.cols {
+		cols[i] = pgx.Identifier{c.name}.Sanitize()
+	}
+	if st.Until == nil {
+		var until *string
+		if err := conn.QueryRow(ctx, "SELECT max("+cols[ci]+")::text FROM "+ident).Scan(&until); err != nil {
+			return classify(fmt.Errorf("postgres: read %s: %w", t.name, err))
+		}
+		if until == nil {
+			return complete(out, t.name, sourceState{Since: st.Since})
+		}
+		st = sourceState{Since: st.Since, Until: until}
+	}
+	var args []string
+	arg := func(v string) string {
+		args = append(args, v)
+		return "$" + strconv.Itoa(len(args))
+	}
+	bounds := func() string {
+		args = args[:0]
+		w := cols[ci] + " <= " + arg(*st.Until)
+		if st.Since != nil {
+			w += " AND " + cols[ci] + " >= " + arg(*st.Since)
+		}
+		return w
+	}
+	list := strings.Join(cols, ", ")
+
+	if len(t.key) == 0 {
+		if !st.Done {
+			if _, _, err := s.query(ctx, conn, b, t.name, "SELECT "+list+" FROM "+ident+" WHERE "+bounds(), args, 0, out); err != nil {
+				return err
+			}
+			st.Done = true
+			if err := resume(out, t.name, st); err != nil {
+				return err
+			}
+		}
+		return complete(out, t.name, sourceState{Since: st.Until})
+	}
+
+	order := []string{cols[ci]}
+	for _, k := range t.key {
+		if k != ci {
+			order = append(order, cols[k])
+		}
+	}
+	text := make([]string, len(order))
+	for i, c := range order {
+		text[i] = c + "::text AS _openetl_key_" + strconv.Itoa(i)
+	}
+	head := "SELECT " + list + ", " + strings.Join(text, ", ") + " FROM " + ident + " WHERE "
+	tail := " ORDER BY " + strings.Join(order, ", ") + " LIMIT " + strconv.Itoa(s.cfg.ChunkRows)
+	if st.After != nil && len(st.After) != len(order) {
+		return fmt.Errorf("postgres: %s state has %d cursor and key columns, the read has %d", t.name, len(st.After), len(order))
+	}
+	for {
+		where := bounds()
+		if st.After != nil {
+			params := make([]string, len(st.After))
+			for i, v := range st.After {
+				params[i] = arg(v)
+			}
+			where += " AND (" + strings.Join(order, ", ") + ") > (" + strings.Join(params, ", ") + ")"
+		}
+		n, last, err := s.query(ctx, conn, b, t.name, head+where+tail, args, len(order), out)
+		if err != nil {
+			return err
+		}
+		if n > 0 {
+			st.After = last
+		}
+		if err := resume(out, t.name, st); err != nil {
+			return err
+		}
+		if n < s.cfg.ChunkRows {
+			return complete(out, t.name, sourceState{Since: st.Until})
+		}
+	}
+}
+
+func complete(out source.Emitter, stream string, next sourceState) error {
+	b, err := json.Marshal(next)
+	if err != nil {
+		return err
+	}
+	return out.Complete(stream, b)
 }
 
 // query runs sql and emits its rows. The last keyCols result columns are the
