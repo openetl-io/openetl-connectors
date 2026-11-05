@@ -154,7 +154,7 @@ func TestProtoSchema(t *testing.T) {
 	batch := row(t)
 	defer batch.Release()
 	cols, _ := values(t, batch)
-	text, err := protoSchema("items", cols)
+	text, err := protoSchema("items", cols, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

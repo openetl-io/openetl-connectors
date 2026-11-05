@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math"
 	"net/http"
+	"slices"
 	"strings"
 	"time"
 
@@ -248,22 +249,118 @@ type protoEncoder struct {
 	cols []Col
 }
 
-// protoSchema is a proto3 file with one message, name, holding cols. Field
-// numbers follow the columns' order, which only ever grows at the end.
-func protoSchema(name string, cols []Col) (string, error) {
+// protoSchema is a proto3 file with one message, name, holding cols. A
+// field keeps its number in prev, the subject's latest schema, and new
+// fields take numbers above any prev used, since Protobuf reads fields by
+// number and the engine adds a source's new columns before its own.
+func protoSchema(name string, cols []Col, prev *protoLayout) (string, error) {
 	var b strings.Builder
 	b.WriteString("syntax = \"proto3\";\n\npackage openetl;\n\nimport \"google/protobuf/timestamp.proto\";\n\n")
-	if err := protoMessage(&b, AvroName(name), cols, ""); err != nil {
+	if err := protoMessage(&b, AvroName(name), cols, "", prev); err != nil {
 		return "", err
 	}
 	return b.String(), nil
 }
 
-func protoMessage(b *strings.Builder, name string, cols []Col, indent string) error {
+// protoLayout is a message's field numbers by name, and its nested
+// messages', in a registered schema.
+type protoLayout struct {
+	nums     map[string]protoreflect.FieldNumber
+	reserved [][2]protoreflect.FieldNumber
+	// The highest number used or reserved.
+	max    protoreflect.FieldNumber
+	nested map[string]*protoLayout
+}
+
+func layoutOf(md protoreflect.MessageDescriptor) *protoLayout {
+	l := &protoLayout{nums: map[string]protoreflect.FieldNumber{}, nested: map[string]*protoLayout{}}
+	for i := range md.Fields().Len() {
+		f := md.Fields().Get(i)
+		l.nums[string(f.Name())] = f.Number()
+		l.max = max(l.max, f.Number())
+		if m := f.Message(); m != nil && m.Parent() == md {
+			l.nested[string(f.Name())] = layoutOf(m)
+		}
+	}
+	for i := range md.ReservedRanges().Len() {
+		r := md.ReservedRanges().Get(i)
+		l.reserved = append(l.reserved, r)
+		l.max = max(l.max, r[1]-1)
+	}
+	return l
+}
+
+func (l *protoLayout) num(name string) (protoreflect.FieldNumber, bool) {
+	if l == nil {
+		return 0, false
+	}
+	n, ok := l.nums[name]
+	return n, ok
+}
+
+func (l *protoLayout) child(name string) *protoLayout {
+	if l == nil {
+		return nil
+	}
+	return l.nested[name]
+}
+
+// latestLayout is subject's latest Protobuf schema's layout, nil if it has
+// none.
+func latestLayout(ctx context.Context, reg *sr.Client, subject string) (*protoLayout, error) {
+	ss, err := reg.SchemaByVersion(ctx, subject, -1)
+	if err != nil {
+		var re *sr.ResponseError
+		if errors.As(err, &re) && re.StatusCode == http.StatusNotFound {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("the latest schema of %s: %w", subject, err)
+	}
+	if ss.Type != sr.TypeProtobuf {
+		return nil, nil
+	}
+	fd, err := protoFile(ctx, reg, ss.Schema)
+	if err != nil {
+		return nil, fmt.Errorf("the latest schema of %s: %w", subject, err)
+	}
+	if fd.Messages().Len() == 0 {
+		return nil, nil
+	}
+	return layoutOf(fd.Messages().Get(0)), nil
+}
+
+func protoMessage(b *strings.Builder, name string, cols []Col, indent string, prev *protoLayout) error {
 	fmt.Fprintf(b, "%smessage %s {\n", indent, name)
+	var next protoreflect.FieldNumber
+	var gone [][2]protoreflect.FieldNumber
+	if prev != nil {
+		next = prev.max
+		kept := map[string]bool{}
+		for i := range cols {
+			kept[cols[i].name] = true
+		}
+		gone = slices.Clone(prev.reserved)
+		for n, num := range prev.nums {
+			if !kept[n] {
+				gone = append(gone, [2]protoreflect.FieldNumber{num, num + 1})
+			}
+		}
+		slices.SortFunc(gone, func(a, b [2]protoreflect.FieldNumber) int { return int(a[0] - b[0]) })
+	}
+	if len(gone) > 0 {
+		var rs []string
+		for _, r := range gone {
+			if r[1]-1 == r[0] {
+				rs = append(rs, fmt.Sprint(r[0]))
+			} else {
+				rs = append(rs, fmt.Sprintf("%d to %d", r[0], r[1]-1))
+			}
+		}
+		fmt.Fprintf(b, "%s  reserved %s;\n", indent, strings.Join(rs, ", "))
+	}
 	for i := range cols {
 		c := &cols[i]
-		t, nested, err := protoType(c, indent+"  ")
+		t, nested, err := protoType(c, indent+"  ", prev.child(c.name))
 		if err != nil {
 			return err
 		}
@@ -274,14 +371,19 @@ func protoMessage(b *strings.Builder, name string, cols []Col, indent string) er
 		} else if strings.HasPrefix(t, "M_") || t == "google.protobuf.Timestamp" {
 			label = ""
 		}
-		fmt.Fprintf(b, "%s  %s%s %s = %d;\n", indent, label, t, c.name, i+1)
+		num, ok := prev.num(c.name)
+		if !ok {
+			next++
+			num = next
+		}
+		fmt.Fprintf(b, "%s  %s%s %s = %d;\n", indent, label, t, c.name, num)
 	}
 	fmt.Fprintf(b, "%s}\n", indent)
 	return nil
 }
 
 // protoType is c's field type, and any message it defines for it.
-func protoType(c *Col, indent string) (string, string, error) {
+func protoType(c *Col, indent string, prev *protoLayout) (string, string, error) {
 	switch c.kind {
 	case kBool:
 		return "bool", "", nil
@@ -310,11 +412,11 @@ func protoType(c *Col, indent string) (string, string, error) {
 		}
 		e := *c.elem
 		e.name = c.name
-		return protoType(&e, indent)
+		return protoType(&e, indent, prev)
 	case kStruct:
 		name := "M_" + c.name
 		var b strings.Builder
-		if err := protoMessage(&b, name, c.fields, indent); err != nil {
+		if err := protoMessage(&b, name, c.fields, indent, prev); err != nil {
 			return "", "", err
 		}
 		return name, b.String(), nil
@@ -332,7 +434,11 @@ func compileProto(ctx context.Context, files map[string]string, root string) (pr
 }
 
 func newProtoEncoder(ctx context.Context, reg *sr.Client, subject, name string, cols []Col) (*protoEncoder, error) {
-	text, err := protoSchema(name, cols)
+	prev, err := latestLayout(ctx, reg, subject)
+	if err != nil {
+		return nil, err
+	}
+	text, err := protoSchema(name, cols, prev)
 	if err != nil {
 		return nil, err
 	}
@@ -362,8 +468,8 @@ func protoFill(m protoreflect.Message, cols []Col, vals []any) error {
 		if vals[i] == nil {
 			continue
 		}
-		fd := fields.ByNumber(protoreflect.FieldNumber(i + 1))
 		c := &cols[i]
+		fd := fields.ByName(protoreflect.Name(c.name))
 		if c.kind == kList {
 			l := m.Mutable(fd).List()
 			for _, e := range vals[i].([]any) {
