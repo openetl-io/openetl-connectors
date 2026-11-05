@@ -385,13 +385,13 @@ func (w *writer) create(ctx context.Context, ident table.Identifier, sc *ice.Sch
 
 // ApplySchema creates each stream's table, adds its new columns and widens
 // the columns whose type widened.
-func (w *writer) ApplySchema(ctx context.Context, streams []destination.StreamSchema) error {
+func (w *writer) ApplySchema(ctx context.Context, streams []destination.StreamSchema) (destination.SchemaApplied, error) {
 	for _, s := range streams {
 		if _, err := w.tableFor(ctx, s.Name, s.Schema); err != nil {
-			return err
+			return destination.SchemaApplied{}, err
 		}
 	}
-	return nil
+	return destination.SchemaApplied{}, nil
 }
 
 func (w *writer) StartReads(_ context.Context, starts map[string]time.Time) error {

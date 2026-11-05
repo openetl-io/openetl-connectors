@@ -899,22 +899,22 @@ func (w *writer) ensureKey(ctx context.Context, table string, key []string) erro
 
 // ApplySchema creates each stream's table, adds its new columns and widens
 // the columns whose type widened.
-func (w *writer) ApplySchema(ctx context.Context, streams []destination.StreamSchema) error {
+func (w *writer) ApplySchema(ctx context.Context, streams []destination.StreamSchema) (destination.SchemaApplied, error) {
 	if _, err := w.pool.Exec(ctx, "CREATE SCHEMA IF NOT EXISTS "+pgx.Identifier{w.schema}.Sanitize()); err != nil {
-		return fmt.Errorf("postgres: create schema %s: %w", w.schema, err)
+		return destination.SchemaApplied{}, fmt.Errorf("postgres: create schema %s: %w", w.schema, err)
 	}
 	for _, s := range streams {
 		cols, err := columnsOf(s.Schema)
 		if err != nil {
-			return err
+			return destination.SchemaApplied{}, err
 		}
 		table := targetTable(s.Schema, s.Name)
 		if err := w.ensureTable(ctx, table, cols); err != nil {
-			return err
+			return destination.SchemaApplied{}, err
 		}
 		w.setTable(s.Name, table)
 	}
-	return nil
+	return destination.SchemaApplied{}, nil
 }
 
 // ensureTable creates the table with cols, or adds and widens its columns

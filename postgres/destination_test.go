@@ -440,12 +440,12 @@ func TestColumnsWiden(t *testing.T) {
 	}
 	text := arrow.NewSchema([]arrow.Field{{Name: "x", Type: arrow.BinaryTypes.String, Nullable: true}, nameField}, table("nums"))
 	for range 2 {
-		if err := sa.ApplySchema(ctx, []destination.StreamSchema{{Name: "nums", Schema: text}}); err != nil {
+		if _, err := sa.ApplySchema(ctx, []destination.StreamSchema{{Name: "nums", Schema: text}}); err != nil {
 			t.Fatal(err)
 		}
 	}
 	narrower := arrow.NewSchema(ints, table("nums"))
-	if err := sa.ApplySchema(ctx, []destination.StreamSchema{{Name: "nums", Schema: narrower}}); err != nil {
+	if _, err := sa.ApplySchema(ctx, []destination.StreamSchema{{Name: "nums", Schema: narrower}}); err != nil {
 		t.Fatal(err)
 	}
 	if got := typ(); got != "text" {
@@ -455,11 +455,11 @@ func TestColumnsWiden(t *testing.T) {
 		t.Errorf("name isn't a new column, or x lost its value")
 	}
 	flags := arrow.NewSchema([]arrow.Field{{Name: "x", Type: arrow.FixedWidthTypes.Boolean, Nullable: true}}, table("other"))
-	if err := sa.ApplySchema(ctx, []destination.StreamSchema{{Name: "other", Schema: flags}}); err != nil {
+	if _, err := sa.ApplySchema(ctx, []destination.StreamSchema{{Name: "other", Schema: flags}}); err != nil {
 		t.Fatal(err)
 	}
 	ints2 := arrow.NewSchema(ints, table("other"))
-	if err := sa.ApplySchema(ctx, []destination.StreamSchema{{Name: "other", Schema: ints2}}); err == nil {
+	if _, err := sa.ApplySchema(ctx, []destination.StreamSchema{{Name: "other", Schema: ints2}}); err == nil {
 		t.Error("boolean became bigint")
 	}
 }

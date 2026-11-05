@@ -45,7 +45,7 @@ func (e *env) text(q string) string {
 
 func applySchema(t *testing.T, w destination.Writer, stream string, fields []arrow.Field) {
 	t.Helper()
-	if err := w.(destination.SchemaApplier).ApplySchema(t.Context(), []destination.StreamSchema{{Name: stream, Schema: arrow.NewSchema(fields, nil)}}); err != nil {
+	if _, err := w.(destination.SchemaApplier).ApplySchema(t.Context(), []destination.StreamSchema{{Name: stream, Schema: arrow.NewSchema(fields, nil)}}); err != nil {
 		t.Fatal(err)
 	}
 }
