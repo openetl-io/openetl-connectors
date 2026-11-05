@@ -100,5 +100,9 @@ func TestDestinationConformance(t *testing.T) {
 			_, err := pool.Exec(ctx, "DROP SCHEMA IF EXISTS "+pgx.Identifier{namespace}.Sanitize()+" CASCADE")
 			return err
 		},
+		NotNull: func(ctx context.Context, namespace, stream, column string) error {
+			_, err := pool.Exec(ctx, "ALTER TABLE "+pgx.Identifier{namespace, stream}.Sanitize()+" ALTER COLUMN "+pgx.Identifier{column}.Sanitize()+" SET NOT NULL")
+			return err
+		},
 	}.Test(t)
 }
