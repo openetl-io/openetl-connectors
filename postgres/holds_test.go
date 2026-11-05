@@ -202,8 +202,8 @@ func TestAppendHoldsCellsAndRecoversPatches(t *testing.T) {
 	}
 }
 
-// A column a view depends on can't change type, so ApplySchema refuses it
-// and applies the rest, and says up front what each table can't take.
+// A column's type never changes, so ApplySchema refuses a widening and
+// applies the rest, and says up front what each table can't take.
 func TestApplySchemaRefusesWhatItCantChange(t *testing.T) {
 	env := newEnv(t)
 	ctx := t.Context()
@@ -212,7 +212,6 @@ func TestApplySchemaRefusesWhatItCantChange(t *testing.T) {
 	small := arrow.Field{Name: "x", Type: arrow.PrimitiveTypes.Int32, Nullable: true}
 	applySchema(t, w, "users", []arrow.Field{idField, small, nameField, priceField})
 	env.exec("ALTER TABLE $schema.users ALTER COLUMN name SET NOT NULL")
-	env.exec("CREATE VIEW $schema.v AS SELECT x FROM $schema.users")
 
 	sa := w.(destination.SchemaApplier)
 	wide := arrow.Field{Name: "x", Type: arrow.PrimitiveTypes.Int64, Nullable: true}
@@ -222,11 +221,11 @@ func TestApplySchemaRefusesWhatItCantChange(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(applied.Refused) != 1 || applied.Refused[0].Column != "x" || !strings.Contains(applied.Refused[0].Reason, "view") {
+	if len(applied.Refused) != 1 || applied.Refused[0].Column != "x" || !strings.Contains(applied.Refused[0].Reason, "alter it to bigint") {
 		t.Errorf("refused %+v", applied.Refused)
 	}
 	l := applied.Limits["users"]
-	if strings.Join(l.Fixed, ",") != "x" || strings.Join(l.NotNull, ",") != "name" || l.MaxColumns != 1600 {
+	if strings.Join(l.Fixed, ",") != "id,x,name,price,z" || strings.Join(l.NotNull, ",") != "name" || l.MaxColumns != 1600 {
 		t.Errorf("limits %+v", l)
 	}
 	if l.Columns != 5 {
@@ -239,11 +238,11 @@ func TestApplySchemaRefusesWhatItCantChange(t *testing.T) {
 		t.Errorf("x is %s and z is %q", typ("x"), typ("z"))
 	}
 
-	// Once the view is gone, the change goes through.
-	env.exec("DROP VIEW $schema.v")
+	// Once the user has altered it, the column takes the change.
+	env.exec("ALTER TABLE $schema.users ALTER COLUMN x TYPE bigint")
 	applied, err = sa.ApplySchema(ctx, []destination.StreamSchema{{Name: "users", Schema: arrow.NewSchema([]arrow.Field{idField, wide}, nil)}})
 	if err != nil || len(applied.Refused) != 0 || typ("x") != "bigint" {
-		t.Errorf("after the view: %+v, %v, x is %s", applied, err, typ("x"))
+		t.Errorf("after altering x: %+v, %v, x is %s", applied, err, typ("x"))
 	}
 }
 
@@ -272,30 +271,34 @@ func TestSchemaChangesWaitForLocksBriefly(t *testing.T) {
 		_ = tx.Rollback(context.Background())
 	}()
 	start := time.Now()
-	applySchema(t, w, "users", []arrow.Field{idField, {Name: "x", Type: arrow.PrimitiveTypes.Int64, Nullable: true}})
+	applySchema(t, w, "users", []arrow.Field{idField, small, nameField})
 	if d := time.Since(start); d < 600*time.Millisecond {
 		t.Errorf("the change didn't wait for the lock: %v", d)
 	}
-	if got := env.text("SELECT format_type(atttypid, atttypmod) FROM pg_attribute WHERE attrelid = '" + env.schema + ".users'::regclass AND attname = 'x'"); got != "bigint" {
-		t.Errorf("x is %s", got)
+	if n := env.count("SELECT count(*) FROM pg_attribute WHERE attrelid = '" + env.schema + ".users'::regclass AND attname = 'name'"); n != 1 {
+		t.Error("name wasn't added")
 	}
 }
 
-// A view the catalog read didn't show still refuses its column, and the
-// rest of the change is applied.
-func TestAlterFindsTheColumnItCantChange(t *testing.T) {
+// Columns added since the catalog read still count toward Postgres's limit:
+// the column past it is refused, and the rest added.
+func TestAlterFindsTheColumnItCantAdd(t *testing.T) {
 	env := newEnv(t)
 	ctx := t.Context()
 	w := env.open(1, destination.ScopePipeline, "users")
 	recov(t, w, 1, destination.Epoch{}, nil)
-	applySchema(t, w, "users", []arrow.Field{idField, {Name: "x", Type: arrow.PrimitiveTypes.Int32, Nullable: true}})
+	applySchema(t, w, "users", []arrow.Field{idField})
 	wr := w.(*writer)
 	have, err := wr.catalog(ctx, []string{"users"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	env.exec("CREATE VIEW $schema.v AS SELECT x FROM $schema.users")
-	cols, err := columnsOf(arrow.NewSchema([]arrow.Field{idField, {Name: "x", Type: arrow.PrimitiveTypes.Int64, Nullable: true}, nameField}, nil))
+	adds := make([]string, maxColumns-2)
+	for i := range adds {
+		adds[i] = fmt.Sprintf("ADD COLUMN c%d int", i)
+	}
+	env.exec("ALTER TABLE $schema.users " + strings.Join(adds, ", "))
+	cols, err := columnsOf(arrow.NewSchema([]arrow.Field{idField, nameField, priceField}, nil))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -303,7 +306,7 @@ func TestAlterFindsTheColumnItCantChange(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(refused) != 1 || refused[0][0] != "x" {
+	if len(refused) != 1 || refused[0][0] != "price" {
 		t.Errorf("refused %v", refused)
 	}
 	if n := env.count("SELECT count(*) FROM pg_attribute WHERE attrelid = '" + env.schema + ".users'::regclass AND attname = 'name'"); n != 1 {

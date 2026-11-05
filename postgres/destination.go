@@ -1030,8 +1030,8 @@ func (w *writer) preparePatch(ctx context.Context, desc staged, s stagedStream) 
 	return out, nil
 }
 
-// ensureRead creates the read's table, labelled, or adds and widens its
-// columns to hold cols.
+// ensureRead creates the read's table, labelled, or adds its columns to
+// hold cols.
 func (w *writer) ensureRead(ctx context.Context, s stagedStream, cols []column) error {
 	have, err := w.columnTypes(ctx, s.Read)
 	if err != nil {
@@ -1115,10 +1115,9 @@ func (w *writer) ensureKey(ctx context.Context, table string, key []string) erro
 	return nil
 }
 
-// ApplySchema creates each stream's table, adds its new columns and widens
-// the columns whose type widened, in one statement per table. A column it
-// can't add or change is refused, and the rest applied. It reports what
-// each table can't take.
+// ApplySchema creates each stream's table and adds its new columns, in one
+// statement per table. A column it can't add, or whose type changed, is
+// refused, and the rest applied. It reports what each table can't take.
 func (w *writer) ApplySchema(ctx context.Context, streams []destination.StreamSchema) (destination.SchemaApplied, error) {
 	var out destination.SchemaApplied
 	if _, err := w.pool.Exec(ctx, "CREATE SCHEMA IF NOT EXISTS "+pgx.Identifier{w.schema}.Sanitize()); err != nil {
@@ -1156,8 +1155,8 @@ func (w *writer) ApplySchema(ctx context.Context, streams []destination.StreamSc
 	return out, nil
 }
 
-// ensureTable creates the table with cols, or adds and widens its columns
-// to hold them. A column already wider is left alone.
+// ensureTable creates the table with cols, or adds its columns to hold
+// them. A column already wider is left alone.
 func (w *writer) ensureTable(ctx context.Context, table string, cols []column) error {
 	have, err := w.catalog(ctx, []string{table})
 	if err != nil {
@@ -1178,8 +1177,8 @@ const maxColumns = 1600
 
 // tableInfo is a table as the catalog has it.
 type tableInfo struct {
-	cols           []column
-	notNull, fixed map[string]bool
+	cols    []column
+	notNull map[string]bool
 	// Its columns as the limit counts them.
 	attrs int
 }
@@ -1191,29 +1190,25 @@ func (t *tableInfo) limits() destination.TableLimits {
 	}
 	l.Columns = t.attrs
 	for _, c := range t.cols {
-		switch {
-		case slices.Contains(metadataColumns, c.name):
-		case t.notNull[c.name]:
+		if slices.Contains(metadataColumns, c.name) {
+			continue
+		}
+		if t.notNull[c.name] {
 			l.NotNull = append(l.NotNull, c.name)
 		}
-		if t.fixed[c.name] && !slices.Contains(metadataColumns, c.name) {
-			l.Fixed = append(l.Fixed, c.name)
-		}
+		l.Fixed = append(l.Fixed, c.name)
 	}
 	return l
 }
 
-// catalog reads the tables' columns in one query: their types, which
-// can't take a null, and which a view or rule depends on. A table that
-// doesn't exist is missing.
+// catalog reads the tables' columns in one query: their types, and which
+// can't take a null. A table that doesn't exist is missing.
 func (w *writer) catalog(ctx context.Context, tables []string) (map[string]*tableInfo, error) {
 	idents := make([]string, len(tables))
 	for i, t := range tables {
 		idents[i] = w.ident(t)
 	}
-	rows, err := w.pool.Query(ctx, `SELECT t.i, a.attname, format_type(a.atttypid, a.atttypmod), a.attnotnull, a.attisdropped,
-		EXISTS (SELECT 1 FROM pg_depend d WHERE d.classid = 'pg_rewrite'::regclass AND d.refclassid = 'pg_class'::regclass
-			AND d.refobjid = a.attrelid AND d.refobjsubid = a.attnum)
+	rows, err := w.pool.Query(ctx, `SELECT t.i, a.attname, format_type(a.atttypid, a.atttypmod), a.attnotnull, a.attisdropped
 		FROM unnest($1::text[]) WITH ORDINALITY t(name, i) JOIN pg_attribute a ON a.attrelid = to_regclass(t.name)
 		WHERE a.attnum > 0 ORDER BY t.i, a.attnum`, idents)
 	if err != nil {
@@ -1222,12 +1217,12 @@ func (w *writer) catalog(ctx context.Context, tables []string) (map[string]*tabl
 	out := map[string]*tableInfo{}
 	var i int64
 	var c column
-	var notNull, dropped, fixed bool
-	_, err = pgx.ForEachRow(rows, []any{&i, &c.name, &c.typ, &notNull, &dropped, &fixed}, func() error {
+	var notNull, dropped bool
+	_, err = pgx.ForEachRow(rows, []any{&i, &c.name, &c.typ, &notNull, &dropped}, func() error {
 		name := tables[i-1]
 		t := out[name]
 		if t == nil {
-			t = &tableInfo{notNull: map[string]bool{}, fixed: map[string]bool{}}
+			t = &tableInfo{notNull: map[string]bool{}}
 			out[name] = t
 		}
 		t.attrs++
@@ -1235,7 +1230,7 @@ func (w *writer) catalog(ctx context.Context, tables []string) (map[string]*tabl
 			return nil
 		}
 		t.cols = append(t.cols, c)
-		t.notNull[c.name], t.fixed[c.name] = notNull, fixed
+		t.notNull[c.name] = notNull
 		return nil
 	})
 	if err != nil {
@@ -1244,9 +1239,9 @@ func (w *writer) catalog(ctx context.Context, tables []string) (map[string]*tabl
 	return out, nil
 }
 
-// alter creates the table with cols if it doesn't exist, or adds and widens
-// its columns in one ALTER TABLE, and returns the columns it refused, with
-// why. have is updated to match.
+// alter creates the table with cols if it doesn't exist, or adds its new
+// columns in one ALTER TABLE, and returns the columns it refused, with why:
+// it never changes a column's type. have is updated to match.
 func (w *writer) alter(ctx context.Context, table string, cols []column, have *tableInfo) ([][2]string, error) {
 	if have == nil {
 		if err := w.ddl(ctx, "CREATE TABLE IF NOT EXISTS "+w.ident(table)+" ("+columnDefs(cols)+")"); err != nil {
@@ -1260,7 +1255,6 @@ func (w *writer) alter(ctx context.Context, table string, cols []column, have *t
 	attrs := have.attrs
 	for _, c := range cols {
 		i := slices.IndexFunc(have.cols, func(x column) bool { return x.name == c.name })
-		q := pgx.Identifier{c.name}.Sanitize()
 		var clause string
 		switch {
 		case i < 0 && attrs >= maxColumns:
@@ -1274,11 +1268,9 @@ func (w *writer) alter(ctx context.Context, table string, cols []column, have *t
 		case !widens(have.cols[i].typ, c.typ):
 			refused = append(refused, [2]string{c.name, fmt.Sprintf("it's %s, and can't widen to %s", have.cols[i].typ, c.typ)})
 			continue
-		case have.fixed[c.name]:
-			refused = append(refused, [2]string{c.name, fmt.Sprintf("a view or rule depends on it, so it can't change from %s to %s", have.cols[i].typ, c.typ)})
-			continue
 		default:
-			clause = "ALTER COLUMN " + q + " TYPE " + c.typ + " USING " + q + "::" + c.typ
+			refused = append(refused, [2]string{c.name, fmt.Sprintf("it's %s, and the destination doesn't change a column's type, which can rewrite the table; alter it to %s yourself", have.cols[i].typ, c.typ)})
+			continue
 		}
 		clauses, changed = append(clauses, clause), append(changed, c)
 	}
@@ -1289,31 +1281,33 @@ func (w *writer) alter(ctx context.Context, table string, cols []column, have *t
 	if reason, ok := refusal(err); ok && len(clauses) == 1 {
 		return append(refused, [2]string{changed[0].name, reason}), nil
 	} else if ok {
-		// One of them can't change; find it, and apply the rest.
+		// One of them can't be added; find it, and add the rest.
 		for i, clause := range clauses {
 			err := w.ddl(ctx, "ALTER TABLE "+w.ident(table)+" "+clause)
 			if reason, ok := refusal(err); ok {
 				refused = append(refused, [2]string{changed[i].name, reason})
 			} else if err != nil {
-				return nil, fmt.Errorf("postgres: change column %q of %s: %w", changed[i].name, table, err)
-			} else if strings.HasPrefix(clause, "ADD ") {
+				return nil, fmt.Errorf("postgres: add column %q to %s: %w", changed[i].name, table, err)
+			} else {
 				have.attrs++
+				have.cols = append(have.cols, changed[i])
 			}
 		}
 		return refused, nil
 	}
 	if err != nil {
-		return nil, fmt.Errorf("postgres: change the columns of %s: %w", table, err)
+		return nil, fmt.Errorf("postgres: add columns to %s: %w", table, err)
 	}
 	have.attrs = attrs
+	have.cols = append(have.cols, changed...)
 	return refused, nil
 }
 
-// refusal is why a schema change failed, if the table can't take it: a
-// view or rule depends on the column, or it has too many columns.
+// refusal is why adding columns failed, if the table can't take them: it
+// has too many columns.
 func refusal(err error) (string, bool) {
 	pe, ok := errors.AsType[*pgconn.PgError](err)
-	if !ok || (pe.Code != "0A000" && pe.Code != "54011") {
+	if !ok || pe.Code != "54011" {
 		return "", false
 	}
 	return pe.Message, true

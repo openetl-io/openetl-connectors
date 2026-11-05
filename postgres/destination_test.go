@@ -391,7 +391,9 @@ func TestMergeNeedsAKey(t *testing.T) {
 	}
 }
 
-func TestColumnsWiden(t *testing.T) {
+// Staging widens within an epoch, but a target column's type never
+// changes: a narrower type lands in it, and a wider one is refused.
+func TestColumnsNeverChangeType(t *testing.T) {
 	env := newEnv(t)
 	ctx := t.Context()
 	w := env.open(1, destination.ScopePipeline, "nums")
@@ -402,14 +404,13 @@ func TestColumnsWiden(t *testing.T) {
 	if err := w.Write(ctx, e1, "nums", batch(t, ints, `[{"x": 1}]`)); err != nil {
 		t.Fatal(err)
 	}
+	if err := w.Write(ctx, e1, "nums", batch(t, floats, `[{"x": 2.5}]`)); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := w.Commit(ctx, e1, precommit(t, w, e1)); err != nil {
 		t.Fatal(err)
 	}
-	// Widened within epoch 2, and across epochs.
 	if err := w.Write(ctx, e2, "nums", batch(t, ints, `[{"x": 2}]`)); err != nil {
-		t.Fatal(err)
-	}
-	if err := w.Write(ctx, e2, "nums", batch(t, floats, `[{"x": 2.5}]`)); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := w.Commit(ctx, e2, precommit(t, w, e2)); err != nil {
@@ -440,19 +441,37 @@ func TestColumnsWiden(t *testing.T) {
 	}
 	text := arrow.NewSchema([]arrow.Field{{Name: "x", Type: arrow.BinaryTypes.String, Nullable: true}, nameField}, table("nums"))
 	for range 2 {
-		if _, err := sa.ApplySchema(ctx, []destination.StreamSchema{{Name: "nums", Schema: text}}); err != nil {
+		applied, err := sa.ApplySchema(ctx, []destination.StreamSchema{{Name: "nums", Schema: text}})
+		if err != nil {
 			t.Fatal(err)
+		}
+		if len(applied.Refused) != 1 || applied.Refused[0].Column != "x" || !strings.Contains(applied.Refused[0].Reason, "doesn't change a column's type") {
+			t.Errorf("double precision to text: %+v", applied.Refused)
 		}
 	}
 	narrower := arrow.NewSchema(ints, table("nums"))
-	if _, err := sa.ApplySchema(ctx, []destination.StreamSchema{{Name: "nums", Schema: narrower}}); err != nil {
-		t.Fatal(err)
+	if applied, err := sa.ApplySchema(ctx, []destination.StreamSchema{{Name: "nums", Schema: narrower}}); err != nil || len(applied.Refused) > 0 {
+		t.Fatalf("bigint into double precision: %+v, %v", applied.Refused, err)
 	}
-	if got := typ(); got != "text" {
+	if got := typ(); got != "double precision" {
 		t.Errorf("x is %s after ApplySchema", got)
 	}
-	if n := env.count("SELECT count(*) FROM $schema.nums WHERE name IS NULL AND x = '2.5'"); n != 1 {
+	if n := env.count("SELECT count(*) FROM $schema.nums WHERE name IS NULL AND x = 2.5"); n != 1 {
 		t.Errorf("name isn't a new column, or x lost its value")
+	}
+	e3 := destination.Epoch{Generation: 1, N: 3}
+	if err := w.Write(ctx, e3, "nums", batch(t, []arrow.Field{text.Field(0)}, `[{"x": "three"}]`)); err != nil {
+		t.Fatal(err)
+	}
+	staged, err := w.PreCommit(ctx, e3)
+	if err == nil {
+		_, err = w.Commit(ctx, e3, staged)
+	}
+	if err == nil {
+		t.Error("a wider staged column committed")
+	}
+	if got := typ(); got != "double precision" {
+		t.Errorf("x is %s after a wider epoch", got)
 	}
 	flags := arrow.NewSchema([]arrow.Field{{Name: "x", Type: arrow.FixedWidthTypes.Boolean, Nullable: true}}, table("other"))
 	if _, err := sa.ApplySchema(ctx, []destination.StreamSchema{{Name: "other", Schema: flags}}); err != nil {
