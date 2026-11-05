@@ -445,7 +445,8 @@ func TestColumnsNeverChangeType(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if len(applied.Refused) != 1 || applied.Refused[0].Column != "x" || !strings.Contains(applied.Refused[0].Reason, "doesn't change a column's type") {
+		if r := applied.Refused; len(r) != 1 || r[0].Column != "x" || !strings.Contains(r[0].Reason, "doesn't change a column's type") ||
+			r[0].FromType != "double precision" || r[0].ToType != "text" || !strings.HasSuffix(r[0].Fix, `ALTER COLUMN "x" TYPE text`) {
 			t.Errorf("double precision to text: %+v", applied.Refused)
 		}
 	}
@@ -482,7 +483,7 @@ func TestColumnsNeverChangeType(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(applied.Refused) != 1 || applied.Refused[0].Column != "x" || !strings.Contains(applied.Refused[0].Reason, "can't widen") {
+	if r := applied.Refused; len(r) != 1 || r[0].Column != "x" || r[0].Reason != "it can't change a column from boolean to bigint" || r[0].Fix != "" {
 		t.Errorf("boolean to bigint: %+v", applied.Refused)
 	}
 }

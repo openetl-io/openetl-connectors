@@ -222,8 +222,12 @@ func TestApplySchemaRefusesWhatItCantChange(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(applied.Refused) != 1 || applied.Refused[0].Column != "x" || !strings.Contains(applied.Refused[0].Reason, "alter it to bigint") {
-		t.Errorf("refused %+v", applied.Refused)
+	want := destination.RefusedColumn{
+		Stream: "users", Column: "x", Reason: "it doesn't change a column's type, which can rewrite the table", FromType: "integer", ToType: "bigint",
+		Fix: `ALTER TABLE "` + env.schema + `"."users" ALTER COLUMN "x" TYPE bigint`,
+	}
+	if len(applied.Refused) != 1 || applied.Refused[0] != want {
+		t.Fatalf("refused %+v", applied.Refused)
 	}
 	l := applied.Limits["users"]
 	if len(l.Fixed) != 0 || strings.Join(l.NotNull, ",") != "name" || l.MaxColumns != 1600 {
@@ -239,8 +243,8 @@ func TestApplySchemaRefusesWhatItCantChange(t *testing.T) {
 		t.Errorf("x is %s and z is %q", typ("x"), typ("z"))
 	}
 
-	// Once the user has altered it, the column takes the change.
-	env.exec("ALTER TABLE $schema.users ALTER COLUMN x TYPE bigint")
+	// Once the user has run the fix, the column takes the change.
+	env.exec(want.Fix)
 	applied, err = sa.ApplySchema(ctx, []destination.StreamSchema{{Name: "users", Schema: arrow.NewSchema([]arrow.Field{idField, wide}, nil)}})
 	if err != nil || len(applied.Refused) != 0 || typ("x") != "bigint" {
 		t.Errorf("after altering x: %+v, %v, x is %s", applied, err, typ("x"))
@@ -307,8 +311,8 @@ func TestAlterFindsTheColumnItCantAdd(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(refused) != 1 || refused[0][0] != "price" {
-		t.Errorf("refused %v", refused)
+	if len(refused) != 1 || refused[0].Column != "price" || !strings.HasPrefix(refused[0].Reason, "it takes no more columns: ") || refused[0].ToType != "text" || refused[0].Fix != "" {
+		t.Errorf("refused %+v", refused)
 	}
 	if n := env.count("SELECT count(*) FROM pg_attribute WHERE attrelid = '" + env.schema + ".users'::regclass AND attname = 'name'"); n != 1 {
 		t.Error("name wasn't added")

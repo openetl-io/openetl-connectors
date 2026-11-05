@@ -1144,7 +1144,8 @@ func (w *writer) ApplySchema(ctx context.Context, streams []destination.StreamSc
 			return destination.SchemaApplied{}, err
 		}
 		for _, r := range refused {
-			out.Refused = append(out.Refused, destination.RefusedColumn{Stream: s.Name, Column: r[0], Reason: r[1]})
+			r.Stream = s.Name
+			out.Refused = append(out.Refused, r)
 		}
 		if t == nil {
 			t = &tableInfo{attrs: len(want[i])}
@@ -1167,7 +1168,7 @@ func (w *writer) ensureTable(ctx context.Context, table string, cols []column) e
 		return err
 	}
 	if len(refused) > 0 {
-		return fmt.Errorf("postgres: column %q of %s: %s", refused[0][0], table, refused[0][1])
+		return fmt.Errorf("postgres: column %q of %s: %s", refused[0].Column, table, refused[0].Reason)
 	}
 	return nil
 }
@@ -1238,14 +1239,17 @@ func (w *writer) catalog(ctx context.Context, tables []string) (map[string]*tabl
 // alter creates the table with cols if it doesn't exist, or adds its new
 // columns in one ALTER TABLE, and returns the columns it refused, with why:
 // it never changes a column's type. have is updated to match.
-func (w *writer) alter(ctx context.Context, table string, cols []column, have *tableInfo) ([][2]string, error) {
+func (w *writer) alter(ctx context.Context, table string, cols []column, have *tableInfo) ([]destination.RefusedColumn, error) {
 	if have == nil {
 		if err := w.ddl(ctx, "CREATE TABLE IF NOT EXISTS "+w.ident(table)+" ("+columnDefs(cols)+")"); err != nil {
 			return nil, fmt.Errorf("postgres: create %s: %w", table, err)
 		}
 		return nil, nil
 	}
-	var refused [][2]string
+	var refused []destination.RefusedColumn
+	full := func(c column, why string) destination.RefusedColumn {
+		return destination.RefusedColumn{Column: c.name, Reason: "it takes no more columns: " + why, ToType: c.typ}
+	}
 	var clauses []string
 	var changed []column
 	attrs := have.attrs
@@ -1254,7 +1258,7 @@ func (w *writer) alter(ctx context.Context, table string, cols []column, have *t
 		var clause string
 		switch {
 		case i < 0 && attrs >= maxColumns:
-			refused = append(refused, [2]string{c.name, fmt.Sprintf("the table has the %d columns Postgres takes, dropped ones included", maxColumns)})
+			refused = append(refused, full(c, fmt.Sprintf("the table has the %d columns Postgres takes, dropped ones included", maxColumns)))
 			continue
 		case i < 0:
 			clause = "ADD COLUMN IF NOT EXISTS " + columnDef(c)
@@ -1262,10 +1266,15 @@ func (w *writer) alter(ctx context.Context, table string, cols []column, have *t
 		case have.cols[i].typ == c.typ || widens(c.typ, have.cols[i].typ):
 			continue
 		case !widens(have.cols[i].typ, c.typ):
-			refused = append(refused, [2]string{c.name, fmt.Sprintf("it's %s, and can't widen to %s", have.cols[i].typ, c.typ)})
+			refused = append(refused, destination.RefusedColumn{
+				Column: c.name, Reason: fmt.Sprintf("it can't change a column from %s to %s", have.cols[i].typ, c.typ), FromType: have.cols[i].typ, ToType: c.typ,
+			})
 			continue
 		default:
-			refused = append(refused, [2]string{c.name, fmt.Sprintf("it's %s, and the destination doesn't change a column's type, which can rewrite the table; alter it to %s yourself", have.cols[i].typ, c.typ)})
+			refused = append(refused, destination.RefusedColumn{
+				Column: c.name, Reason: "it doesn't change a column's type, which can rewrite the table", FromType: have.cols[i].typ, ToType: c.typ,
+				Fix: "ALTER TABLE " + w.ident(table) + " ALTER COLUMN " + pgx.Identifier{c.name}.Sanitize() + " TYPE " + c.typ,
+			})
 			continue
 		}
 		clauses, changed = append(clauses, clause), append(changed, c)
@@ -1275,13 +1284,13 @@ func (w *writer) alter(ctx context.Context, table string, cols []column, have *t
 	}
 	err := w.ddl(ctx, "ALTER TABLE "+w.ident(table)+" "+strings.Join(clauses, ", "))
 	if reason, ok := refusal(err); ok && len(clauses) == 1 {
-		return append(refused, [2]string{changed[0].name, reason}), nil
+		return append(refused, full(changed[0], reason)), nil
 	} else if ok {
 		// One of them can't be added; find it, and add the rest.
 		for i, clause := range clauses {
 			err := w.ddl(ctx, "ALTER TABLE "+w.ident(table)+" "+clause)
 			if reason, ok := refusal(err); ok {
-				refused = append(refused, [2]string{changed[i].name, reason})
+				refused = append(refused, full(changed[i], reason))
 			} else if err != nil {
 				return nil, fmt.Errorf("postgres: add column %q to %s: %w", changed[i].name, table, err)
 			} else {
