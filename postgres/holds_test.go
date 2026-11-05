@@ -203,7 +203,8 @@ func TestAppendHoldsCellsAndRecoversPatches(t *testing.T) {
 }
 
 // A column's type never changes, so ApplySchema refuses a widening and
-// applies the rest, and says up front what each table can't take.
+// applies the rest, and says up front what each table can't take. No
+// column is fixed: one the user has altered takes the change.
 func TestApplySchemaRefusesWhatItCantChange(t *testing.T) {
 	env := newEnv(t)
 	ctx := t.Context()
@@ -225,7 +226,7 @@ func TestApplySchemaRefusesWhatItCantChange(t *testing.T) {
 		t.Errorf("refused %+v", applied.Refused)
 	}
 	l := applied.Limits["users"]
-	if strings.Join(l.Fixed, ",") != "id,x,name,price,z" || strings.Join(l.NotNull, ",") != "name" || l.MaxColumns != 1600 {
+	if len(l.Fixed) != 0 || strings.Join(l.NotNull, ",") != "name" || l.MaxColumns != 1600 {
 		t.Errorf("limits %+v", l)
 	}
 	if l.Columns != 5 {

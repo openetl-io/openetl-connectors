@@ -1190,13 +1190,9 @@ func (t *tableInfo) limits() destination.TableLimits {
 	}
 	l.Columns = t.attrs
 	for _, c := range t.cols {
-		if slices.Contains(metadataColumns, c.name) {
-			continue
-		}
-		if t.notNull[c.name] {
+		if !slices.Contains(metadataColumns, c.name) && t.notNull[c.name] {
 			l.NotNull = append(l.NotNull, c.name)
 		}
-		l.Fixed = append(l.Fixed, c.name)
 	}
 	return l
 }
