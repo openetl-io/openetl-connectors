@@ -459,8 +459,12 @@ func TestColumnsWiden(t *testing.T) {
 		t.Fatal(err)
 	}
 	ints2 := arrow.NewSchema(ints, table("other"))
-	if _, err := sa.ApplySchema(ctx, []destination.StreamSchema{{Name: "other", Schema: ints2}}); err == nil {
-		t.Error("boolean became bigint")
+	applied, err := sa.ApplySchema(ctx, []destination.StreamSchema{{Name: "other", Schema: ints2}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(applied.Refused) != 1 || applied.Refused[0].Column != "x" || !strings.Contains(applied.Refused[0].Reason, "can't widen") {
+		t.Errorf("boolean to bigint: %+v", applied.Refused)
 	}
 }
 

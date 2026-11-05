@@ -30,6 +30,7 @@ import (
 
 	sdk "github.com/unsuitable001/openetl/sdk/go"
 	"github.com/unsuitable001/openetl/sdk/go/destination"
+	protocolv1 "github.com/unsuitable001/openetl/sdk/go/protocol/v1"
 )
 
 type DestinationConfig struct {
@@ -48,6 +49,7 @@ var (
 	_ destination.Destination   = (*Destination)(nil)
 	_ destination.SchemaApplier = (*writer)(nil)
 	_ destination.ReadTracker   = (*writer)(nil)
+	_ destination.Patcher       = (*writer)(nil)
 )
 
 func NewDestination(config []byte) (*Destination, error) {
@@ -93,6 +95,7 @@ func (d *Destination) Open(ctx context.Context, cfg destination.OpenConfig) (des
 		cfg:     cfg,
 		schema:  cfg.Namespace,
 		staging: map[uint64]map[string]*stagingTable{},
+		patches: map[uint64]map[string]*stagingTable{},
 		ended:   map[uint64][]string{},
 		streams: map[string]destination.Stream{},
 		tables:  map[string]string{},
@@ -112,8 +115,9 @@ type writer struct {
 	cfg     destination.OpenConfig
 	schema  string
 	streams map[string]destination.Stream
-	// Only Write, StartReads, EndRead and PreCommit use these.
+	// Only Write, Patch, StartReads, EndRead and PreCommit use these.
 	staging map[uint64]map[string]*stagingTable
+	patches map[uint64]map[string]*stagingTable
 	starts  map[string]time.Time
 	ended   map[uint64][]string // streams whose read ends in each epoch
 	// Each stream's target, from its batches and schemas.
@@ -131,6 +135,10 @@ type stagingTable struct {
 	rows   uint64
 	// Merge: the key's columns.
 	key []string
+	// Columns whose held cells keep the target's value.
+	last []string
+	// Patches: columns that fill another held column, by that column.
+	fills map[string]string
 }
 
 // staged is the descriptor PreCommit returns.
@@ -167,6 +175,12 @@ type stagedStream struct {
 	// the read has ended in it, replaces the target's.
 	Read  string `json:"read,omitempty"`
 	Ended bool   `json:"ended,omitempty"`
+	// Merge: columns whose held cells keep the target's value.
+	Last []string `json:"last,omitempty"`
+	// The epoch's patches' staging, and the columns in it that fill
+	// another held column.
+	Patch string            `json:"patch,omitempty"`
+	Fills map[string]string `json:"fills,omitempty"`
 }
 
 func (s stagedStream) deduped() bool { return s.Dedupe || s.DedupeEpoch }
@@ -189,12 +203,16 @@ const (
 	// A changelog's: the columns an update didn't send, as a JSON array,
 	// whose values are null. In a merge's target, those it never received.
 	unchangedColumn = "_openetl_unchanged"
+	// A row's held columns, as a JSON array; in the target, a JSON object
+	// from each to the _openetl_id of the version whose value is held.
+	heldColumn   = destination.HeldColumn
+	syncedColumn = "_openetl_synced_at"
 	// The engine names renamed columns' source names in each schema's
 	// metadata: a JSON object from destination name to source name.
 	sourceNamesKey = "openetl.source_names"
 )
 
-var metadataColumns = []string{idColumn, opColumn, seqColumn, "_openetl_synced_at", deletedColumn}
+var metadataColumns = []string{idColumn, opColumn, seqColumn, syncedColumn, deletedColumn, unchangedColumn, heldColumn}
 
 func indexName(table string) string {
 	h := sha256.Sum256([]byte(table))
@@ -209,6 +227,10 @@ func keyIndexName(table string) string {
 func stagingName(pipeline, stream string, e destination.Epoch) string {
 	h := sha256.Sum256([]byte(pipeline + "\x00" + stream + "\x00" + strconv.FormatUint(e.Generation, 10) + "\x00" + strconv.FormatUint(e.N, 10)))
 	return "_openetl_stage_" + hex.EncodeToString(h[:12])
+}
+
+func patchName(pipeline, stream string, e destination.Epoch) string {
+	return stagingName(pipeline, stream+"\x00patch", e)
 }
 
 func readName(pipeline, stream string, start time.Time) string {
@@ -252,41 +274,98 @@ func (w *writer) Write(ctx context.Context, e destination.Epoch, stream string, 
 	if _, ok := w.starts[stream]; cfg.Mode == destination.Overwrite && !ok {
 		return fmt.Errorf("postgres: stream %q overwrites, but its read has no start", stream)
 	}
-	cols, err := columnsOf(batch.Schema())
+	var key []string
+	if cfg.Mode == destination.Merge {
+		var err error
+		if key, err = keyColumns(batch.Schema(), cfg.PrimaryKey); err != nil {
+			return fmt.Errorf("postgres: stream %q: %w", stream, err)
+		}
+	}
+	st, err := w.stage(ctx, w.staging, stagingName(w.cfg.Pipeline, stream, e), e, stream, targetTable(batch.Schema(), stream), key, batch)
 	if err != nil {
 		return err
 	}
-	byStream := w.staging[e.N]
+	w.setTable(stream, st.target)
+	for _, f := range batch.Schema().Fields() {
+		if v, _ := f.Metadata.GetValue(destination.HeldKey); v == "last" && !slices.Contains(st.last, f.Name) {
+			st.last = append(st.last, f.Name)
+		}
+	}
+	return nil
+}
+
+// Patch stages patches in a table of their own, which Commit applies after
+// the epoch's rows, in the same transaction and under the same marker.
+func (w *writer) Patch(ctx context.Context, e destination.Epoch, stream string, batch arrow.RecordBatch) error {
+	cfg, ok := w.streams[stream]
+	switch {
+	case !ok:
+		return fmt.Errorf("postgres: unknown stream %q", stream)
+	case cfg.Mode != destination.Merge && cfg.Mode != destination.Append:
+		return fmt.Errorf("postgres: stream %q overwrites, and takes no patches", stream)
+	case batch.NumRows() == 0:
+		return nil
+	case len(batch.Schema().FieldIndices(idColumn)) == 0 || len(batch.Schema().FieldIndices(heldColumn)) == 0:
+		return fmt.Errorf("postgres: patches for %q need %s and %s", stream, idColumn, heldColumn)
+	}
+	var key []string
+	if cfg.Mode == destination.Merge {
+		var err error
+		if key, err = keyColumns(batch.Schema(), cfg.PrimaryKey); err != nil {
+			return fmt.Errorf("postgres: patches for %q: %w", stream, err)
+		}
+	}
+	target := w.table(stream)
+	if target == "" {
+		target = targetTable(batch.Schema(), stream)
+	}
+	st, err := w.stage(ctx, w.patches, patchName(w.cfg.Pipeline, stream, e), e, stream, target, key, batch)
+	if err != nil {
+		return err
+	}
+	for _, f := range batch.Schema().Fields() {
+		if held, ok := f.Metadata.GetValue(destination.FillsKey); ok {
+			if st.fills == nil {
+				st.fills = map[string]string{}
+			}
+			st.fills[f.Name] = held
+		}
+	}
+	return nil
+}
+
+// stage copies a batch into the stream's staging table for epoch e in
+// tables, which it creates, labelled, or widens.
+func (w *writer) stage(ctx context.Context, tables map[uint64]map[string]*stagingTable, name string, e destination.Epoch, stream, target string, key []string, batch arrow.RecordBatch) (*stagingTable, error) {
+	cols, err := columnsOf(batch.Schema())
+	if err != nil {
+		return nil, err
+	}
+	byStream := tables[e.N]
 	if byStream == nil {
 		byStream = map[string]*stagingTable{}
-		w.staging[e.N] = byStream
+		tables[e.N] = byStream
 	}
 	st := byStream[stream]
 	if st == nil {
-		st = &stagingTable{name: stagingName(w.cfg.Pipeline, stream, e), target: targetTable(batch.Schema(), stream)}
-		if cfg.Mode == destination.Merge {
-			if st.key, err = keyColumns(batch.Schema(), cfg.PrimaryKey); err != nil {
-				return fmt.Errorf("postgres: stream %q: %w", stream, err)
-			}
-		}
+		st = &stagingTable{name: name, target: target, key: key}
 		label := stagingLabel{Pipeline: w.cfg.Pipeline, Generation: e.Generation, Epoch: e.N}
 		if err := w.createLabelled(ctx, st.name, label, cols); err != nil {
-			return fmt.Errorf("postgres: create staging for %s: %w", stream, err)
+			return nil, fmt.Errorf("postgres: create staging for %s: %w", stream, err)
 		}
 		st.cols = cols
 		byStream[stream] = st
-		w.setTable(stream, st.target)
 	} else if err := w.widen(ctx, st, cols); err != nil {
-		return err
+		return nil, err
 	}
 
 	n := int(batch.NumRows())
 	if len(cols) == 0 {
 		if _, err := w.pool.Exec(ctx, "INSERT INTO "+w.ident(st.name)+" SELECT FROM generate_series(1, $1)", n); err != nil {
-			return err
+			return nil, err
 		}
 		st.rows += uint64(n) //nolint:gosec // a batch's rows
-		return nil
+		return st, nil
 	}
 	names := make([]string, len(cols))
 	for i, c := range cols {
@@ -309,10 +388,10 @@ func (w *writer) Write(ctx context.Context, e destination.Epoch, stream string, 
 		return row, nil
 	}))
 	if err != nil {
-		return fmt.Errorf("postgres: stage %s: %w", stream, err)
+		return nil, fmt.Errorf("postgres: stage %s: %w", stream, err)
 	}
 	st.rows += uint64(n) //nolint:gosec // a batch's rows
-	return nil
+	return st, nil
 }
 
 // keyColumns returns the destination names of a stream's primary key, which
@@ -427,19 +506,23 @@ func columnDefs(cols []column) string {
 // PreCommit has nothing to flush: every Write committed its rows to staging.
 func (w *writer) PreCommit(_ context.Context, e destination.Epoch) (destination.Staged, error) {
 	desc := staged{Generation: e.Generation, Epoch: e.N}
-	byStream := w.staging[e.N]
+	byStream, patches := w.staging[e.N], w.patches[e.N]
 	for _, s := range w.cfg.Streams {
-		st := byStream[s.Name]
+		st, pt := byStream[s.Name], patches[s.Name]
 		ended := s.Mode == destination.Overwrite && slices.Contains(w.ended[e.N], s.Name)
-		if st == nil && !ended {
+		if st == nil && pt == nil && !ended {
 			continue
 		}
 		ss := stagedStream{
 			Name: s.Name, Table: w.table(s.Name),
 			Dedupe: s.Dedupe == destination.DedupeTarget, DedupeEpoch: s.Dedupe == destination.DedupeEpoch,
 		}
+		key := []string(nil)
+		if pt != nil {
+			ss.Table, ss.Patch, ss.Fills, key = pt.target, pt.name, pt.fills, pt.key
+		}
 		if st != nil {
-			ss.Table, ss.Staging, ss.Rows = st.target, st.name, st.rows
+			ss.Table, ss.Staging, ss.Rows, ss.Last, key = st.target, st.name, st.rows, st.last, st.key
 		}
 		switch s.Mode {
 		case destination.Overwrite:
@@ -447,11 +530,12 @@ func (w *writer) PreCommit(_ context.Context, e destination.Epoch) (destination.
 			// target's.
 			ss.Mode, ss.Read, ss.Ended = modeOverwrite, readName(w.cfg.Pipeline, s.Name, w.starts[s.Name]), ended
 		case destination.Merge:
-			ss.Mode, ss.Key, ss.HardDeletes = modeMerge, st.key, s.Deletes == destination.HardDelete
+			ss.Mode, ss.Key, ss.HardDeletes = modeMerge, key, s.Deletes == destination.HardDelete
 		}
 		desc.Streams = append(desc.Streams, ss)
 	}
 	delete(w.staging, e.N)
+	delete(w.patches, e.N)
 	delete(w.ended, e.N)
 	return json.Marshal(desc)
 }
@@ -474,6 +558,8 @@ type prepared struct {
 	read []string
 	// Merge: the columns an update in the staging didn't send.
 	unchanged []string
+	// The patches' staging's columns; none if there's nothing to patch.
+	patch []string
 }
 
 // apply applies each stream that has no marker yet, then drops its staging.
@@ -550,7 +636,23 @@ func (w *writer) applyTx(ctx context.Context, desc staged, streams []stagedStrea
 // applyStream applies one stream's staging in tx, and returns the rows it
 // inserted.
 func (w *writer) applyStream(ctx context.Context, tx pgx.Tx, s stagedStream, p prepared) (uint64, error) {
+	n, err := w.applyRows(ctx, tx, s, p)
+	if err != nil {
+		return 0, err
+	}
+	for _, q := range w.patch(s, p.patch) {
+		if _, err := tx.Exec(ctx, q); err != nil {
+			return 0, fmt.Errorf("patch: %w", err)
+		}
+	}
+	return n, nil
+}
+
+func (w *writer) applyRows(ctx context.Context, tx pgx.Tx, s stagedStream, p prepared) (uint64, error) {
 	if s.Mode == modeMerge {
+		if s.Staging == "" {
+			return 0, nil
+		}
 		for _, q := range w.merge(s, p.cols, p.unchanged) {
 			if _, err := tx.Exec(ctx, q); err != nil {
 				return 0, err
@@ -581,18 +683,74 @@ func (w *writer) applyStream(ctx context.Context, tx pgx.Tx, s stagedStream, p p
 // deduped stream inserts one row per _openetl_id, and with Dedupe only IDs
 // the target doesn't have.
 func (w *writer) insert(s stagedStream, cols []string) string {
-	list := quoteAll(cols)
+	list, sel := quoteAll(cols), selectList(cols, "s")
 	into := "INSERT INTO " + w.ident(s.into()) + " (" + list + ") "
 	id := pgx.Identifier{idColumn}.Sanitize()
 	switch {
 	case s.Dedupe:
-		return into + "SELECT DISTINCT ON (" + id + ") " + list + " FROM " + w.ident(s.Staging) +
+		return into + "SELECT DISTINCT ON (s." + id + ") " + sel + " FROM " + w.ident(s.Staging) +
 			" s WHERE NOT EXISTS (SELECT 1 FROM " + w.ident(s.into()) + " t WHERE t." + id + " = s." + id + ")"
 	case s.DedupeEpoch:
-		return into + "SELECT DISTINCT ON (" + id + ") " + list + " FROM " + w.ident(s.Staging)
+		return into + "SELECT DISTINCT ON (s." + id + ") " + sel + " FROM " + w.ident(s.Staging) + " s"
 	default:
-		return into + "SELECT " + list + " FROM " + w.ident(s.Staging)
+		return into + "SELECT " + sel + " FROM " + w.ident(s.Staging) + " s"
 	}
+}
+
+// selectList is cols from rel, with a staged row's list of held columns
+// made into the target's object.
+func selectList(cols []string, rel string) string {
+	out := make([]string, len(cols))
+	for i, c := range cols {
+		out[i] = rel + "." + pgx.Identifier{c}.Sanitize()
+		if c == heldColumn && slices.Contains(cols, idColumn) {
+			out[i] = heldObject(rel) + " AS " + pgx.Identifier{c}.Sanitize()
+		}
+	}
+	return strings.Join(out, ", ")
+}
+
+// heldObject maps each of rel's held columns to its _openetl_id, the
+// version whose value is held; null for none.
+func heldObject(rel string) string {
+	return "(SELECT jsonb_object_agg(c, " + rel + "." + pgx.Identifier{idColumn}.Sanitize() + "::text) FROM jsonb_array_elements_text(" +
+		rel + "." + pgx.Identifier{heldColumn}.Sanitize() + ") c)"
+}
+
+// patch fills held cells from the epoch's patches: each column where the
+// target still holds the version the patch comes from, matched by key for
+// merge and by _openetl_id for append.
+func (w *writer) patch(s stagedStream, cols []string) []string {
+	if len(cols) == 0 {
+		return nil
+	}
+	q := func(c string) string { return pgx.Identifier{c}.Sanitize() }
+	var match []string
+	if s.Mode == modeMerge {
+		for _, k := range s.Key {
+			match = append(match, "t."+q(k)+" = p."+q(k))
+		}
+	} else {
+		match = []string{"t." + q(idColumn) + " = p." + q(idColumn)}
+	}
+	var out []string
+	for _, c := range cols {
+		if slices.Contains(metadataColumns, c) || slices.Contains(s.Key, c) {
+			continue
+		}
+		held := c
+		if f, ok := s.Fills[c]; ok {
+			held = f
+		}
+		lit := quoteLiteral(held)
+		set := q(c) + " = p." + q(c) + ", " + q(heldColumn) + " = nullif(t." + q(heldColumn) + " - " + lit + ", '{}'::jsonb)"
+		if slices.Contains(cols, syncedColumn) {
+			set += ", " + q(syncedColumn) + " = p." + q(syncedColumn)
+		}
+		out = append(out, "UPDATE "+w.ident(s.Table)+" AS t SET "+set+" FROM "+w.ident(s.Patch)+" AS p WHERE "+strings.Join(match, " AND ")+
+			" AND coalesce(p."+q(heldColumn)+" ? "+lit+", false) AND t."+q(heldColumn)+" ->> "+lit+" = p."+q(idColumn)+"::text")
+	}
+	return out
 }
 
 // merge upserts each key's latest staged version, by _openetl_seq and then
@@ -609,7 +767,8 @@ func (w *writer) merge(s stagedStream, cols, unchanged []string) []string {
 	if hasSeq {
 		order += ", " + q(seqColumn) + " DESC NULLS LAST"
 	}
-	latest := "WITH s AS (SELECT DISTINCT ON (" + key + ") " + list + " FROM " + w.ident(s.Staging) + " ORDER BY " + order + ", ctid DESC) "
+	hasHeld := slices.Contains(cols, heldColumn) && slices.Contains(cols, idColumn)
+	latest := "WITH s AS (SELECT DISTINCT ON (" + key + ") " + selectList(cols, "x") + " FROM " + w.ident(s.Staging) + " x ORDER BY " + order + ", x.ctid DESC) "
 	if len(unchanged) > 0 {
 		latest = w.latestResolved(s, cols, unchanged, hasSeq)
 	}
@@ -635,10 +794,20 @@ func (w *writer) merge(s stagedStream, cols, unchanged []string) []string {
 		case c == unchangedColumn:
 			// The columns neither ever sent.
 			v = "CASE WHEN EXCLUDED." + q(c) + " IS NULL OR t." + q(c) + " IS NULL THEN NULL ELSE (SELECT jsonb_agg(u) FROM jsonb_array_elements_text(EXCLUDED." + q(c) + ") u WHERE t." + q(c) + " ? u) END"
+		case c == heldColumn && hasHeld:
+			// The row's, and the target's for the columns it didn't send.
+			kept := "'{}'::jsonb"
+			if slices.Contains(cols, unchangedColumn) {
+				kept = "coalesce((SELECT jsonb_object_agg(k, h) FROM jsonb_each(t." + q(c) + ") j(k, h) WHERE coalesce(EXCLUDED." + q(unchangedColumn) + " ? k, false)), '{}'::jsonb)"
+			}
+			v = "nullif(" + kept + " || coalesce(EXCLUDED." + q(c) + ", '{}'::jsonb), '{}'::jsonb)"
 		case slices.Contains(unchanged, c):
 			v = "CASE WHEN " + sent("EXCLUDED", c) + " THEN " + v + " ELSE t." + q(c) + " END"
 		}
-		if hasOp && !s.HardDeletes && (!slices.Contains(metadataColumns, c) || c == unchangedColumn) {
+		if hasHeld && slices.Contains(s.Last, c) && !slices.Contains(metadataColumns, c) {
+			v = "CASE WHEN coalesce(EXCLUDED." + q(heldColumn) + " ? " + quoteLiteral(c) + ", false) THEN t." + q(c) + " ELSE " + v + " END"
+		}
+		if hasOp && !s.HardDeletes && (!slices.Contains(metadataColumns, c) || c == unchangedColumn || c == heldColumn) {
 			v = "CASE WHEN " + isDelete("EXCLUDED") + " THEN t." + q(c) + " ELSE " + v + " END"
 		}
 		sets = append(sets, q(c)+" = "+v)
@@ -683,16 +852,26 @@ func (w *writer) latestResolved(s stagedStream, cols, unchanged []string, hasSeq
 	for i, c := range cols {
 		sel[i] = "l." + q(c)
 	}
-	from, remaining := "l", "l."+q(unchangedColumn)
+	hasHeld := slices.Contains(cols, heldColumn) && slices.Contains(cols, idColumn)
+	from, remaining, held := "l", "l."+q(unchangedColumn), "coalesce("+heldObject("l")+", '{}'::jsonb)"
 	for i, c := range unchanged {
 		p, lit := "p"+strconv.Itoa(i), quoteLiteral(c)
-		from += " LEFT JOIN LATERAL (SELECT true AS found, e." + q(c) + " AS v FROM " + w.ident(s.Staging) + " e" +
+		version := ""
+		if hasHeld {
+			// The version a column comes from may hold it.
+			version = ", coalesce(e." + q(heldColumn) + " ? " + lit + ", false) AS held, e." + q(idColumn) + "::text AS id"
+			held += " || CASE WHEN " + p + ".found AND " + p + ".held THEN jsonb_build_object(" + lit + ", " + p + ".id) ELSE '{}'::jsonb END"
+		}
+		from += " LEFT JOIN LATERAL (SELECT true AS found, e." + q(c) + " AS v" + version + " FROM " + w.ident(s.Staging) + " e" +
 			" WHERE l." + q(unchangedColumn) + " ? " + lit + " AND " + strings.Join(match, " AND ") + " AND " + before +
 			" AND NOT coalesce(e." + q(unchangedColumn) + " ? " + lit + ", false) ORDER BY " + latestFirst + " LIMIT 1) " + p + " ON true"
 		sel[slices.Index(cols, c)] = "CASE WHEN " + p + ".found THEN " + p + ".v ELSE l." + q(c) + " END AS " + q(c)
 		remaining = "(" + remaining + " - CASE WHEN " + p + ".found THEN " + lit + " ELSE '' END)"
 	}
 	sel[slices.Index(cols, unchangedColumn)] = "nullif(" + remaining + ", '[]') AS " + q(unchangedColumn)
+	if hasHeld {
+		sel[slices.Index(cols, heldColumn)] = "nullif(" + held + ", '{}'::jsonb) AS " + q(heldColumn)
+	}
 	return "WITH l AS (SELECT DISTINCT ON (" + key + ") *, ctid AS _openetl_ctid FROM " + w.ident(s.Staging) + " ORDER BY " + order + ", ctid DESC), " +
 		"s AS (SELECT " + strings.Join(sel, ", ") + " FROM " + from + ") "
 }
@@ -778,15 +957,23 @@ func (w *writer) prepare(ctx context.Context, desc staged, s stagedStream) (prep
 				return p, err
 			}
 		}
-	} else if err := w.ensureTable(ctx, s.Table, cols); err != nil {
-		return p, err
+	} else if cols != nil {
+		if err := w.ensureTable(ctx, s.Table, cols); err != nil {
+			return p, err
+		}
+	}
+	if s.Patch != "" {
+		var err error
+		if p.patch, err = w.preparePatch(ctx, desc, s); err != nil {
+			return p, err
+		}
 	}
 	if s.Dedupe && cols != nil {
 		if err := w.ensureIndex(ctx, s.into(), indexName(s.into()), false, []string{idColumn}); err != nil {
 			return p, fmt.Errorf("postgres: index %s on %s: %w", idColumn, s.into(), err)
 		}
 	}
-	if s.Mode == modeMerge {
+	if s.Mode == modeMerge && (cols != nil || p.patch != nil) {
 		if err := w.ensureKey(ctx, s.Table, s.Key); err != nil {
 			return p, err
 		}
@@ -810,6 +997,37 @@ func (w *writer) prepare(ctx context.Context, desc staged, s stagedStream) (prep
 		}
 	}
 	return p, nil
+}
+
+// preparePatch returns the columns of the stream's patches, none if its
+// target doesn't exist, _openetl_synced_at only if the target has it, and
+// gives an append target the _openetl_id index
+// patches match on.
+func (w *writer) preparePatch(ctx context.Context, desc staged, s stagedStream) ([]string, error) {
+	cols, err := w.columnTypes(ctx, s.Patch)
+	if err != nil {
+		return nil, err
+	}
+	if len(cols) == 0 {
+		return nil, fmt.Errorf("postgres: patches for %s in epoch %d-g%d are missing", s.Name, desc.Epoch, desc.Generation)
+	}
+	target, err := w.columnTypes(ctx, s.Table)
+	if err != nil || len(target) == 0 {
+		return nil, err
+	}
+	if s.Mode != modeMerge {
+		if err := w.ensureIndex(ctx, s.Table, indexName(s.Table), false, []string{idColumn}); err != nil {
+			return nil, fmt.Errorf("postgres: index %s on %s: %w", idColumn, s.Table, err)
+		}
+	}
+	if _, err := w.pool.Exec(ctx, "ANALYZE "+w.ident(s.Patch)); err != nil {
+		return nil, fmt.Errorf("postgres: analyze the patches of %s: %w", s.Name, err)
+	}
+	out := names(cols)
+	if !slices.ContainsFunc(target, func(c column) bool { return c.name == syncedColumn }) {
+		out = slices.DeleteFunc(out, func(c string) bool { return c == syncedColumn })
+	}
+	return out, nil
 }
 
 // ensureRead creates the read's table, labelled, or adds and widens its
@@ -898,59 +1116,240 @@ func (w *writer) ensureKey(ctx context.Context, table string, key []string) erro
 }
 
 // ApplySchema creates each stream's table, adds its new columns and widens
-// the columns whose type widened.
+// the columns whose type widened, in one statement per table. A column it
+// can't add or change is refused, and the rest applied. It reports what
+// each table can't take.
 func (w *writer) ApplySchema(ctx context.Context, streams []destination.StreamSchema) (destination.SchemaApplied, error) {
+	var out destination.SchemaApplied
 	if _, err := w.pool.Exec(ctx, "CREATE SCHEMA IF NOT EXISTS "+pgx.Identifier{w.schema}.Sanitize()); err != nil {
-		return destination.SchemaApplied{}, fmt.Errorf("postgres: create schema %s: %w", w.schema, err)
+		return out, fmt.Errorf("postgres: create schema %s: %w", w.schema, err)
 	}
-	for _, s := range streams {
+	tables := make([]string, len(streams))
+	want := make([][]column, len(streams))
+	for i, s := range streams {
 		cols, err := columnsOf(s.Schema)
+		if err != nil {
+			return out, err
+		}
+		tables[i], want[i] = targetTable(s.Schema, s.Name), cols
+	}
+	have, err := w.catalog(ctx, tables)
+	if err != nil {
+		return out, err
+	}
+	out.Limits = make(map[string]destination.TableLimits, len(streams))
+	for i, s := range streams {
+		t := have[tables[i]]
+		refused, err := w.alter(ctx, tables[i], want[i], t)
 		if err != nil {
 			return destination.SchemaApplied{}, err
 		}
-		table := targetTable(s.Schema, s.Name)
-		if err := w.ensureTable(ctx, table, cols); err != nil {
-			return destination.SchemaApplied{}, err
+		for _, r := range refused {
+			out.Refused = append(out.Refused, destination.RefusedColumn{Stream: s.Name, Column: r[0], Reason: r[1]})
 		}
-		w.setTable(s.Name, table)
+		if t == nil {
+			t = &tableInfo{attrs: len(want[i])}
+		}
+		out.Limits[s.Name] = t.limits()
+		w.setTable(s.Name, tables[i])
 	}
-	return destination.SchemaApplied{}, nil
+	return out, nil
 }
 
 // ensureTable creates the table with cols, or adds and widens its columns
 // to hold them. A column already wider is left alone.
 func (w *writer) ensureTable(ctx context.Context, table string, cols []column) error {
-	have, err := w.columnTypes(ctx, table)
+	have, err := w.catalog(ctx, []string{table})
 	if err != nil {
 		return err
 	}
-	if len(have) == 0 {
-		if _, err := w.pool.Exec(ctx, "CREATE TABLE IF NOT EXISTS "+w.ident(table)+" ("+columnDefs(cols)+")"); err != nil {
-			return fmt.Errorf("postgres: create %s: %w", table, err)
-		}
-		if have, err = w.columnTypes(ctx, table); err != nil {
-			return err
-		}
+	refused, err := w.alter(ctx, table, cols, have[table])
+	if err != nil {
+		return err
 	}
-	for _, c := range cols {
-		i := slices.IndexFunc(have, func(x column) bool { return x.name == c.name })
-		q := pgx.Identifier{c.name}.Sanitize()
-		var ddl string
-		switch {
-		case i < 0:
-			ddl = "ADD COLUMN IF NOT EXISTS " + columnDef(c)
-		case have[i].typ == c.typ || widens(c.typ, have[i].typ):
-			continue
-		case widens(have[i].typ, c.typ):
-			ddl = "ALTER COLUMN " + q + " TYPE " + c.typ + " USING " + q + "::" + c.typ
-		default:
-			return fmt.Errorf("postgres: column %q of %s is %s, and can't widen to %s", c.name, table, have[i].typ, c.typ)
-		}
-		if _, err := w.pool.Exec(ctx, "ALTER TABLE "+w.ident(table)+" "+ddl); err != nil {
-			return fmt.Errorf("postgres: change column %q of %s: %w", c.name, table, err)
-		}
+	if len(refused) > 0 {
+		return fmt.Errorf("postgres: column %q of %s: %s", refused[0][0], table, refused[0][1])
 	}
 	return nil
+}
+
+// Postgres's limit on a table's columns, dropped ones included.
+const maxColumns = 1600
+
+// tableInfo is a table as the catalog has it.
+type tableInfo struct {
+	cols           []column
+	notNull, fixed map[string]bool
+	// Its columns as the limit counts them.
+	attrs int
+}
+
+func (t *tableInfo) limits() destination.TableLimits {
+	l := destination.TableLimits{MaxColumns: maxColumns}
+	if t == nil {
+		return l
+	}
+	l.Columns = t.attrs
+	for _, c := range t.cols {
+		switch {
+		case slices.Contains(metadataColumns, c.name):
+		case t.notNull[c.name]:
+			l.NotNull = append(l.NotNull, c.name)
+		}
+		if t.fixed[c.name] && !slices.Contains(metadataColumns, c.name) {
+			l.Fixed = append(l.Fixed, c.name)
+		}
+	}
+	return l
+}
+
+// catalog reads the tables' columns in one query: their types, which
+// can't take a null, and which a view or rule depends on. A table that
+// doesn't exist is missing.
+func (w *writer) catalog(ctx context.Context, tables []string) (map[string]*tableInfo, error) {
+	idents := make([]string, len(tables))
+	for i, t := range tables {
+		idents[i] = w.ident(t)
+	}
+	rows, err := w.pool.Query(ctx, `SELECT t.i, a.attname, format_type(a.atttypid, a.atttypmod), a.attnotnull, a.attisdropped,
+		EXISTS (SELECT 1 FROM pg_depend d WHERE d.classid = 'pg_rewrite'::regclass AND d.refclassid = 'pg_class'::regclass
+			AND d.refobjid = a.attrelid AND d.refobjsubid = a.attnum)
+		FROM unnest($1::text[]) WITH ORDINALITY t(name, i) JOIN pg_attribute a ON a.attrelid = to_regclass(t.name)
+		WHERE a.attnum > 0 ORDER BY t.i, a.attnum`, idents)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: read the columns of %s: %w", strings.Join(tables, ", "), err)
+	}
+	out := map[string]*tableInfo{}
+	var i int64
+	var c column
+	var notNull, dropped, fixed bool
+	_, err = pgx.ForEachRow(rows, []any{&i, &c.name, &c.typ, &notNull, &dropped, &fixed}, func() error {
+		name := tables[i-1]
+		t := out[name]
+		if t == nil {
+			t = &tableInfo{notNull: map[string]bool{}, fixed: map[string]bool{}}
+			out[name] = t
+		}
+		t.attrs++
+		if dropped {
+			return nil
+		}
+		t.cols = append(t.cols, c)
+		t.notNull[c.name], t.fixed[c.name] = notNull, fixed
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("postgres: read the columns of %s: %w", strings.Join(tables, ", "), err)
+	}
+	return out, nil
+}
+
+// alter creates the table with cols if it doesn't exist, or adds and widens
+// its columns in one ALTER TABLE, and returns the columns it refused, with
+// why. have is updated to match.
+func (w *writer) alter(ctx context.Context, table string, cols []column, have *tableInfo) ([][2]string, error) {
+	if have == nil {
+		if err := w.ddl(ctx, "CREATE TABLE IF NOT EXISTS "+w.ident(table)+" ("+columnDefs(cols)+")"); err != nil {
+			return nil, fmt.Errorf("postgres: create %s: %w", table, err)
+		}
+		return nil, nil
+	}
+	var refused [][2]string
+	var clauses []string
+	var changed []column
+	attrs := have.attrs
+	for _, c := range cols {
+		i := slices.IndexFunc(have.cols, func(x column) bool { return x.name == c.name })
+		q := pgx.Identifier{c.name}.Sanitize()
+		var clause string
+		switch {
+		case i < 0 && attrs >= maxColumns:
+			refused = append(refused, [2]string{c.name, fmt.Sprintf("the table has the %d columns Postgres takes, dropped ones included", maxColumns)})
+			continue
+		case i < 0:
+			clause = "ADD COLUMN IF NOT EXISTS " + columnDef(c)
+			attrs++
+		case have.cols[i].typ == c.typ || widens(c.typ, have.cols[i].typ):
+			continue
+		case !widens(have.cols[i].typ, c.typ):
+			refused = append(refused, [2]string{c.name, fmt.Sprintf("it's %s, and can't widen to %s", have.cols[i].typ, c.typ)})
+			continue
+		case have.fixed[c.name]:
+			refused = append(refused, [2]string{c.name, fmt.Sprintf("a view or rule depends on it, so it can't change from %s to %s", have.cols[i].typ, c.typ)})
+			continue
+		default:
+			clause = "ALTER COLUMN " + q + " TYPE " + c.typ + " USING " + q + "::" + c.typ
+		}
+		clauses, changed = append(clauses, clause), append(changed, c)
+	}
+	if len(clauses) == 0 {
+		return refused, nil
+	}
+	err := w.ddl(ctx, "ALTER TABLE "+w.ident(table)+" "+strings.Join(clauses, ", "))
+	if reason, ok := refusal(err); ok && len(clauses) == 1 {
+		return append(refused, [2]string{changed[0].name, reason}), nil
+	} else if ok {
+		// One of them can't change; find it, and apply the rest.
+		for i, clause := range clauses {
+			err := w.ddl(ctx, "ALTER TABLE "+w.ident(table)+" "+clause)
+			if reason, ok := refusal(err); ok {
+				refused = append(refused, [2]string{changed[i].name, reason})
+			} else if err != nil {
+				return nil, fmt.Errorf("postgres: change column %q of %s: %w", changed[i].name, table, err)
+			} else if strings.HasPrefix(clause, "ADD ") {
+				have.attrs++
+			}
+		}
+		return refused, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("postgres: change the columns of %s: %w", table, err)
+	}
+	have.attrs = attrs
+	return refused, nil
+}
+
+// refusal is why a schema change failed, if the table can't take it: a
+// view or rule depends on the column, or it has too many columns.
+func refusal(err error) (string, bool) {
+	pe, ok := errors.AsType[*pgconn.PgError](err)
+	if !ok || (pe.Code != "0A000" && pe.Code != "54011") {
+		return "", false
+	}
+	return pe.Message, true
+}
+
+// How long a schema change waits for its table's lock before it gives up
+// and tries again, so readers don't queue behind it, and how often it tries.
+var (
+	lockTimeout = 5 * time.Second
+	ddlAttempts = 5
+)
+
+func (w *writer) ddl(ctx context.Context, stmt string) error {
+	backoff := lockTimeout / 5
+	var err error
+	for range ddlAttempts {
+		err = pgx.BeginFunc(ctx, w.pool, func(tx pgx.Tx) error {
+			if _, err := tx.Exec(ctx, fmt.Sprintf("SET LOCAL lock_timeout = %d", lockTimeout.Milliseconds())); err != nil {
+				return err
+			}
+			_, err := tx.Exec(ctx, stmt)
+			return err
+		})
+		if pe, ok := errors.AsType[*pgconn.PgError](err); !ok || pe.Code != "55P03" {
+			return err
+		}
+		t := time.NewTimer(backoff)
+		select {
+		case <-t.C:
+		case <-ctx.Done():
+			t.Stop()
+			return ctx.Err()
+		}
+		backoff *= 2
+	}
+	return sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_TRANSIENT, fmt.Errorf("postgres: waited for a lock %d times: %w", ddlAttempts, err))
 }
 
 // columnTypes returns a table's columns in order, or none if it doesn't
@@ -990,8 +1389,10 @@ func (w *writer) unapplied(ctx context.Context, desc staged, streams []stagedStr
 // because its marker exists.
 func (w *writer) dropStaging(ctx context.Context, streams []stagedStream) {
 	for _, s := range streams {
-		if s.Staging != "" {
-			_, _ = w.pool.Exec(ctx, "DROP TABLE IF EXISTS "+w.ident(s.Staging))
+		for _, t := range []string{s.Staging, s.Patch} {
+			if t != "" {
+				_, _ = w.pool.Exec(ctx, "DROP TABLE IF EXISTS "+w.ident(t))
+			}
 		}
 	}
 }
@@ -1036,16 +1437,18 @@ func (w *writer) Recover(ctx context.Context, gen uint64, e destination.Epoch, s
 	// staging.
 	needs, present := 0, 0
 	for _, m := range missing {
-		if m.Staging == "" {
-			continue
-		}
-		needs++
-		var ok bool
-		if err := w.pool.QueryRow(ctx, "SELECT to_regclass($1) IS NOT NULL", w.ident(m.Staging)).Scan(&ok); err != nil {
-			return 0, err
-		}
-		if ok {
-			present++
+		for _, t := range []string{m.Staging, m.Patch} {
+			if t == "" {
+				continue
+			}
+			needs++
+			var ok bool
+			if err := w.pool.QueryRow(ctx, "SELECT to_regclass($1) IS NOT NULL", w.ident(t)).Scan(&ok); err != nil {
+				return 0, err
+			}
+			if ok {
+				present++
+			}
 		}
 	}
 	var r destination.Recovery
