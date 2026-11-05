@@ -327,7 +327,9 @@ func TestStaleCommitAfterRecovery(t *testing.T) {
 	env.wantIDs("users", 1, 2)
 }
 
-func TestColumnsAddAndWiden(t *testing.T) {
+// New columns are added, and a narrower type is written into a wider
+// column.
+func TestColumnsAddAndNarrowerTypesFit(t *testing.T) {
 	env := newEnv(t)
 	w := env.open(1, destination.ScopePipeline, appends("users")...)
 	recov(t, w, 1, destination.Epoch{}, nil)
@@ -335,8 +337,8 @@ func TestColumnsAddAndWiden(t *testing.T) {
 	small := arrow.Field{Name: "id", Type: arrow.PrimitiveTypes.Int32, Nullable: true}
 	extra := arrow.Field{Name: "extra", Type: arrow.BinaryTypes.String, Nullable: true}
 	for _, b := range []arrow.RecordBatch{
-		batch(t, []arrow.Field{small, nameField}, `[{"id": 1, "name": "a"}]`),
-		batch(t, []arrow.Field{idField, nameField, extra}, `[{"id": 2, "name": "b", "extra": "x"}]`),
+		batch(t, []arrow.Field{idField, nameField}, `[{"id": 1, "name": "a"}]`),
+		batch(t, []arrow.Field{small, nameField, extra}, `[{"id": 2, "name": "b", "extra": "x"}]`),
 	} {
 		if err := w.Write(t.Context(), e1, "users", b); err != nil {
 			t.Fatal(err)

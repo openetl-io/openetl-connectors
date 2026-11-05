@@ -22,7 +22,6 @@ import (
 	ice "github.com/apache/iceberg-go"
 	iceio "github.com/apache/iceberg-go/io"
 	"github.com/apache/iceberg-go/table"
-	"github.com/google/uuid"
 )
 
 const (
@@ -31,6 +30,8 @@ const (
 	seqColumn       = "_openetl_seq"
 	deletedColumn   = "_openetl_deleted"
 	unchangedColumn = "_openetl_unchanged"
+	syncedColumn    = "_openetl_synced_at"
+	heldColumn      = "_openetl_held"
 	// The engine names renamed columns' source names in each schema's
 	// metadata: a JSON object from destination name to source name.
 	sourceNamesKey = "openetl.source_names"
@@ -40,7 +41,7 @@ const (
 )
 
 // A soft delete takes these from the delete, and the rest from the row.
-var metadataColumns = []string{idColumn, opColumn, seqColumn, "_openetl_synced_at", deletedColumn}
+var metadataColumns = []string{idColumn, opColumn, seqColumn, syncedColumn, deletedColumn}
 
 // keyColumns maps a stream's primary key, under source names, to its
 // destination names.
@@ -86,7 +87,7 @@ func (w *writer) mergeInto(ctx context.Context, tx *table.Transaction, tbl *tabl
 	if err != nil {
 		return nil, err
 	}
-	m, err := newMerge(sc, staged, s.Key, s.HardDeletes)
+	m, err := newMerge(sc, staged, s.Key, s.HardDeletes, s.Last)
 	staged.Release()
 	if err != nil {
 		return nil, err
@@ -99,18 +100,19 @@ func (w *writer) mergeInto(ctx context.Context, tx *table.Transaction, tbl *tabl
 	if err != nil {
 		return nil, err
 	}
+	if len(s.Patches) > 0 {
+		if rows, dels, err = m.patch(ctx, tbl, fs, s, rows, dels); err != nil {
+			return nil, fmt.Errorf("patch its rows: %w", err)
+		}
+	}
 	defer rows.Release()
 	defer dels.Release()
 
 	var written []string
 	var data, deletes []ice.DataFile
 	if rows.NumRows() > 0 {
-		for df, err := range table.WriteRecords(ctx, tbl, sc, one(rows), table.WithWriteUUID(uuid.New())) {
-			if err != nil {
-				return written, err
-			}
-			data = append(data, df)
-			written = append(written, df.FilePath())
+		if written, data, err = writeData(ctx, tbl, sc, rows); err != nil {
+			return written, err
 		}
 	}
 	if dels.NumRows() > 0 {
@@ -135,6 +137,66 @@ func (w *writer) mergeInto(ctx context.Context, tx *table.Transaction, tbl *tabl
 	return written, tx.NewRowDelta(marker).AddRows(data...).AddDeletes(deletes...).Commit(ctx)
 }
 
+// patch applies the epoch's patches after the merge: to the rows it adds,
+// and to the table's rows of the other keys they name, which it rewrites.
+// It takes rows and dels, and returns them with the patches applied.
+func (m *merge) patch(ctx context.Context, tbl *table.Table, fs iceio.IO, s stagedStream, rows, dels arrow.RecordBatch) (arrow.RecordBatch, arrow.RecordBatch, error) {
+	release := func() { rows.Release(); dels.Release() }
+	ps, err := readPatches(ctx, fs, s.Patches, m.sc)
+	if err != nil {
+		release()
+		return nil, nil, err
+	}
+	defer ps.Release()
+	match := func(rec arrow.RecordBatch, r int) string { return keyOf(rec, m.key, r) }
+	p := newPatcher(m.sc, ps, s.Fills, match)
+	patched, _, err := p.apply(ctx, rows)
+	if err != nil {
+		release()
+		return nil, nil, err
+	}
+	rows.Release()
+	rows = patched
+	have, skip := map[string]bool{}, map[string]bool{}
+	for r := range int(rows.NumRows()) {
+		have[match(rows, r)] = true
+	}
+	keyIdx := make([]int, len(m.key))
+	for i := range keyIdx {
+		keyIdx[i] = i
+	}
+	for r := range int(dels.NumRows()) {
+		skip[keyOf(dels, keyIdx, r)] = true
+	}
+	filter := func(rs []int) ice.BooleanExpression { return keyFilter(m.sc, ps, m.key, rs) }
+	target, err := patchTarget(ctx, tbl, m.sc, p, filter, have, skip)
+	if err != nil || target == nil || target.NumRows() == 0 {
+		if target != nil {
+			target.Release()
+		}
+		if err != nil {
+			release()
+			return nil, nil, err
+		}
+		return rows, dels, nil
+	}
+	defer target.Release()
+	all, err := concat(m.sc, []arrow.RecordBatch{rows, target})
+	if err != nil {
+		release()
+		return nil, nil, err
+	}
+	keys := keysOf(target, m.key)
+	defer keys.Release()
+	allDels, err := concat(dels.Schema(), []arrow.RecordBatch{dels, keys})
+	release()
+	if err != nil {
+		all.Release()
+		return nil, nil, err
+	}
+	return all, allDels, nil
+}
+
 func one(b arrow.RecordBatch) iter.Seq2[arrow.RecordBatch, error] {
 	return func(yield func(arrow.RecordBatch, error) bool) { yield(b, nil) }
 }
@@ -152,10 +214,12 @@ type merge struct {
 	staged int
 	key    []int
 	// -1 where the table has no such column.
-	seq, op, unchanged int
-	hard               bool
-	keys               []string
-	byKey              map[string]*version
+	seq, op, unchanged, held int
+	// Columns whose held cells keep the table's value.
+	last  []int
+	hard  bool
+	keys  []string
+	byKey map[string]*version
 	// The table had no rows to delete.
 	empty bool
 }
@@ -183,10 +247,16 @@ func columnIndex(sc *arrow.Schema, name string) int {
 	return -1
 }
 
-func newMerge(sc *arrow.Schema, staged arrow.RecordBatch, key []string, hard bool) (*merge, error) {
+func newMerge(sc *arrow.Schema, staged arrow.RecordBatch, key []string, hard bool, last []string) (*merge, error) {
 	m := &merge{
 		sc: sc, rec: staged, staged: int(staged.NumRows()), hard: hard, byKey: map[string]*version{},
 		seq: columnIndex(sc, seqColumn), op: columnIndex(sc, opColumn), unchanged: columnIndex(sc, unchangedColumn),
+		held: columnIndex(sc, heldColumn),
+	}
+	for _, c := range last {
+		if j := columnIndex(sc, c); j >= 0 && m.held >= 0 {
+			m.last = append(m.last, j)
+		}
 	}
 	if len(key) == 0 {
 		return nil, errors.New("it merges, and has no key")
@@ -213,7 +283,7 @@ func newMerge(sc *arrow.Schema, staged arrow.RecordBatch, key []string, hard boo
 		v := m.byKey[k]
 		m.resolve(v)
 		switch {
-		case m.isDelete(v.latest) && !hard, len(v.remaining) > 0:
+		case m.isDelete(v.latest) && !hard, len(v.remaining) > 0, len(m.holdsLast(v.latest)) > 0:
 			v.full = true
 		case m.seq >= 0 && !m.rec.Column(m.seq).IsNull(v.latest):
 			v.guard = true
@@ -222,10 +292,12 @@ func newMerge(sc *arrow.Schema, staged arrow.RecordBatch, key []string, hard boo
 	return m, nil
 }
 
-func (m *merge) keyOf(r int) string {
+func (m *merge) keyOf(r int) string { return keyOf(m.rec, m.key, r) }
+
+func keyOf(rec arrow.RecordBatch, key []int, r int) string {
 	var b []byte
-	for _, j := range m.key {
-		c := m.rec.Column(j)
+	for _, j := range key {
+		c := rec.Column(j)
 		if c.IsNull(r) {
 			b = append(b, 0)
 			continue
@@ -235,6 +307,21 @@ func (m *merge) keyOf(r int) string {
 		b = append(append(b, ':'), v...)
 	}
 	return string(b)
+}
+
+// holdsLast is the columns marked last that row r holds.
+func (m *merge) holdsLast(r int) []int {
+	if len(m.last) == 0 {
+		return nil
+	}
+	h := heldAt(m.rec.Column(m.held), r)
+	var out []int
+	for _, j := range m.last {
+		if _, ok := h[m.sc.Field(j).Name]; ok {
+			out = append(out, j)
+		}
+	}
+	return out
 }
 
 func (m *merge) isDelete(r int) bool {
@@ -390,13 +477,17 @@ func (m *merge) readTarget(ctx context.Context, tbl *table.Table) error {
 	return nil
 }
 
-// keyFilter matches the keys of rows, and possibly others.
 func (m *merge) keyFilter(rows []int) ice.BooleanExpression {
+	return keyFilter(m.sc, m.rec, m.key, rows)
+}
+
+// keyFilter matches the keys of rec's rows, and possibly others.
+func keyFilter(sc *arrow.Schema, rec arrow.RecordBatch, key []int, rows []int) ice.BooleanExpression {
 	var preds []ice.BooleanExpression
 columns:
-	for _, j := range m.key {
-		c := m.rec.Column(j)
-		ref := ice.Reference(m.sc.Field(j).Name)
+	for _, j := range key {
+		c := rec.Column(j)
+		ref := ice.Reference(sc.Field(j).Name)
 		seen := map[string]bool{}
 		var lits []ice.Literal
 		lo, hi := -1, -1
@@ -446,6 +537,7 @@ func (m *merge) result(ctx context.Context) (rows, dels arrow.RecordBatch, err e
 	}
 	idx := make([][]int, n)
 	var unchanged [][]string
+	var held []map[string][]byte
 	var deleted []int
 	for _, k := range m.keys {
 		v := m.byKey[k]
@@ -464,8 +556,9 @@ func (m *merge) result(ctx context.Context) (rows, dels arrow.RecordBatch, err e
 			continue
 		}
 		var u []string
+		softDelete := t >= 0 && m.isDelete(l)
 		switch {
-		case t >= 0 && m.isDelete(l):
+		case softDelete:
 			for j := range n {
 				idx[j] = append(idx[j], cond(meta[j], l, t))
 			}
@@ -491,14 +584,24 @@ func (m *merge) result(ctx context.Context) (rows, dels arrow.RecordBatch, err e
 			u = v.remaining
 		}
 		unchanged = append(unchanged, u)
+		if m.held >= 0 {
+			held = append(held, m.heldOf(idx, l, t, softDelete))
+		}
 	}
 
 	cols := make([]arrow.Array, n)
 	defer releaseAll(cols)
 	for j := range n {
-		if j == m.unchanged {
+		switch j {
+		case m.unchanged:
 			cols[j], err = listOf(m.sc.Field(j).Type, unchanged)
-		} else {
+		case m.held:
+			mt, ok := m.sc.Field(j).Type.(*arrow.MapType)
+			if !ok {
+				return nil, nil, fmt.Errorf("its table's %s is %s, not a map", heldColumn, m.sc.Field(j).Type)
+			}
+			cols[j], err = heldArray(mt, held)
+		default:
 			cols[j], err = take(ctx, m.rec.Column(j), idx[j])
 		}
 		if err != nil {
@@ -518,6 +621,41 @@ func (m *merge) result(ctx context.Context) (rows, dels arrow.RecordBatch, err e
 		}
 	}
 	return rows, array.NewRecordBatch(arrow.NewSchema(keyFields, nil), keyCols, int64(len(deleted))), nil
+}
+
+// heldOf is the held columns of the row just added to idx, each held for
+// the version the row takes its value from. A column marked last that the
+// latest version holds keeps the table's value instead, held for the latest
+// version.
+func (m *merge) heldOf(idx [][]int, l, t int, softDelete bool) map[string][]byte {
+	i := len(idx[0]) - 1
+	seen := map[int]map[string][]byte{}
+	at := func(r int) map[string][]byte {
+		h, ok := seen[r]
+		if !ok {
+			h = heldAt(m.rec.Column(m.held), r)
+			seen[r] = h
+		}
+		return h
+	}
+	out := map[string][]byte{}
+	for j, f := range m.sc.Fields() {
+		if j == m.held || j == m.unchanged || slices.Contains(metadataColumns, f.Name) {
+			continue
+		}
+		if v, ok := at(idx[j][i])[f.Name]; ok {
+			out[f.Name] = v
+		}
+	}
+	if softDelete || t < 0 {
+		return out
+	}
+	for _, j := range m.holdsLast(l) {
+		name := m.sc.Field(j).Name
+		idx[j][i] = t
+		out[name] = at(l)[name]
+	}
+	return out
 }
 
 func (m *merge) unchangedColumn() arrow.Array {
@@ -658,6 +796,8 @@ func literalAt(arr arrow.Array, r int) (ice.Literal, bool) {
 	case *array.String:
 		return ice.NewLiteral(c.Value(r)), true
 	case *array.Binary:
+		return ice.NewLiteral(slices.Clone(c.Value(r))), true
+	case *array.FixedSizeBinary:
 		return ice.NewLiteral(slices.Clone(c.Value(r))), true
 	case *array.Date32:
 		return ice.NewLiteral(ice.Date(c.Value(r))), true

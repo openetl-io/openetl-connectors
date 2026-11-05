@@ -7,7 +7,10 @@
 // the catalog refuses the commit if another landed first. Overwrite keeps a
 // read's files out of the table until the read ends, then replaces the
 // table's files with them. Merge reads its files back at Commit, and adds
-// equality deletes of the keys they change with the keys' new rows.
+// equality deletes of the keys they change with the keys' new rows. It never
+// changes a column's type, and takes holds: patches are staged like rows,
+// and Commit rewrites the rows they fill, by key or by _openetl_id, with
+// equality deletes in the same snapshot.
 package iceberg
 
 import (
@@ -16,6 +19,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"slices"
 	"strconv"
 	"strings"
@@ -23,6 +27,7 @@ import (
 	"time"
 
 	"github.com/apache/arrow-go/v18/arrow"
+	"github.com/apache/arrow-go/v18/arrow/array"
 	ice "github.com/apache/iceberg-go"
 	"github.com/apache/iceberg-go/catalog"
 	"github.com/apache/iceberg-go/catalog/glue"
@@ -37,6 +42,7 @@ import (
 
 	sdk "github.com/unsuitable001/openetl/sdk/go"
 	"github.com/unsuitable001/openetl/sdk/go/destination"
+	protocolv1 "github.com/unsuitable001/openetl/sdk/go/protocol/v1"
 )
 
 type DestinationConfig struct {
@@ -70,6 +76,7 @@ var (
 	_ destination.Checker       = (*Destination)(nil)
 	_ destination.SchemaApplier = (*writer)(nil)
 	_ destination.ReadTracker   = (*writer)(nil)
+	_ destination.Patcher       = (*writer)(nil)
 )
 
 func NewDestination(config []byte) (*Destination, error) {
@@ -144,9 +151,18 @@ func (d *Destination) catalog(ctx context.Context) (catalog.Catalog, error) {
 	}
 	c, err := rest.NewCatalog(ctx, "openetl", d.cfg.URI, opts...)
 	if err != nil {
-		return nil, fmt.Errorf("iceberg: catalog %s: %w", d.cfg.URI, err)
+		return nil, unavailable(fmt.Errorf("iceberg: catalog %s: %w", d.cfg.URI, err))
 	}
 	return c, nil
+}
+
+// unavailable classifies an error reaching the catalog or the store as the
+// destination being unavailable.
+func unavailable(err error) error {
+	if _, ok := errors.AsType[net.Error](err); ok && !errors.Is(err, context.Canceled) {
+		return sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_DESTINATION_UNAVAILABLE, err)
+	}
+	return err
 }
 
 // Check confirms the catalog answers and lists namespaces.
@@ -156,7 +172,7 @@ func (d *Destination) Check(ctx context.Context) error {
 		return err
 	}
 	if _, err := c.ListNamespaces(ctx, nil); err != nil {
-		return fmt.Errorf("iceberg: list namespaces: %w", err)
+		return unavailable(fmt.Errorf("iceberg: list namespaces: %w", err))
 	}
 	return nil
 }
@@ -190,6 +206,7 @@ func (d *Destination) Open(ctx context.Context, cfg destination.OpenConfig) (des
 		names:   map[string]string{},
 		keys:    map[string][]string{},
 		parts:   map[uint64]map[string]*epochFiles{},
+		patches: map[uint64]map[string]*epochFiles{},
 		ended:   map[uint64][]string{},
 		reads:   map[string]*read{},
 	}
@@ -210,18 +227,23 @@ type writer struct {
 	cancel context.CancelFunc
 
 	mu sync.Mutex
-	// Each stream's table, as Write and ApplySchema last made it hold their
-	// schema, and its name.
-	tables  map[string]*table.Table
-	schemas map[string]*arrow.Schema
-	names   map[string]string
+	// Each stream's table, as Write and ApplySchema, or Patch, last made it
+	// hold their schema, and its name.
+	tables           map[string]*table.Table
+	written, patched map[string]ensured
+	names            map[string]string
 	// Merge: each stream's key under destination names.
 	keys map[string][]string
+	// Columns whose values Write or Patch left out, since the table
+	// couldn't take their type, until ApplySchema refuses them.
+	dropped map[string]map[string]bool
 
-	// Only Write, StartReads, EndRead, PreCommit and Recover use these.
-	parts  map[uint64]map[string]*epochFiles
-	starts map[string]time.Time
-	ended  map[uint64][]string
+	// Only Write, Patch, StartReads, EndRead, PreCommit and Recover use
+	// these.
+	parts   map[uint64]map[string]*epochFiles
+	patches map[uint64]map[string]*epochFiles
+	starts  map[string]time.Time
+	ended   map[uint64][]string
 	// Overwrite: each stream's read in progress.
 	reads map[string]*read
 }
@@ -263,18 +285,34 @@ type stagedStream struct {
 	// files are read back at Commit, and no snapshot holds them.
 	Key         []string `json:"key,omitempty"`
 	HardDeletes bool     `json:"hard_deletes,omitempty"`
+	// Merge: columns whose held cells keep the table's value.
+	Last []string `json:"last,omitempty"`
+	// The epoch's patches' files, in the table's schema, read back at
+	// Commit; and the columns in them that fill another held column, by
+	// that column.
+	Patches []string          `json:"patches,omitempty"`
+	Fills   map[string]string `json:"fills,omitempty"`
 }
 
 // applies reports whether committing the stream changes its table, and
-// returns the files it adds.
+// returns the files it needs: those it adds, and the patches.
 func (s stagedStream) applies() ([]string, bool) {
 	if s.Mode != modeOverwrite {
-		return s.Files, len(s.Files) > 0
+		files := append(slices.Clone(s.Files), s.Patches...)
+		return files, len(files) > 0
 	}
 	if !s.Ended {
 		return nil, false
 	}
 	return append(slices.Clone(s.Earlier), s.Files...), true
+}
+
+// adds is the files committing the stream adds to its table as they are.
+func (s stagedStream) adds() []string {
+	if s.Mode == modeOverwrite {
+		return append(slices.Clone(s.Earlier), s.Files...)
+	}
+	return s.Files
 }
 
 const (
@@ -295,14 +333,25 @@ func (w *writer) ident(ns []string, name string) table.Identifier {
 	return append(slices.Clone(ns), name)
 }
 
-func (w *writer) setTable(stream string, tbl *table.Table, sc *arrow.Schema) {
+// ensured is a schema a table was made to hold, and its columns whose type
+// the table can't take.
+type ensured struct {
+	schema  *arrow.Schema
+	refused []destination.RefusedColumn
+}
+
+func (w *writer) setTable(stream string, tbl *table.Table, e ensured, patch bool) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	w.tables[stream] = tbl
-	if w.schemas == nil {
-		w.schemas = map[string]*arrow.Schema{}
+	if w.written == nil {
+		w.written, w.patched = map[string]ensured{}, map[string]ensured{}
 	}
-	w.schemas[stream] = sc
+	if patch {
+		w.patched[stream] = e
+	} else {
+		w.written[stream] = e
+	}
 	w.names[stream] = tbl.Identifier()[len(tbl.Identifier())-1]
 }
 
@@ -312,29 +361,34 @@ func (w *writer) name(stream string) string {
 	return w.names[stream]
 }
 
-// tableFor returns the stream's table once it holds every column of sc.
-func (w *writer) tableFor(ctx context.Context, stream string, sc *arrow.Schema) (*table.Table, error) {
+// tableFor returns the stream's table once it holds every column of sc,
+// with the columns of sc whose type it can't take. patch: sc is a patch's.
+func (w *writer) tableFor(ctx context.Context, stream string, sc *arrow.Schema, patch bool) (*table.Table, []destination.RefusedColumn, error) {
 	w.mu.Lock()
-	tbl, have := w.tables[stream], w.schemas[stream]
+	tbl, have := w.tables[stream], w.written[stream]
+	if patch {
+		have = w.patched[stream]
+	}
 	w.mu.Unlock()
-	if tbl != nil && have != nil && have.Equal(sc) {
-		return tbl, nil
+	if tbl != nil && have.schema != nil && have.schema.Equal(sc) {
+		return tbl, have.refused, nil
 	}
-	tbl, err := w.ensure(ctx, targetTable(sc, stream), sc)
+	tbl, refused, err := w.ensure(ctx, targetTable(sc, stream), sc)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	w.setTable(stream, tbl, sc)
-	return tbl, nil
+	w.setTable(stream, tbl, ensured{schema: sc, refused: refused}, patch)
+	return tbl, refused, nil
 }
 
-// ensure creates the table with sc's columns, or adds the columns it lacks
-// and widens those sc widens. It isn't fenced: a column added for an epoch
-// that never commits stays empty.
-func (w *writer) ensure(ctx context.Context, name string, sc *arrow.Schema) (*table.Table, error) {
+// ensure creates the table with sc's columns, or adds the columns it
+// lacks. It never changes a column's type: it leaves the columns whose type
+// can't take sc's as they are, and returns them. It isn't fenced: a column
+// added for an epoch that never commits stays empty.
+func (w *writer) ensure(ctx context.Context, name string, sc *arrow.Schema) (*table.Table, []destination.RefusedColumn, error) {
 	want, err := icebergSchema(sc)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	ident := w.ident(w.ns, name)
 	for attempt := 0; ; attempt++ {
@@ -343,14 +397,15 @@ func (w *writer) ensure(ctx context.Context, name string, sc *arrow.Schema) (*ta
 			if tbl, err = w.create(ctx, ident, want); errors.Is(err, catalog.ErrTableAlreadyExists) && attempt < commitRetries {
 				continue
 			}
-			return tbl, err
+			return tbl, nil, err
 		}
 		if err != nil {
-			return nil, fmt.Errorf("iceberg: load %s: %w", strings.Join(ident, "."), err)
+			return nil, nil, fmt.Errorf("iceberg: load %s: %w", strings.Join(ident, "."), err)
 		}
+		refused, add := compareSchemas(ident, tbl.Schema(), want)
 		tx := tbl.NewTransaction()
-		if err := tx.UpdateSchema(true, false).UnionByNameWith(want).Commit(); err != nil {
-			return nil, fmt.Errorf("iceberg: %s: %w", strings.Join(ident, "."), err)
+		if err := tx.UpdateSchema(true, false).UnionByNameWith(add).Commit(); err != nil {
+			return nil, nil, fmt.Errorf("iceberg: %s: %w", strings.Join(ident, "."), err)
 		}
 		// A transaction without changes commits nothing.
 		tbl, err = tx.Commit(ctx)
@@ -358,10 +413,62 @@ func (w *writer) ensure(ctx context.Context, name string, sc *arrow.Schema) (*ta
 			continue
 		}
 		if err != nil {
-			return nil, fmt.Errorf("iceberg: change the schema of %s: %w", strings.Join(ident, "."), err)
+			return nil, nil, fmt.Errorf("iceberg: change the schema of %s: %w", strings.Join(ident, "."), err)
 		}
-		return tbl, nil
+		return tbl, refused, nil
 	}
+}
+
+// compareSchemas returns the columns of want whose type have's can't take,
+// and what want adds to have: new columns, and new fields of structs. A
+// column keeps whether it's required.
+func compareSchemas(ident table.Identifier, have, want *ice.Schema) ([]destination.RefusedColumn, *ice.Schema) {
+	var refused []destination.RefusedColumn
+	var keep []ice.NestedField
+	for _, f := range want.Fields() {
+		h, ok := have.FindFieldByName(f.Name)
+		switch {
+		case !ok:
+			keep = append(keep, f)
+			continue
+		case holds(h.Type, f.Type):
+			if !holds(f.Type, h.Type) {
+				f.Required = h.Required
+				keep = append(keep, f)
+			}
+			continue
+		}
+		r := destination.RefusedColumn{Column: f.Name, FromType: h.Type.String(), ToType: f.Type.String()}
+		if promotes(h.Type, f.Type) {
+			r.Reason = "it doesn't change a column's type"
+			r.Fix = "ALTER TABLE " + sparkIdent(ident...) + " ALTER COLUMN " + sparkIdent(f.Name) + " TYPE " + sparkType(f.Type)
+		} else {
+			r.Reason = fmt.Sprintf("it doesn't change a column's type, and Iceberg can't change %s to %s", h.Type, f.Type)
+		}
+		refused = append(refused, r)
+	}
+	return refused, ice.NewSchema(0, keep...)
+}
+
+// limits are what tbl can't take: partition columns can't be held, and
+// required columns can't take a null.
+func limits(tbl *table.Table) destination.TableLimits {
+	var l destination.TableLimits
+	sc := tbl.Schema()
+	for _, f := range sc.Fields() {
+		if f.Required && !slices.Contains(metadataColumns, f.Name) && f.Name != heldColumn && f.Name != unchangedColumn {
+			l.NotNull = append(l.NotNull, f.Name)
+		}
+	}
+	spec := tbl.Spec()
+	for _, pf := range spec.Fields() {
+		for _, id := range pf.SourceIDs {
+			if name, ok := sc.FindColumnName(id); ok && !slices.Contains(l.Unholdable, name) {
+				l.Unholdable = append(l.Unholdable, name)
+			}
+		}
+	}
+	return l
 }
 
 func (w *writer) create(ctx context.Context, ident table.Identifier, sc *ice.Schema) (*table.Table, error) {
@@ -383,15 +490,35 @@ func (w *writer) create(ctx context.Context, ident table.Identifier, sc *ice.Sch
 	return tbl, nil
 }
 
-// ApplySchema creates each stream's table, adds its new columns and widens
-// the columns whose type widened.
+// ApplySchema creates each stream's table and adds its new columns. It
+// never changes a column's type: it refuses a column whose type changed,
+// even where Iceberg could promote it, and the platform holds the column
+// until the user changes it. It reports what each table can't take.
 func (w *writer) ApplySchema(ctx context.Context, streams []destination.StreamSchema) (destination.SchemaApplied, error) {
+	out := destination.SchemaApplied{Limits: make(map[string]destination.TableLimits, len(streams))}
 	for _, s := range streams {
-		if _, err := w.tableFor(ctx, s.Name, s.Schema); err != nil {
+		// Not from the cache: the user may have changed the table.
+		tbl, refused, err := w.ensure(ctx, targetTable(s.Schema, s.Name), s.Schema)
+		if err != nil {
 			return destination.SchemaApplied{}, err
 		}
+		w.setTable(s.Name, tbl, ensured{schema: s.Schema, refused: refused}, false)
+		w.mu.Lock()
+		dropped := w.dropped[s.Name]
+		delete(w.dropped, s.Name)
+		w.mu.Unlock()
+		for col := range dropped {
+			if !slices.ContainsFunc(refused, func(r destination.RefusedColumn) bool { return r.Column == col }) {
+				return destination.SchemaApplied{}, fmt.Errorf("iceberg: %s's column %q changed type while the epoch was written, and its values were left out; read the epoch again", s.Name, col)
+			}
+		}
+		for _, r := range refused {
+			r.Stream = s.Name
+			out.Refused = append(out.Refused, r)
+		}
+		out.Limits[s.Name] = limits(tbl)
 	}
-	return destination.SchemaApplied{}, nil
+	return out, nil
 }
 
 func (w *writer) StartReads(_ context.Context, starts map[string]time.Time) error {
@@ -410,12 +537,16 @@ func (w *writer) EndRead(_ context.Context, e destination.Epoch, stream string) 
 	return nil
 }
 
-// epochFiles is what a stream wrote in an epoch: its closed parts' files,
-// and the part being written.
+// epochFiles is what a stream wrote in an epoch, or its patches: its closed
+// parts' files, and the part being written.
 type epochFiles struct {
 	files []string
 	open  *part
 	n     int
+	// Columns marked to keep the table's value in held cells.
+	last []string
+	// Patches: columns that fill another held column, by that column.
+	fills map[string]string
 }
 
 // part streams batches into data files in one table schema.
@@ -428,14 +559,18 @@ type part struct {
 	err      error
 }
 
-func (w *writer) startPart(tbl *table.Table, e destination.Epoch, stream string, k int) (*part, error) {
+func (w *writer) startPart(tbl *table.Table, e destination.Epoch, stream string, k int, patch bool) (*part, error) {
 	sc, err := table.SchemaToArrowSchema(tbl.Schema(), nil, true, false)
 	if err != nil {
 		return nil, fmt.Errorf("iceberg: %w", err)
 	}
 	p := &part{schemaID: tbl.Schema().ID, arrow: sc, ch: make(chan arrow.RecordBatch, 1), done: make(chan struct{})}
 	// Data file names come from it, so each generation and epoch has its own.
-	id := uuid.NewSHA1(uuid.NameSpaceURL, fmt.Appendf(nil, "openetl:%s/%s/%d/%d/%d", w.cfg.Pipeline, stream, e.Generation, e.N, k))
+	kind := ""
+	if patch {
+		kind = "patch/"
+	}
+	id := uuid.NewSHA1(uuid.NameSpaceURL, fmt.Appendf(nil, "openetl:%s%s/%s/%d/%d/%d", kind, w.cfg.Pipeline, stream, e.Generation, e.N, k))
 	batches := func(yield func(arrow.RecordBatch, error) bool) {
 		for b := range p.ch {
 			if !yield(b, nil) {
@@ -494,14 +629,81 @@ func (w *writer) Write(ctx context.Context, e destination.Epoch, stream string, 
 		}
 		w.keys[stream] = key
 	}
-	tbl, err := w.tableFor(ctx, stream, batch.Schema())
+	ef, err := w.stage(ctx, w.parts, e, stream, batch, false)
 	if err != nil {
 		return err
 	}
-	byStream := w.parts[e.N]
+	for _, f := range batch.Schema().Fields() {
+		if v, _ := f.Metadata.GetValue(destination.HeldKey); v == "last" && !slices.Contains(ef.last, f.Name) {
+			ef.last = append(ef.last, f.Name)
+		}
+	}
+	return nil
+}
+
+// Patch stages patches in files of their own, which Commit reads back and
+// applies after the epoch's rows, in the same snapshot.
+func (w *writer) Patch(ctx context.Context, e destination.Epoch, stream string, batch arrow.RecordBatch) error {
+	cfg, ok := w.streams[stream]
+	switch {
+	case !ok:
+		return fmt.Errorf("iceberg: unknown stream %q", stream)
+	case cfg.Mode != destination.Merge && cfg.Mode != destination.Append:
+		return fmt.Errorf("iceberg: stream %q overwrites, and takes no patches", stream)
+	case batch.NumRows() == 0:
+		return nil
+	case !batch.Schema().HasField(idColumn) || !batch.Schema().HasField(heldColumn):
+		return fmt.Errorf("iceberg: patches for %q need %s and %s", stream, idColumn, heldColumn)
+	}
+	if _, ok := w.keys[stream]; cfg.Mode == destination.Merge && !ok {
+		key, err := keyColumns(batch.Schema(), cfg.PrimaryKey)
+		if err != nil {
+			return fmt.Errorf("iceberg: patches for %q: %w", stream, err)
+		}
+		w.keys[stream] = key
+	}
+	ef, err := w.stage(ctx, w.patches, e, stream, batch, true)
+	if err != nil {
+		return err
+	}
+	for _, f := range batch.Schema().Fields() {
+		if held, ok := f.Metadata.GetValue(destination.FillsKey); ok {
+			if ef.fills == nil {
+				ef.fills = map[string]string{}
+			}
+			ef.fills[f.Name] = held
+		}
+	}
+	return nil
+}
+
+// stage streams batch into the stream's files for epoch e in parts. A
+// column whose type the table can't take is left out: ApplySchema refuses
+// it before the epoch is recorded.
+func (w *writer) stage(ctx context.Context, parts map[uint64]map[string]*epochFiles, e destination.Epoch, stream string, batch arrow.RecordBatch, patch bool) (*epochFiles, error) {
+	tbl, refused, err := w.tableFor(ctx, stream, batch.Schema(), patch)
+	if err != nil {
+		return nil, err
+	}
+	if len(refused) > 0 {
+		w.mu.Lock()
+		if w.dropped == nil {
+			w.dropped = map[string]map[string]bool{}
+		}
+		if w.dropped[stream] == nil {
+			w.dropped[stream] = map[string]bool{}
+		}
+		for _, r := range refused {
+			w.dropped[stream][r.Column] = true
+		}
+		w.mu.Unlock()
+		batch = without(batch, refused)
+		defer batch.Release()
+	}
+	byStream := parts[e.N]
 	if byStream == nil {
 		byStream = map[string]*epochFiles{}
-		w.parts[e.N] = byStream
+		parts[e.N] = byStream
 	}
 	ef := byStream[stream]
 	if ef == nil {
@@ -512,50 +714,85 @@ func (w *writer) Write(ctx context.Context, e destination.Epoch, stream string, 
 		files, err := ef.open.finish()
 		ef.open = nil
 		if err != nil {
-			return err
+			return nil, err
 		}
 		ef.files = append(ef.files, files...)
 	}
 	if ef.open == nil {
-		if ef.open, err = w.startPart(tbl, e, stream, ef.n); err != nil {
-			return err
+		if ef.open, err = w.startPart(tbl, e, stream, ef.n, patch); err != nil {
+			return nil, err
 		}
 		ef.n++
 	}
 	b, err := conform(ctx, batch, ef.open.arrow)
 	if err != nil {
-		return fmt.Errorf("iceberg: stream %q: %w", stream, err)
+		return nil, fmt.Errorf("iceberg: stream %q: %w", stream, err)
 	}
-	return ef.open.send(b)
+	return ef, ef.open.send(b)
+}
+
+// without is batch without the refused columns, retained.
+func without(batch arrow.RecordBatch, refused []destination.RefusedColumn) arrow.RecordBatch {
+	var fields []arrow.Field
+	var cols []arrow.Array
+	for i, f := range batch.Schema().Fields() {
+		if !slices.ContainsFunc(refused, func(r destination.RefusedColumn) bool { return r.Column == f.Name }) {
+			fields, cols = append(fields, f), append(cols, batch.Column(i))
+		}
+	}
+	md := batch.Schema().Metadata()
+	return array.NewRecordBatch(arrow.NewSchema(fields, &md), cols, batch.NumRows())
+}
+
+// finish closes the files' last part, and returns all of them.
+func (ef *epochFiles) finish() ([]string, error) {
+	if ef == nil {
+		return nil, nil
+	}
+	files := ef.files
+	if ef.open != nil {
+		more, err := ef.open.finish()
+		ef.open = nil
+		if err != nil {
+			return nil, err
+		}
+		files = append(files, more...)
+	}
+	return files, nil
 }
 
 // PreCommit closes the epoch's data files. They are durable once closed,
 // and invisible until Commit adds them to their tables.
 func (w *writer) PreCommit(_ context.Context, e destination.Epoch) (destination.Staged, error) {
 	desc := staged{Generation: e.Generation, Epoch: e.N, Namespace: w.ns}
-	byStream := w.parts[e.N]
+	byStream, patches := w.parts[e.N], w.patches[e.N]
 	delete(w.parts, e.N)
+	delete(w.patches, e.N)
 	ended := w.ended[e.N]
 	delete(w.ended, e.N)
 	for _, s := range w.cfg.Streams {
-		var files []string
-		if ef := byStream[s.Name]; ef != nil {
-			files = ef.files
-			if ef.open != nil {
-				more, err := ef.open.finish()
-				if err != nil {
-					return nil, err
-				}
-				files = append(files, more...)
-			}
+		ef, pf := byStream[s.Name], patches[s.Name]
+		files, err := ef.finish()
+		if err != nil {
+			return nil, err
+		}
+		patched, err := pf.finish()
+		if err != nil {
+			return nil, err
 		}
 		isEnd := s.Mode == destination.Overwrite && slices.Contains(ended, s.Name)
-		if len(files) == 0 && !isEnd {
+		if len(files) == 0 && len(patched) == 0 && !isEnd {
 			continue
 		}
-		ss := stagedStream{Name: s.Name, Table: w.name(s.Name), Files: files}
+		ss := stagedStream{Name: s.Name, Table: w.name(s.Name), Files: files, Patches: patched}
+		if pf != nil {
+			ss.Fills = pf.fills
+		}
 		if s.Mode == destination.Merge {
 			ss.Mode, ss.Key, ss.HardDeletes = modeMerge, w.keys[s.Name], s.Deletes == destination.HardDelete
+			if ef != nil {
+				ss.Last = ef.last
+			}
 		}
 		if s.Mode == destination.Overwrite {
 			r := w.reads[s.Name]
@@ -710,14 +947,14 @@ func (w *writer) prepare(ctx context.Context, desc staged, streams []stagedStrea
 		if applied(tbl.Properties(), w.cfg.Pipeline, desc) {
 			continue
 		}
-		tx, written, err := w.transaction(ctx, tbl, desc, s, files)
+		tx, written, err := w.transaction(ctx, tbl, desc, s, s.adds())
 		if err != nil {
 			w.dropFiles(desc.Namespace, s.Table, written)
 			return txs, fmt.Errorf("iceberg: %s: %w", strings.Join(ident, "."), err)
 		}
-		p := pending{tx: tx, ns: desc.Namespace, table: s.Table, written: written}
+		p := pending{tx: tx, ns: desc.Namespace, table: s.Table, written: written, staged: s.Patches}
 		if s.Mode == modeMerge {
-			p.staged = s.Files
+			p.staged = append(slices.Clone(s.Files), s.Patches...)
 		}
 		txs = append(txs, p)
 	}
@@ -742,7 +979,7 @@ func (w *writer) transaction(ctx context.Context, tbl *table.Table, desc staged,
 	if s.Mode == modeMerge {
 		written, err = w.mergeInto(ctx, tx, tbl, s, marker)
 	} else {
-		err = w.addFiles(ctx, tx, tbl, s, paths, marker)
+		written, err = w.addFiles(ctx, tx, tbl, s, paths, marker)
 	}
 	if err != nil {
 		return nil, written, err
@@ -753,23 +990,27 @@ func (w *writer) transaction(ctx context.Context, tbl *table.Table, desc staged,
 	return tx, written, nil
 }
 
-// addFiles stages an append or an overwrite of the staged files in tx.
-func (w *writer) addFiles(ctx context.Context, tx *table.Transaction, tbl *table.Table, s stagedStream, paths []string, marker ice.Properties) error {
+// addFiles stages an append or an overwrite of the staged files in tx,
+// and an append's patches. It returns the files it wrote.
+func (w *writer) addFiles(ctx context.Context, tx *table.Transaction, tbl *table.Table, s stagedStream, paths []string, marker ice.Properties) ([]string, error) {
 	fs, err := tbl.FS(ctx)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	files := make([]ice.DataFile, len(paths))
 	for i, p := range paths {
 		if files[i], err = table.FileToDataFile(ctx, fs, p, tbl.Schema(), tbl.Spec(), 0, tbl.Properties()); err != nil {
-			return fmt.Errorf("staged file %s: %w", p, err)
+			return nil, fmt.Errorf("staged file %s: %w", p, err)
 		}
+	}
+	if s.Mode == "" && len(s.Patches) > 0 {
+		return w.appendPatched(ctx, tx, tbl, s, files, marker)
 	}
 	var current []ice.DataFile
 	if s.Mode == modeOverwrite && tbl.CurrentSnapshot() != nil {
 		tasks, err := tbl.Scan().PlanFiles(ctx)
 		if err != nil {
-			return fmt.Errorf("plan its files: %w", err)
+			return nil, fmt.Errorf("plan its files: %w", err)
 		}
 		for _, t := range tasks {
 			current = append(current, t.File)
@@ -781,7 +1022,7 @@ func (w *writer) addFiles(ctx context.Context, tx *table.Transaction, tbl *table
 	case len(files) > 0:
 		err = tx.AddDataFiles(ctx, files, marker, table.WithoutAutoNameMapping())
 	}
-	return err
+	return nil, err
 }
 
 func (w *writer) checkFence(props ice.Properties, gen uint64) error {
@@ -897,6 +1138,7 @@ func (w *writer) Recover(ctx context.Context, gen uint64, e destination.Epoch, s
 			if st.Mode == modeMerge {
 				w.dropFiles(desc.Namespace, st.Table, st.Files)
 			}
+			w.dropFiles(desc.Namespace, st.Table, st.Patches)
 			continue
 		}
 		missing = append(missing, st)
@@ -921,6 +1163,7 @@ func (w *writer) Recover(ctx context.Context, gen uint64, e destination.Epoch, s
 		r = destination.Lost
 		for _, st := range desc.Streams {
 			w.dropFiles(desc.Namespace, st.Table, st.Files)
+			w.dropFiles(desc.Namespace, st.Table, st.Patches)
 		}
 	default:
 		return 0, fmt.Errorf("iceberg: epoch %d-g%d is partly applied and the staged files for the rest are gone", desc.Epoch, desc.Generation)
@@ -977,14 +1220,16 @@ func (w *writer) dropFiles(ns []string, name string, paths []string) {
 
 // Close drops the files of epochs that were never pre-committed.
 func (w *writer) Close(context.Context) error {
-	for _, byStream := range w.parts {
-		for stream, ef := range byStream {
-			files := ef.files
-			if ef.open != nil {
-				more, _ := ef.open.finish()
-				files = append(files, more...)
+	for _, parts := range []map[uint64]map[string]*epochFiles{w.parts, w.patches} {
+		for _, byStream := range parts {
+			for stream, ef := range byStream {
+				files := ef.files
+				if ef.open != nil {
+					more, _ := ef.open.finish()
+					files = append(files, more...)
+				}
+				w.dropFiles(w.ns, w.name(stream), files)
 			}
-			w.dropFiles(w.ns, w.name(stream), files)
 		}
 	}
 	w.cancel()

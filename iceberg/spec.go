@@ -18,4 +18,5 @@ var DestinationCapabilities = destination.Capabilities{
 	DefaultCommitInterval: time.Minute,
 	MinCommitInterval:     time.Second,
 	WriteModes:            []destination.WriteMode{destination.Append, destination.Overwrite, destination.Merge},
+	Holds:                 destination.Holds{ByKey: true, ByID: true, Last: true, Guarded: true},
 }
