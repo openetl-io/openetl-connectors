@@ -240,7 +240,7 @@ func TestDestinationRecoversAndFences(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := old.Commit(t.Context(), e1, st1); err != nil {
+	if _, err := old.Commit(t.Context(), e1, []destination.Staged{st1}); err != nil {
 		t.Fatal(err)
 	}
 	write(t, old, e2, table, 20, 40)
@@ -250,13 +250,13 @@ func TestDestinationRecoversAndFences(t *testing.T) {
 	}
 
 	next := openWriter(t, d, pipeline, 2, table)
-	if r, err := next.Recover(t.Context(), 2, e2, st2); err != nil || r != destination.Lost {
+	if r, err := next.Recover(t.Context(), 2, e2, []destination.Staged{st2}); err != nil || r != destination.Lost {
 		t.Errorf("Recover(2) = %v, %v; want lost", r, err)
 	}
-	if r, err := next.Recover(t.Context(), 2, e1, st1); err != nil || r != destination.Applied {
+	if r, err := next.Recover(t.Context(), 2, e1, []destination.Staged{st1}); err != nil || r != destination.Applied {
 		t.Errorf("Recover(1) = %v, %v; want applied", r, err)
 	}
-	if _, err := old.Commit(t.Context(), e2, st2); !errors.Is(err, destination.ErrFenced) {
+	if _, err := old.Commit(t.Context(), e2, []destination.Staged{st2}); !errors.Is(err, destination.ErrFenced) {
 		t.Errorf("the old attempt's Commit = %v, want fenced", err)
 	}
 	wantIDs(t, ids(t, committed(t, table)), 0, 20)
@@ -268,10 +268,10 @@ func TestDestinationRecoversAndFences(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := next.Commit(t.Context(), e, st); err != nil {
+	if _, err := next.Commit(t.Context(), e, []destination.Staged{st}); err != nil {
 		t.Fatal(err)
 	}
-	if r, err := next.Recover(t.Context(), 2, e, st); err != nil || r != destination.Applied {
+	if r, err := next.Recover(t.Context(), 2, e, []destination.Staged{st}); err != nil || r != destination.Applied {
 		t.Errorf("Recover(g2, 2) = %v, %v; want applied", r, err)
 	}
 	wantIDs(t, ids(t, committed(t, table)), 0, 40)
@@ -321,6 +321,10 @@ func (c *capture) ResumePoint(stream string, state []byte) error {
 	defer c.mu.Unlock()
 	c.states[stream] = state
 	return nil
+}
+
+func (c *capture) Split(stream, id string) source.SplitEmitter {
+	return source.WholeSplit(c, stream, id)
 }
 
 func (c *capture) Complete(stream string, next []byte) error {
@@ -495,7 +499,7 @@ func TestSourceFollowsATopic(t *testing.T) {
 	if c.complete[topic] != nil {
 		t.Error("a continuous read completed")
 	}
-	if err := s.Committed(t.Context(), map[string][]byte{topic: c.states[topic]}); err != nil {
+	if err := s.Committed(t.Context(), map[string][]byte{topic: c.states[topic]}, nil); err != nil {
 		t.Fatal(err)
 	}
 	cl, _ := kgo.NewClient(kgo.SeedBrokers(brokers()))

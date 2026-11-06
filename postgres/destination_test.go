@@ -285,7 +285,7 @@ func TestStaleWriterIsFenced(t *testing.T) {
 	if r := recov(t, w2, 2, destination.Epoch{}, nil); r != destination.Applied {
 		t.Fatalf("Recover = %v", r)
 	}
-	if _, err := w1.Commit(ctx, e, st); !errors.Is(err, destination.ErrFenced) {
+	if _, err := w1.Commit(ctx, e, []destination.Staged{st}); !errors.Is(err, destination.ErrFenced) {
 		t.Fatalf("stale Commit: %v, want fenced", err)
 	}
 	if _, err := w1.Recover(ctx, 1, destination.Epoch{}, nil); !errors.Is(err, destination.ErrFenced) {
@@ -334,7 +334,7 @@ func TestRecoverDropsStaleStaging(t *testing.T) {
 		t.Fatal(err)
 	}
 	st := precommit(t, w1, head)
-	if _, err := w1.Commit(ctx, head, st); err != nil {
+	if _, err := w1.Commit(ctx, head, []destination.Staged{st}); err != nil {
 		t.Fatal(err)
 	}
 	stale, other := stage(w1, pipeline, 1, 2), stage(w2, "p2", 1, 1)
@@ -355,7 +355,7 @@ func TestRecoverDropsStaleStaging(t *testing.T) {
 	if !exists(other) || !exists(current) {
 		t.Error("Recover dropped another pipeline's staging, or its own generation's")
 	}
-	if _, err := w1.Commit(ctx, destination.Epoch{Generation: 1, N: 2}, staleSt); !errors.Is(err, destination.ErrFenced) {
+	if _, err := w1.Commit(ctx, destination.Epoch{Generation: 1, N: 2}, []destination.Staged{staleSt}); !errors.Is(err, destination.ErrFenced) {
 		t.Errorf("committing dropped staging: %v, want fenced", err)
 	}
 }
@@ -374,7 +374,7 @@ func TestBatchWithoutColumns(t *testing.T) {
 	if err := w.Write(ctx, e, "empty", batch(t, []arrow.Field{idField}, `[{"id": 1}]`)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := w.Commit(ctx, e, precommit(t, w, e)); err != nil {
+	if _, err := w.Commit(ctx, e, []destination.Staged{precommit(t, w, e)}); err != nil {
 		t.Fatal(err)
 	}
 	if n := env.count("SELECT count(*) FROM $schema.empty"); n != 4 {
@@ -407,13 +407,13 @@ func TestColumnsNeverChangeType(t *testing.T) {
 	if err := w.Write(ctx, e1, "nums", batch(t, floats, `[{"x": 2.5}]`)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := w.Commit(ctx, e1, precommit(t, w, e1)); err != nil {
+	if _, err := w.Commit(ctx, e1, []destination.Staged{precommit(t, w, e1)}); err != nil {
 		t.Fatal(err)
 	}
 	if err := w.Write(ctx, e2, "nums", batch(t, ints, `[{"x": 2}]`)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := w.Commit(ctx, e2, precommit(t, w, e2)); err != nil {
+	if _, err := w.Commit(ctx, e2, []destination.Staged{precommit(t, w, e2)}); err != nil {
 		t.Fatal(err)
 	}
 	typ := func() string {
@@ -536,7 +536,7 @@ func TestDedupeAtApply(t *testing.T) {
 				t.Fatal(err)
 			}
 		}
-		if c, err = w.Commit(ctx, e2, precommit(t, w, e2)); err != nil {
+		if c, err = w.Commit(ctx, e2, []destination.Staged{precommit(t, w, e2)}); err != nil {
 			t.Fatal(err)
 		}
 		if want := map[string]uint64{"events": 1}; !maps.Equal(c.Collapsed, want) {
@@ -569,7 +569,7 @@ func TestDedupeRebuildsAnInvalidIndex(t *testing.T) {
 	if err := w.Write(ctx, e1, "events", batch(t, fields, `[{"id": 1, "_openetl_id": `+uid(1)+`}]`)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := w.Commit(ctx, e1, precommit(t, w, e1)); err != nil {
+	if _, err := w.Commit(ctx, e1, []destination.Staged{precommit(t, w, e1)}); err != nil {
 		t.Fatal(err)
 	}
 	index := pgx.Identifier{indexName("events")}.Sanitize()
@@ -594,7 +594,7 @@ func TestDedupeRebuildsAnInvalidIndex(t *testing.T) {
 	if err := w2.Write(ctx, e2, "events", batch(t, fields, `[{"id": 1, "_openetl_id": `+uid(1)+`}, {"id": 3, "_openetl_id": `+uid(3)+`}]`)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := w2.Commit(ctx, e2, precommit(t, w2, e2)); err != nil {
+	if _, err := w2.Commit(ctx, e2, []destination.Staged{precommit(t, w2, e2)}); err != nil {
 		t.Fatal(err)
 	}
 	if n := env.count("SELECT count(*) FROM pg_index i JOIN pg_indexes x ON x.indexname = '" + indexName("events") + "' AND x.schemaname = '" + env.schema + "'" +

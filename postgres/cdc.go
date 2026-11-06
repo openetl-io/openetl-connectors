@@ -1015,7 +1015,7 @@ func (s *Source) setReader(r *cdcReader) {
 
 // Committed lets the slot discard the log before the streams' positions.
 // Without a read running, it advances the slot itself.
-func (s *Source) Committed(ctx context.Context, states map[string][]byte) error {
+func (s *Source) Committed(ctx context.Context, states map[string][]byte, _ map[string][]source.Split) error {
 	var low pglogrepl.LSN
 	slot := ""
 	for _, b := range states {

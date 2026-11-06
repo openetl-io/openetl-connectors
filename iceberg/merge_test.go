@@ -42,7 +42,7 @@ func writeRows(t *testing.T, w destination.Writer, e destination.Epoch, stream s
 
 func commitEpoch(t *testing.T, w destination.Writer, e destination.Epoch) destination.Committed {
 	t.Helper()
-	c, err := w.Commit(t.Context(), e, precommit(t, w, e))
+	c, err := w.Commit(t.Context(), e, []destination.Staged{precommit(t, w, e)})
 	if err != nil {
 		t.Fatal(err)
 	}

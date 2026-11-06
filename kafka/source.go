@@ -574,7 +574,7 @@ func (s *Source) key(ctx context.Context, k []byte) []byte {
 // Committed commits the checkpoint's offsets to the consumer group, so
 // Kafka's tools show the read's lag. The checkpoint, not the group, is
 // where reads resume.
-func (s *Source) Committed(ctx context.Context, states map[string][]byte) error {
+func (s *Source) Committed(ctx context.Context, states map[string][]byte, _ map[string][]source.Split) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.acker == nil {

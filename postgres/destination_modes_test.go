@@ -253,7 +253,7 @@ func TestMergeIntoAnExistingTable(t *testing.T) {
 	}
 	e2 := destination.Epoch{Generation: 1, N: 2}
 	write(t, w, e2, "logs", batch(t, []arrow.Field{idField, nameField}, `[{"id": 1, "name": "c"}]`))
-	if _, err := w.Commit(t.Context(), e2, precommit(t, w, e2)); err == nil || !strings.Contains(err.Error(), "needs one row per primary key") {
+	if _, err := w.Commit(t.Context(), e2, []destination.Staged{precommit(t, w, e2)}); err == nil || !strings.Contains(err.Error(), "needs one row per primary key") {
 		t.Errorf("merging into a table with repeated keys: %v", err)
 	}
 	if n := env.count("SELECT count(*) FROM pg_indexes WHERE schemaname = '" + env.schema + "' AND tablename = 'logs'"); n != 0 {

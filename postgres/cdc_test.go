@@ -446,7 +446,7 @@ func TestCDCAcknowledges(t *testing.T) {
 		t.Fatal("the slot moved before a checkpoint committed")
 	}
 	// Without a read running, Committed advances the slot itself.
-	if err := s.Committed(t.Context(), map[string][]byte{"users": []byte(state), "other": []byte(`{"after":["1"]}`)}); err != nil {
+	if err := s.Committed(t.Context(), map[string][]byte{"users": []byte(state), "other": []byte(`{"after":["1"]}`)}, nil); err != nil {
 		t.Fatal(err)
 	}
 	if got := confirmed(); got != pglogrepl.LSN(st.LSN) {
@@ -462,7 +462,7 @@ func TestCDCAcknowledges(t *testing.T) {
 	if err := json.Unmarshal([]byte(c3.last("users")), &st); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Committed(t.Context(), map[string][]byte{"users": []byte(c3.last("users"))}); err != nil {
+	if err := s.Committed(t.Context(), map[string][]byte{"users": []byte(c3.last("users"))}, nil); err != nil {
 		t.Fatal(err)
 	}
 	c3.await(t, "the slot to confirm "+pglogrepl.LSN(st.LSN).String(), func() bool { return confirmed() >= pglogrepl.LSN(st.LSN) })

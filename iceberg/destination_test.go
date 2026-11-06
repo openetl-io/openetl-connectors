@@ -525,7 +525,7 @@ func TestGlue(t *testing.T) {
 		}
 	}
 	t.Cleanup(func() { testHookBeforeCommit = nil })
-	if _, err := w3.Commit(t.Context(), e3, st3); !errors.Is(err, destination.ErrFenced) {
+	if _, err := w3.Commit(t.Context(), e3, []destination.Staged{st3}); !errors.Is(err, destination.ErrFenced) {
 		t.Errorf("stale commit after recovery: %v, want fenced", err)
 	}
 	env.wantIDs("users", 1, 2, 3, 4)

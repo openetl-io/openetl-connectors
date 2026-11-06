@@ -91,6 +91,10 @@ func (c *capture) ResumePoint(stream string, state []byte) error {
 	return nil
 }
 
+func (c *capture) Split(stream, id string) source.SplitEmitter {
+	return source.WholeSplit(c, stream, id)
+}
+
 func (c *capture) Complete(stream string, next []byte) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
