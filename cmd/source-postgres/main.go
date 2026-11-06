@@ -6,10 +6,10 @@ import (
 	"log/slog"
 	"os"
 
-	"github.com/unsuitable001/openetl-connectors/postgres"
-	sdk "github.com/unsuitable001/openetl/sdk/go"
-	"github.com/unsuitable001/openetl/sdk/go/host"
-	"github.com/unsuitable001/openetl/sdk/go/source"
+	"github.com/openetl-io/openetl-connectors/postgres"
+	sdk "github.com/openetl-io/openetl/sdk/go"
+	"github.com/openetl-io/openetl/sdk/go/host"
+	"github.com/openetl-io/openetl/sdk/go/source"
 )
 
 func main() {

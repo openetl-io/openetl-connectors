@@ -17,7 +17,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/jackc/pgx/v5"
 
-	"github.com/unsuitable001/openetl/sdk/go/source"
+	"github.com/openetl-io/openetl/sdk/go/source"
 )
 
 // sourceEnv is a fresh schema in the test database.

@@ -14,7 +14,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/twmb/franz-go/pkg/sr"
 
-	sdk "github.com/unsuitable001/openetl/sdk/go"
+	sdk "github.com/openetl-io/openetl/sdk/go"
 )
 
 // The formats.

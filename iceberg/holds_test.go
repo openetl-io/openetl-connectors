@@ -14,7 +14,7 @@ import (
 	ice "github.com/apache/iceberg-go"
 	"github.com/apache/iceberg-go/table"
 
-	"github.com/unsuitable001/openetl/sdk/go/destination"
+	"github.com/openetl-io/openetl/sdk/go/destination"
 )
 
 var (

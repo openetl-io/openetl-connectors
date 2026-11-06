@@ -15,7 +15,7 @@ import (
 	"github.com/twmb/franz-go/pkg/kerr"
 	"github.com/twmb/franz-go/pkg/kgo"
 
-	"github.com/unsuitable001/openetl/sdk/go/conformance"
+	"github.com/openetl-io/openetl/sdk/go/conformance"
 )
 
 var noBroker = map[string]any{"brokers": []string{"127.0.0.1:1"}}

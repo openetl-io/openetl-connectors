@@ -13,7 +13,7 @@ import (
 	"github.com/apache/iceberg-go/catalog"
 	"github.com/apache/iceberg-go/table"
 
-	"github.com/unsuitable001/openetl/sdk/go/conformance"
+	"github.com/openetl-io/openetl/sdk/go/conformance"
 )
 
 func TestDestinationConformance(t *testing.T) {

@@ -1,8 +1,8 @@
 name: s3
 description: Parquet files on S3, or on a local filesystem
-license: MIT
-repository: https://github.com/unsuitable001/openetl-connectors
-docs: https://github.com/unsuitable001/openetl-connectors#readme
+license: Apache-2.0
+repository: https://github.com/openetl-io/openetl-connectors
+docs: https://github.com/openetl-io/openetl-connectors#readme
 logo: https://a0.awsstatic.com/libra-css/images/site/touch-icon-ipad-144-smile.png
 tags: [files, aws]
 author: OpenETL

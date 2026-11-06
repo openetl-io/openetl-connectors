@@ -19,7 +19,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/jackc/pgx/v5"
 
-	"github.com/unsuitable001/openetl/sdk/go/destination"
+	"github.com/openetl-io/openetl/sdk/go/destination"
 )
 
 // Runs against the compose Postgres (make deps-up) or

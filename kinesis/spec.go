@@ -4,7 +4,7 @@ import (
 	_ "embed"
 	"time"
 
-	"github.com/unsuitable001/openetl/sdk/go/destination"
+	"github.com/openetl-io/openetl/sdk/go/destination"
 )
 
 var (

@@ -13,8 +13,8 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/unsuitable001/openetl/sdk/go/conformance"
-	"github.com/unsuitable001/openetl/sdk/go/source"
+	"github.com/openetl-io/openetl/sdk/go/conformance"
+	"github.com/openetl-io/openetl/sdk/go/source"
 )
 
 // badPassword is dsn() with a password the server rejects.

@@ -19,8 +19,8 @@ import (
 	"google.golang.org/protobuf/types/dynamicpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
-	sdk "github.com/unsuitable001/openetl/sdk/go"
-	protocolv1 "github.com/unsuitable001/openetl/sdk/go/protocol/v1"
+	sdk "github.com/openetl-io/openetl/sdk/go"
+	protocolv1 "github.com/openetl-io/openetl/sdk/go/protocol/v1"
 )
 
 // Encoder encodes one part of a row, its key or its value, as an object

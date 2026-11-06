@@ -9,7 +9,7 @@ import (
 
 	"github.com/apache/arrow-go/v18/arrow"
 
-	"github.com/unsuitable001/openetl-connectors/records"
+	"github.com/openetl-io/openetl-connectors/records"
 )
 
 func TestCmpSeq(t *testing.T) {

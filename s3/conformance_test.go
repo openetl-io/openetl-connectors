@@ -22,7 +22,7 @@ import (
 	"github.com/apache/arrow-go/v18/parquet/pqarrow"
 	"gocloud.dev/blob"
 
-	"github.com/unsuitable001/openetl/sdk/go/conformance"
+	"github.com/openetl-io/openetl/sdk/go/conformance"
 )
 
 func TestDestinationConformance(t *testing.T) {

@@ -15,7 +15,7 @@ import (
 	awskinesis "github.com/aws/aws-sdk-go-v2/service/kinesis"
 	"github.com/aws/aws-sdk-go-v2/service/kinesis/types"
 
-	"github.com/unsuitable001/openetl/sdk/go/conformance"
+	"github.com/openetl-io/openetl/sdk/go/conformance"
 )
 
 const closedPort = "http://127.0.0.1:1"

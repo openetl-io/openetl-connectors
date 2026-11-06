@@ -3,10 +3,10 @@
 package main
 
 import (
-	"github.com/unsuitable001/openetl-connectors/kafka"
-	sdk "github.com/unsuitable001/openetl/sdk/go"
-	"github.com/unsuitable001/openetl/sdk/go/destination"
-	"github.com/unsuitable001/openetl/sdk/go/host"
+	"github.com/openetl-io/openetl-connectors/kafka"
+	sdk "github.com/openetl-io/openetl/sdk/go"
+	"github.com/openetl-io/openetl/sdk/go/destination"
+	"github.com/openetl-io/openetl/sdk/go/host"
 )
 
 func main() {

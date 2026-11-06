@@ -18,8 +18,8 @@ import (
 	"github.com/twmb/franz-go/pkg/sasl/plain"
 	"github.com/twmb/franz-go/pkg/sasl/scram"
 
-	"github.com/unsuitable001/openetl-connectors/records"
-	sdk "github.com/unsuitable001/openetl/sdk/go"
+	"github.com/openetl-io/openetl-connectors/records"
+	sdk "github.com/openetl-io/openetl/sdk/go"
 )
 
 // Connection is the config both connectors share: brokers, TLS, SASL, the

@@ -1,4 +1,4 @@
-module github.com/unsuitable001/openetl-connectors
+module github.com/openetl-io/openetl-connectors
 
 go 1.26.0
 
@@ -17,11 +17,11 @@ require (
 	github.com/google/uuid v1.6.0
 	github.com/jackc/pglogrepl v0.0.0-20261003132456-662581bb6bb6
 	github.com/jackc/pgx/v5 v5.12.0
+	github.com/openetl-io/openetl/sdk/go v0.0.0
 	github.com/twmb/avro v1.9.0
 	github.com/twmb/franz-go v1.22.2
 	github.com/twmb/franz-go/pkg/kadm v1.19.0
 	github.com/twmb/franz-go/pkg/sr v1.8.0
-	github.com/unsuitable001/openetl/sdk/go v0.0.0
 	gocloud.dev v0.46.0
 	google.golang.org/protobuf v1.36.12
 )
@@ -134,4 +134,4 @@ require (
 
 // Until the SDK is published, the connectors build against a checkout of
 // openetl next to this one.
-replace github.com/unsuitable001/openetl/sdk/go => ../openetl/sdk/go
+replace github.com/openetl-io/openetl/sdk/go => ../openetl/sdk/go

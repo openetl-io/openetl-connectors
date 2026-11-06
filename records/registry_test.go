@@ -14,7 +14,7 @@ import (
 
 	"google.golang.org/protobuf/reflect/protoreflect"
 
-	protocolv1 "github.com/unsuitable001/openetl/sdk/go/protocol/v1"
+	protocolv1 "github.com/openetl-io/openetl/sdk/go/protocol/v1"
 )
 
 // Runs against the compose schema registry (make deps-up), or

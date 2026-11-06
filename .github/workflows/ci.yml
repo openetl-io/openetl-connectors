@@ -3,7 +3,7 @@ name: ci
 on:
   pull_request:
   push:
-    branches: [master]
+    branches: [main]
 
 permissions:
   contents: read
@@ -28,8 +28,8 @@ jobs:
       # go.mod replaces the SDK with ../openetl/sdk/go.
       - uses: actions/checkout@v5
         with:
-          repository: unsuitable001/openetl
-          ref: initial-implementation
+          repository: openetl-io/openetl
+          ref: main
           path: openetl
           ssh-key: ${{ secrets.OPENETL_DEPLOY_KEY }}
       - uses: actions/setup-go@v6

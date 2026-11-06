@@ -1,6 +1,6 @@
 # openetl-connectors
 
-The official connectors for [openetl](https://github.com/unsuitable001/openetl). Each package, such as `postgres`, has a source role, a destination role or both, and each role is an external connector: an executable that serves the connector protocol on a Unix socket, which the openetl runner starts as a subprocess.
+The official connectors for [openetl](https://github.com/openetl-io/openetl). Each package, such as `postgres`, has a source role, a destination role or both, and each role is an external connector: an executable that serves the connector protocol on a Unix socket, which the openetl runner starts as a subprocess.
 
 | Connector | Executable | Notes |
 |---|---|---|
@@ -66,4 +66,4 @@ Each package directory holds its `openetl-connector.yaml`.
 
 ## License
 
-MIT
+Apache 2.0
