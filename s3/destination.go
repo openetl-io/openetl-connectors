@@ -374,7 +374,11 @@ func (w *writer) descriptor(e destination.Epoch, s destination.Staged) (staged, 
 	return d, nil
 }
 
-func (w *writer) Commit(ctx context.Context, e destination.Epoch, s destination.Staged) (_ destination.Committed, err error) {
+func (w *writer) Commit(ctx context.Context, e destination.Epoch, committables []destination.Staged) (_ destination.Committed, err error) {
+	s, err := destination.One(committables)
+	if err != nil {
+		return destination.Committed{}, err
+	}
 	defer func() { err = classify(err) }()
 	d, err := w.descriptor(e, s)
 	if err != nil {
@@ -426,7 +430,11 @@ func (w *writer) dropStaged(d staged) {
 	}
 }
 
-func (w *writer) Recover(ctx context.Context, gen uint64, e destination.Epoch, s destination.Staged) (_ destination.Recovery, err error) {
+func (w *writer) Recover(ctx context.Context, gen uint64, e destination.Epoch, committables []destination.Staged) (_ destination.Recovery, err error) {
+	s, err := destination.One(committables)
+	if err != nil {
+		return 0, err
+	}
 	defer func() { err = classify(err) }()
 	r, err := w.recover(ctx, e, s)
 	if err != nil {

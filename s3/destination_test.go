@@ -140,14 +140,14 @@ func (e *env) precommit(w destination.Writer, ep destination.Epoch) destination.
 
 func (e *env) commit(w destination.Writer, ep destination.Epoch, st destination.Staged) {
 	e.t.Helper()
-	if _, err := w.Commit(e.t.Context(), ep, st); err != nil {
+	if _, err := w.Commit(e.t.Context(), ep, []destination.Staged{st}); err != nil {
 		e.t.Fatal(err)
 	}
 }
 
 func (e *env) recover(w destination.Writer, gen uint64, ep destination.Epoch, st destination.Staged) destination.Recovery {
 	e.t.Helper()
-	r, err := w.Recover(e.t.Context(), gen, ep, st)
+	r, err := w.Recover(e.t.Context(), gen, ep, []destination.Staged{st})
 	if err != nil {
 		e.t.Fatal(err)
 	}
@@ -296,7 +296,7 @@ func testStaleCommitAfterRecovery(e *env) {
 	if r := e.recover(e.open(2, "users"), 2, ep, st); r != destination.Redone {
 		e.t.Fatalf("recover: %v, want redone", r)
 	}
-	if _, err := w.Commit(e.t.Context(), ep, st); err != nil {
+	if _, err := w.Commit(e.t.Context(), ep, []destination.Staged{st}); err != nil {
 		e.t.Errorf("stale commit: %v", err)
 	}
 	e.wantIDs("users", 1, 2)

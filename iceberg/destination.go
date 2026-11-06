@@ -811,7 +811,11 @@ func (w *writer) PreCommit(_ context.Context, e destination.Epoch) (destination.
 	return json.Marshal(desc)
 }
 
-func (w *writer) Commit(ctx context.Context, _ destination.Epoch, s destination.Staged) (destination.Committed, error) {
+func (w *writer) Commit(ctx context.Context, _ destination.Epoch, committables []destination.Staged) (destination.Committed, error) {
+	s, err := destination.One(committables)
+	if err != nil {
+		return destination.Committed{}, err
+	}
 	var desc staged
 	if err := json.Unmarshal(s, &desc); err != nil {
 		return destination.Committed{}, fmt.Errorf("iceberg: staged descriptor: %w", err)
@@ -1091,7 +1095,11 @@ func (w *writer) raiseFence(ctx context.Context, ns []string, names []string, ge
 	return nil
 }
 
-func (w *writer) Recover(ctx context.Context, gen uint64, e destination.Epoch, s destination.Staged) (destination.Recovery, error) {
+func (w *writer) Recover(ctx context.Context, gen uint64, e destination.Epoch, committables []destination.Staged) (destination.Recovery, error) {
+	s, err := destination.One(committables)
+	if err != nil {
+		return 0, err
+	}
 	var desc staged
 	if !e.IsZero() {
 		if err := json.Unmarshal(s, &desc); err != nil {

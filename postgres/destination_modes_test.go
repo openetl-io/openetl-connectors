@@ -60,7 +60,7 @@ func write(t *testing.T, w destination.Writer, e destination.Epoch, stream strin
 func commit(t *testing.T, w destination.Writer, e destination.Epoch) (destination.Staged, destination.Committed) {
 	t.Helper()
 	st := precommit(t, w, e)
-	c, err := w.Commit(t.Context(), e, st)
+	c, err := w.Commit(t.Context(), e, []destination.Staged{st})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -288,7 +288,7 @@ func TestOverwrite(t *testing.T) {
 	write(t, w, e2, "users", batch(t, fields, `[{"id": 3, "name": "c"}]`))
 	endRead(t, rt, e2, "users")
 	st2, _ := commit(t, w, e2)
-	if _, err := w.Commit(t.Context(), e2, st2); err != nil {
+	if _, err := w.Commit(t.Context(), e2, []destination.Staged{st2}); err != nil {
 		t.Fatal(err)
 	}
 	if got := env.text(users); got != "1:a,2:b,3:c" {

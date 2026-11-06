@@ -204,7 +204,7 @@ func TestDestinationCommitsEpochs(t *testing.T) {
 		t.Fatalf("%d records visible before the commit", n)
 	}
 	for range 2 {
-		if _, err := w.Commit(t.Context(), e1, st); err != nil {
+		if _, err := w.Commit(t.Context(), e1, []destination.Staged{st}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -221,7 +221,7 @@ func TestDestinationCommitsEpochs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := w.Commit(t.Context(), e2, st2); err != nil {
+	if _, err := w.Commit(t.Context(), e2, []destination.Staged{st2}); err != nil {
 		t.Fatal(err)
 	}
 	wantIDs(t, ids(t, committed(t, table)), 0, 80)
@@ -560,7 +560,7 @@ func TestRegistryFormats(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if _, err := w.Commit(t.Context(), e, st); err != nil {
+			if _, err := w.Commit(t.Context(), e, []destination.Staged{st}); err != nil {
 				t.Fatal(err)
 			}
 			s := newSource(t, map[string]any{"format": format, "schemaRegistryUrl": registryURL(), "topics": []string{table}})

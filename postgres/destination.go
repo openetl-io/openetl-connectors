@@ -540,7 +540,11 @@ func (w *writer) PreCommit(_ context.Context, e destination.Epoch) (destination.
 	return json.Marshal(desc)
 }
 
-func (w *writer) Commit(ctx context.Context, _ destination.Epoch, s destination.Staged) (destination.Committed, error) {
+func (w *writer) Commit(ctx context.Context, _ destination.Epoch, committables []destination.Staged) (destination.Committed, error) {
+	s, err := destination.One(committables)
+	if err != nil {
+		return destination.Committed{}, err
+	}
 	var desc staged
 	if err := json.Unmarshal(s, &desc); err != nil {
 		return destination.Committed{}, fmt.Errorf("postgres: staged descriptor: %w", err)
@@ -1396,7 +1400,11 @@ func (w *writer) dropStaging(ctx context.Context, streams []stagedStream) {
 	}
 }
 
-func (w *writer) Recover(ctx context.Context, gen uint64, e destination.Epoch, s destination.Staged) (destination.Recovery, error) {
+func (w *writer) Recover(ctx context.Context, gen uint64, e destination.Epoch, committables []destination.Staged) (destination.Recovery, error) {
+	s, err := destination.One(committables)
+	if err != nil {
+		return 0, err
+	}
 	for _, q := range []string{
 		"CREATE SCHEMA IF NOT EXISTS " + pgx.Identifier{w.schema}.Sanitize(),
 		"CREATE TABLE IF NOT EXISTS " + w.ident("_openetl_fence") + " (pipeline text PRIMARY KEY, generation bigint NOT NULL)",
@@ -1410,7 +1418,7 @@ func (w *writer) Recover(ctx context.Context, gen uint64, e destination.Epoch, s
 	}
 	// Waits for applies that hold the fence row.
 	var raised uint64
-	err := w.pool.QueryRow(ctx, "INSERT INTO "+w.ident("_openetl_fence")+` AS f (pipeline, generation) VALUES ($1, $2)
+	err = w.pool.QueryRow(ctx, "INSERT INTO "+w.ident("_openetl_fence")+` AS f (pipeline, generation) VALUES ($1, $2)
 		ON CONFLICT (pipeline) DO UPDATE SET generation = EXCLUDED.generation WHERE f.generation <= EXCLUDED.generation
 		RETURNING generation`, w.cfg.Pipeline, gen).Scan(&raised)
 	if errors.Is(err, pgx.ErrNoRows) {

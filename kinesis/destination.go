@@ -317,12 +317,12 @@ func (w *writer) PreCommit(ctx context.Context, _ destination.Epoch) (destinatio
 	return nil, nil
 }
 
-func (w *writer) Commit(context.Context, destination.Epoch, destination.Staged) (destination.Committed, error) {
+func (w *writer) Commit(context.Context, destination.Epoch, []destination.Staged) (destination.Committed, error) {
 	return destination.Committed{}, nil
 }
 
 // Recover: an epoch in the checkpoint log was accepted in full.
-func (w *writer) Recover(context.Context, uint64, destination.Epoch, destination.Staged) (destination.Recovery, error) {
+func (w *writer) Recover(context.Context, uint64, destination.Epoch, []destination.Staged) (destination.Recovery, error) {
 	return destination.Applied, nil
 }
 

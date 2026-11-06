@@ -184,7 +184,7 @@ func write(t *testing.T, w destination.Writer, e destination.Epoch, stream strin
 
 func recov(t *testing.T, w destination.Writer, gen uint64, e destination.Epoch, st destination.Staged) destination.Recovery {
 	t.Helper()
-	r, err := w.Recover(t.Context(), gen, e, st)
+	r, err := w.Recover(t.Context(), gen, e, []destination.Staged{st})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -202,7 +202,7 @@ func precommit(t *testing.T, w destination.Writer, e destination.Epoch) destinat
 
 func commit(t *testing.T, w destination.Writer, e destination.Epoch, st destination.Staged) {
 	t.Helper()
-	if _, err := w.Commit(t.Context(), e, st); err != nil {
+	if _, err := w.Commit(t.Context(), e, []destination.Staged{st}); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -256,11 +256,11 @@ func TestRecoverRedoesAStagedEpoch(t *testing.T) {
 	if r := recov(t, w2, 2, e, st); r != destination.Applied {
 		t.Fatalf("recover again: %v, want applied", r)
 	}
-	if _, err := w.Commit(t.Context(), e, st); !errors.Is(err, destination.ErrFenced) {
+	if _, err := w.Commit(t.Context(), e, []destination.Staged{st}); !errors.Is(err, destination.ErrFenced) {
 		t.Fatalf("stale commit: %v, want fenced", err)
 	}
 	env.wantIDs("users", 1, 2)
-	if _, err := w.Recover(t.Context(), 1, e, st); !errors.Is(err, destination.ErrFenced) {
+	if _, err := w.Recover(t.Context(), 1, e, []destination.Staged{st}); !errors.Is(err, destination.ErrFenced) {
 		t.Fatalf("stale recover: %v, want fenced", err)
 	}
 }
@@ -321,7 +321,7 @@ func TestStaleCommitAfterRecovery(t *testing.T) {
 		}
 	}
 	t.Cleanup(func() { testHookBeforeCommit = nil })
-	if _, err := w.Commit(t.Context(), e, st); !errors.Is(err, destination.ErrFenced) {
+	if _, err := w.Commit(t.Context(), e, []destination.Staged{st}); !errors.Is(err, destination.ErrFenced) {
 		t.Errorf("stale commit: %v, want fenced", err)
 	}
 	env.wantIDs("users", 1, 2)
@@ -505,7 +505,7 @@ func TestGlue(t *testing.T) {
 	if r := recov(t, w2, 2, e2, st); r != destination.Redone {
 		t.Fatalf("recover: %v, want redone", r)
 	}
-	if _, err := w.Commit(t.Context(), e2, st); !errors.Is(err, destination.ErrFenced) {
+	if _, err := w.Commit(t.Context(), e2, []destination.Staged{st}); !errors.Is(err, destination.ErrFenced) {
 		t.Fatalf("stale commit: %v, want fenced", err)
 	}
 	env.wantIDs("users", 1, 2, 3)

@@ -503,7 +503,11 @@ func (w *writer) PreCommit(ctx context.Context, e destination.Epoch) (destinatio
 // aborting it on the same producer, which leaves a commit that reached the
 // broker in place; Commit then looks for the epoch's marker, as it does
 // without a transaction open for the epoch, after an earlier Commit.
-func (w *writer) Commit(ctx context.Context, e destination.Epoch, st destination.Staged) (destination.Committed, error) {
+func (w *writer) Commit(ctx context.Context, e destination.Epoch, committables []destination.Staged) (destination.Committed, error) {
+	st, err := destination.One(committables)
+	if err != nil {
+		return destination.Committed{}, err
+	}
 	var desc staged
 	if err := json.Unmarshal(st, &desc); err != nil {
 		return destination.Committed{}, fmt.Errorf("kafka: staged descriptor: %w", err)
@@ -543,7 +547,11 @@ func fenced(err error) bool {
 
 // Recover reports whether the epoch's marker is visible. Open has settled
 // every transaction an earlier attempt left, so the answer is final.
-func (w *writer) Recover(ctx context.Context, _ uint64, e destination.Epoch, st destination.Staged) (destination.Recovery, error) {
+func (w *writer) Recover(ctx context.Context, _ uint64, e destination.Epoch, committables []destination.Staged) (destination.Recovery, error) {
+	st, err := destination.One(committables)
+	if err != nil {
+		return 0, err
+	}
 	if e.IsZero() {
 		return destination.Applied, nil
 	}

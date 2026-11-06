@@ -103,7 +103,7 @@ var (
 
 func recov(t *testing.T, w destination.Writer, gen uint64, e destination.Epoch, st destination.Staged) destination.Recovery {
 	t.Helper()
-	r, err := w.Recover(t.Context(), gen, e, st)
+	r, err := w.Recover(t.Context(), gen, e, []destination.Staged{st})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -139,7 +139,7 @@ func TestCommitAppliesOnce(t *testing.T) {
 		t.Fatal("PreCommit made the target visible")
 	}
 	for range 2 {
-		if _, err := w.Commit(ctx, e, st); err != nil {
+		if _, err := w.Commit(ctx, e, []destination.Staged{st}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -214,7 +214,7 @@ func TestRecoverTrimsMarkers(t *testing.T) {
 			t.Fatal(err)
 		}
 		st := precommit(t, w, e)
-		if _, err := w.Commit(ctx, e, st); err != nil {
+		if _, err := w.Commit(ctx, e, []destination.Staged{st}); err != nil {
 			t.Fatal(err)
 		}
 		return st
@@ -466,7 +466,7 @@ func TestColumnsNeverChangeType(t *testing.T) {
 	}
 	staged, err := w.PreCommit(ctx, e3)
 	if err == nil {
-		_, err = w.Commit(ctx, e3, staged)
+		_, err = w.Commit(ctx, e3, []destination.Staged{staged})
 	}
 	if err == nil {
 		t.Error("a wider staged column committed")
@@ -521,14 +521,14 @@ func TestDedupeAtApply(t *testing.T) {
 			}
 		}
 		st1 := precommit(t, w, e1)
-		c, err := w.Commit(ctx, e1, st1)
+		c, err := w.Commit(ctx, e1, []destination.Staged{st1})
 		if err != nil {
 			t.Fatal(err)
 		}
 		if want := map[string]uint64{"events": 1, "pages": 1}; !maps.Equal(c.Collapsed, want) {
 			t.Errorf("scope %d, epoch 1 collapsed %v, want %v", scope, c.Collapsed, want)
 		}
-		if c, err := w.Commit(ctx, e1, st1); err != nil || len(c.Collapsed) != 0 {
+		if c, err := w.Commit(ctx, e1, []destination.Staged{st1}); err != nil || len(c.Collapsed) != 0 {
 			t.Errorf("scope %d: committing epoch 1 again collapsed %v (%v), want nothing", scope, c.Collapsed, err)
 		}
 		for _, stream := range streams {

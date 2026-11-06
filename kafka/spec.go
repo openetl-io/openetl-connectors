@@ -24,4 +24,7 @@ var DestinationCapabilities = destination.Capabilities{
 	MinCommitInterval:     time.Second,
 	MaxCommitInterval:     7 * time.Minute,
 	NanosecondTimestamps:  true,
+	// An epoch is one transaction, until Kafka's two-phase commit (KIP-939)
+	// lets lanes' transactions commit together.
+	WriterLanes: 1,
 }
