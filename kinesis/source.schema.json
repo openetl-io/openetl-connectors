@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Kinesis source",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "region": {"type": "string", "description": "The streams' AWS region. Default: the AWS default config's."},
+    "endpoint": {"type": "string", "description": "A Kinesis-compatible endpoint: an emulator's, or a VPC endpoint."},
+    "accessKeyId": {"type": "string", "x-secret": true, "description": "An AWS access key. Without one, the AWS default credentials."},
+    "secretAccessKey": {"type": "string", "x-secret": true, "description": "The access key's secret."},
+    "schemaRegistryUrl": {"type": "string", "description": "A Confluent-compatible schema registry. Avro and Protobuf need one."},
+    "schemaRegistryUsername": {"type": "string"},
+    "schemaRegistryPassword": {"type": "string", "x-secret": true},
+    "format": {"type": "string", "enum": ["json", "avro", "protobuf", "string"], "default": "json", "description": "How records' data is encoded. Avro and Protobuf use the schema registry's wire format; string reads each record as text."},
+    "streams": {"type": "array", "items": {"type": "string"}, "description": "The Kinesis streams to offer as streams. Empty: every stream the credentials can list."},
+    "streamPattern": {"type": "string", "description": "A regular expression streams must match to be offered."},
+    "startPosition": {"type": "string", "enum": ["earliest", "latest"], "default": "earliest", "description": "Where a shard's first read starts: its oldest record, or records that arrive after the read starts."}
+  }
+}

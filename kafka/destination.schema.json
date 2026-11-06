@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Kafka destination",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["brokers"],
+  "properties": {
+    "brokers": {"type": "array", "items": {"type": "string"}, "minItems": 1, "description": "Bootstrap brokers, as host:port."},
+    "tls": {"type": "boolean", "default": false, "description": "Connect over TLS. Implied by tlsCa and tlsCert."},
+    "tlsCa": {"type": "string", "description": "PEM certificates to trust, instead of the system's."},
+    "tlsCert": {"type": "string", "description": "A PEM client certificate, for mutual TLS."},
+    "tlsKey": {"type": "string", "x-secret": true, "description": "The client certificate's PEM key."},
+    "tlsServerName": {"type": "string", "description": "The name to verify the brokers' certificates against, if not their host."},
+    "tlsInsecureSkipVerify": {"type": "boolean", "default": false, "description": "Don't verify the brokers' certificates."},
+    "saslMechanism": {"type": "string", "enum": ["plain", "scram-sha-256", "scram-sha-512"], "description": "SASL authentication. Unset: none."},
+    "saslUsername": {"type": "string"},
+    "saslPassword": {"type": "string", "x-secret": true},
+    "schemaRegistryUrl": {"type": "string", "description": "A Confluent-compatible schema registry. Avro and Protobuf need one."},
+    "schemaRegistryUsername": {"type": "string"},
+    "schemaRegistryPassword": {"type": "string", "x-secret": true},
+    "format": {"type": "string", "enum": ["json", "avro", "protobuf"], "default": "json", "description": "How values and keys are encoded. Avro and Protobuf register each stream's schemas under <topic>-value and <topic>-key."},
+    "namespace": {"type": "string", "description": "Used when the pipeline names no namespace: topics are named namespace.table."},
+    "createTopics": {"type": "boolean", "default": true, "description": "Create missing topics."},
+    "partitions": {"type": "integer", "minimum": 1, "description": "Created topics' partitions. Default: the brokers'."},
+    "replicationFactor": {"type": "integer", "minimum": 1, "description": "Created topics' replication factor. Default: the brokers'."},
+    "markerTopic": {"type": "string", "minLength": 1, "default": "_openetl_markers", "description": "The compacted topic each epoch's transaction writes its marker to. Created if missing."},
+    "transactionalIdPrefix": {"type": "string", "default": "openetl-", "description": "Transactional IDs are this, the pipeline and the producer's slot."},
+    "tombstones": {"type": "boolean", "default": false, "description": "Follow each delete with a tombstone for its key, for compacted topics."}
+  }
+}

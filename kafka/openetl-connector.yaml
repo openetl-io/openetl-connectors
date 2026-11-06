@@ -1,0 +1,13 @@
+name: kafka
+description: Kafka topics, read exactly from offsets, and written in a transaction per epoch
+license: Apache-2.0
+repository: https://github.com/openetl-io/openetl-connectors
+docs: https://github.com/openetl-io/openetl-connectors#readme
+logo: https://kafka.apache.org/logos/kafka-logo-no-text.png
+tags: [streaming]
+author: OpenETL
+roles:
+  source:
+    build: { go: ../cmd/source-kafka }
+  destination:
+    build: { go: ../cmd/destination-kafka }

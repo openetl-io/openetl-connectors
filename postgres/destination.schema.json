@@ -1,0 +1,11 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Postgres destination",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["dsn"],
+  "properties": {
+    "dsn": {"type": "string", "x-secret": true, "description": "A connection URL or a keyword/value connection string."},
+    "schema": {"type": "string", "default": "public", "description": "Used when the pipeline names no namespace."}
+  }
+}

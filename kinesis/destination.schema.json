@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Kinesis destination",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "region": {"type": "string", "description": "The streams' AWS region. Default: the AWS default config's."},
+    "endpoint": {"type": "string", "description": "A Kinesis-compatible endpoint: an emulator's, or a VPC endpoint."},
+    "accessKeyId": {"type": "string", "x-secret": true, "description": "An AWS access key. Without one, the AWS default credentials."},
+    "secretAccessKey": {"type": "string", "x-secret": true, "description": "The access key's secret."},
+    "schemaRegistryUrl": {"type": "string", "description": "A Confluent-compatible schema registry. Avro and Protobuf need one."},
+    "schemaRegistryUsername": {"type": "string"},
+    "schemaRegistryPassword": {"type": "string", "x-secret": true},
+    "format": {"type": "string", "enum": ["json", "avro", "protobuf"], "default": "json", "description": "How records' data is encoded. Avro and Protobuf register each stream's schema under <stream>-value."},
+    "namespace": {"type": "string", "description": "Used when the pipeline names no namespace: streams are named namespace.table."},
+    "createStreams": {"type": "boolean", "default": true, "description": "Create missing streams."},
+    "shards": {"type": "integer", "minimum": 1, "description": "Created streams are provisioned with this many shards. Unset: on-demand."}
+  }
+}

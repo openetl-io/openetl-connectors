@@ -1,0 +1,13 @@
+name: kinesis
+description: Amazon Kinesis streams, read exactly from sequence numbers, and written with PutRecords
+license: Apache-2.0
+repository: https://github.com/openetl-io/openetl-connectors
+docs: https://github.com/openetl-io/openetl-connectors#readme
+logo: https://a0.awsstatic.com/libra-css/images/site/touch-icon-ipad-144-smile.png
+tags: [streaming, aws]
+author: OpenETL
+roles:
+  source:
+    build: { go: ../cmd/source-kinesis }
+  destination:
+    build: { go: ../cmd/destination-kinesis }
