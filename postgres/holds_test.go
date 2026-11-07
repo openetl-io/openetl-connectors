@@ -271,7 +271,9 @@ func TestSchemaChangesWaitForLocksBriefly(t *testing.T) {
 	if _, err := tx.Exec(ctx, "LOCK TABLE "+w.(*writer).ident("users")+" IN ACCESS SHARE MODE"); err != nil {
 		t.Fatal(err)
 	}
+	rolledBack := make(chan struct{})
 	go func() {
+		defer close(rolledBack)
 		time.Sleep(700 * time.Millisecond)
 		_ = tx.Rollback(context.Background())
 	}()
@@ -280,6 +282,8 @@ func TestSchemaChangesWaitForLocksBriefly(t *testing.T) {
 	if d := time.Since(start); d < 600*time.Millisecond {
 		t.Errorf("the change didn't wait for the lock: %v", d)
 	}
+	// The count shares the connection the rollback is on.
+	<-rolledBack
 	if n := env.count("SELECT count(*) FROM pg_attribute WHERE attrelid = '" + env.schema + ".users'::regclass AND attname = 'name'"); n != 1 {
 		t.Error("name wasn't added")
 	}
