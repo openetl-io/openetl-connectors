@@ -59,6 +59,7 @@ func suite(t *testing.T, newDest func(*testing.T, map[string]any) *Destination) 
 		"RecoverDropsOldGenerations": testRecoverDropsOldGenerations,
 		"CloseDropsUncommitted":      testCloseDropsUncommitted,
 		"LanesNameTheirFiles":        testLanesNameTheirFiles,
+		"TypesDontChange":            testTypesDontChange,
 	} {
 		t.Run(name, func(t *testing.T) {
 			d := newDest(t, nil)
@@ -442,5 +443,42 @@ func testLanesNameTheirFiles(e *env) {
 	}
 	if _, err := w2.Commit(e.t.Context(), destination.Epoch{Generation: 1, N: 2}, st); err == nil {
 		e.t.Error("committed another epoch's descriptors")
+	}
+}
+
+// A table takes new columns, and refuses to change a column's type until a
+// person removes its schema record, as the refusal says.
+func testTypesDontChange(e *env) {
+	ctx := e.t.Context()
+	w := e.open(1, "items")
+	sa, ok := w.(destination.SchemaApplier)
+	if !ok {
+		e.t.Fatal("not a SchemaApplier")
+	}
+	apply := func(fields ...arrow.Field) destination.SchemaApplied {
+		e.t.Helper()
+		a, err := sa.ApplySchema(ctx, []destination.StreamSchema{{Name: "items", Schema: arrow.NewSchema(fields, nil)}})
+		if err != nil {
+			e.t.Fatal(err)
+		}
+		return a
+	}
+	n32 := arrow.Field{Name: "n", Type: arrow.PrimitiveTypes.Int32, Nullable: true}
+	n64 := arrow.Field{Name: "n", Type: arrow.PrimitiveTypes.Int64, Nullable: true}
+	if a := apply(idField, n32); len(a.Refused) != 0 {
+		e.t.Fatalf("the first schema: %+v", a.Refused)
+	}
+	if a := apply(idField, n32, nameField); len(a.Refused) != 0 {
+		e.t.Fatalf("an added column: %+v", a.Refused)
+	}
+	a := apply(idField, n64, nameField)
+	if len(a.Refused) != 1 || a.Refused[0].Column != "n" || a.Refused[0].FromType != "int32" || a.Refused[0].ToType != "int64" || !strings.Contains(a.Refused[0].Fix, schemaKey("items")) {
+		e.t.Fatalf("a changed type: %+v", a.Refused)
+	}
+	if err := e.b.Delete(ctx, schemaKey("items")); err != nil {
+		e.t.Fatal(err)
+	}
+	if a := apply(idField, n64, nameField); len(a.Refused) != 0 {
+		e.t.Errorf("once a person removed the record: %+v", a.Refused)
 	}
 }

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math"
 	"net/http"
 	"slices"
@@ -53,10 +54,37 @@ type jsonEncoder []Col
 
 func (e jsonEncoder) Encode(vals []any) ([]byte, error) { return appendJSONObject(nil, e, vals) }
 
-// register registers s under subject and returns its ID. A schema the
-// registry's compatibility setting refuses is SCHEMA_DRIFT.
+// register registers s under subject and returns its ID. A schema already
+// registered there keeps its ID, as one a person registers to take a change
+// does. Otherwise a schema that changes a field's type from the subject's
+// latest is refused, since no connector changes a type by itself, and so is
+// one the registry's compatibility setting refuses: both SCHEMA_DRIFT.
 func register(ctx context.Context, reg *sr.Client, subject string, s sr.Schema) (int, error) {
-	ss, err := reg.CreateSchema(ctx, subject, s)
+	ss, err := reg.LookupSchema(ctx, subject, s)
+	if err == nil {
+		return ss.ID, nil
+	}
+	if !notFound(err) {
+		return 0, fmt.Errorf("look up %s: %w", subject, err)
+	}
+	latest, err := reg.SchemaByVersion(ctx, subject, -1)
+	switch {
+	case notFound(err):
+	case err != nil:
+		return 0, fmt.Errorf("the latest schema of %s: %w", subject, err)
+	case latest.Type == s.Type:
+		changed, err := typeChanges(ctx, s.Type, latest.Schema.Schema, s.Schema)
+		if err != nil {
+			return 0, fmt.Errorf("the latest schema of %s: %w", subject, err)
+		}
+		if len(changed) > 0 {
+			slog.Warn("a schema with a changed type, which the destination doesn't register itself", "subject", subject, "schema", s.Schema)
+			return 0, sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_SCHEMA_DRIFT, fmt.Errorf(
+				"the schema of %s would change %s, and the destination doesn't change a field's type: to take the change, register the schema this attempt's log shows under %s yourself",
+				subject, strings.Join(changed, ", "), subject))
+		}
+	}
+	ss, err = reg.CreateSchema(ctx, subject, s)
 	if err != nil {
 		var re *sr.ResponseError
 		if errors.As(err, &re) && (re.StatusCode == http.StatusConflict || re.ErrorCode == 409) {
@@ -65,6 +93,119 @@ func register(ctx context.Context, reg *sr.Client, subject string, s sr.Schema) 
 		return 0, fmt.Errorf("register %s: %w", subject, err)
 	}
 	return ss.ID, nil
+}
+
+// notFound: the registry has no such subject, version or schema.
+func notFound(err error) bool {
+	var re *sr.ResponseError
+	return errors.As(err, &re) && re.StatusCode == http.StatusNotFound
+}
+
+// typeChanges are the fields, in both schemas, whose type next changes from
+// prev's, as "name from type to type".
+func typeChanges(ctx context.Context, t sr.SchemaType, prev, next string) ([]string, error) {
+	if t == sr.TypeProtobuf {
+		a, err := compileProto(ctx, map[string]string{"schema.proto": prev}, "schema.proto")
+		if err != nil {
+			return nil, err
+		}
+		b, err := compileProto(ctx, map[string]string{"schema.proto": next}, "schema.proto")
+		if err != nil {
+			return nil, err
+		}
+		if a.Messages().Len() == 0 || b.Messages().Len() == 0 {
+			return nil, nil
+		}
+		return messageChanges("", a.Messages().Get(0), b.Messages().Get(0)), nil
+	}
+	var a, b any
+	if err := json.Unmarshal([]byte(prev), &a); err != nil {
+		return nil, err
+	}
+	if err := json.Unmarshal([]byte(next), &b); err != nil {
+		return nil, err
+	}
+	return recordChanges("", a, b), nil
+}
+
+// recordChanges compares two Avro records' fields by name, and the fields of
+// the records among them.
+func recordChanges(path string, a, b any) []string {
+	fields := func(r any) map[string]any {
+		out := map[string]any{}
+		m, _ := r.(map[string]any)
+		fs, _ := m["fields"].([]any)
+		for _, f := range fs {
+			if fm, ok := f.(map[string]any); ok {
+				if name, ok := fm["name"].(string); ok {
+					out[name] = fm["type"]
+				}
+			}
+		}
+		return out
+	}
+	// The record a type is, if it's one, nullable or not.
+	record := func(t any) any {
+		if u, ok := t.([]any); ok && len(u) == 2 && u[0] == "null" {
+			t = u[1]
+		}
+		if m, ok := t.(map[string]any); ok && m["type"] == "record" {
+			return m
+		}
+		return nil
+	}
+	var out []string
+	before := fields(a)
+	for name, t := range fields(b) {
+		was, ok := before[name]
+		if !ok {
+			continue
+		}
+		if ra, rb := record(was), record(t); ra != nil && rb != nil {
+			out = append(out, recordChanges(path+name+".", ra, rb)...)
+			continue
+		}
+		ja, _ := json.Marshal(was)
+		jb, _ := json.Marshal(t)
+		if string(ja) != string(jb) {
+			out = append(out, fmt.Sprintf("%q from %s to %s", path+name, ja, jb))
+		}
+	}
+	slices.Sort(out)
+	return out
+}
+
+// messageChanges compares two Protobuf messages' fields by name, and the
+// fields of the messages they define for them.
+func messageChanges(path string, a, b protoreflect.MessageDescriptor) []string {
+	describe := func(f protoreflect.FieldDescriptor) string {
+		t := f.Kind().String()
+		if m := f.Message(); m != nil {
+			t = string(m.FullName())
+		}
+		if f.Cardinality() == protoreflect.Repeated {
+			t = "repeated " + t
+		}
+		return t
+	}
+	var out []string
+	for i := range b.Fields().Len() {
+		fb := b.Fields().Get(i)
+		fa := a.Fields().ByName(fb.Name())
+		if fa == nil {
+			continue
+		}
+		name := path + string(fb.Name())
+		ma, mb := fa.Message(), fb.Message()
+		if ma != nil && mb != nil && ma.Parent() == a && mb.Parent() == b && fa.Cardinality() == fb.Cardinality() {
+			out = append(out, messageChanges(name+".", ma, mb)...)
+			continue
+		}
+		if da, db := describe(fa), describe(fb); da != db {
+			out = append(out, fmt.Sprintf("%q from %s to %s", name, da, db))
+		}
+	}
+	return out
 }
 
 // AvroName makes s an Avro or Protobuf name: letters, digits and _, not
@@ -92,15 +233,7 @@ type avroEncoder struct {
 }
 
 func newAvroEncoder(ctx context.Context, reg *sr.Client, subject, name string, cols []Col) (*avroEncoder, error) {
-	fields := make([]any, len(cols))
-	for i := range cols {
-		t, err := avroType(&cols[i], name+"_"+cols[i].name)
-		if err != nil {
-			return nil, err
-		}
-		fields[i] = map[string]any{"name": cols[i].name, "type": nullable(t), "default": nil}
-	}
-	text, err := json.Marshal(map[string]any{"type": "record", "name": AvroName(name), "fields": fields})
+	text, err := avroSchemaText(name, cols)
 	if err != nil {
 		return nil, err
 	}
@@ -113,6 +246,19 @@ func newAvroEncoder(ctx context.Context, reg *sr.Client, subject, name string, c
 		return nil, err
 	}
 	return &avroEncoder{id: id, schema: schema, cols: cols}, nil
+}
+
+// avroSchemaText is an Avro record schema, name, holding cols.
+func avroSchemaText(name string, cols []Col) ([]byte, error) {
+	fields := make([]any, len(cols))
+	for i := range cols {
+		t, err := avroType(&cols[i], name+"_"+cols[i].name)
+		if err != nil {
+			return nil, err
+		}
+		fields[i] = map[string]any{"name": cols[i].name, "type": nullable(t), "default": nil}
+	}
+	return json.Marshal(map[string]any{"type": "record", "name": AvroName(name), "fields": fields})
 }
 
 func nullable(t any) any {
