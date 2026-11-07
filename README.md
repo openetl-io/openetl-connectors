@@ -2,6 +2,8 @@
 
 The official connectors for [openetl](https://github.com/openetl-io/openetl). Each package, such as `postgres`, has a source role, a destination role or both, and each role is an external connector: an executable that serves the connector protocol on a Unix socket, which the openetl runner starts as a subprocess.
 
+**Status: pre-alpha,** like openetl. Nothing has been released, and the connectors change with openetl's protocols and SDK.
+
 | Connector | Executable | Notes |
 |---|---|---|
 | Postgres source | `source-postgres` | Full refresh in primary-key chunks, typed Arrow; incremental by a cursor column the pipeline names (integer, numeric, date, timestamp, timestamptz, text or varchar), in (cursor, key) chunks up to the cursor's highest value when the read starts, each read from the last one's highest value on, so rows at it are read again and rows with a NULL cursor never are; CDC through a logical replication slot (pgoutput), with read-only snapshots in chunks |
@@ -22,6 +24,8 @@ go build -o bin/ ./cmd/...
 ```
 
 From openetl, `make connectors` builds them into its `bin/connectors`, against that checkout's SDK.
+
+`git config core.hooksPath .githooks` checks each commit as CI does: gofmt, and `go vet` on the packages it touches.
 
 ## Test
 
@@ -66,4 +70,4 @@ Each package directory holds its `openetl-connector.yaml`.
 
 ## License
 
-Apache 2.0
+[Apache 2.0](LICENSE)

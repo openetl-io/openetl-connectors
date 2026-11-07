@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# Checks what a commit touches, as CI does. git config core.hooksPath
+# .githooks installs it; git commit --no-verify skips it.
+set -euo pipefail
+cd "$(git rev-parse --show-toplevel)"
+
+go_files=$(git diff --cached --name-only --diff-filter=ACMR -- '*.go')
+[ -n "$go_files" ] || exit 0
+
+unformatted=$(gofmt -l $go_files)
+if [ -n "$unformatted" ]; then
+	echo "pre-commit: gofmt -w these:" >&2
+	echo "$unformatted" >&2
+	exit 1
+fi
+
+pkgs=$(while read -r f; do dirname "$f"; done <<<"$go_files" | sort -u | sed 's|^|./|')
+pkgs=$(go list -tags integration -e -f '{{if not .Error}}{{.Dir}}{{end}}' $pkgs)
+[ -z "$pkgs" ] || go vet -tags integration $pkgs
