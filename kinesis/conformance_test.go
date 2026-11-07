@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strconv"
 	"testing"
 	"time"
 
@@ -30,10 +31,27 @@ func TestSourceConformance(t *testing.T) {
 		putJSON(t, a, i*75, 75)
 	}
 	putJSON(t, b, 0, 40)
+	cl := client(t)
+	next := map[string]int{a: 300, b: 40}
 	conformance.SourceSuite{
 		Launch:      conformance.Exec(conformance.Build(t, "../cmd/source-kinesis")),
 		Config:      config(t, map[string]any{"streams": []string{a, b}}),
 		Unreachable: config(t, map[string]any{"streams": []string{a, b}, "endpoint": closedPort}),
+		AddRecords: func(ctx context.Context, stream string) (int, error) {
+			from := next[stream]
+			next[stream] += 7
+			var entries []types.PutRecordsRequestEntry
+			for j := from; j < from+7; j++ {
+				entries = append(entries, types.PutRecordsRequestEntry{
+					Data: []byte(`{"id":` + strconv.Itoa(j) + `,"name":"n"}`), PartitionKey: aws.String("k" + strconv.Itoa(j%10)),
+				})
+			}
+			res, err := cl.PutRecords(ctx, &awskinesis.PutRecordsInput{StreamName: aws.String(stream), Records: entries})
+			if err == nil && aws.ToInt32(res.FailedRecordCount) > 0 {
+				err = fmt.Errorf("%d records failed", aws.ToInt32(res.FailedRecordCount))
+			}
+			return 7, err
+		},
 	}.Test(t)
 }
 
@@ -126,7 +144,7 @@ func TestDestinationConformance(t *testing.T) {
 			return out, nil
 		},
 		Drop: func(ctx context.Context, namespace string) error {
-			for _, s := range []string{"alpha", "beta"} {
+			for _, s := range []string{"alpha", "beta", "types"} {
 				_, _ = cl.DeleteStream(ctx, &awskinesis.DeleteStreamInput{StreamName: aws.String(namespace + "." + s)})
 			}
 			return nil

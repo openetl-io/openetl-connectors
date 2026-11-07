@@ -3,7 +3,9 @@
 package postgres
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/url"
@@ -11,6 +13,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/openetl-io/openetl/sdk/go/conformance"
@@ -58,12 +61,22 @@ func TestSourceConformance(t *testing.T) {
 		BadCredentials: cfg(badPassword(t)),
 		Unreachable:    cfg(closedPort),
 		AddRecords: func(ctx context.Context, stream string) (int, error) {
-			if stream != "events" {
-				return 0, fmt.Errorf("can't add records to %s", stream)
+			switch stream {
+			case "events":
+				_, err := e.conn.Exec(ctx, "INSERT INTO "+pgx.Identifier{e.schema, "events"}.Sanitize()+
+					" SELECT i, timestamptz '2026-02-01 00:00Z' + i * interval '1 minute', '{}' FROM generate_series(1001, 1010) i")
+				return 10, err
+			case "orders":
+				// Each call adds new orders, as a continuous read is restarted.
+				var from int64
+				if err := e.conn.QueryRow(ctx, "SELECT coalesce(max(id), 0) + 1 FROM "+pgx.Identifier{e.schema, "orders"}.Sanitize()).Scan(&from); err != nil {
+					return 0, err
+				}
+				_, err := e.conn.Exec(ctx, "INSERT INTO "+pgx.Identifier{e.schema, "orders"}.Sanitize()+
+					" SELECT i, i * 1.25, timestamptz '2026-04-01 00:00Z' + i * interval '1 hour' FROM generate_series($1::bigint, $1::bigint + 4) i", from)
+				return 5, err
 			}
-			_, err := e.conn.Exec(ctx, "INSERT INTO "+pgx.Identifier{e.schema, "events"}.Sanitize()+
-				" SELECT i, timestamptz '2026-02-01 00:00Z' + i * interval '1 minute', '{}' FROM generate_series(1001, 1010) i")
-			return 10, err
+			return 0, fmt.Errorf("can't add records to %s", stream)
 		},
 		Streams: []conformance.Stream{
 			{Name: "users", Mode: source.FullRefresh},
@@ -75,7 +88,23 @@ func TestSourceConformance(t *testing.T) {
 }
 
 func TestDestinationConformance(t *testing.T) {
-	pool, err := pgxpool.New(t.Context(), dsn())
+	pc, err := pgxpool.ParseConfig(dsn())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// jsonb's numbers keep their digits, as Postgres keeps them.
+	pc.AfterConnect = func(_ context.Context, c *pgx.Conn) error {
+		c.TypeMap().RegisterType(&pgtype.Type{Name: "jsonb", OID: pgtype.JSONBOID, Codec: &pgtype.JSONBCodec{
+			Marshal: json.Marshal,
+			Unmarshal: func(b []byte, v any) error {
+				d := json.NewDecoder(bytes.NewReader(b))
+				d.UseNumber()
+				return d.Decode(v)
+			},
+		}})
+		return nil
+	}
+	pool, err := pgxpool.NewWithConfig(t.Context(), pc)
 	if err != nil {
 		t.Fatal(err)
 	}
