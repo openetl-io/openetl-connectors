@@ -106,7 +106,7 @@ func newAvroEncoder(ctx context.Context, reg *sr.Client, subject, name string, c
 	}
 	schema, err := avro.Parse(string(text))
 	if err != nil {
-		return nil, fmt.Errorf("Avro schema of %s: %w", subject, err)
+		return nil, fmt.Errorf("avro schema of %s: %w", subject, err)
 	}
 	id, err := register(ctx, reg, subject, sr.Schema{Schema: string(text), Type: sr.TypeAvro})
 	if err != nil {
@@ -444,7 +444,7 @@ func newProtoEncoder(ctx context.Context, reg *sr.Client, subject, name string, 
 	}
 	fd, err := compileProto(ctx, map[string]string{"schema.proto": text}, "schema.proto")
 	if err != nil {
-		return nil, fmt.Errorf("Protobuf schema of %s: %w", subject, err)
+		return nil, fmt.Errorf("protobuf schema of %s: %w", subject, err)
 	}
 	id, err := register(ctx, reg, subject, sr.Schema{Schema: text, Type: sr.TypeProtobuf})
 	if err != nil {

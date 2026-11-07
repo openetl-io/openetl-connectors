@@ -42,7 +42,7 @@ type Connection struct {
 }
 
 func (c *Connection) validate(formats ...string) error {
-	if err := c.Config.Validate(formats...); err != nil {
+	if err := c.Validate(formats...); err != nil {
 		return fmt.Errorf("kinesis: %w", err)
 	}
 	if c.AccessKeyID.IsZero() != c.SecretAccessKey.IsZero() {

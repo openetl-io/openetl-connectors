@@ -43,7 +43,7 @@ func (c *Connection) validate(formats ...string) error {
 	if len(c.Brokers) == 0 {
 		return errors.New("kafka: brokers is empty")
 	}
-	if err := c.Config.Validate(formats...); err != nil {
+	if err := c.Validate(formats...); err != nil {
 		return fmt.Errorf("kafka: %w", err)
 	}
 	switch c.SASLMechanism {

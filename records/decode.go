@@ -66,7 +66,7 @@ func (d *Decoder) Decode(ctx context.Context, b []byte) (json.RawMessage, error)
 		}
 		var v any
 		if _, err := s.schema.Decode(rest, &v); err != nil {
-			return nil, fmt.Errorf("Avro with schema %d: %w", id, err)
+			return nil, fmt.Errorf("avro with schema %d: %w", id, err)
 		}
 		return json.Marshal(avroJSON(s.root, v))
 	case Protobuf:
@@ -76,7 +76,7 @@ func (d *Decoder) Decode(ctx context.Context, b []byte) (json.RawMessage, error)
 		}
 		index, rest, err := confluent.DecodeIndex(rest, 64)
 		if err != nil {
-			return nil, fmt.Errorf("Protobuf message indexes: %w", err)
+			return nil, fmt.Errorf("protobuf message indexes: %w", err)
 		}
 		fd, err := d.proto(ctx, id)
 		if err != nil {
@@ -88,7 +88,7 @@ func (d *Decoder) Decode(ctx context.Context, b []byte) (json.RawMessage, error)
 		}
 		m := dynamicpb.NewMessage(md)
 		if err := proto.Unmarshal(rest, m); err != nil {
-			return nil, fmt.Errorf("Protobuf with schema %d: %w", id, err)
+			return nil, fmt.Errorf("protobuf with schema %d: %w", id, err)
 		}
 		return protojson.MarshalOptions{UseProtoNames: true, EmitUnpopulated: true}.Marshal(m)
 	}
