@@ -3,15 +3,20 @@
 package kafka
 
 import (
+	"bytes"
 	"cmp"
 	"context"
 	"crypto/rand"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"maps"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -519,9 +524,41 @@ func TestSourceFollowsATopic(t *testing.T) {
 	}
 }
 
+// A topic read whole takes a new partition into its state, from its start.
+func TestSourceFollowsNewPartitions(t *testing.T) {
+	topic := uniq("grows_whole")
+	createTopic(t, topic, 1)
+	produceTo(t, topic, 0, 0, 5)
+	s := newSource(t, map[string]any{"topics": []string{topic}})
+	c := newCapture()
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		done <- s.Read(ctx, source.ReadRequest{Pipeline: "p", Continuous: true, Streams: []source.ConfiguredStream{{Name: topic, SyncMode: source.Stream}}}, c)
+	}()
+	await(t, "the first records", func() bool { return c.count(topic) == 5 })
+	addPartitions(t, topic, 1)
+	produceTo(t, topic, 1, 5, 5)
+	awaitFor(t, "the new partition's records", 2*partitionsEvery, func() bool { return c.count(topic) == 10 })
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Errorf("Read = %v", err)
+	}
+	wantIDs(t, rowIDs(t, c.rows[topic]), 0, 10)
+	if next, err := parseState(c.states[topic]); err != nil || !maps.Equal(next, map[int32]int64{0: 5, 1: 5}) {
+		t.Errorf("state %s: %v", c.states[topic], err)
+	}
+}
+
 func await(t *testing.T, what string, ok func() bool) {
 	t.Helper()
-	deadline := time.Now().Add(30 * time.Second)
+	awaitFor(t, what, 30*time.Second, ok)
+}
+
+func awaitFor(t *testing.T, what string, d time.Duration, ok func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(d)
 	for !ok() {
 		if time.Now().After(deadline) {
 			t.Fatalf("timed out waiting for %s", what)
@@ -557,9 +594,10 @@ func TestRegistryFormats(t *testing.T) {
 			extra := map[string]any{"format": format, "schemaRegistryUrl": registryURL()}
 			d := newDest(t, extra)
 			pipeline, table := uniq("p"), uniq("typed")
+			createTopic(t, table, 4)
 			w := openWriter(t, d, pipeline, 1, table)
 			e := destination.Epoch{Generation: 1, N: 1}
-			write(t, w, e, table, 0, 10)
+			write(t, w, e, table, 0, 40)
 			st, err := w.PreCommit(t.Context(), e)
 			if err != nil {
 				t.Fatal(err)
@@ -593,7 +631,545 @@ func TestRegistryFormats(t *testing.T) {
 					t.Errorf("key %v", r[keyColumn])
 				}
 			}
-			wantIDs(t, got, 0, 10)
+			wantIDs(t, got, 0, 40)
+
+			// Splits decode concurrently, from an empty schema cache.
+			cold := newSource(t, map[string]any{"format": format, "schemaRegistryUrl": registryURL(), "topics": []string{table}})
+			sc := readSplits(t, cold, table, splitsOf(t, cold, table, nil))
+			if n := sc.count(); n != 40 {
+				t.Errorf("read %d rows in splits, want 40", n)
+			}
 		})
+	}
+}
+
+// splitCapture is an Emitter that keeps what a read emits per split, and holds
+// a source to what the platform takes: emits on a split the stream has, none
+// after it completes, one goroutine at a time.
+type splitCapture struct {
+	*capture
+	mu     sync.Mutex
+	splits map[string]map[string]*splitRecord
+	total  int
+	// Emits fail with errStopped once this many rows are in, if any.
+	stopAt int
+}
+
+var errStopped = errors.New("stopped")
+
+type splitRecord struct {
+	busy     atomic.Bool
+	rows     []map[string]any
+	state    []byte
+	covered  int
+	complete bool
+	added    []source.Split
+}
+
+func newSplitCapture(streams map[string][]source.Split) *splitCapture {
+	c := &splitCapture{capture: newCapture(), splits: map[string]map[string]*splitRecord{}}
+	for stream, splits := range streams {
+		c.splits[stream] = map[string]*splitRecord{}
+		for _, sp := range splits {
+			c.splits[stream][sp.ID] = &splitRecord{state: sp.State}
+		}
+	}
+	return c
+}
+
+func (c *splitCapture) Split(stream, id string) source.SplitEmitter {
+	if id == source.WholeStream {
+		return source.WholeSplit(c.capture, stream, id)
+	}
+	return splitEmit{c, stream, id}
+}
+
+type splitEmit struct {
+	c          *splitCapture
+	stream, id string
+}
+
+func (e splitEmit) emit(f func(*splitRecord) error) error {
+	e.c.mu.Lock()
+	rec := e.c.splits[e.stream][e.id]
+	e.c.mu.Unlock()
+	if rec == nil {
+		return fmt.Errorf("emitted on split %s of %s, which it doesn't have", e.id, e.stream)
+	}
+	if !rec.busy.CompareAndSwap(false, true) {
+		return fmt.Errorf("two goroutines emit on split %s of %s", e.id, e.stream)
+	}
+	defer rec.busy.Store(false)
+	time.Sleep(time.Millisecond)
+	e.c.mu.Lock()
+	defer e.c.mu.Unlock()
+	if rec.complete {
+		return fmt.Errorf("emitted on split %s of %s after completing it", e.id, e.stream)
+	}
+	if e.c.stopAt > 0 && e.c.total >= e.c.stopAt {
+		return errStopped
+	}
+	return f(rec)
+}
+
+func (e splitEmit) Rows(rows []json.RawMessage) error {
+	return e.emit(func(rec *splitRecord) error {
+		for _, r := range rows {
+			var m map[string]any
+			if err := json.Unmarshal(r, &m); err != nil {
+				return err
+			}
+			rec.rows = append(rec.rows, m)
+		}
+		e.c.total += len(rows)
+		return nil
+	})
+}
+
+func (e splitEmit) Records(arrow.RecordBatch) error { return errors.New("no typed batches") }
+
+func (e splitEmit) add(rec *splitRecord, added []source.Split) error {
+	for _, sp := range added {
+		if e.c.splits[e.stream][sp.ID] != nil {
+			return fmt.Errorf("added split %s of %s, which it already has", sp.ID, e.stream)
+		}
+		e.c.splits[e.stream][sp.ID] = &splitRecord{state: sp.State}
+		rec.added = append(rec.added, sp)
+	}
+	return nil
+}
+
+func (e splitEmit) ResumePoint(state []byte, added ...source.Split) error {
+	return e.emit(func(rec *splitRecord) error {
+		rec.state, rec.covered = state, len(rec.rows)
+		return e.add(rec, added)
+	})
+}
+
+func (e splitEmit) Complete(next []byte, added ...source.Split) error {
+	return e.emit(func(rec *splitRecord) error {
+		rec.state, rec.covered, rec.complete = next, len(rec.rows), true
+		return e.add(rec, added)
+	})
+}
+
+func (c *splitCapture) has(stream, id string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.splits[stream][id] != nil
+}
+
+func (c *splitCapture) count() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.total
+}
+
+// states are the stream's splits where the read got to, as the platform's
+// record has them.
+func (c *splitCapture) states(stream string) []source.Split {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var out []source.Split
+	for _, id := range slices.Sorted(maps.Keys(c.splits[stream])) {
+		out = append(out, source.Split{ID: id, State: c.splits[stream][id].state})
+	}
+	return out
+}
+
+// rowsOf are the rows of the stream's splits. resumed: only those their last
+// resume points cover.
+func (c *splitCapture) rowsOf(stream string, resumed bool) []map[string]any {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var out []map[string]any
+	for _, rec := range c.splits[stream] {
+		if resumed {
+			out = append(out, rec.rows[:rec.covered]...)
+		} else {
+			out = append(out, rec.rows...)
+		}
+	}
+	return out
+}
+
+func splitsOf(t *testing.T, s *Source, topic string, ended []source.Split) []source.Split {
+	t.Helper()
+	splits, err := s.Splits(t.Context(), source.ConfiguredStream{Name: topic, SyncMode: source.Stream}, ended)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return splits
+}
+
+// readSplits reads the splits, in a read that ends once every one completes.
+func readSplits(t *testing.T, s *Source, topic string, splits []source.Split) *splitCapture {
+	t.Helper()
+	c := newSplitCapture(map[string][]source.Split{topic: splits})
+	ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
+	defer cancel()
+	req := source.ReadRequest{Pipeline: "p", Lanes: 2, Streams: []source.ConfiguredStream{{Name: topic, SyncMode: source.Stream, Splits: splits}}}
+	if err := s.Read(ctx, req, c); err != nil {
+		t.Fatal(err)
+	}
+	for id, rec := range c.splits[topic] {
+		if !rec.complete {
+			t.Errorf("split %s didn't complete", id)
+		}
+	}
+	return c
+}
+
+// produceTo writes ids from..from+n-1 to one partition.
+func produceTo(t *testing.T, topic string, partition int32, from, n int) {
+	t.Helper()
+	cl, err := kgo.NewClient(kgo.SeedBrokers(brokers()), kgo.DefaultProduceTopic(topic), kgo.RecordPartitioner(kgo.ManualPartitioner()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cl.Close()
+	var recs []*kgo.Record
+	for i := from; i < from+n; i++ {
+		recs = append(recs, &kgo.Record{Partition: partition, Value: []byte(`{"id":` + strconv.Itoa(i) + `}`)})
+	}
+	if err := cl.ProduceSync(t.Context(), recs...).FirstErr(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func addPartitions(t *testing.T, topic string, add int) {
+	t.Helper()
+	cl, err := kgo.NewClient(kgo.SeedBrokers(brokers()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cl.Close()
+	adm := kadm.NewClient(cl)
+	tds, err := adm.ListTopics(t.Context(), topic)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := len(tds[topic].Partitions) + add
+	if _, err := adm.CreatePartitions(t.Context(), add, topic); err != nil {
+		t.Fatal(err)
+	}
+	await(t, "the new partitions", func() bool {
+		tds, err := adm.ListTopics(t.Context(), topic)
+		return err == nil && len(tds[topic].Partitions) == want
+	})
+}
+
+func groupOffsets(t *testing.T, group, topic string) map[int32]int64 {
+	t.Helper()
+	cl, err := kgo.NewClient(kgo.SeedBrokers(brokers()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cl.Close()
+	offs, err := kadm.NewClient(cl).FetchOffsets(t.Context(), group)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := map[int32]int64{}
+	offs.Each(func(o kadm.OffsetResponse) {
+		if o.Topic == topic {
+			out[o.Partition] = o.At
+		}
+	})
+	return out
+}
+
+// A partition is a split: each reads its own records, in order, completes
+// where its partition ended, and the next read goes on from there.
+func TestSourceReadsPartitionsAsSplits(t *testing.T) {
+	topic := uniq("splits")
+	createTopic(t, topic, 3)
+	produce(t, topic, 0, 300)
+	transaction(t, topic, 1000, 5, false)
+	transaction(t, topic, 300, 5, true)
+	s := newSource(t, map[string]any{"topics": []string{topic}})
+	splits := splitsOf(t, s, topic, nil)
+	if len(splits) != 3 || splits[0].ID != "p0" || splits[1].ID != "p1" || splits[2].ID != "p2" {
+		t.Fatalf("splits %v", splits)
+	}
+	c := readSplits(t, s, topic, splits)
+	wantIDs(t, rowIDs(t, c.rowsOf(topic, false)), 0, 305)
+	for id, rec := range c.splits[topic] {
+		p, err := parsePartition(id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		offset := int64(-1)
+		for _, r := range rec.rows {
+			if int32(r[partitionColumn].(float64)) != p {
+				t.Errorf("split %s has a row of partition %v", id, r[partitionColumn])
+			}
+			o := int64(r[offsetColumn].(float64))
+			if o <= offset {
+				t.Errorf("split %s: offset %d after %d", id, o, offset)
+			}
+			offset = o
+		}
+		next, err := splitOffsets([]source.Split{{ID: id, State: rec.state}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if next[p] <= offset {
+			t.Errorf("split %s completes at %d, its last row's offset %d", id, next[p], offset)
+		}
+	}
+
+	produce(t, topic, 305, 20)
+	again := readSplits(t, s, topic, splitsOf(t, s, topic, c.states(topic)))
+	wantIDs(t, rowIDs(t, again.rowsOf(topic, false)), 305, 325)
+	idle := readSplits(t, s, topic, splitsOf(t, s, topic, again.states(topic)))
+	if n := idle.count(); n != 0 {
+		t.Errorf("%d rows from a read with nothing new", n)
+	}
+	if !slices.EqualFunc(idle.states(topic), again.states(topic), func(a, b source.Split) bool { return a.ID == b.ID && bytes.Equal(a.State, b.State) }) {
+		t.Errorf("a read with nothing new moved: %s, from %s", idle.states(topic), again.states(topic))
+	}
+}
+
+// A retry reads only the splits that haven't completed, each from its state,
+// and nothing else: not the partition that completed, nor any record twice.
+func TestSourceResumesAMixOfSplits(t *testing.T) {
+	topic := uniq("mix")
+	createTopic(t, topic, 3)
+	produce(t, topic, 0, 300)
+	s := newSource(t, map[string]any{"topics": []string{topic}})
+	first := readSplits(t, s, topic, splitsOf(t, s, topic, nil))
+	want := map[int64]int{}
+	midway := first.splits[topic]["p1"].rows[len(first.splits[topic]["p1"].rows)/2]
+	mid := int64(midway[offsetColumn].(float64))
+	for _, r := range first.rowsOf(topic, false) {
+		switch int32(r[partitionColumn].(float64)) {
+		case 1:
+			if int64(r[offsetColumn].(float64)) >= mid {
+				want[int64(r["id"].(float64))]++
+			}
+		case 2:
+			want[int64(r["id"].(float64))]++
+		}
+	}
+	c := readSplits(t, s, topic, []source.Split{{ID: "p1", State: encodeOffset(mid)}, {ID: "p2"}})
+	if c.has(topic, "p0") {
+		t.Error("read a split that had completed")
+	}
+	if got := rowIDs(t, c.rowsOf(topic, false)); !maps.Equal(got, want) {
+		t.Errorf("read %v, want %v", got, want)
+	}
+}
+
+// A read that stops partway restarts from its splits' states: every record is
+// in what those cover or what the restart reads, exactly once.
+func TestSourceRestartsFromSplitStates(t *testing.T) {
+	topic := uniq("restart")
+	createTopic(t, topic, 4)
+	for i := range 12 {
+		produce(t, topic, i*1000, 1000)
+	}
+	s := newSource(t, map[string]any{"topics": []string{topic}})
+	splits := splitsOf(t, s, topic, nil)
+	c := newSplitCapture(map[string][]source.Split{topic: splits})
+	c.stopAt = pollRecords + 1000
+	req := source.ReadRequest{Pipeline: "p", Streams: []source.ConfiguredStream{{Name: topic, SyncMode: source.Stream, Splits: splits}}}
+	if err := s.Read(t.Context(), req, c); !errors.Is(err, errStopped) {
+		t.Fatalf("Read = %v", err)
+	}
+	covered := len(c.rowsOf(topic, true))
+	if covered == 0 || covered == 12000 {
+		t.Errorf("the states cover %d rows of 12000", covered)
+	}
+	again := readSplits(t, s, topic, c.states(topic))
+	got := rowIDs(t, c.rowsOf(topic, true))
+	for id, n := range rowIDs(t, again.rowsOf(topic, false)) {
+		got[id] += n
+	}
+	wantIDs(t, got, 0, 12000)
+}
+
+// A partition added during a continuous read joins at a resume point of a
+// running split, at its start, and reads, reports and commits like the rest.
+func TestSourceSplitsGainNewPartitions(t *testing.T) {
+	topic := uniq("grows")
+	createTopic(t, topic, 2)
+	produceTo(t, topic, 0, 0, 10)
+	produceTo(t, topic, 1, 10, 10)
+	s := newSource(t, map[string]any{"topics": []string{topic}})
+	splits := splitsOf(t, s, topic, nil)
+	c := newSplitCapture(map[string][]source.Split{topic: splits})
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		done <- s.Read(ctx, source.ReadRequest{Pipeline: uniq("p"), Continuous: true, Lanes: 2, Streams: []source.ConfiguredStream{{Name: topic, SyncMode: source.Stream, Splits: splits}}}, c)
+	}()
+	await(t, "the first records", func() bool { return c.count() == 20 })
+	addPartitions(t, topic, 1)
+	produceTo(t, topic, 2, 20, 5)
+	awaitFor(t, "the new partition", 2*partitionsEvery, func() bool { return c.has(topic, "p2") })
+	await(t, "the new partition's records", func() bool { return c.count() == 25 })
+	produceTo(t, topic, 0, 25, 5)
+	await(t, "records after it joined", func() bool { return c.count() == 30 })
+	awaitFor(t, "a progress report", 2*progressEvery, func() bool {
+		c.capture.mu.Lock()
+		defer c.capture.mu.Unlock()
+		return len(c.capture.progress) > 0
+	})
+	c.mu.Lock()
+	rec := c.splits[topic]["p2"]
+	added := append(slices.Clone(c.splits[topic]["p0"].added), c.splits[topic]["p1"].added...)
+	nrows := len(rec.rows)
+	c.mu.Unlock()
+	if len(added) != 1 || added[0].ID != "p2" || string(added[0].State) != string(encodeOffset(0)) {
+		t.Errorf("added %v", added)
+	}
+	if nrows != 5 {
+		t.Errorf("the new split has %d rows, want 5", nrows)
+	}
+	progress := func() source.Progress {
+		c.capture.mu.Lock()
+		defer c.capture.mu.Unlock()
+		return c.capture.progress[0]
+	}()
+	if progress.Stream != topic || progress.LagRecords == nil {
+		t.Errorf("progress %+v", progress)
+	}
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Errorf("Read = %v", err)
+	}
+	wantIDs(t, rowIDs(t, c.rowsOf(topic, false)), 0, 30)
+
+	// The checkpoint's offsets go to the group, by split, and a restart from
+	// them reads what follows, in the new partition too.
+	group := uniq("group")
+	acker := newSource(t, map[string]any{"topics": []string{topic}, "group": group})
+	if err := acker.Committed(t.Context(), nil, map[string][]source.Split{topic: c.states(topic)}); err != nil {
+		t.Fatal(err)
+	}
+	if got := groupOffsets(t, group, topic); !maps.Equal(got, map[int32]int64{0: 15, 1: 10, 2: 5}) {
+		t.Errorf("the group's offsets %v", got)
+	}
+	produceTo(t, topic, 2, 30, 5)
+	again := readSplits(t, s, topic, c.states(topic))
+	wantIDs(t, rowIDs(t, again.rowsOf(topic, false)), 30, 35)
+}
+
+// A record from before splits continues whole, in the state it has. Once that
+// read ends, the next is in splits, from its offsets, beside a topic read
+// whole in the same request.
+func TestSourceWholeStatesKeepWorking(t *testing.T) {
+	topic, other := uniq("was_whole"), uniq("stays_whole")
+	createTopic(t, topic, 2)
+	createTopic(t, other, 1)
+	produce(t, topic, 0, 50)
+	produce(t, other, 0, 10)
+	s := newSource(t, map[string]any{"topics": []string{topic, other}})
+	first := read(t, s, topic, nil)
+	wantIDs(t, rowIDs(t, first.rows[topic]), 0, 50)
+	offsets, err := parseState(first.complete[topic])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(offsets) != 2 {
+		t.Fatalf("whole state %s", first.complete[topic])
+	}
+	produce(t, topic, 50, 10)
+	continued := read(t, s, topic, first.complete[topic])
+	wantIDs(t, rowIDs(t, continued.rows[topic]), 50, 60)
+	if _, err := parseState(continued.states[topic]); err != nil || len(continued.states[topic]) == 0 {
+		t.Errorf("whole resume point %s: %v", continued.states[topic], err)
+	}
+
+	produce(t, topic, 60, 10)
+	ended := []source.Split{{ID: source.WholeStream, State: continued.complete[topic]}}
+	splits := splitsOf(t, s, topic, ended)
+	if len(splits) != 2 || splits[0].ID != "p0" || splits[1].ID != "p1" {
+		t.Fatalf("splits %v", splits)
+	}
+	c := newSplitCapture(map[string][]source.Split{topic: splits})
+	ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
+	defer cancel()
+	req := source.ReadRequest{Pipeline: "p", Lanes: 2, Streams: []source.ConfiguredStream{{Name: topic, SyncMode: source.Stream, Splits: splits}, {Name: other, SyncMode: source.Stream}}}
+	if err := s.Read(ctx, req, c); err != nil {
+		t.Fatal(err)
+	}
+	wantIDs(t, rowIDs(t, c.rowsOf(topic, false)), 60, 70)
+	wantIDs(t, rowIDs(t, c.rows[other]), 0, 10)
+	if c.complete[other] == nil {
+		t.Errorf("%s didn't complete", other)
+	}
+	for _, sp := range c.states(topic) {
+		if !c.splits[topic][sp.ID].complete {
+			t.Errorf("split %s didn't complete", sp.ID)
+		}
+	}
+
+	// A group commit takes both kinds of state at once.
+	group := uniq("group")
+	acker := newSource(t, map[string]any{"topics": []string{topic, other}, "group": group})
+	if err := acker.Committed(t.Context(), map[string][]byte{other: c.complete[other]}, map[string][]source.Split{topic: c.states(topic)}); err != nil {
+		t.Fatal(err)
+	}
+	if got := groupOffsets(t, group, other); !maps.Equal(got, map[int32]int64{0: 10}) {
+		t.Errorf("the group's offsets of %s: %v", other, got)
+	}
+	var sum int64
+	for _, o := range groupOffsets(t, group, topic) {
+		sum += o
+	}
+	if sum != 70 {
+		t.Errorf("the group's offsets of %s add to %d, want 70", topic, sum)
+	}
+}
+
+// startOffset latest starts a topic never read at its end; a partition added
+// after that read starts at its start, since it's all new.
+func TestSourceSplitsStartAtLatest(t *testing.T) {
+	topic := uniq("latest")
+	createTopic(t, topic, 2)
+	produce(t, topic, 0, 20)
+	s := newSource(t, map[string]any{"topics": []string{topic}, "startOffset": "latest"})
+	c := readSplits(t, s, topic, splitsOf(t, s, topic, nil))
+	if n := c.count(); n != 0 {
+		t.Errorf("read %d rows from before the first read", n)
+	}
+	produce(t, topic, 20, 20)
+	addPartitions(t, topic, 1)
+	produceTo(t, topic, 2, 40, 5)
+	again := readSplits(t, s, topic, splitsOf(t, s, topic, c.states(topic)))
+	wantIDs(t, rowIDs(t, again.rowsOf(topic, false)), 20, 45)
+}
+
+// An offset below its partition's start is lost, when asked for the splits
+// and when read; a split at its beginning reads what's left.
+func TestSourceSplitPositionLost(t *testing.T) {
+	topic := uniq("retained")
+	createTopic(t, topic, 1)
+	produce(t, topic, 0, 10)
+	cl, _ := kgo.NewClient(kgo.SeedBrokers(brokers()))
+	defer cl.Close()
+	del := kadm.Offsets{}
+	del.Add(kadm.Offset{Topic: topic, Partition: 0, At: 6})
+	if _, err := kadm.NewClient(cl).DeleteRecords(t.Context(), del); err != nil {
+		t.Fatal(err)
+	}
+	s := newSource(t, map[string]any{"topics": []string{topic}})
+	lost := []source.Split{{ID: "p0", State: encodeOffset(3)}}
+	wantLost := func(err error) {
+		t.Helper()
+		var coded interface{ ErrorCode() protocolv1.ErrorCode }
+		if !errors.As(err, &coded) || coded.ErrorCode() != protocolv1.ErrorCode_ERROR_CODE_POSITION_LOST {
+			t.Errorf("got %v, want POSITION_LOST", err)
+		}
+	}
+	_, err := s.Splits(t.Context(), source.ConfiguredStream{Name: topic}, lost)
+	wantLost(err)
+	wantLost(s.Read(t.Context(), source.ReadRequest{Pipeline: "p", Streams: []source.ConfiguredStream{{Name: topic, SyncMode: source.Stream, Splits: lost}}}, newSplitCapture(map[string][]source.Split{topic: lost})))
+	c := readSplits(t, s, topic, []source.Split{{ID: "p0"}})
+	if n := c.count(); n != 4 {
+		t.Errorf("read %d rows of the 4 left", n)
 	}
 }
