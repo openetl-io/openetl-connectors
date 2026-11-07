@@ -13,6 +13,8 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	ice "github.com/apache/iceberg-go"
 	"github.com/apache/iceberg-go/table"
+
+	"github.com/openetl-io/openetl-connectors/records"
 )
 
 const (
@@ -166,6 +168,9 @@ func icebergArrowType(f arrow.Field) (arrow.DataType, error) {
 			fields[i] = arrow.Field{Name: c.Name, Type: ct, Nullable: true}
 		}
 		return arrow.StructOf(fields...), nil
+	case *arrow.MonthDayNanoIntervalType:
+		// Iceberg has no interval.
+		return records.IntervalType, nil
 	}
 	return nil, fmt.Errorf("no Iceberg type holds %s", f.Type)
 }
@@ -222,7 +227,9 @@ func conform(ctx context.Context, batch arrow.RecordBatch, sc *arrow.Schema) (ar
 			cols[i] = c
 			continue
 		}
-		c, err := castTo(ctx, batch.Column(idx[0]), f.Type)
+		in := records.IntervalArrayAsStruct(batch.Column(idx[0]))
+		c, err := castTo(ctx, in, f.Type)
+		in.Release()
 		if err != nil {
 			return nil, fmt.Errorf("iceberg: column %q: %w", f.Name, err)
 		}

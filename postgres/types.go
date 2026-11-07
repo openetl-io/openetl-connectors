@@ -129,6 +129,13 @@ func columnOf(f arrow.Field) (column, error) {
 		c.value = func(a arrow.Array, i int) any {
 			return pgtype.Numeric{Int: storage(a).(*array.Decimal128).Value(i).BigInt(), Exp: -scale, Valid: true}
 		}
+	case *arrow.MonthDayNanoIntervalType:
+		// Postgres keeps microseconds, as the engine does.
+		c.typ = "interval"
+		c.value = func(a arrow.Array, i int) any {
+			v := storage(a).(*array.MonthDayNanoInterval).Value(i)
+			return pgtype.Interval{Months: v.Months, Days: v.Days, Microseconds: v.Nanoseconds / 1000, Valid: true}
+		}
 	case *arrow.ListType, *arrow.LargeListType, *arrow.FixedSizeListType, *arrow.StructType, *arrow.MapType:
 		c.typ = "jsonb"
 		c.value = func(a arrow.Array, i int) any {
