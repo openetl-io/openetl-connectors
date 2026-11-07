@@ -38,14 +38,16 @@ const jsonProp = "openetl.type"
 
 // NewEncoder builds the encoder for cols, registering its schema under
 // subject for the formats that need one. name names the record or message.
-func NewEncoder(ctx context.Context, format string, reg *sr.Client, subject, name string, cols []Col) (Encoder, error) {
+// Only with allowTypeChanges does it register a schema that changes a
+// field's type.
+func NewEncoder(ctx context.Context, format string, reg *sr.Client, subject, name string, cols []Col, allowTypeChanges bool) (Encoder, error) {
 	switch format {
 	case JSON:
 		return jsonEncoder(cols), nil
 	case Avro:
-		return newAvroEncoder(ctx, reg, subject, name, cols)
+		return newAvroEncoder(ctx, reg, subject, name, cols, allowTypeChanges)
 	case Protobuf:
-		return newProtoEncoder(ctx, reg, subject, name, cols)
+		return newProtoEncoder(ctx, reg, subject, name, cols, allowTypeChanges)
 	}
 	return nil, fmt.Errorf("format %q can't be written", format)
 }
@@ -57,9 +59,10 @@ func (e jsonEncoder) Encode(vals []any) ([]byte, error) { return appendJSONObjec
 // register registers s under subject and returns its ID. A schema already
 // registered there keeps its ID, as one a person registers to take a change
 // does. Otherwise a schema that changes a field's type from the subject's
-// latest is refused, since no connector changes a type by itself, and so is
-// one the registry's compatibility setting refuses: both SCHEMA_DRIFT.
-func register(ctx context.Context, reg *sr.Client, subject string, s sr.Schema) (int, error) {
+// latest is refused, since no connector changes a type by itself unless the
+// pipeline allows it, and so is one the registry's compatibility setting
+// refuses: both SCHEMA_DRIFT.
+func register(ctx context.Context, reg *sr.Client, subject string, s sr.Schema, allowTypeChanges bool) (int, error) {
 	ss, err := reg.LookupSchema(ctx, subject, s)
 	if err == nil {
 		return ss.ID, nil
@@ -69,7 +72,7 @@ func register(ctx context.Context, reg *sr.Client, subject string, s sr.Schema) 
 	}
 	latest, err := reg.SchemaByVersion(ctx, subject, -1)
 	switch {
-	case notFound(err):
+	case allowTypeChanges, notFound(err):
 	case err != nil:
 		return 0, fmt.Errorf("the latest schema of %s: %w", subject, err)
 	case latest.Type == s.Type:
@@ -232,7 +235,7 @@ type avroEncoder struct {
 	cols   []Col
 }
 
-func newAvroEncoder(ctx context.Context, reg *sr.Client, subject, name string, cols []Col) (*avroEncoder, error) {
+func newAvroEncoder(ctx context.Context, reg *sr.Client, subject, name string, cols []Col, allowTypeChanges bool) (*avroEncoder, error) {
 	text, err := avroSchemaText(name, cols)
 	if err != nil {
 		return nil, err
@@ -241,7 +244,7 @@ func newAvroEncoder(ctx context.Context, reg *sr.Client, subject, name string, c
 	if err != nil {
 		return nil, fmt.Errorf("avro schema of %s: %w", subject, err)
 	}
-	id, err := register(ctx, reg, subject, sr.Schema{Schema: string(text), Type: sr.TypeAvro})
+	id, err := register(ctx, reg, subject, sr.Schema{Schema: string(text), Type: sr.TypeAvro}, allowTypeChanges)
 	if err != nil {
 		return nil, err
 	}
@@ -579,7 +582,7 @@ func compileProto(ctx context.Context, files map[string]string, root string) (pr
 	return fds[0], nil
 }
 
-func newProtoEncoder(ctx context.Context, reg *sr.Client, subject, name string, cols []Col) (*protoEncoder, error) {
+func newProtoEncoder(ctx context.Context, reg *sr.Client, subject, name string, cols []Col, allowTypeChanges bool) (*protoEncoder, error) {
 	prev, err := latestLayout(ctx, reg, subject)
 	if err != nil {
 		return nil, err
@@ -592,7 +595,7 @@ func newProtoEncoder(ctx context.Context, reg *sr.Client, subject, name string, 
 	if err != nil {
 		return nil, fmt.Errorf("protobuf schema of %s: %w", subject, err)
 	}
-	id, err := register(ctx, reg, subject, sr.Schema{Schema: text, Type: sr.TypeProtobuf})
+	id, err := register(ctx, reg, subject, sr.Schema{Schema: text, Type: sr.TypeProtobuf}, allowTypeChanges)
 	if err != nil {
 		return nil, err
 	}

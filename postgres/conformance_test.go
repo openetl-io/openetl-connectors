@@ -87,14 +87,16 @@ func TestDestinationConformance(t *testing.T) {
 		BadCredentials: cfg(badPassword(t)),
 		Unreachable:    cfg(closedPort),
 		Read: func(ctx context.Context, namespace, stream string) ([]map[string]any, error) {
-			rows, err := pool.Query(ctx, "SELECT * FROM "+pgx.Identifier{namespace, stream}.Sanitize())
-			if err != nil {
-				if pe, ok := errors.AsType[*pgconn.PgError](err); ok && (pe.Code == "42P01" || pe.Code == "3F000") {
-					return nil, nil
-				}
-				return nil, err
+			// Not from a cached plan, whose columns' types a widening changes.
+			rows, err := pool.Query(ctx, "SELECT * FROM "+pgx.Identifier{namespace, stream}.Sanitize(), pgx.QueryExecModeExec)
+			var out []map[string]any
+			if err == nil {
+				out, err = pgx.CollectRows(rows, pgx.RowToMap)
 			}
-			return pgx.CollectRows(rows, pgx.RowToMap)
+			if pe, ok := errors.AsType[*pgconn.PgError](err); ok && (pe.Code == "42P01" || pe.Code == "3F000") {
+				return nil, nil
+			}
+			return out, err
 		},
 		Drop: func(ctx context.Context, namespace string) error {
 			_, err := pool.Exec(ctx, "DROP SCHEMA IF EXISTS "+pgx.Identifier{namespace}.Sanitize()+" CASCADE")

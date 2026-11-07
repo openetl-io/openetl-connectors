@@ -141,6 +141,8 @@ func TestDestinationConformance(t *testing.T) {
 		// Partitions show a transaction once its coordinator has written
 		// their markers, just after the commit returns.
 		Settle: 10 * time.Second,
+		// JSON records, which keep no types.
+		Untyped: true,
 		Read: func(ctx context.Context, namespace, stream string) ([]map[string]any, error) {
 			recs, err := readCommitted(ctx, cl, namespace+"."+stream)
 			if err != nil {

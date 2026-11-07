@@ -28,13 +28,13 @@ func TestRegistryRefusesAnIncompatibleSchema(t *testing.T) {
 		t.Fatal(err)
 	}
 	subject := "drift_" + strings.ToLower(rand.Text())[:8] + "-value"
-	if _, err := NewEncoder(t.Context(), Avro, reg, subject, "t", []Col{{name: "id", kind: kInt64}}); err != nil {
+	if _, err := NewEncoder(t.Context(), Avro, reg, subject, "t", []Col{{name: "id", kind: kInt64}}, false); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := NewEncoder(t.Context(), Avro, reg, subject, "t", []Col{{name: "id", kind: kInt64}, {name: "extra", kind: kString}}); err != nil {
+	if _, err := NewEncoder(t.Context(), Avro, reg, subject, "t", []Col{{name: "id", kind: kInt64}, {name: "extra", kind: kString}}, false); err != nil {
 		t.Errorf("an added column: %v", err)
 	}
-	_, err = NewEncoder(t.Context(), Avro, reg, subject, "t", []Col{{name: "id", kind: kBool}})
+	_, err = NewEncoder(t.Context(), Avro, reg, subject, "t", []Col{{name: "id", kind: kBool}}, false)
 	var coded interface{ ErrorCode() protocolv1.ErrorCode }
 	if !errors.As(err, &coded) || coded.ErrorCode() != protocolv1.ErrorCode_ERROR_CODE_SCHEMA_DRIFT {
 		t.Errorf("a changed type: %v", err)
@@ -55,13 +55,13 @@ func TestATypeChangesOnlyOnceAPersonRegistersIt(t *testing.T) {
 			subject := "widen_" + strings.ToLower(rand.Text())[:8] + "-value"
 			narrow := []Col{{name: "id", kind: kInt64}, {name: "n", kind: kInt32}}
 			wide := []Col{{name: "id", kind: kInt64}, {name: "n", kind: kInt64}, {name: "extra", kind: kString}}
-			if _, err := NewEncoder(ctx, format, reg, subject, "t", narrow); err != nil {
+			if _, err := NewEncoder(ctx, format, reg, subject, "t", narrow, false); err != nil {
 				t.Fatal(err)
 			}
-			if _, err := NewEncoder(ctx, format, reg, subject, "t", append(slices.Clone(narrow), Col{name: "extra", kind: kString})); err != nil {
+			if _, err := NewEncoder(ctx, format, reg, subject, "t", append(slices.Clone(narrow), Col{name: "extra", kind: kString}), false); err != nil {
 				t.Fatalf("an added field: %v", err)
 			}
-			_, err = NewEncoder(ctx, format, reg, subject, "t", wide)
+			_, err = NewEncoder(ctx, format, reg, subject, "t", wide, false)
 			var coded interface{ ErrorCode() protocolv1.ErrorCode }
 			if !errors.As(err, &coded) || coded.ErrorCode() != protocolv1.ErrorCode_ERROR_CODE_SCHEMA_DRIFT || !strings.Contains(err.Error(), `"n"`) {
 				t.Fatalf("a widened field: %v", err)
@@ -86,8 +86,17 @@ func TestATypeChangesOnlyOnceAPersonRegistersIt(t *testing.T) {
 			if _, err := reg.CreateSchema(ctx, subject, sr.Schema{Schema: text, Type: typ}); err != nil {
 				t.Fatalf("a person registers it: %v", err)
 			}
-			if _, err := NewEncoder(ctx, format, reg, subject, "t", wide); err != nil {
+			if _, err := NewEncoder(ctx, format, reg, subject, "t", wide, false); err != nil {
 				t.Errorf("once registered: %v", err)
+			}
+
+			// A pipeline that allows type changes registers it itself.
+			allowed := "widen_" + strings.ToLower(rand.Text())[:8] + "-value"
+			if _, err := NewEncoder(ctx, format, reg, allowed, "t", narrow, true); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := NewEncoder(ctx, format, reg, allowed, "t", wide, true); err != nil {
+				t.Errorf("a widened field the pipeline allows: %v", err)
 			}
 		})
 	}
@@ -127,7 +136,7 @@ func TestProtobufNumbersStay(t *testing.T) {
 		want: map[string]int{"id": 1, "address": 2, "address.city": 1, "address.zip": 3, "email": 6, "_openetl_id": 3, "_openetl_synced_at": 4},
 	}}
 	for v, ver := range versions {
-		enc, err := NewEncoder(t.Context(), Protobuf, reg, subject, "t", ver.cols)
+		enc, err := NewEncoder(t.Context(), Protobuf, reg, subject, "t", ver.cols, false)
 		if err != nil {
 			t.Fatalf("version %d: %v", v+1, err)
 		}
