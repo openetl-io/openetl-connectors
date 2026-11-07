@@ -195,7 +195,7 @@ func TestRecoverReportsLost(t *testing.T) {
 		t.Fatal(err)
 	}
 	st := precommit(t, w1, e)
-	if _, err := env.conn.Exec(ctx, "DROP TABLE "+pgx.Identifier{env.schema, stagingName("p1", "users", e)}.Sanitize()); err != nil {
+	if _, err := env.conn.Exec(ctx, "DROP TABLE "+pgx.Identifier{env.schema, stagingName("p1", "users", e, 0)}.Sanitize()); err != nil {
 		t.Fatal(err)
 	}
 	w2 := env.open(2, destination.ScopePipeline, "users")
@@ -255,7 +255,7 @@ func TestRecoverTrimsMarkers(t *testing.T) {
 		t.Fatal(err)
 	}
 	st := precommit(t, w2, lost)
-	if _, err := env.conn.Exec(ctx, "DROP TABLE "+pgx.Identifier{env.schema, stagingName("p1", "users", lost)}.Sanitize()); err != nil {
+	if _, err := env.conn.Exec(ctx, "DROP TABLE "+pgx.Identifier{env.schema, stagingName("p1", "users", lost, 0)}.Sanitize()); err != nil {
 		t.Fatal(err)
 	}
 	w3 := env.open(3, destination.ScopePipeline, "users")
@@ -317,7 +317,7 @@ func TestRecoverDropsStaleStaging(t *testing.T) {
 		if err := w.Write(ctx, e, "users", rows); err != nil {
 			t.Fatal(err)
 		}
-		return pgx.Identifier{env.schema, stagingName(pipeline, "users", e)}.Sanitize()
+		return pgx.Identifier{env.schema, stagingName(pipeline, "users", e, 0)}.Sanitize()
 	}
 	exists := func(table string) bool {
 		var ok bool

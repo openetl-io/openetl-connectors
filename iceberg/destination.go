@@ -1,12 +1,13 @@
 // Package iceberg has the Iceberg destination: append, overwrite and merge
 // writes into Iceberg tables through a REST or Glue catalog. Writes stream
 // each stream's batches into Parquet data files under its table's location,
-// which PreCommit lists in the staged descriptor. Commit adds them in one
-// snapshot per table, with the epoch's marker in the snapshot summary and in
-// a table property, on the snapshot it checked the fence and the marker on:
-// the catalog refuses the commit if another landed first. Overwrite keeps a
-// read's files out of the table until the read ends, then replaces the
-// table's files with them. Merge reads its files back at Commit, and adds
+// a writer lane's own, which PreCommit lists in the lane's staged descriptor.
+// Commit adds every lane's in one snapshot per table, with the epoch's marker
+// in the snapshot summary and in a table property, on the snapshot it checked
+// the fence and the marker on: the catalog refuses the commit if another
+// landed first. Overwrite keeps a read's files out of the table until the read
+// ends, in manifests each lane references in its descriptors, then replaces
+// the table's files with them. Merge reads its files back at Commit, and adds
 // equality deletes of the keys they change with the keys' new rows. It never
 // changes a column's type, and takes holds: patches are staged like rows,
 // and Commit rewrites the rows they fill, by key or by _openetl_id, with
@@ -15,10 +16,12 @@ package iceberg
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"net"
 	"slices"
 	"strconv"
@@ -235,8 +238,9 @@ type writer struct {
 	// Merge: each stream's key under destination names.
 	keys map[string][]string
 	// Columns whose values Write or Patch left out, since the table
-	// couldn't take their type, until ApplySchema refuses them.
-	dropped map[string]map[string]bool
+	// couldn't take their type, until ApplySchema refuses them, each with the
+	// table's type then.
+	dropped map[string]map[string]string
 
 	// Only Write, Patch, StartReads, EndRead, PreCommit and Recover use
 	// these.
@@ -248,11 +252,17 @@ type writer struct {
 	reads map[string]*read
 }
 
-// read is an overwrite read whose files stay out of its table until it ends.
+// read is an overwrite read whose files stay out of its table until it ends:
+// the lane's part of it, or on lane 0 after Recover, every earlier lane's too.
 type read struct {
 	start int64
 	table string
-	files []string
+	// Its earlier epochs' files: in manifests, and the last epoch's, listed.
+	manifests []manifestRef
+	files     []string
+	// Recover restored it, so StartReads can tell it was abandoned. A lane
+	// that started it can't: another lane may have seen it end.
+	restored bool
 }
 
 // staged is the descriptor PreCommit returns.
@@ -275,12 +285,13 @@ type stagedStream struct {
 	Files []string `json:"files,omitempty"`
 	// Empty for append.
 	Mode string `json:"mode,omitempty"`
-	// Overwrite: the read's start in microseconds, its earlier epochs' files,
-	// and whether it ended in this epoch, which replaces the table's files
-	// with the read's.
-	Read    int64    `json:"read,omitempty"`
-	Earlier []string `json:"earlier,omitempty"`
-	Ended   bool     `json:"ended,omitempty"`
+	// Overwrite: the read's start in microseconds, its earlier epochs' files
+	// in manifests, or in descriptors from before those, listed, and whether
+	// it ended in this epoch, which replaces the table's files with the read's.
+	Read      int64         `json:"read,omitempty"`
+	Manifests []manifestRef `json:"manifests,omitempty"`
+	Earlier   []string      `json:"earlier,omitempty"`
+	Ended     bool          `json:"ended,omitempty"`
 	// Merge: the key's columns, and whether a delete removes the row. The
 	// files are read back at Commit, and no snapshot holds them.
 	Key         []string `json:"key,omitempty"`
@@ -295,7 +306,8 @@ type stagedStream struct {
 }
 
 // applies reports whether committing the stream changes its table, and
-// returns the files it needs: those it adds, and the patches.
+// returns the files it needs, but for those in its manifests: those it adds,
+// and the patches.
 func (s stagedStream) applies() ([]string, bool) {
 	if s.Mode != modeOverwrite {
 		files := append(slices.Clone(s.Files), s.Patches...)
@@ -307,7 +319,8 @@ func (s stagedStream) applies() ([]string, bool) {
 	return append(slices.Clone(s.Earlier), s.Files...), true
 }
 
-// adds is the files committing the stream adds to its table as they are.
+// adds is the files committing the stream adds to its table as they are, but
+// for those in its manifests.
 func (s stagedStream) adds() []string {
 	if s.Mode == modeOverwrite {
 		return append(slices.Clone(s.Earlier), s.Files...)
@@ -324,10 +337,12 @@ const (
 	epochKey      = "openetl.epoch"
 )
 
-// The table properties: the generation that last recovered the pipeline,
-// and the last epoch it committed, as "N:g".
+// The table properties: the generation that last recovered the pipeline, the
+// last epoch it committed, as "N:g", and the start of the last overwrite read
+// that replaced the table's files.
 func fenceKey(pipeline string) string  { return "openetl.fence." + pipeline }
 func loadedKey(pipeline string) string { return "openetl.loaded." + pipeline }
+func readKey(pipeline string) string   { return "openetl.read." + pipeline }
 
 func (w *writer) ident(ns []string, name string) table.Identifier {
 	return append(slices.Clone(ns), name)
@@ -471,10 +486,27 @@ func limits(tbl *table.Table) destination.TableLimits {
 	return l
 }
 
-func (w *writer) create(ctx context.Context, ident table.Identifier, sc *ice.Schema) (*table.Table, error) {
-	ns := ident[:len(ident)-1]
+// createMu keeps a job's lanes from racing to create a namespace or a table.
+// The race gains nothing, and a catalog can take it badly: on a primary key
+// failure, Iceberg's REST fixture stays locked until it restarts.
+var createMu sync.Mutex
+
+// ensureNamespace creates ns unless it's there.
+func (w *writer) ensureNamespace(ctx context.Context, ns table.Identifier) error {
+	if ok, err := w.cat.CheckNamespaceExists(ctx, ns); err == nil && ok {
+		return nil
+	}
 	if err := w.cat.CreateNamespace(ctx, ns, nil); err != nil && !errors.Is(err, catalog.ErrNamespaceAlreadyExists) {
-		return nil, fmt.Errorf("iceberg: create namespace %s: %w", strings.Join(ns, "."), err)
+		return fmt.Errorf("iceberg: create namespace %s: %w", strings.Join(ns, "."), err)
+	}
+	return nil
+}
+
+func (w *writer) create(ctx context.Context, ident table.Identifier, sc *ice.Schema) (*table.Table, error) {
+	createMu.Lock()
+	defer createMu.Unlock()
+	if err := w.ensureNamespace(ctx, ident[:len(ident)-1]); err != nil {
+		return nil, err
 	}
 	opts := []catalog.CreateTableOpt{catalog.WithProperties(ice.Properties{
 		table.PropertyFormatVersion: "2",
@@ -521,13 +553,17 @@ func (w *writer) ApplySchema(ctx context.Context, streams []destination.StreamSc
 	return out, nil
 }
 
-func (w *writer) StartReads(_ context.Context, starts map[string]time.Time) error {
+func (w *writer) StartReads(ctx context.Context, starts map[string]time.Time) error {
 	w.starts = starts
 	for name, r := range w.reads {
-		if start, ok := starts[name]; !ok || start.UnixMicro() != r.start {
-			w.dropFiles(w.ns, r.table, r.files)
-			delete(w.reads, name)
+		if start, ok := starts[name]; ok && start.UnixMicro() == r.start {
+			r.restored = false
+			continue
 		}
+		if r.restored {
+			w.dropRead(ctx, name, r)
+		}
+		delete(w.reads, name)
 	}
 	return nil
 }
@@ -565,12 +601,13 @@ func (w *writer) startPart(tbl *table.Table, e destination.Epoch, stream string,
 		return nil, fmt.Errorf("iceberg: %w", err)
 	}
 	p := &part{schemaID: tbl.Schema().ID, arrow: sc, ch: make(chan arrow.RecordBatch, 1), done: make(chan struct{})}
-	// Data file names come from it, so each generation and epoch has its own.
+	// Data file names come from it, so each generation, epoch and lane has
+	// its own.
 	kind := ""
 	if patch {
 		kind = "patch/"
 	}
-	id := uuid.NewSHA1(uuid.NameSpaceURL, fmt.Appendf(nil, "openetl:%s%s/%s/%d/%d/%d", kind, w.cfg.Pipeline, stream, e.Generation, e.N, k))
+	id := uuid.NewSHA1(uuid.NameSpaceURL, fmt.Appendf(nil, "openetl:%s%s/%s/%d/%d/%d/%d", kind, w.cfg.Pipeline, stream, e.Generation, e.N, w.cfg.Lane, k))
 	batches := func(yield func(arrow.RecordBatch, error) bool) {
 		for b := range p.ch {
 			if !yield(b, nil) {
@@ -688,13 +725,13 @@ func (w *writer) stage(ctx context.Context, parts map[uint64]map[string]*epochFi
 	if len(refused) > 0 {
 		w.mu.Lock()
 		if w.dropped == nil {
-			w.dropped = map[string]map[string]bool{}
+			w.dropped = map[string]map[string]string{}
 		}
 		if w.dropped[stream] == nil {
-			w.dropped[stream] = map[string]bool{}
+			w.dropped[stream] = map[string]string{}
 		}
 		for _, r := range refused {
-			w.dropped[stream][r.Column] = true
+			w.dropped[stream][r.Column] = r.FromType
 		}
 		w.mu.Unlock()
 		batch = without(batch, refused)
@@ -762,8 +799,13 @@ func (ef *epochFiles) finish() ([]string, error) {
 }
 
 // PreCommit closes the epoch's data files. They are durable once closed,
-// and invisible until Commit adds them to their tables.
-func (w *writer) PreCommit(_ context.Context, e destination.Epoch) (destination.Staged, error) {
+// and invisible until Commit adds them to their tables. A lane with a read in
+// progress describes it in every epoch, with rows or not, as the epoch it ends
+// in can be one the lane knows nothing of.
+func (w *writer) PreCommit(ctx context.Context, e destination.Epoch) (destination.Staged, error) {
+	if err := w.checkDropped(ctx); err != nil {
+		return nil, err
+	}
 	desc := staged{Generation: e.Generation, Epoch: e.N, Namespace: w.ns}
 	byStream, patches := w.parts[e.N], w.patches[e.N]
 	delete(w.parts, e.N)
@@ -781,7 +823,8 @@ func (w *writer) PreCommit(_ context.Context, e destination.Epoch) (destination.
 			return nil, err
 		}
 		isEnd := s.Mode == destination.Overwrite && slices.Contains(ended, s.Name)
-		if len(files) == 0 && len(patched) == 0 && !isEnd {
+		r := w.reads[s.Name]
+		if len(files) == 0 && len(patched) == 0 && !isEnd && r == nil {
 			continue
 		}
 		ss := stagedStream{Name: s.Name, Table: w.name(s.Name), Files: files, Patches: patched}
@@ -795,13 +838,17 @@ func (w *writer) PreCommit(_ context.Context, e destination.Epoch) (destination.
 			}
 		}
 		if s.Mode == destination.Overwrite {
-			r := w.reads[s.Name]
 			if r == nil {
 				r = &read{start: w.starts[s.Name].UnixMicro(), table: ss.Table}
 				w.reads[s.Name] = r
 			}
-			ss.Mode, ss.Read, ss.Earlier, ss.Ended = modeOverwrite, r.start, slices.Clone(r.files), isEnd
-			r.files = append(r.files, files...)
+			ss.Table = cmp.Or(ss.Table, r.table)
+			r.table = ss.Table
+			if err := w.saveEarlier(ctx, s.Name, r); err != nil {
+				return nil, err
+			}
+			ss.Mode, ss.Read, ss.Manifests, ss.Ended = modeOverwrite, r.start, slices.Clone(r.manifests), isEnd
+			r.files = files
 			if isEnd {
 				delete(w.reads, s.Name)
 			}
@@ -811,16 +858,93 @@ func (w *writer) PreCommit(_ context.Context, e destination.Epoch) (destination.
 	return json.Marshal(desc)
 }
 
+// checkDropped stops an epoch whose values a lane left out, if the table has
+// since changed so that it takes them. Lane 0's ApplySchema checks its own;
+// the others get none.
+func (w *writer) checkDropped(ctx context.Context) error {
+	if w.cfg.Lane == 0 {
+		return nil
+	}
+	w.mu.Lock()
+	dropped := w.dropped
+	w.mu.Unlock()
+	for stream, cols := range dropped {
+		tbl, err := w.cat.LoadTable(ctx, w.ident(w.ns, w.name(stream)))
+		if err != nil {
+			return fmt.Errorf("iceberg: load %s: %w", w.name(stream), err)
+		}
+		for col, typ := range cols {
+			if f, ok := tbl.Schema().FindFieldByName(col); !ok || f.Type.String() != typ {
+				return fmt.Errorf("iceberg: %s's column %q changed type while the epoch was written, and its values were left out; read the epoch again", stream, col)
+			}
+		}
+	}
+	return nil
+}
+
 func (w *writer) Commit(ctx context.Context, _ destination.Epoch, committables []destination.Staged) (destination.Committed, error) {
-	s, err := destination.One(committables)
+	desc, err := w.mergeLanes(committables)
 	if err != nil {
 		return destination.Committed{}, err
 	}
-	var desc staged
-	if err := json.Unmarshal(s, &desc); err != nil {
-		return destination.Committed{}, fmt.Errorf("iceberg: staged descriptor: %w", err)
-	}
 	return destination.Committed{}, w.apply(ctx, desc, desc.Streams)
+}
+
+// mergeLanes merges the epoch's descriptors, one per lane of the attempt
+// that staged it, by stream. A lane that didn't know a read ended, or had no
+// rows of a stream, says less: its table can come from the schemas.
+func (w *writer) mergeLanes(committables []destination.Staged) (staged, error) {
+	var out staged
+	at := map[string]int{}
+	if len(committables) == 0 {
+		return out, errors.New("iceberg: no staged descriptor")
+	}
+	for i, c := range committables {
+		var desc staged
+		if err := json.Unmarshal(c, &desc); err != nil {
+			return out, fmt.Errorf("iceberg: staged descriptor: %w", err)
+		}
+		if i == 0 {
+			out.Generation, out.Epoch, out.Namespace = desc.Generation, desc.Epoch, desc.Namespace
+		} else if desc.Generation != out.Generation || desc.Epoch != out.Epoch {
+			return out, fmt.Errorf("iceberg: staged descriptors of epochs %d-g%d and %d-g%d", out.Epoch, out.Generation, desc.Epoch, desc.Generation)
+		}
+		for _, s := range desc.Streams {
+			j, ok := at[s.Name]
+			if !ok {
+				j = len(out.Streams)
+				at[s.Name] = j
+				out.Streams = append(out.Streams, stagedStream{Name: s.Name, Mode: s.Mode, HardDeletes: s.HardDeletes, Read: s.Read})
+			}
+			m := &out.Streams[j]
+			if m.Read != s.Read {
+				return out, fmt.Errorf("iceberg: two reads of %s in epoch %d-g%d", s.Name, out.Epoch, out.Generation)
+			}
+			m.Table, m.Ended = cmp.Or(m.Table, s.Table), m.Ended || s.Ended
+			m.Files = append(m.Files, s.Files...)
+			m.Patches = append(m.Patches, s.Patches...)
+			m.Manifests = append(m.Manifests, s.Manifests...)
+			m.Earlier = append(m.Earlier, s.Earlier...)
+			if len(m.Key) == 0 {
+				m.Key = s.Key
+			}
+			for _, c := range s.Last {
+				if !slices.Contains(m.Last, c) {
+					m.Last = append(m.Last, c)
+				}
+			}
+			if len(s.Fills) > 0 && m.Fills == nil {
+				m.Fills = map[string]string{}
+			}
+			maps.Copy(m.Fills, s.Fills)
+		}
+	}
+	for i := range out.Streams {
+		if s := &out.Streams[i]; s.Table == "" {
+			s.Table = w.name(s.Name)
+		}
+	}
+	return out, nil
 }
 
 // pending is a table's transaction, with the files it wrote, which no
@@ -832,6 +956,8 @@ type pending struct {
 	table   string
 	written []string
 	staged  []string
+	// Overwrite: the stream's reads' manifests, which it makes unneeded too.
+	readsDir string
 }
 
 func (w *writer) discard(ps []pending) {
@@ -840,7 +966,10 @@ func (w *writer) discard(ps []pending) {
 	}
 }
 
-func (w *writer) committed(p pending) { w.dropFiles(p.ns, p.table, p.staged) }
+func (w *writer) committed(p pending) {
+	w.dropFiles(p.ns, p.table, p.staged)
+	w.dropManifests(p.ns, p.table, p.readsDir)
+}
 
 // apply commits each stream that changes its table and has no marker yet:
 // all in one catalog transaction, or with stream scope one per table. A
@@ -932,14 +1061,15 @@ func (w *writer) prepare(ctx context.Context, desc staged, streams []stagedStrea
 			continue
 		}
 		ident := w.ident(desc.Namespace, s.Table)
+		hasFiles := len(files) > 0 || len(s.Manifests) > 0
 		if s.Table == "" {
-			if len(files) > 0 {
+			if hasFiles {
 				return nil, fmt.Errorf("iceberg: stream %q staged files for no table", s.Name)
 			}
 			continue
 		}
 		tbl, err := w.cat.LoadTable(ctx, ident)
-		if errors.Is(err, catalog.ErrNoSuchTable) && len(files) == 0 {
+		if errors.Is(err, catalog.ErrNoSuchTable) && !hasFiles {
 			continue
 		}
 		if err != nil {
@@ -951,14 +1081,25 @@ func (w *writer) prepare(ctx context.Context, desc staged, streams []stagedStrea
 		if applied(tbl.Properties(), w.cfg.Pipeline, desc) {
 			continue
 		}
-		tx, written, err := w.transaction(ctx, tbl, desc, s, s.adds())
+		paths := s.adds()
+		if len(s.Manifests) > 0 {
+			earlier, err := manifestFiles(ctx, tbl, w.readDir(tbl, s.Name, s.Read), s.Manifests)
+			if err != nil {
+				return txs, fmt.Errorf("iceberg: %s: the read's earlier files: %w", strings.Join(ident, "."), err)
+			}
+			paths = append(earlier, paths...)
+		}
+		tx, written, err := w.transaction(ctx, tbl, desc, s, paths)
 		if err != nil {
 			w.dropFiles(desc.Namespace, s.Table, written)
 			return txs, fmt.Errorf("iceberg: %s: %w", strings.Join(ident, "."), err)
 		}
 		p := pending{tx: tx, ns: desc.Namespace, table: s.Table, written: written, staged: s.Patches}
-		if s.Mode == modeMerge {
+		switch s.Mode {
+		case modeMerge:
 			p.staged = append(slices.Clone(s.Files), s.Patches...)
+		case modeOverwrite:
+			p.readsDir = w.readsDir(tbl, s.Name)
 		}
 		txs = append(txs, p)
 	}
@@ -988,7 +1129,11 @@ func (w *writer) transaction(ctx context.Context, tbl *table.Table, desc staged,
 	if err != nil {
 		return nil, written, err
 	}
-	if err := tx.SetProperties(ice.Properties{loadedKey(w.cfg.Pipeline): fmt.Sprintf("%d:%d", desc.Epoch, desc.Generation)}); err != nil {
+	props := ice.Properties{loadedKey(w.cfg.Pipeline): fmt.Sprintf("%d:%d", desc.Epoch, desc.Generation)}
+	if s.Mode == modeOverwrite {
+		props[readKey(w.cfg.Pipeline)] = strconv.FormatInt(s.Read, 10)
+	}
+	if err := tx.SetProperties(props); err != nil {
 		return nil, written, err
 	}
 	return tx, written, nil
@@ -1096,14 +1241,11 @@ func (w *writer) raiseFence(ctx context.Context, ns []string, names []string, ge
 }
 
 func (w *writer) Recover(ctx context.Context, gen uint64, e destination.Epoch, committables []destination.Staged) (destination.Recovery, error) {
-	s, err := destination.One(committables)
-	if err != nil {
-		return 0, err
-	}
 	var desc staged
 	if !e.IsZero() {
-		if err := json.Unmarshal(s, &desc); err != nil {
-			return 0, fmt.Errorf("iceberg: staged descriptor: %w", err)
+		var err error
+		if desc, err = w.mergeLanes(committables); err != nil {
+			return 0, err
 		}
 	}
 	w.mu.Lock()
@@ -1147,14 +1289,21 @@ func (w *writer) Recover(ctx context.Context, gen uint64, e destination.Epoch, c
 				w.dropFiles(desc.Namespace, st.Table, st.Files)
 			}
 			w.dropFiles(desc.Namespace, st.Table, st.Patches)
+			if st.Mode == modeOverwrite {
+				w.dropManifests(desc.Namespace, st.Table, w.readsDir(tbl, st.Name))
+			}
 			continue
 		}
 		missing = append(missing, st)
-		if len(files) == 0 {
+		if len(files) == 0 && len(st.Manifests) == 0 {
 			continue
 		}
 		needs++
-		if tbl != nil && w.allExist(ctx, tbl, files) {
+		if tbl == nil {
+			continue
+		}
+		earlier, err := manifestFiles(ctx, tbl, w.readDir(tbl, st.Name, st.Read), st.Manifests)
+		if err == nil && w.allExist(ctx, tbl, append(earlier, files...)) {
 			present++
 		}
 	}
@@ -1167,7 +1316,8 @@ func (w *writer) Recover(ctx context.Context, gen uint64, e destination.Epoch, c
 			return 0, err
 		}
 		r = destination.Redone
-	case present == 0 && len(missing) == applying:
+	case len(missing) == applying:
+		// Nothing of it is visible, and some lane's files are gone.
 		r = destination.Lost
 		for _, st := range desc.Streams {
 			w.dropFiles(desc.Namespace, st.Table, st.Files)
@@ -1177,18 +1327,50 @@ func (w *writer) Recover(ctx context.Context, gen uint64, e destination.Epoch, c
 		return 0, fmt.Errorf("iceberg: epoch %d-g%d is partly applied and the staged files for the rest are gone", desc.Epoch, desc.Generation)
 	}
 	// A read that hasn't ended continues, unless StartReads says it began
-	// again.
+	// again. A lane that never knew it ended still describes it, so the table
+	// says. A lost epoch's end didn't happen.
 	for _, st := range desc.Streams {
-		if st.Mode != modeOverwrite || st.Ended {
+		if st.Mode != modeOverwrite || st.Ended && r != destination.Lost {
+			continue
+		}
+		ended, err := w.readEnded(ctx, desc.Namespace, st)
+		if err != nil {
+			return 0, err
+		}
+		if ended {
 			continue
 		}
 		files := st.Earlier
 		if r != destination.Lost {
 			files = append(slices.Clone(files), st.Files...)
 		}
-		w.reads[st.Name] = &read{start: st.Read, table: st.Table, files: files}
+		w.reads[st.Name] = &read{start: st.Read, table: st.Table, manifests: st.Manifests, files: files, restored: true}
 	}
 	return r, nil
+}
+
+// readEnded reports whether the stream's table has taken the files of its
+// read, or a later one's.
+func (w *writer) readEnded(ctx context.Context, ns []string, st stagedStream) (bool, error) {
+	if st.Table == "" {
+		return false, nil
+	}
+	tbl, err := w.cat.LoadTable(ctx, w.ident(ns, st.Table))
+	if errors.Is(err, catalog.ErrNoSuchTable) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("iceberg: load %s: %w", st.Table, err)
+	}
+	v, ok := tbl.Properties()[readKey(w.cfg.Pipeline)]
+	if !ok {
+		return false, nil
+	}
+	start, err := strconv.ParseInt(v, 10, 64)
+	if err != nil {
+		return false, fmt.Errorf("iceberg: the read %q of %s: %w", v, st.Table, err)
+	}
+	return start >= st.Read, nil
 }
 
 // allExist reports whether every file can be opened.

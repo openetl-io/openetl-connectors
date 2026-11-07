@@ -32,6 +32,19 @@ jobs:
           ref: main
           path: openetl
           ssh-key: ${{ secrets.OPENETL_DEPLOY_KEY }}
+      # A pull request takes the SDK from openetl's branch of its name, when
+      # there is one, so a change across both repositories is checked whole.
+      - name: SDK of the same branch
+        if: github.event_name == 'pull_request'
+        working-directory: openetl
+        env:
+          BRANCH: ${{ github.head_ref }}
+        run: |
+          if git fetch --depth=1 origin "refs/heads/$BRANCH"; then
+            git checkout --detach FETCH_HEAD
+          else
+            echo "openetl has no branch $BRANCH, so main's SDK"
+          fi
       - uses: actions/setup-go@v6
         with:
           go-version-file: openetl-connectors/go.mod

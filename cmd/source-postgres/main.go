@@ -22,5 +22,8 @@ func main() {
 		Source:       func(c []byte, _ host.Host) (source.Source, error) { return postgres.NewSource(c) },
 		// Committed advances the replication slot.
 		Acknowledges: true,
+		// Tables are read in key ranges, and a range's remainder divided.
+		Splits:  true,
+		Resplit: true,
 	})
 }

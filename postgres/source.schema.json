@@ -12,6 +12,7 @@
     "batchBytes": {"type": "integer", "minimum": 1, "default": 4194304, "description": "Approximate bytes of values per Arrow batch."},
     "publication": {"type": "string", "minLength": 1, "default": "openetl", "description": "The publication that tables read with cdc are in. Created, or given the tables it lacks, if the user may."},
     "slot": {"type": "string", "pattern": "^[a-z0-9_]{1,63}$", "description": "The replication slot tables read with cdc are read through. Default: one named after the pipeline, openetl_<pipeline>."},
-    "snapshotChunkRows": {"type": "integer", "minimum": 1, "default": 10000, "description": "Rows per chunk of a cdc table's snapshot, which is held in memory until the log catches up with it."}
+    "snapshotChunkRows": {"type": "integer", "minimum": 1, "default": 10000, "description": "Rows per chunk of a cdc table's snapshot, which is held in memory until the log catches up with it, a chunk per connection reading it."},
+    "maxConnections": {"type": "integer", "minimum": 1, "default": 4, "description": "The most connections a read holds to read tables, as many as it has lanes up to this. A cdc read's replication connection is one more."}
   }
 }

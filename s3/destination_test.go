@@ -58,6 +58,7 @@ func suite(t *testing.T, newDest func(*testing.T, map[string]any) *Destination) 
 		"StaleCommitAfterRecovery":   testStaleCommitAfterRecovery,
 		"RecoverDropsOldGenerations": testRecoverDropsOldGenerations,
 		"CloseDropsUncommitted":      testCloseDropsUncommitted,
+		"LanesNameTheirFiles":        testLanesNameTheirFiles,
 	} {
 		t.Run(name, func(t *testing.T) {
 			d := newDest(t, nil)
@@ -400,5 +401,46 @@ func testTypes(e *env) {
 	at := got[0].Column(sc.FieldIndices("at")[0]).(*array.Timestamp)
 	if at.Value(0)%1000 != 789 {
 		e.t.Errorf("at lost its nanoseconds: %d", at.Value(0))
+	}
+}
+
+// Each lane's files have names of their own, and one commit of every lane's
+// committable copies them under one marker per stream.
+func testLanesNameTheirFiles(e *env) {
+	w0 := e.open(1, "users", "orders")
+	cfg := destination.OpenConfig{Pipeline: "p1", Generation: 1, Scope: destination.ScopeStream, Lane: 1,
+		Streams: []destination.Stream{{Name: "users", Mode: destination.Append}, {Name: "orders", Mode: destination.Append}}}
+	w1, err := e.d.Open(e.t.Context(), cfg)
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	e.t.Cleanup(func() { _ = w1.Close(context.Background()) })
+	e.recover(w0, 1, destination.Epoch{}, nil)
+	ep := destination.Epoch{Generation: 1, N: 1}
+	e.write(w0, ep, "users", 1)
+	e.write(w1, ep, "users", 2)
+	e.write(w1, ep, "orders", 10)
+	st := []destination.Staged{e.precommit(w0, ep), e.precommit(w1, ep)}
+	for range 2 {
+		if _, err := w0.Commit(e.t.Context(), ep, st); err != nil {
+			e.t.Fatal(err)
+		}
+	}
+	e.wantIDs("users", 1, 2)
+	e.wantIDs("orders", 10)
+	if got := e.keys("users/"); !slices.Equal(got, []string{
+		fmt.Sprintf("users/p1-%020d-g%020d-00000.parquet", 1, 1), fmt.Sprintf("users/p1-%020d-g%020d-l1-00000.parquet", 1, 1),
+	}) {
+		e.t.Errorf("users' files: %v", got)
+	}
+	if got := e.keys(reserved + "/p1/loads/"); len(got) != 2 {
+		e.t.Errorf("markers %v, want one per stream", got)
+	}
+	w2 := e.open(2, "users", "orders")
+	if r, err := w2.Recover(e.t.Context(), 2, ep, st); err != nil || r != destination.Applied {
+		e.t.Errorf("recover on one lane: %v, %v, want applied", r, err)
+	}
+	if _, err := w2.Commit(e.t.Context(), destination.Epoch{Generation: 1, N: 2}, st); err == nil {
+		e.t.Error("committed another epoch's descriptors")
 	}
 }

@@ -838,7 +838,7 @@ func readFile(ctx context.Context, fs iceio.IO, path string, sc *arrow.Schema, o
 		_ = f.Close()
 		return err
 	}
-	defer pf.Close()
+	defer func() { _ = pf.Close() }()
 	fr, err := pqarrow.NewFileReader(pf, pqarrow.ArrowReadProperties{BatchSize: 64 << 10}, memory.DefaultAllocator)
 	if err != nil {
 		return err
