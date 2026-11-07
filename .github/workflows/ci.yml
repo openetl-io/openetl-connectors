@@ -126,3 +126,10 @@ jobs:
         env:
           OPENETL_TEST_GLUE_ENDPOINT: http://127.0.0.1:5000
         run: go test -race -tags integration -count=1 ./...
+      # What a release publishes, for this runner's platform, checked with
+      # the conformance kit as anyone checks a package.
+      - name: Packages, through the conformance kit
+        working-directory: openetl-connectors
+        env:
+          OPENETL: ${{ runner.temp }}/openetl
+        run: .github/test-packages.sh
