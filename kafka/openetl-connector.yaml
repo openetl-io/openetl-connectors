@@ -1,4 +1,5 @@
 name: kafka
+title: Apache Kafka
 description: Kafka topics, read exactly from offsets, and written in a transaction per epoch
 license: Apache-2.0
 repository: https://github.com/openetl-io/openetl-connectors
