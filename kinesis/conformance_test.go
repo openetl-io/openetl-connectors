@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"testing"
 	"time"
 
@@ -16,6 +17,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/kinesis/types"
 
 	"github.com/openetl-io/openetl/sdk/go/conformance"
+	protocolv1 "github.com/openetl-io/openetl/sdk/go/protocol/v1"
 )
 
 const closedPort = "http://127.0.0.1:1"
@@ -33,6 +35,69 @@ func TestSourceConformance(t *testing.T) {
 		Config:      config(t, map[string]any{"streams": []string{a, b}}),
 		Unreachable: config(t, map[string]any{"streams": []string{a, b}, "endpoint": closedPort}),
 	}.Test(t)
+}
+
+// Over the protocol, the connector declares splits and reads them; a shard's
+// children join with its completion.
+func TestSourceSplitsOverTheProtocol(t *testing.T) {
+	name := uniq("conf_splits")
+	createStream(t, name, 1)
+	putJSON(t, name, 0, 50)
+	const parent = "shardId-000000000000"
+	split(t, name, parent)
+	putJSON(t, name, 50, 50)
+	launch := conformance.Exec(conformance.Build(t, "../cmd/source-kinesis"))
+	p, err := launch(t.Context(), config(t, map[string]any{"streams": []string{name}}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+	spec, err := protocolv1.NewConnectorServiceClient(p.Conn()).Spec(t.Context(), &protocolv1.SpecRequest{Host: conformance.Host})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !spec.GetSource().GetSplits() || spec.GetSource().GetResplit() {
+		t.Errorf("capabilities %v", spec.GetSource())
+	}
+	cl := protocolv1.NewSourceServiceClient(p.Conn())
+	stream := &protocolv1.ConfiguredStream{Name: name, SyncMode: protocolv1.SyncMode_SYNC_MODE_STREAM}
+	res, err := cl.Splits(t.Context(), &protocolv1.SplitsRequest{Config: p.Config(), Stream: stream})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.GetSplits()) != 1 || res.GetSplits()[0].GetId() != parent {
+		t.Fatalf("splits %v", res.GetSplits())
+	}
+	stream.Splits = res.GetSplits()
+	rs, err := cl.Read(t.Context(), &protocolv1.ReadRequest{Config: p.Config(), Pipeline: "p", Lanes: 3, Streams: []*protocolv1.ConfiguredStream{stream}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows := 0
+	completed := map[string]bool{}
+	var added []*protocolv1.Split
+	for {
+		m, err := rs.Recv()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		switch msg := m.GetMsg().(type) {
+		case *protocolv1.ReadResponse_Batch:
+			if msg.Batch.GetSplit() == "" {
+				t.Errorf("a batch of %q", msg.Batch.GetSplit())
+			}
+			rows += len(msg.Batch.GetRows().GetRows())
+		case *protocolv1.ReadResponse_Complete:
+			completed[msg.Complete.GetSplit()] = true
+			added = append(added, msg.Complete.GetAdded()...)
+		}
+	}
+	if rows != 100 || len(completed) != 3 || len(added) != 2 {
+		t.Errorf("%d rows, completed %v, added %v", rows, completed, added)
+	}
 }
 
 func TestDestinationConformance(t *testing.T) {
