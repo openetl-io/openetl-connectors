@@ -21,5 +21,6 @@ func main() {
 		Source:       func(c []byte, _ host.Host) (source.Source, error) { return kafka.NewSource(c) },
 		// Committed commits the offsets to the consumer group.
 		Acknowledges: true,
+		Splits:       true,
 	})
 }

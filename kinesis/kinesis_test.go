@@ -8,11 +8,15 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"maps"
 	"math/big"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -602,4 +606,525 @@ func TestFormatsRoundTrip(t *testing.T) {
 			wantIDs(t, got, 0, 10)
 		})
 	}
+}
+
+// merge merges two adjacent shards.
+func merge(t *testing.T, stream, a, b string) {
+	t.Helper()
+	cl := client(t)
+	if _, err := cl.MergeShards(t.Context(), &awskinesis.MergeShardsInput{StreamName: aws.String(stream), ShardToMerge: aws.String(a), AdjacentShardToMerge: aws.String(b)}); err != nil {
+		t.Fatal(err)
+	}
+	active(t, cl, stream)
+}
+
+// splitCapture is an Emitter that keeps what a read emits per split, and holds
+// a source to what the platform takes: emits on a split the stream has, none
+// after it completes, one goroutine at a time.
+type splitCapture struct {
+	*capture
+	mu     sync.Mutex
+	splits map[string]map[string]*splitRecord
+	seq    int
+}
+
+type splitRecord struct {
+	busy     atomic.Bool
+	rows     []map[string]any
+	state    []byte
+	covered  int
+	complete bool
+	added    []source.Split
+	// When its first and last rows came, and when it completed.
+	firstRow, lastRow, completed int
+}
+
+func newSplitCapture(streams map[string][]source.Split) *splitCapture {
+	c := &splitCapture{capture: newCapture(), splits: map[string]map[string]*splitRecord{}}
+	for stream, splits := range streams {
+		c.splits[stream] = map[string]*splitRecord{}
+		for _, sp := range splits {
+			c.splits[stream][sp.ID] = &splitRecord{state: sp.State}
+		}
+	}
+	return c
+}
+
+func (c *splitCapture) Split(stream, id string) source.SplitEmitter {
+	if id == source.WholeStream {
+		return source.WholeSplit(c.capture, stream, id)
+	}
+	return splitEmit{c, stream, id}
+}
+
+type splitEmit struct {
+	c          *splitCapture
+	stream, id string
+}
+
+func (e splitEmit) emit(f func(*splitRecord) error) error {
+	e.c.mu.Lock()
+	rec := e.c.splits[e.stream][e.id]
+	e.c.mu.Unlock()
+	if rec == nil {
+		return fmt.Errorf("emitted on split %s of %s, which it doesn't have", e.id, e.stream)
+	}
+	if !rec.busy.CompareAndSwap(false, true) {
+		return fmt.Errorf("two goroutines emit on split %s of %s", e.id, e.stream)
+	}
+	defer rec.busy.Store(false)
+	time.Sleep(time.Millisecond)
+	e.c.mu.Lock()
+	defer e.c.mu.Unlock()
+	if rec.complete {
+		return fmt.Errorf("emitted on split %s of %s after completing it", e.id, e.stream)
+	}
+	e.c.seq++
+	return f(rec)
+}
+
+func (e splitEmit) Rows(rows []json.RawMessage) error {
+	return e.emit(func(rec *splitRecord) error {
+		for _, r := range rows {
+			var m map[string]any
+			if err := json.Unmarshal(r, &m); err != nil {
+				return err
+			}
+			rec.rows = append(rec.rows, m)
+		}
+		if rec.firstRow == 0 {
+			rec.firstRow = e.c.seq
+		}
+		rec.lastRow = e.c.seq
+		return nil
+	})
+}
+
+func (e splitEmit) Records(arrow.RecordBatch) error { return errors.New("no typed batches") }
+
+func (e splitEmit) add(rec *splitRecord, added []source.Split) error {
+	for _, sp := range added {
+		if e.c.splits[e.stream][sp.ID] != nil {
+			return fmt.Errorf("added split %s of %s, which it already has", sp.ID, e.stream)
+		}
+		e.c.splits[e.stream][sp.ID] = &splitRecord{state: sp.State}
+		rec.added = append(rec.added, sp)
+	}
+	return nil
+}
+
+func (e splitEmit) ResumePoint(state []byte, added ...source.Split) error {
+	return e.emit(func(rec *splitRecord) error {
+		rec.state, rec.covered = state, len(rec.rows)
+		return e.add(rec, added)
+	})
+}
+
+func (e splitEmit) Complete(next []byte, added ...source.Split) error {
+	return e.emit(func(rec *splitRecord) error {
+		rec.state, rec.covered, rec.complete, rec.completed = next, len(rec.rows), true, e.c.seq
+		return e.add(rec, added)
+	})
+}
+
+// states are the stream's splits where the read got to. open: only those a
+// retry reads.
+func (c *splitCapture) states(stream string, open bool) []source.Split {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var out []source.Split
+	for _, id := range slices.Sorted(maps.Keys(c.splits[stream])) {
+		if !open || !c.splits[stream][id].complete {
+			out = append(out, source.Split{ID: id, State: c.splits[stream][id].state})
+		}
+	}
+	return out
+}
+
+func (c *splitCapture) ids(t *testing.T, stream string, resumed bool) map[int64]int {
+	t.Helper()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var rows []map[string]any
+	for _, rec := range c.splits[stream] {
+		if resumed {
+			rows = append(rows, rec.rows[:rec.covered]...)
+		} else {
+			rows = append(rows, rec.rows...)
+		}
+	}
+	return rowIDs(t, rows)
+}
+
+func (c *splitCapture) total(stream string) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	n := 0
+	for _, rec := range c.splits[stream] {
+		n += len(rec.rows)
+	}
+	return n
+}
+
+func (c *splitCapture) has(stream, id string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.splits[stream][id] != nil
+}
+
+func (c *splitCapture) record(stream, id string) *splitRecord {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.splits[stream][id]
+}
+
+// wantAfter fails unless every row of the child comes after every row of the
+// parent, whose split has completed by then.
+func (c *splitCapture) wantAfter(t *testing.T, stream, parent, child string) {
+	t.Helper()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	p, ch := c.splits[stream][parent], c.splits[stream][child]
+	if p == nil || ch == nil {
+		t.Fatalf("splits %s and %s: %v, %v", parent, child, p, ch)
+	}
+	if ch.firstRow != 0 && (ch.firstRow < p.lastRow || !p.complete || ch.firstRow < p.completed) {
+		t.Errorf("%s's first row at %d, %s's last at %d, completed at %d", child, ch.firstRow, parent, p.lastRow, p.completed)
+	}
+}
+
+func splitsOf(t *testing.T, s *Source, stream string, ended []source.Split) []source.Split {
+	t.Helper()
+	splits, err := s.Splits(t.Context(), source.ConfiguredStream{Name: stream, SyncMode: source.Stream}, ended)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return splits
+}
+
+func wantSplits(t *testing.T, splits []source.Split, ids ...string) {
+	t.Helper()
+	got := make([]string, len(splits))
+	for i, sp := range splits {
+		got[i] = sp.ID
+	}
+	if !slices.Equal(got, ids) {
+		t.Errorf("splits %v, want %v", got, ids)
+	}
+}
+
+// readSplits reads the splits, in a read that ends once every one completes.
+func readSplits(t *testing.T, s *Source, stream string, splits []source.Split) *splitCapture {
+	t.Helper()
+	c := newSplitCapture(map[string][]source.Split{stream: splits})
+	ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
+	defer cancel()
+	req := source.ReadRequest{Pipeline: "p", Lanes: 2, Streams: []source.ConfiguredStream{{Name: stream, SyncMode: source.Stream, Splits: splits}}}
+	if err := s.Read(ctx, req, c); err != nil {
+		t.Fatal(err)
+	}
+	for id, rec := range c.splits[stream] {
+		if !rec.complete {
+			t.Errorf("split %s didn't complete", id)
+		}
+	}
+	return c
+}
+
+// A shard is a split: each reads its own records, completes where it stopped,
+// and the next read goes on from there. A stream read whole last time splits
+// from the whole state.
+func TestSourceReadsShardsAsSplits(t *testing.T) {
+	stream := uniq("splits")
+	createStream(t, stream, 2)
+	putJSON(t, stream, 0, 100)
+	s := newSource(t, map[string]any{"streams": []string{stream}})
+	const a, b = "shardId-000000000000", "shardId-000000000001"
+	splits := splitsOf(t, s, stream, nil)
+	wantSplits(t, splits, a, b)
+	c := readSplits(t, s, stream, splits)
+	wantIDs(t, c.ids(t, stream, false), 0, 100)
+	for id, rec := range c.splits[stream] {
+		var st shardState
+		if err := json.Unmarshal(rec.state, &st); err != nil {
+			t.Fatal(err)
+		}
+		if len(rec.rows) == 0 || st.Done || st.After != rec.rows[len(rec.rows)-1][sequenceColumn] {
+			t.Errorf("split %s: state %s after %d rows", id, rec.state, len(rec.rows))
+		}
+		for _, r := range rec.rows {
+			if r[shardColumn] != id {
+				t.Errorf("split %s has a row of shard %v", id, r[shardColumn])
+			}
+		}
+	}
+	putJSON(t, stream, 100, 50)
+	again := readSplits(t, s, stream, splitsOf(t, s, stream, c.states(stream, false)))
+	wantIDs(t, again.ids(t, stream, false), 100, 150)
+	idle := readSplits(t, s, stream, splitsOf(t, s, stream, again.states(stream, false)))
+	if n := idle.total(stream); n != 0 {
+		t.Errorf("a read with nothing new read %d rows", n)
+	}
+
+	// A record from before splits continues whole, and splits once it ends.
+	whole := read(t, s, stream, nil)
+	wantIDs(t, rowIDs(t, whole.rows[stream]), 0, 150)
+	putJSON(t, stream, 150, 10)
+	whole = read(t, s, stream, whole.complete[stream])
+	wantIDs(t, rowIDs(t, whole.rows[stream]), 150, 160)
+	putJSON(t, stream, 160, 10)
+	fromWhole := splitsOf(t, s, stream, []source.Split{{ID: source.WholeStream, State: whole.complete[stream]}})
+	wantSplits(t, fromWhole, a, b)
+	wantIDs(t, readSplits(t, s, stream, fromWhole).ids(t, stream, false), 160, 170)
+}
+
+// A split reads its parent first: the children join with its completion, and
+// the reads after it know it's done without being told, however far back.
+func TestSourceSplitsJoinAfterTheirParent(t *testing.T) {
+	stream := uniq("resharded")
+	createStream(t, stream, 1)
+	putJSON(t, stream, 0, 300)
+	const parent, c1, c2 = "shardId-000000000000", "shardId-000000000001", "shardId-000000000002"
+	split(t, stream, parent)
+	putJSON(t, stream, 300, 100)
+	s := newSource(t, map[string]any{"streams": []string{stream}})
+	splits := splitsOf(t, s, stream, nil)
+	wantSplits(t, splits, parent)
+	c := readSplits(t, s, stream, splits)
+	wantIDs(t, c.ids(t, stream, false), 0, 400)
+	wantSplits(t, c.splits[stream][parent].added, c1, c2)
+	c.wantAfter(t, stream, parent, c1)
+	c.wantAfter(t, stream, parent, c2)
+	var st shardState
+	if err := json.Unmarshal(c.splits[stream][parent].state, &st); err != nil || !st.Done {
+		t.Errorf("the parent's state %s: %v", c.splits[stream][parent].state, err)
+	}
+
+	// From a position partway through the parent.
+	rows := c.splits[stream][parent].rows
+	mid := rows[len(rows)/2][sequenceColumn].(string)
+	midway := readSplits(t, s, stream, []source.Split{{ID: parent, State: encodeShard(shardState{After: mid, Since: time.Now()})}})
+	if n := midway.total(stream); n != 100+len(rows)-len(rows)/2-1 {
+		t.Errorf("resuming partway through the parent read %d rows, of %d in it", n, len(rows))
+	}
+	wantSplits(t, midway.splits[stream][parent].added, c1, c2)
+	midway.wantAfter(t, stream, parent, c1)
+
+	next := splitsOf(t, s, stream, c.states(stream, false))
+	wantSplits(t, next, c1, c2)
+	putJSON(t, stream, 400, 20)
+	second := readSplits(t, s, stream, next)
+	wantIDs(t, second.ids(t, stream, false), 400, 420)
+	if second.has(stream, parent) {
+		t.Error("the second read read the parent")
+	}
+	third := splitsOf(t, s, stream, second.states(stream, false))
+	wantSplits(t, third, c1, c2)
+	if n := readSplits(t, s, stream, third).total(stream); n != 0 {
+		t.Errorf("the third read read %d rows", n)
+	}
+}
+
+// A merged child waits for both parents: it joins with the last one's
+// completion, however the read got there.
+func TestSourceMergedSplitWaitsForBothParents(t *testing.T) {
+	stream := uniq("merged")
+	createStream(t, stream, 2)
+	putJSON(t, stream, 0, 200)
+	const a, b, m = "shardId-000000000000", "shardId-000000000001", "shardId-000000000002"
+	merge(t, stream, a, b)
+	putJSON(t, stream, 200, 100)
+	s := newSource(t, map[string]any{"streams": []string{stream}})
+	splits := splitsOf(t, s, stream, nil)
+	wantSplits(t, splits, a, b)
+	first := readSplits(t, s, stream, splits)
+	wantIDs(t, first.ids(t, stream, false), 0, 300)
+	first.wantAfter(t, stream, a, m)
+	first.wantAfter(t, stream, b, m)
+	added := append(slices.Clone(first.splits[stream][a].added), first.splits[stream][b].added...)
+	wantSplits(t, added, m)
+
+	bRows := first.splits[stream][b].rows
+	midB := bRows[len(bRows)/2][sequenceColumn].(string)
+	midState := encodeShard(shardState{After: midB, Since: time.Now()})
+	rest := len(bRows) - len(bRows)/2 - 1
+	mRows := len(first.splits[stream][m].rows)
+	done := first.splits[stream][a].state
+
+	t.Run("one parent completed in an earlier read", func(t *testing.T) {
+		ended := []source.Split{{ID: a, State: done}, {ID: b, State: midState}}
+		next := splitsOf(t, s, stream, ended)
+		wantSplits(t, next, a, b)
+		c := readSplits(t, s, stream, next)
+		if n := len(c.splits[stream][a].rows); n != 0 {
+			t.Errorf("the done parent read %d rows", n)
+		}
+		if n := c.total(stream); n != rest+mRows {
+			t.Errorf("read %d rows, want %d", n, rest+mRows)
+		}
+		wantSplits(t, c.splits[stream][b].added, m)
+		c.wantAfter(t, stream, b, m)
+		wantSplits(t, splitsOf(t, s, stream, c.states(stream, false)), m)
+	})
+
+	t.Run("a retry of a bounded read leaves the child to the next read", func(t *testing.T) {
+		c := readSplits(t, s, stream, []source.Split{{ID: b, State: midState}})
+		if n := c.total(stream); n != rest {
+			t.Errorf("read %d rows, want %d", n, rest)
+		}
+		if c.has(stream, m) {
+			t.Error("read a child, one parent's end unknown")
+		}
+		ended := append([]source.Split{{ID: a, State: done}}, c.states(stream, false)...)
+		next := splitsOf(t, s, stream, ended)
+		wantSplits(t, next, m)
+		if n := readSplits(t, s, stream, next).total(stream); n != mRows {
+			t.Errorf("the next read read %d rows, want %d", n, mRows)
+		}
+	})
+
+	t.Run("a retry of a continuous read adds the child", func(t *testing.T) {
+		splits := []source.Split{{ID: b, State: midState}}
+		c := newSplitCapture(map[string][]source.Split{stream: splits})
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		errc := make(chan error, 1)
+		go func() {
+			errc <- s.Read(ctx, source.ReadRequest{Pipeline: "p", Continuous: true, Streams: []source.ConfiguredStream{{Name: stream, SyncMode: source.Stream, Splits: splits}}}, c)
+		}()
+		await(t, "what's left of the parent and the child", func() bool { return c.total(stream) == rest+mRows })
+		cancel()
+		if err := <-errc; !errors.Is(err, context.Canceled) {
+			t.Errorf("Read = %v", err)
+		}
+		if c.has(stream, a) {
+			t.Error("read a parent that had completed")
+		}
+		wantSplits(t, c.record(stream, b).added, m)
+		c.wantAfter(t, stream, b, m)
+	})
+
+	// A barrier can land between one parent's last resume point and its
+	// completion, with the other's completion and the child in the record.
+	t.Run("a child in the record before its parent's end", func(t *testing.T) {
+		aRows := first.splits[stream][a].rows
+		midA := aRows[len(aRows)-1][sequenceColumn].(string)
+		child := source.Split{ID: m, State: encodeShard(shardState{Since: time.Now()})}
+		c := readSplits(t, s, stream, []source.Split{{ID: a, State: encodeShard(shardState{After: midA, Since: time.Now()})}, child})
+		if n := len(c.splits[stream][a].added); n != 0 {
+			t.Errorf("added %v, which the read has", c.splits[stream][a].added)
+		}
+		if n := c.total(stream); n != mRows {
+			t.Errorf("read %d rows, want %d", n, mRows)
+		}
+		c.wantAfter(t, stream, a, m)
+	})
+}
+
+// A continuous read follows a reshard split by split, and reports on them; a
+// restart reads what its states don't cover, of the splits that haven't
+// completed, and adds nothing the record has.
+func TestSourceSplitsFollowAReshard(t *testing.T) {
+	stream := uniq("live")
+	createStream(t, stream, 1)
+	putJSON(t, stream, 0, 100)
+	const parent, c1, c2 = "shardId-000000000000", "shardId-000000000001", "shardId-000000000002"
+	s := newSource(t, map[string]any{"streams": []string{stream}})
+	splits := splitsOf(t, s, stream, nil)
+	c := newSplitCapture(map[string][]source.Split{stream: splits})
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		done <- s.Read(ctx, source.ReadRequest{Pipeline: "p", Continuous: true, Streams: []source.ConfiguredStream{{Name: stream, SyncMode: source.Stream, Splits: splits}}}, c)
+	}()
+	await(t, "the first records", func() bool { return c.total(stream) == 100 })
+	split(t, stream, parent)
+	putJSON(t, stream, 100, 100)
+	await(t, "the children's records", func() bool { return c.total(stream) == 200 })
+	await(t, "a progress report", func() bool {
+		c.capture.mu.Lock()
+		defer c.capture.mu.Unlock()
+		return len(c.capture.progress) > 0
+	})
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Errorf("Read = %v", err)
+	}
+	wantIDs(t, c.ids(t, stream, false), 0, 200)
+	wantSplits(t, c.splits[stream][parent].added, c1, c2)
+	c.wantAfter(t, stream, parent, c1)
+	c.wantAfter(t, stream, parent, c2)
+	if p := c.capture.progress[0]; p.Stream != stream || p.Lag == nil || p.RetentionLeft == nil {
+		t.Errorf("progress %+v", p)
+	}
+
+	putJSON(t, stream, 200, 50)
+	open := c.states(stream, true)
+	wantSplits(t, open, c1, c2)
+	again := newSplitCapture(map[string][]source.Split{stream: open})
+	ctx2, cancel2 := context.WithCancel(t.Context())
+	defer cancel2()
+	go func() {
+		done <- s.Read(ctx2, source.ReadRequest{Pipeline: "p", Continuous: true, Streams: []source.ConfiguredStream{{Name: stream, SyncMode: source.Stream, Splits: open}}}, again)
+	}()
+	await(t, "what the states don't cover", func() bool { return again.total(stream) >= 50 })
+	cancel2()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Errorf("Read = %v", err)
+	}
+	if again.has(stream, parent) {
+		t.Error("the restart read the parent")
+	}
+	got := c.ids(t, stream, true)
+	for id, n := range again.ids(t, stream, false) {
+		got[id] += n
+	}
+	wantIDs(t, got, 0, 250)
+}
+
+// A shard Kinesis no longer lists is lost only if it could have held records
+// the read hadn't reached; otherwise its split completes at once, and the next
+// read drops it.
+func TestSourceSplitPositionLost(t *testing.T) {
+	stream := uniq("retained")
+	createStream(t, stream, 1)
+	putJSON(t, stream, 0, 10)
+	const shard, gone = "shardId-000000000000", "shardId-000000000099"
+	s := newSource(t, map[string]any{"streams": []string{stream}})
+	first := readSplits(t, s, stream, splitsOf(t, s, stream, nil))
+	at := first.splits[stream][shard].state
+	old := encodeShard(shardState{After: "1", Since: time.Now().Add(-25 * time.Hour)})
+	lost := []source.Split{{ID: shard, State: at}, {ID: gone, State: old}}
+	_, err := s.Splits(t.Context(), source.ConfiguredStream{Name: stream}, lost)
+	wantCode(t, err, protocolv1.ErrorCode_ERROR_CODE_POSITION_LOST)
+	err = s.Read(t.Context(), source.ReadRequest{Pipeline: "p", Streams: []source.ConfiguredStream{{Name: stream, SyncMode: source.Stream, Splits: lost}}}, newSplitCapture(map[string][]source.Split{stream: lost}))
+	wantCode(t, err, protocolv1.ErrorCode_ERROR_CODE_POSITION_LOST)
+
+	recent := []source.Split{{ID: shard, State: at}, {ID: gone, State: encodeShard(shardState{After: "1", Since: time.Now()})}}
+	wantSplits(t, splitsOf(t, s, stream, recent), shard)
+	c := readSplits(t, s, stream, recent)
+	if n := c.total(stream); n != 0 {
+		t.Errorf("read %d rows", n)
+	}
+	var st shardState
+	if err := json.Unmarshal(c.splits[stream][gone].state, &st); err != nil || !st.Done {
+		t.Errorf("the expired shard's state %s: %v", c.splits[stream][gone].state, err)
+	}
+	wantSplits(t, splitsOf(t, s, stream, c.states(stream, false)), shard)
+}
+
+// startPosition latest skips what the stream held before the first read, and
+// a sync that reads nothing keeps its place.
+func TestSourceSplitsStartAtLatest(t *testing.T) {
+	stream := uniq("latest")
+	createStream(t, stream, 2)
+	putJSON(t, stream, 0, 20)
+	s := newSource(t, map[string]any{"streams": []string{stream}, "startPosition": "latest"})
+	c := readSplits(t, s, stream, splitsOf(t, s, stream, nil))
+	if n := c.total(stream); n != 0 {
+		t.Errorf("read %d rows from before the first read", n)
+	}
+	putJSON(t, stream, 20, 20)
+	wantIDs(t, readSplits(t, s, stream, splitsOf(t, s, stream, c.states(stream, false))).ids(t, stream, false), 20, 40)
 }
