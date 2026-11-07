@@ -486,14 +486,27 @@ func limits(tbl *table.Table) destination.TableLimits {
 	return l
 }
 
-func (w *writer) create(ctx context.Context, ident table.Identifier, sc *ice.Schema) (*table.Table, error) {
-	ns := ident[:len(ident)-1]
+// createMu keeps a job's lanes from racing to create a namespace or a table.
+// The race gains nothing, and a catalog can take it badly: on a primary key
+// failure, Iceberg's REST fixture stays locked until it restarts.
+var createMu sync.Mutex
+
+// ensureNamespace creates ns unless it's there.
+func (w *writer) ensureNamespace(ctx context.Context, ns table.Identifier) error {
+	if ok, err := w.cat.CheckNamespaceExists(ctx, ns); err == nil && ok {
+		return nil
+	}
 	if err := w.cat.CreateNamespace(ctx, ns, nil); err != nil && !errors.Is(err, catalog.ErrNamespaceAlreadyExists) {
-		// Lanes race to create it, and a catalog can answer the loser with an
-		// internal error.
-		if ok, cerr := w.cat.CheckNamespaceExists(ctx, ns); cerr != nil || !ok {
-			return nil, fmt.Errorf("iceberg: create namespace %s: %w", strings.Join(ns, "."), err)
-		}
+		return fmt.Errorf("iceberg: create namespace %s: %w", strings.Join(ns, "."), err)
+	}
+	return nil
+}
+
+func (w *writer) create(ctx context.Context, ident table.Identifier, sc *ice.Schema) (*table.Table, error) {
+	createMu.Lock()
+	defer createMu.Unlock()
+	if err := w.ensureNamespace(ctx, ident[:len(ident)-1]); err != nil {
+		return nil, err
 	}
 	opts := []catalog.CreateTableOpt{catalog.WithProperties(ice.Properties{
 		table.PropertyFormatVersion: "2",
