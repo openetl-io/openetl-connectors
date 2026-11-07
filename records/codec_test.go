@@ -96,7 +96,7 @@ func TestFormatsRoundTrip(t *testing.T) {
 	}
 	for _, format := range []string{JSON, Avro, Protobuf} {
 		t.Run(format, func(t *testing.T) {
-			enc, err := NewEncoder(t.Context(), format, reg, "items_"+format+"-value", "items", cols)
+			enc, err := NewEncoder(t.Context(), format, reg, "items_"+format+"-value", "items", cols, false)
 			if err != nil {
 				t.Fatal(err)
 			}

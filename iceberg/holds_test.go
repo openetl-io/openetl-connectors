@@ -300,7 +300,7 @@ func TestApplySchemaRefusesTypeChanges(t *testing.T) {
 	writeRows(t, w, ep(2), "users", []arrow.Field{idField, wide, extra}, `[{"id": 2, "n": 5000000000, "extra": "x"}]`)
 	a := apply(idField, wide, extra)
 	want := destination.RefusedColumn{
-		Stream: "users", Column: "n", Reason: "it doesn't change a column's type", FromType: "int", ToType: "long",
+		Stream: "users", Column: "n", Reason: "it doesn't change a column's type unless the pipeline's typeChanges allows it", FromType: "int", ToType: "long",
 		Fix: "ALTER TABLE `" + env.ns + "`.`users` ALTER COLUMN `n` TYPE BIGINT",
 	}
 	if len(a.Refused) != 1 || a.Refused[0] != want {

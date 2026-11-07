@@ -1122,12 +1122,12 @@ func (w *writer) prepare(ctx context.Context, desc staged, s stagedStream) (prep
 		}
 		p.read = names(have)
 		if s.Ended && len(have) > 0 && s.Table != "" {
-			if err := w.ensureTable(ctx, s.Table, have); err != nil {
+			if err := w.ensureTable(ctx, s.Name, s.Table, have); err != nil {
 				return p, err
 			}
 		}
 	} else if cols != nil {
-		if err := w.ensureTable(ctx, s.Table, cols); err != nil {
+		if err := w.ensureTable(ctx, s.Name, s.Table, cols); err != nil {
 			return p, err
 		}
 	}
@@ -1304,7 +1304,7 @@ func (w *writer) ensureRead(ctx context.Context, s stagedStream, cols []column) 
 			return fmt.Errorf("postgres: column %q of the read table for %s, as its target has it: %w", c.name, s.Name, err)
 		}
 	}
-	return w.ensureTable(ctx, s.Read, cols)
+	return w.ensureTable(ctx, s.Name, s.Read, cols)
 }
 
 // ensureIndex builds the index without blocking the table's writers. A
@@ -1400,7 +1400,7 @@ func (w *writer) ApplySchema(ctx context.Context, streams []destination.StreamSc
 	out.Limits = make(map[string]destination.TableLimits, len(streams))
 	for i, s := range streams {
 		t := have[tables[i]]
-		refused, err := w.alter(ctx, tables[i], want[i], t)
+		refused, err := w.alter(ctx, tables[i], want[i], t, w.streams[s.Name].AllowTypeChanges)
 		if err != nil {
 			return destination.SchemaApplied{}, err
 		}
@@ -1417,14 +1417,14 @@ func (w *writer) ApplySchema(ctx context.Context, streams []destination.StreamSc
 	return out, nil
 }
 
-// ensureTable creates the table with cols, or adds its columns to hold
+// ensureTable creates stream's table with cols, or adds its columns to hold
 // them. A column already wider is left alone.
-func (w *writer) ensureTable(ctx context.Context, table string, cols []column) error {
+func (w *writer) ensureTable(ctx context.Context, stream, table string, cols []column) error {
 	have, err := w.catalog(ctx, []string{table})
 	if err != nil {
 		return err
 	}
-	refused, err := w.alter(ctx, table, cols, have[table])
+	refused, err := w.alter(ctx, table, cols, have[table], w.streams[stream].AllowTypeChanges)
 	if err != nil {
 		return err
 	}
@@ -1498,9 +1498,10 @@ func (w *writer) catalog(ctx context.Context, tables []string) (map[string]*tabl
 }
 
 // alter creates the table with cols if it doesn't exist, or adds its new
-// columns in one ALTER TABLE, and returns the columns it refused, with why:
-// it never changes a column's type. have is updated to match.
-func (w *writer) alter(ctx context.Context, table string, cols []column, have *tableInfo) ([]destination.RefusedColumn, error) {
+// columns in one ALTER TABLE, and returns the columns it refused, with why.
+// It widens a column's type only if the stream allows type changes, since
+// that can rewrite the table. have is updated to match.
+func (w *writer) alter(ctx context.Context, table string, cols []column, have *tableInfo, allow bool) ([]destination.RefusedColumn, error) {
 	if have == nil {
 		if err := w.ddl(ctx, "CREATE TABLE IF NOT EXISTS "+w.ident(table)+" ("+columnDefs(cols)+")"); err != nil {
 			return nil, fmt.Errorf("postgres: create %s: %w", table, err)
@@ -1513,6 +1514,8 @@ func (w *writer) alter(ctx context.Context, table string, cols []column, have *t
 	}
 	var clauses []string
 	var changed []column
+	// Columns to widen, by their index in have.cols.
+	widen := map[int]column{}
 	attrs := have.attrs
 	for _, c := range cols {
 		i := slices.IndexFunc(have.cols, func(x column) bool { return x.name == c.name })
@@ -1531,14 +1534,32 @@ func (w *writer) alter(ctx context.Context, table string, cols []column, have *t
 				Column: c.name, Reason: fmt.Sprintf("it can't change a column from %s to %s", have.cols[i].typ, c.typ), FromType: have.cols[i].typ, ToType: c.typ,
 			})
 			continue
+		case allow:
+			widen[i] = c
+			continue
 		default:
 			refused = append(refused, destination.RefusedColumn{
-				Column: c.name, Reason: "it doesn't change a column's type, which can rewrite the table", FromType: have.cols[i].typ, ToType: c.typ,
+				Column: c.name, Reason: "it doesn't change a column's type unless the pipeline's typeChanges allows it, as that can rewrite the table",
+				FromType: have.cols[i].typ, ToType: c.typ,
 				Fix: "ALTER TABLE " + w.ident(table) + " ALTER COLUMN " + pgx.Identifier{c.name}.Sanitize() + " TYPE " + c.typ,
 			})
 			continue
 		}
 		clauses, changed = append(clauses, clause), append(changed, c)
+	}
+	for _, i := range slices.Sorted(maps.Keys(widen)) {
+		c := widen[i]
+		q := pgx.Identifier{c.name}.Sanitize()
+		err := w.ddl(ctx, "ALTER TABLE "+w.ident(table)+" ALTER COLUMN "+q+" TYPE "+c.typ+" USING "+q+"::"+c.typ)
+		// Such as a view that depends on the column.
+		if pe, ok := errors.AsType[*pgconn.PgError](err); ok && pe.Code == "0A000" {
+			refused = append(refused, destination.RefusedColumn{Column: c.name, Reason: "it can't change the column's type: " + pe.Message, FromType: have.cols[i].typ, ToType: c.typ})
+			continue
+		}
+		if err != nil {
+			return nil, fmt.Errorf("postgres: change the type of column %q of %s to %s: %w", c.name, table, c.typ, err)
+		}
+		have.cols[i].typ = c.typ
 	}
 	if len(clauses) == 0 {
 		return refused, nil

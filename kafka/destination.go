@@ -371,12 +371,12 @@ func (w *writer) encoder(ctx context.Context, stream string, sc *arrow.Schema) (
 		e.key = append(e.key, i)
 		keyCols = append(keyCols, cols[i])
 	}
-	f := w.d.cfg.Format
-	if e.valueEnc, err = records.NewEncoder(ctx, f, w.reg, e.topic+"-value", table, cols); err != nil {
+	f, allow := w.d.cfg.Format, w.streams[stream].AllowTypeChanges
+	if e.valueEnc, err = records.NewEncoder(ctx, f, w.reg, e.topic+"-value", table, cols, allow); err != nil {
 		return nil, fmt.Errorf("kafka: stream %q: %w", stream, err)
 	}
 	if len(keyCols) > 0 {
-		if e.keyEnc, err = records.NewEncoder(ctx, f, w.reg, e.topic+"-key", table+"_key", keyCols); err != nil {
+		if e.keyEnc, err = records.NewEncoder(ctx, f, w.reg, e.topic+"-key", table+"_key", keyCols, allow); err != nil {
 			return nil, fmt.Errorf("kafka: stream %q: %w", stream, err)
 		}
 	}

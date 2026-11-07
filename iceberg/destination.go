@@ -388,7 +388,7 @@ func (w *writer) tableFor(ctx context.Context, stream string, sc *arrow.Schema, 
 	if tbl != nil && have.schema != nil && have.schema.Equal(sc) {
 		return tbl, have.refused, nil
 	}
-	tbl, refused, err := w.ensure(ctx, targetTable(sc, stream), sc)
+	tbl, refused, err := w.ensure(ctx, stream, sc)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -396,16 +396,17 @@ func (w *writer) tableFor(ctx context.Context, stream string, sc *arrow.Schema, 
 	return tbl, refused, nil
 }
 
-// ensure creates the table with sc's columns, or adds the columns it
-// lacks. It never changes a column's type: it leaves the columns whose type
-// can't take sc's as they are, and returns them. It isn't fenced: a column
-// added for an epoch that never commits stays empty.
-func (w *writer) ensure(ctx context.Context, name string, sc *arrow.Schema) (*table.Table, []destination.RefusedColumn, error) {
+// ensure creates stream's table with sc's columns, or adds the columns it
+// lacks. It changes a column's type only where the stream allows type changes
+// and Iceberg promotes it: it leaves the other columns whose type can't take
+// sc's as they are, and returns them. It isn't fenced: a column added or
+// promoted for an epoch that never commits stays as it is.
+func (w *writer) ensure(ctx context.Context, stream string, sc *arrow.Schema) (*table.Table, []destination.RefusedColumn, error) {
 	want, err := icebergSchema(sc)
 	if err != nil {
 		return nil, nil, err
 	}
-	ident := w.ident(w.ns, name)
+	ident := w.ident(w.ns, targetTable(sc, stream))
 	for attempt := 0; ; attempt++ {
 		tbl, err := w.cat.LoadTable(ctx, ident)
 		if errors.Is(err, catalog.ErrNoSuchTable) {
@@ -417,9 +418,13 @@ func (w *writer) ensure(ctx context.Context, name string, sc *arrow.Schema) (*ta
 		if err != nil {
 			return nil, nil, fmt.Errorf("iceberg: load %s: %w", strings.Join(ident, "."), err)
 		}
-		refused, add := compareSchemas(ident, tbl.Schema(), want)
+		refused, add, promote := compareSchemas(ident, tbl.Schema(), want, w.streams[stream].AllowTypeChanges)
 		tx := tbl.NewTransaction()
-		if err := tx.UpdateSchema(true, false).UnionByNameWith(add).Commit(); err != nil {
+		u := tx.UpdateSchema(true, false).UnionByNameWith(add)
+		for _, f := range promote {
+			u = u.UpdateColumn([]string{f.Name}, table.ColumnUpdate{FieldType: ice.Optional[ice.Type]{Val: f.Type, Valid: true}})
+		}
+		if err := u.Commit(); err != nil {
 			return nil, nil, fmt.Errorf("iceberg: %s: %w", strings.Join(ident, "."), err)
 		}
 		// A transaction without changes commits nothing.
@@ -435,11 +440,12 @@ func (w *writer) ensure(ctx context.Context, name string, sc *arrow.Schema) (*ta
 }
 
 // compareSchemas returns the columns of want whose type have's can't take,
-// and what want adds to have: new columns, and new fields of structs. A
-// column keeps whether it's required.
-func compareSchemas(ident table.Identifier, have, want *ice.Schema) ([]destination.RefusedColumn, *ice.Schema) {
+// what want adds to have: new columns, and new fields of structs, and with
+// allow, the columns whose type Iceberg promotes to want's. A column keeps
+// whether it's required.
+func compareSchemas(ident table.Identifier, have, want *ice.Schema, allow bool) ([]destination.RefusedColumn, *ice.Schema, []ice.NestedField) {
 	var refused []destination.RefusedColumn
-	var keep []ice.NestedField
+	var keep, promote []ice.NestedField
 	for _, f := range want.Fields() {
 		h, ok := have.FindFieldByName(f.Name)
 		switch {
@@ -454,15 +460,22 @@ func compareSchemas(ident table.Identifier, have, want *ice.Schema) ([]destinati
 			continue
 		}
 		r := destination.RefusedColumn{Column: f.Name, FromType: h.Type.String(), ToType: f.Type.String()}
-		if promotes(h.Type, f.Type) {
-			r.Reason = "it doesn't change a column's type"
+		switch {
+		case promotes(h.Type, f.Type) && allow:
+			f.Required = h.Required
+			promote = append(promote, f)
+			continue
+		case promotes(h.Type, f.Type):
+			r.Reason = "it doesn't change a column's type unless the pipeline's typeChanges allows it"
 			r.Fix = "ALTER TABLE " + sparkIdent(ident...) + " ALTER COLUMN " + sparkIdent(f.Name) + " TYPE " + sparkType(f.Type)
-		} else {
+		case allow:
+			r.Reason = fmt.Sprintf("Iceberg can't change %s to %s", h.Type, f.Type)
+		default:
 			r.Reason = fmt.Sprintf("it doesn't change a column's type, and Iceberg can't change %s to %s", h.Type, f.Type)
 		}
 		refused = append(refused, r)
 	}
-	return refused, ice.NewSchema(0, keep...)
+	return refused, ice.NewSchema(0, keep...), promote
 }
 
 // limits are what tbl can't take: partition columns can't be held, and
@@ -530,7 +543,7 @@ func (w *writer) ApplySchema(ctx context.Context, streams []destination.StreamSc
 	out := destination.SchemaApplied{Limits: make(map[string]destination.TableLimits, len(streams))}
 	for _, s := range streams {
 		// Not from the cache: the user may have changed the table.
-		tbl, refused, err := w.ensure(ctx, targetTable(s.Schema, s.Name), s.Schema)
+		tbl, refused, err := w.ensure(ctx, s.Name, s.Schema)
 		if err != nil {
 			return destination.SchemaApplied{}, err
 		}

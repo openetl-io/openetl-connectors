@@ -162,7 +162,7 @@ func (w *writer) encoder(ctx context.Context, stream string, sc *arrow.Schema) (
 	if len(e.key) == 0 && e.id < 0 {
 		return nil, fmt.Errorf("kinesis: stream %q has neither a primary key nor %s for partition keys", stream, idColumn)
 	}
-	if e.enc, err = records.NewEncoder(ctx, w.d.cfg.Format, w.reg, e.target+"-value", table, cols); err != nil {
+	if e.enc, err = records.NewEncoder(ctx, w.d.cfg.Format, w.reg, e.target+"-value", table, cols, w.streams[stream].AllowTypeChanges); err != nil {
 		return nil, fmt.Errorf("kinesis: stream %q: %w", stream, err)
 	}
 	w.encs[stream] = e

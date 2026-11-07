@@ -106,6 +106,8 @@ func TestDestinationConformance(t *testing.T) {
 		Launch:      conformance.Exec(conformance.Build(t, "../cmd/destination-kinesis")),
 		Config:      config(t, nil),
 		Unreachable: config(t, map[string]any{"endpoint": closedPort}),
+		// JSON records, which keep no types.
+		Untyped: true,
 		Read: func(ctx context.Context, namespace, stream string) ([]map[string]any, error) {
 			recs, err := readAll(ctx, cl, namespace+"."+stream)
 			if err != nil {

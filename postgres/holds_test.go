@@ -223,7 +223,8 @@ func TestApplySchemaRefusesWhatItCantChange(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := destination.RefusedColumn{
-		Stream: "users", Column: "x", Reason: "it doesn't change a column's type, which can rewrite the table", FromType: "integer", ToType: "bigint",
+		Stream: "users", Column: "x", Reason: "it doesn't change a column's type unless the pipeline's typeChanges allows it, as that can rewrite the table",
+		FromType: "integer", ToType: "bigint",
 		Fix: `ALTER TABLE "` + env.schema + `"."users" ALTER COLUMN "x" TYPE bigint`,
 	}
 	if len(applied.Refused) != 1 || applied.Refused[0] != want {
@@ -248,6 +249,40 @@ func TestApplySchemaRefusesWhatItCantChange(t *testing.T) {
 	applied, err = sa.ApplySchema(ctx, []destination.StreamSchema{{Name: "users", Schema: arrow.NewSchema([]arrow.Field{idField, wide}, nil)}})
 	if err != nil || len(applied.Refused) != 0 || typ("x") != "bigint" {
 		t.Errorf("after altering x: %+v, %v, x is %s", applied, err, typ("x"))
+	}
+}
+
+// A stream that allows type changes has its columns widened in place, keeping
+// their rows; a view on a column refuses its change, naming why.
+func TestApplySchemaWidensWhatTheStreamAllows(t *testing.T) {
+	env := newEnv(t)
+	ctx := t.Context()
+	w := env.openStreams(1, destination.ScopePipeline, destination.Stream{Name: "users", Mode: destination.Append, AllowTypeChanges: true})
+	recov(t, w, 1, destination.Epoch{}, nil)
+	x32 := arrow.Field{Name: "x", Type: arrow.PrimitiveTypes.Int32, Nullable: true}
+	y32 := arrow.Field{Name: "y", Type: arrow.PrimitiveTypes.Int32, Nullable: true}
+	applySchema(t, w, "users", []arrow.Field{idField, x32, y32, priceField})
+	env.exec("INSERT INTO $schema.users (id, x, y) VALUES (1, 7, 8)")
+	env.exec("CREATE VIEW $schema.ys AS SELECT y FROM $schema.users")
+
+	x64 := arrow.Field{Name: "x", Type: arrow.PrimitiveTypes.Int64, Nullable: true}
+	y64 := arrow.Field{Name: "y", Type: arrow.PrimitiveTypes.Int64, Nullable: true}
+	text := arrow.Field{Name: "price", Type: arrow.BinaryTypes.String, Nullable: true}
+	applied, err := w.(destination.SchemaApplier).ApplySchema(ctx, []destination.StreamSchema{{Name: "users", Schema: arrow.NewSchema([]arrow.Field{idField, x64, y64, text}, nil)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(applied.Refused) != 1 || applied.Refused[0].Column != "y" || !strings.Contains(applied.Refused[0].Reason, "view") || applied.Refused[0].ToType != "bigint" {
+		t.Fatalf("refused %+v, want y, which the view uses", applied.Refused)
+	}
+	typ := func(c string) string {
+		return env.text("SELECT format_type(atttypid, atttypmod) FROM pg_attribute WHERE attrelid = '" + env.schema + ".users'::regclass AND attname = '" + c + "'")
+	}
+	if typ("x") != "bigint" || typ("price") != "text" || typ("y") != "integer" {
+		t.Errorf("x is %s, price %s and y %s", typ("x"), typ("price"), typ("y"))
+	}
+	if got := env.text("SELECT x || ':' || y FROM $schema.users"); got != "7:8" {
+		t.Errorf("the row is %q after widening", got)
 	}
 }
 
@@ -311,7 +346,7 @@ func TestAlterFindsTheColumnItCantAdd(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	refused, err := wr.alter(ctx, "users", cols, have["users"])
+	refused, err := wr.alter(ctx, "users", cols, have["users"], false)
 	if err != nil {
 		t.Fatal(err)
 	}
