@@ -40,16 +40,22 @@ type SourceConfig struct {
 	// one named after the pipeline, openetl_<pipeline>.
 	Slot string `json:"slot"`
 	// Rows per chunk of a cdc table's snapshot, which is held in memory
-	// until the log catches up with it. Default 10000.
+	// until the log catches up with it, a chunk per connection reading it.
+	// Default 10000.
 	SnapshotChunkRows int `json:"snapshotChunkRows"`
+	// The most connections a read holds to read tables, as many as it has
+	// lanes up to this; a cdc read's replication connection is one more.
+	// Default 4.
+	MaxConnections int `json:"maxConnections"`
 }
 
 // Source reads tables: a full refresh reads a table's rows, an incremental
 // read the rows from a cursor column's floor on, and cdc reads its changes
 // through a logical replication slot (cdc.go). A table with a primary key is
 // read in key order, or (cursor, key) order, a chunk per query, so a resumed
-// read yields exactly the rows after its last chunk. A table without one is
-// read in a single query.
+// read yields exactly the rows after its last chunk, within its key range if
+// it's read in splits (source_splits.go). A table without one is read in a
+// single query.
 type Source struct {
 	cfg  SourceConfig
 	conn *pgx.ConnConfig
@@ -57,12 +63,14 @@ type Source struct {
 	mu sync.Mutex
 	// The cdc read running, which Committed acknowledges on.
 	reader *cdcReader
+	// The keyed splits being read, which Resplit splits.
+	reading map[readingKey]*readingSplit
 }
 
 var _ source.Source = (*Source)(nil)
 
 func NewSource(config []byte) (*Source, error) {
-	cfg := SourceConfig{Schema: "public", ChunkRows: 100_000, BatchBytes: 4 << 20, Publication: "openetl", SnapshotChunkRows: 10_000}
+	cfg := SourceConfig{Schema: "public", ChunkRows: 100_000, BatchBytes: 4 << 20, Publication: "openetl", SnapshotChunkRows: 10_000, MaxConnections: 4}
 	dec := json.NewDecoder(bytes.NewReader(config))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&cfg); err != nil {
@@ -71,8 +79,8 @@ func NewSource(config []byte) (*Source, error) {
 	switch {
 	case cfg.DSN.IsZero():
 		return nil, errors.New("postgres: config needs a dsn")
-	case cfg.ChunkRows <= 0 || cfg.BatchBytes <= 0 || cfg.SnapshotChunkRows <= 0:
-		return nil, errors.New("postgres: chunkRows, batchBytes and snapshotChunkRows must be positive")
+	case cfg.ChunkRows <= 0 || cfg.BatchBytes <= 0 || cfg.SnapshotChunkRows <= 0 || cfg.MaxConnections <= 0:
+		return nil, errors.New("postgres: chunkRows, batchBytes, snapshotChunkRows and maxConnections must be positive")
 	case cfg.Publication == "":
 		return nil, errors.New("postgres: publication can't be empty")
 	case len(cfg.Slot) > 63 || strings.Trim(cfg.Slot, "abcdefghijklmnopqrstuvwxyz0123456789_") != "":
@@ -122,7 +130,7 @@ func (s *Source) Discover(ctx context.Context) (source.Catalog, error) {
 			return source.Catalog{}, fmt.Errorf("postgres: %s: %w", t.name, err)
 		}
 		b.release()
-		cs := source.CatalogStream{Name: t.name, Replay: source.Exact, Schema: b.declared, SyncModes: []source.SyncMode{source.FullRefresh}}
+		cs := source.CatalogStream{Name: t.name, SplitsByKey: len(t.key) > 0, Replay: source.Exact, Schema: b.declared, SyncModes: []source.SyncMode{source.FullRefresh}}
 		if slices.ContainsFunc(t.cols, func(c sourceColumn) bool { return cursorTypes[c.oid] }) {
 			cs.SyncModes = append(cs.SyncModes, source.Incremental)
 		}
@@ -225,6 +233,8 @@ type sourceState struct {
 	// next read's Since.
 	Since *string `json:"since,omitempty"`
 	Until *string `json:"until,omitempty"`
+	// A split's key range.
+	keyRange
 }
 
 // The column types an incremental read can order by.
@@ -234,50 +244,81 @@ var cursorTypes = map[uint32]bool{
 }
 
 func (s *Source) Read(ctx context.Context, req source.ReadRequest, out source.Emitter) error {
-	conn, err := pgx.ConnectConfig(ctx, s.conn)
-	if err != nil {
-		return classify(fmt.Errorf("postgres: connect: %w", err))
-	}
-	defer func() { _ = conn.Close(context.WithoutCancel(ctx)) }()
-	tables, err := s.tables(ctx, conn)
+	limit := min(max(req.Lanes, 1), s.cfg.MaxConnections)
+	conns := newConnPool(s.conn, limit)
+	defer conns.closeIdle(ctx)
+	conn, err := conns.get(ctx)
 	if err != nil {
 		return err
 	}
-	var cdc []source.ConfiguredStream
+	tables, err := s.tables(ctx, conn)
+	conns.put(ctx, conn)
+	if err != nil {
+		return err
+	}
+	var cdc, rest []source.ConfiguredStream
 	for _, cs := range req.Streams {
-		i := 0
-		for i < len(tables) && tables[i].name != cs.Name {
-			i++
-		}
-		if i == len(tables) {
+		switch {
+		case !hasTable(tables, cs.Name):
 			return fmt.Errorf("postgres: unknown stream %q", cs.Name)
-		}
-		if cs.SyncMode == source.CDC {
+		case cs.SyncMode == source.CDC:
 			cdc = append(cdc, cs)
-			continue
+		default:
+			rest = append(rest, cs)
 		}
-		var st sourceState
-		if cs.State != nil {
-			if err := json.Unmarshal(cs.State, &st); err != nil {
-				return fmt.Errorf("postgres: %s state: %w", cs.Name, err)
-			}
-		}
-		if cs.SyncMode == source.Incremental {
-			err = s.readIncremental(ctx, conn, tables[i], cs.Cursor, st, out)
-		} else {
-			err = s.readTable(ctx, conn, tables[i], st, out)
-		}
-		if err != nil {
-			return err
-		}
+	}
+	readRest := func(ctx context.Context, lanes int) error {
+		return source.ReadSplits(ctx, source.ReadRequest{Streams: rest, Lanes: lanes}, out, func(ctx context.Context, cs source.ConfiguredStream, sp source.Split, e source.SplitEmitter) error {
+			return s.readSplit(ctx, conns, tables, cs, sp, e)
+		})
 	}
 	if len(cdc) == 0 {
-		return nil
+		return readRest(ctx, limit)
 	}
-	return s.readCDC(ctx, conn, req, cdc, tables, out)
+	// With one connection the log waits for the tables, since it never ends.
+	if limit == 1 {
+		if err := readRest(ctx, 1); err != nil {
+			return err
+		}
+		return s.readCDC(ctx, conns, req, cdc, tables, out)
+	}
+	ctx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		if err := readRest(ctx, limit-1); err != nil {
+			cancel(err)
+		}
+	})
+	if err := s.readCDC(ctx, conns, req, cdc, tables, out); err != nil {
+		cancel(err)
+	}
+	wg.Wait()
+	return context.Cause(ctx)
 }
 
-func (s *Source) readTable(ctx context.Context, conn *pgx.Conn, t table, st sourceState, out source.Emitter) error {
+// readSplit reads one split of a table read in full or incrementally, on a
+// connection of its own.
+func (s *Source) readSplit(ctx context.Context, conns *connPool, tables []table, cs source.ConfiguredStream, sp source.Split, out source.SplitEmitter) error {
+	var st sourceState
+	if sp.State != nil {
+		if err := json.Unmarshal(sp.State, &st); err != nil {
+			return fmt.Errorf("postgres: %s state: %w", cs.Name, err)
+		}
+	}
+	conn, err := conns.get(ctx)
+	if err != nil {
+		return err
+	}
+	defer conns.put(ctx, conn)
+	t := tables[slices.IndexFunc(tables, func(t table) bool { return t.name == cs.Name })]
+	if cs.SyncMode == source.Incremental {
+		return s.readIncremental(ctx, conn, t, sp.ID, cs.Cursor, st, out)
+	}
+	return s.readTable(ctx, conn, t, sp.ID, st, out)
+}
+
+func (s *Source) readTable(ctx context.Context, conn *pgx.Conn, t table, id string, st sourceState, out source.SplitEmitter) error {
 	b, err := newBatcher(memory.DefaultAllocator, t.cols)
 	if err != nil {
 		return fmt.Errorf("postgres: %s: %w", t.name, err)
@@ -295,61 +336,79 @@ func (s *Source) readTable(ctx context.Context, conn *pgx.Conn, t table, st sour
 			if _, _, err := s.query(ctx, conn, b, t.name, "SELECT "+list+" FROM "+ident, nil, 0, out); err != nil {
 				return err
 			}
-			if err := resume(out, t.name, sourceState{Done: true}); err != nil {
+			if err := resume(out, sourceState{Done: true}); err != nil {
 				return err
 			}
 		}
-		return out.Complete(t.name, nil)
+		return out.Complete(nil)
 	}
 
 	key := make([]string, len(t.key))
 	keyText := make([]string, len(t.key))
-	params := make([]string, len(t.key))
 	for i, k := range t.key {
 		key[i] = cols[k]
 		keyText[i] = cols[k] + "::text AS _openetl_key_" + strconv.Itoa(i)
-		params[i] = "$" + strconv.Itoa(i+1)
 	}
 	head := "SELECT " + list + ", " + strings.Join(keyText, ", ") + " FROM " + ident
 	tail := " ORDER BY " + strings.Join(key, ", ") + " LIMIT " + strconv.Itoa(s.cfg.ChunkRows)
-	after := st.After
-	if after != nil && len(after) != len(t.key) {
-		return fmt.Errorf("postgres: %s state has %d key columns, the table has %d", t.name, len(after), len(t.key))
+	if st.After != nil && len(st.After) != len(t.key) {
+		return fmt.Errorf("postgres: %s state has %d key columns, the table has %d", t.name, len(st.After), len(t.key))
 	}
+	st = sourceState{After: st.After, keyRange: st.keyRange}
+	reading := s.startSplit(t.name, id)
+	defer s.endSplit(t.name, id)
 	for {
-		sql := head + tail
-		if after != nil {
-			sql = head + " WHERE (" + strings.Join(key, ", ") + ") > (" + strings.Join(params, ", ") + ")" + tail
+		var args []string
+		arg := func(v string) string {
+			args = append(args, v)
+			return "$" + strconv.Itoa(len(args))
 		}
-		n, last, err := s.query(ctx, conn, b, t.name, sql, after, len(t.key), out)
+		where := st.where(key[0], arg)
+		if st.After != nil {
+			where = append(where, afterKey(key, st.After, arg))
+		}
+		sql := head
+		if len(where) > 0 {
+			sql += " WHERE " + strings.Join(where, " AND ")
+		}
+		n, last, err := s.query(ctx, conn, b, t.name, sql+tail, args, len(t.key), out)
 		if err != nil {
 			return err
 		}
 		if n > 0 {
-			after = last
+			st.After = last
 		}
-		if err := resume(out, t.name, sourceState{After: after}); err != nil {
+		ended := n < s.cfg.ChunkRows
+		added, err := s.resplit(ctx, conn, t, reading, &st, ended, st.position(), false)
+		if err != nil {
 			return err
 		}
-		if n < s.cfg.ChunkRows {
-			return out.Complete(t.name, nil)
+		if err := resume(out, st, added...); err != nil {
+			return err
+		}
+		if ended {
+			return out.Complete(nil)
 		}
 	}
+}
+
+// afterKey says a row is after a position in the order of key.
+func afterKey(key, after []string, arg func(string) string) string {
+	params := make([]string, len(after))
+	for i, v := range after {
+		params[i] = arg(v)
+	}
+	return "(" + strings.Join(key, ", ") + ") > (" + strings.Join(params, ", ") + ")"
 }
 
 // readIncremental reads the rows whose cursor is from the state's floor up
 // to the cursor's highest value when the read started, in (cursor, key)
 // order. It completes with that value as the next read's floor, so the rows
 // that hold it are read again then. Rows with a NULL cursor aren't read.
-func (s *Source) readIncremental(ctx context.Context, conn *pgx.Conn, t table, cursor string, st sourceState, out source.Emitter) error {
-	ci := slices.IndexFunc(t.cols, func(c sourceColumn) bool { return c.name == cursor })
-	switch {
-	case cursor == "":
-		return configInvalid("postgres: %s is read incrementally, which needs a cursor column", t.name)
-	case ci < 0:
-		return configInvalid("postgres: %s has no column %q for a cursor", t.name, cursor)
-	case !cursorTypes[t.cols[ci].oid]:
-		return configInvalid("postgres: %s.%s can't be a cursor: that takes an integer, numeric, date, timestamp, timestamptz, text or varchar column", t.name, cursor)
+func (s *Source) readIncremental(ctx context.Context, conn *pgx.Conn, t table, id, cursor string, st sourceState, out source.SplitEmitter) error {
+	ci, err := cursorColumn(t, cursor)
+	if err != nil {
+		return err
 	}
 	b, err := newBatcher(memory.DefaultAllocator, t.cols)
 	if err != nil {
@@ -367,7 +426,7 @@ func (s *Source) readIncremental(ctx context.Context, conn *pgx.Conn, t table, c
 			return classify(fmt.Errorf("postgres: read %s: %w", t.name, err))
 		}
 		if until == nil {
-			return complete(out, t.name, sourceState{Since: st.Since})
+			return complete(out, sourceState{Since: st.Since})
 		}
 		st = sourceState{Since: st.Since, Until: until}
 	}
@@ -392,11 +451,11 @@ func (s *Source) readIncremental(ctx context.Context, conn *pgx.Conn, t table, c
 				return err
 			}
 			st.Done = true
-			if err := resume(out, t.name, st); err != nil {
+			if err := resume(out, st); err != nil {
 				return err
 			}
 		}
-		return complete(out, t.name, sourceState{Since: st.Until})
+		return complete(out, sourceState{Since: st.Until})
 	}
 
 	order := []string{cols[ci]}
@@ -414,43 +473,69 @@ func (s *Source) readIncremental(ctx context.Context, conn *pgx.Conn, t table, c
 	if st.After != nil && len(st.After) != len(order) {
 		return fmt.Errorf("postgres: %s state has %d cursor and key columns, the read has %d", t.name, len(st.After), len(order))
 	}
+	first := pgx.Identifier{t.cols[t.key[0]].name}.Sanitize()
+	reading := s.startSplit(t.name, id)
+	defer s.endSplit(t.name, id)
 	for {
-		where := bounds()
+		where := []string{bounds()}
+		where = append(where, st.where(first, arg)...)
 		if st.After != nil {
-			params := make([]string, len(st.After))
-			for i, v := range st.After {
-				params[i] = arg(v)
-			}
-			where += " AND (" + strings.Join(order, ", ") + ") > (" + strings.Join(params, ", ") + ")"
+			where = append(where, afterKey(order, st.After, arg))
 		}
-		n, last, err := s.query(ctx, conn, b, t.name, head+where+tail, args, len(order), out)
+		n, last, err := s.query(ctx, conn, b, t.name, head+strings.Join(where, " AND ")+tail, args, len(order), out)
 		if err != nil {
 			return err
 		}
 		if n > 0 {
 			st.After = last
 		}
-		if err := resume(out, t.name, st); err != nil {
+		ended := n < s.cfg.ChunkRows
+		// The position follows the key only where the cursor is its first
+		// column.
+		var pos *string
+		if t.key[0] == ci {
+			pos = st.position()
+		}
+		added, err := s.resplit(ctx, conn, t, reading, &st, ended, pos, true)
+		if err != nil {
 			return err
 		}
-		if n < s.cfg.ChunkRows {
-			return complete(out, t.name, sourceState{Since: st.Until})
+		if err := resume(out, st, added...); err != nil {
+			return err
+		}
+		if ended {
+			return complete(out, sourceState{Since: st.Until})
 		}
 	}
 }
 
-func complete(out source.Emitter, stream string, next sourceState) error {
+// cursorColumn is the index of a table's column that an incremental read can
+// order by.
+func cursorColumn(t table, cursor string) (int, error) {
+	ci := slices.IndexFunc(t.cols, func(c sourceColumn) bool { return c.name == cursor })
+	switch {
+	case cursor == "":
+		return 0, configInvalid("postgres: %s is read incrementally, which needs a cursor column", t.name)
+	case ci < 0:
+		return 0, configInvalid("postgres: %s has no column %q for a cursor", t.name, cursor)
+	case !cursorTypes[t.cols[ci].oid]:
+		return 0, configInvalid("postgres: %s.%s can't be a cursor: that takes an integer, numeric, date, timestamp, timestamptz, text or varchar column", t.name, cursor)
+	}
+	return ci, nil
+}
+
+func complete(out source.SplitEmitter, next sourceState) error {
 	b, err := json.Marshal(next)
 	if err != nil {
 		return err
 	}
-	return out.Complete(stream, b)
+	return out.Complete(b)
 }
 
 // query runs sql and emits its rows. The last keyCols result columns are the
 // key as text; query returns the last row's. Every row is emitted before it
 // returns.
-func (s *Source) query(ctx context.Context, conn *pgx.Conn, b *batcher, stream, sql string, args []string, keyCols int, out source.Emitter) (int, []string, error) {
+func (s *Source) query(ctx context.Context, conn *pgx.Conn, b *batcher, stream, sql string, args []string, keyCols int, out source.SplitEmitter) (int, []string, error) {
 	params := make([][]byte, len(args))
 	for i, a := range args {
 		params[i] = []byte(a)
@@ -469,7 +554,7 @@ func (s *Source) query(ctx context.Context, conn *pgx.Conn, b *batcher, stream, 
 	for rr.NextRow() {
 		vals := rr.Values()
 		if text := b.past(vals[:len(b.cols)]); text != nil {
-			err = b.alone(stream, vals[:len(b.cols)], text, out)
+			err = b.alone(vals[:len(b.cols)], text, out)
 		} else {
 			err = b.add(vals[:len(b.cols)])
 		}
@@ -478,7 +563,7 @@ func (s *Source) query(ctx context.Context, conn *pgx.Conn, b *batcher, stream, 
 		}
 		n++
 		if b.bytes >= s.cfg.BatchBytes {
-			if err = b.flush(stream, out); err != nil {
+			if err = b.flush(out); err != nil {
 				break
 			}
 		}
@@ -493,17 +578,17 @@ func (s *Source) query(ctx context.Context, conn *pgx.Conn, b *batcher, stream, 
 		err = fmt.Errorf("postgres: read %s: %w", stream, cerr)
 	}
 	if err == nil {
-		err = b.flush(stream, out)
+		err = b.flush(out)
 	}
 	return n, last, err
 }
 
-func resume(out source.Emitter, stream string, st sourceState) error {
+func resume(out source.SplitEmitter, st sourceState, added ...source.Split) error {
 	b, err := json.Marshal(st)
 	if err != nil {
 		return err
 	}
-	return out.ResumePoint(stream, b)
+	return out.ResumePoint(b, added...)
 }
 
 // batcher builds one table's Arrow batches.
@@ -578,8 +663,8 @@ func (b *batcher) past(vals [][]byte) map[int]string {
 // alone emits a row in a batch of its own, with text in place of the values
 // its columns' types can't hold. The engine parses the text as the declared
 // type and quarantines the row.
-func (b *batcher) alone(stream string, vals [][]byte, text map[int]string, out source.Emitter) error {
-	if err := b.flush(stream, out); err != nil {
+func (b *batcher) alone(vals [][]byte, text map[int]string, out source.SplitEmitter) error {
+	if err := b.flush(out); err != nil {
 		return err
 	}
 	vals = slices.Clone(vals)
@@ -589,16 +674,16 @@ func (b *batcher) alone(stream string, vals [][]byte, text map[int]string, out s
 	if err := b.add(vals); err != nil {
 		return err
 	}
-	return b.emit(stream, text, out)
+	return b.emit(text, out)
 }
 
-func (b *batcher) flush(stream string, out source.Emitter) error {
-	return b.emit(stream, nil, out)
+func (b *batcher) flush(out source.SplitEmitter) error {
+	return b.emit(nil, out)
 }
 
 // emit sends the rows built so far, with the columns in text replaced by
 // strings (one-row batches only).
-func (b *batcher) emit(stream string, text map[int]string, out source.Emitter) error {
+func (b *batcher) emit(text map[int]string, out source.SplitEmitter) error {
 	if b.rows == 0 {
 		return nil
 	}
@@ -624,7 +709,7 @@ func (b *batcher) emit(stream string, text map[int]string, out source.Emitter) e
 		a.Release()
 	}
 	b.rows, b.bytes = 0, 0
-	if err := out.Records(stream, rec); err != nil {
+	if err := out.Records(rec); err != nil {
 		rec.Release()
 		return err
 	}

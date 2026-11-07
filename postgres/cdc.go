@@ -9,8 +9,10 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -41,8 +43,10 @@ const (
 	quietEvery  = 10 * time.Second
 	// How often the slot hears where the pipeline has committed to.
 	statusEvery = 10 * time.Second
-	// A log quiet for this long is asked where it is.
+	// A log quiet for this long is asked where it is, and sooner while a
+	// chunk waits for it.
 	idleAfter = time.Second
+	heldAfter = 10 * time.Millisecond
 	// How often the read reports its progress, and logs it.
 	progressEvery = 10 * time.Second
 	logLagEvery   = time.Minute
@@ -75,6 +79,15 @@ type cdcState struct {
 type snapshotCursor struct {
 	// The primary key of the last row read, spelled as text; none before
 	// the first chunk.
+	After []string `json:"after,omitempty"`
+	// Where the table is read in key ranges: those not read yet, each with
+	// its own position, in place of After.
+	Ranges []*snapshotRange `json:"ranges,omitempty"`
+}
+
+// snapshotRange is a key range of a table whose snapshot isn't read yet.
+type snapshotRange struct {
+	keyRange
 	After []string `json:"after,omitempty"`
 }
 
@@ -115,8 +128,8 @@ type cdcStream struct {
 	b *changeBatcher
 	// Changes in transactions that committed before it were read before.
 	from pglogrepl.LSN
-	// nil once the table's snapshot has been read.
-	snapshot *snapshotCursor
+	// What's left of the table's snapshot; empty once it has been read.
+	ranges []*snapshotRange
 	// Converts each column's text as the engine reads it.
 	conv []func([]byte) []byte
 	// Emitted since its last resume point.
@@ -152,6 +165,7 @@ type txn struct {
 // transaction its snapshot saw.
 type chunk struct {
 	stream *cdcStream
+	rng    *snapshotRange
 	snap   pgSnapshot
 	// Transactions that committed at or after it weren't seen.
 	lsn  pglogrepl.LSN
@@ -166,6 +180,7 @@ type chunk struct {
 type cdcReader struct {
 	s          *Source
 	out        source.Emitter
+	conns      *connPool
 	conn       *pgx.Conn
 	repl       *pgconn.PgConn
 	slot       string
@@ -186,20 +201,27 @@ type cdcReader struct {
 	serverEnd  pglogrepl.LSN
 	lastCommit time.Time
 	txn        *txn
-	chunk      *chunk
+	// Chunks held, of different key ranges.
+	chunks []*chunk
 	// Transactions read lately that changed keys of tables whose snapshot
 	// isn't read yet; a later chunk's snapshot may not have seen them.
 	recent []*txn
 }
 
 // readCDC reads the streams through the pipeline's replication slot: each
-// table's changes, and until it has been read, its snapshot, a chunk at a
-// time between them. A chunk is read in a transaction of its own; it's held
-// until the log has passed every transaction its snapshot saw, and a key a
-// later transaction changes gets its chunk row first. Nothing is written to
-// the source but the slot and, if missing, the publication.
-func (s *Source) readCDC(ctx context.Context, conn *pgx.Conn, req source.ReadRequest, cfgs []source.ConfiguredStream, tables []table, out source.Emitter) error {
-	r := &cdcReader{s: s, out: out, conn: conn, slot: s.slotName(req.Pipeline), pub: s.cfg.Publication, continuous: req.Continuous, rels: map[uint32]*relation{}}
+// table's changes, and until it has been read, its snapshot, in chunks
+// between them, a chunk of a key range per connection the read can hold. A
+// chunk is read in a transaction of its own; it's held until the log has
+// passed every transaction its snapshot saw, and a key a later transaction
+// changes gets its chunk row first. Nothing is written to the source but the
+// slot and, if missing, the publication.
+func (s *Source) readCDC(ctx context.Context, conns *connPool, req source.ReadRequest, cfgs []source.ConfiguredStream, tables []table, out source.Emitter) error {
+	conn, err := conns.get(ctx)
+	if err != nil {
+		return err
+	}
+	defer conns.put(ctx, conn)
+	r := &cdcReader{s: s, out: out, conns: conns, conn: conn, slot: s.slotName(req.Pipeline), pub: s.cfg.Publication, continuous: req.Continuous, rels: map[uint32]*relation{}}
 	if err := conn.QueryRow(ctx, "SELECT current_setting('server_version_num')::int").Scan(&r.version); err != nil {
 		return classify(err)
 	}
@@ -215,21 +237,25 @@ func (s *Source) readCDC(ctx context.Context, conn *pgx.Conn, req source.ReadReq
 		if len(t.key) == 0 {
 			return configInvalid("postgres: %s has no primary key, so it can't be read with cdc", t.name)
 		}
-		st := &cdcStream{t: t, snapshot: &snapshotCursor{}}
+		st := &cdcStream{t: t}
 		var state cdcState
 		if cs.State != nil {
 			if err := json.Unmarshal(cs.State, &state); err != nil {
 				return fmt.Errorf("postgres: %s state: %w", cs.Name, err)
 			}
 		}
-		// A state from a full refresh starts the table again.
-		if state.Slot != "" {
-			if state.Slot != r.slot {
-				return positionLost("postgres: %s was read through replication slot %q, and the source now reads %q", t.name, state.Slot, r.slot)
-			}
-			st.from, st.snapshot = pglogrepl.LSN(state.LSN), state.Snapshot
-			if st.snapshot != nil && st.snapshot.After != nil && len(st.snapshot.After) != len(t.key) {
-				return fmt.Errorf("postgres: %s state has %d key columns, the table has %d", t.name, len(st.snapshot.After), len(t.key))
+		if state.Slot != "" && state.Slot != r.slot {
+			return positionLost("postgres: %s was read through replication slot %q, and the source now reads %q", t.name, state.Slot, r.slot)
+		}
+		// A state from a full refresh has no position, and starts the table
+		// again.
+		st.from = pglogrepl.LSN(state.LSN)
+		if st.ranges, err = r.snapshotRanges(ctx, t, state); err != nil {
+			return err
+		}
+		for _, rng := range st.ranges {
+			if rng.After != nil && len(rng.After) != len(t.key) {
+				return fmt.Errorf("postgres: %s state has %d key columns, the table has %d", t.name, len(rng.After), len(t.key))
 			}
 		}
 		st.b = newChangeBatcher(memory.DefaultAllocator, t.cols)
@@ -290,6 +316,35 @@ func (s *Source) readCDC(ctx context.Context, conn *pgx.Conn, req source.ReadReq
 	s.setReader(r)
 	defer s.setReader(nil)
 	return r.run(ctx)
+}
+
+// snapshotRanges is what's left of a table's snapshot, from its state. One
+// not started is read in key ranges if several connections can read it.
+func (r *cdcReader) snapshotRanges(ctx context.Context, t table, state cdcState) ([]*snapshotRange, error) {
+	cursor := state.Snapshot
+	switch {
+	case state.Slot == "" || cursor != nil && cursor.After == nil && len(cursor.Ranges) == 0:
+		if r.conns.limit == 1 {
+			return []*snapshotRange{{}}, nil
+		}
+		ranges, err := r.s.keyRanges(ctx, r.conn, t, r.s.cfg.SnapshotChunkRows)
+		if err != nil {
+			return nil, err
+		}
+		if len(ranges) == 0 {
+			return []*snapshotRange{{}}, nil
+		}
+		out := make([]*snapshotRange, len(ranges))
+		for i, k := range ranges {
+			out[i] = &snapshotRange{keyRange: k}
+		}
+		return out, nil
+	case cursor == nil:
+		return nil, nil
+	case len(cursor.Ranges) > 0:
+		return cursor.Ranges, nil
+	}
+	return []*snapshotRange{{After: cursor.After}}, nil
 }
 
 func configInvalid(format string, args ...any) error {
@@ -420,19 +475,19 @@ func (r *cdcReader) run(ctx context.Context) error {
 	ask := false
 	for {
 		if r.txn == nil {
-			if r.chunk == nil {
-				if err := r.readChunk(ctx); err != nil {
+			if len(r.chunks) == 0 {
+				if err := r.readChunks(ctx); err != nil {
 					return err
 				}
-				if r.chunk != nil {
-					// Learn at once whether the log has passed it.
+				if len(r.chunks) > 0 {
+					// Learn at once whether the log has passed them.
 					nextStatus, ask = time.Time{}, true
 				}
 			}
 			if err := r.resume(); err != nil {
 				return err
 			}
-			if !r.continuous && r.chunk == nil && r.pos >= r.target && r.snapshotsRead() {
+			if !r.continuous && len(r.chunks) == 0 && r.pos >= r.target && r.snapshotsRead() {
 				return r.complete()
 			}
 		}
@@ -456,7 +511,15 @@ func (r *cdcReader) run(ctx context.Context) error {
 			}
 			nextStatus, ask = now.Add(statusEvery), false
 		}
-		deadline := now.Add(idleAfter)
+		// Chunks that passed at once leave the log nothing to wait for.
+		if r.txn == nil && len(r.chunks) == 0 && !r.snapshotsRead() {
+			continue
+		}
+		quiet := idleAfter
+		if r.txn == nil && len(r.chunks) > 0 {
+			quiet = heldAfter
+		}
+		deadline := now.Add(quiet)
 		if nextStatus.Before(deadline) {
 			deadline = nextStatus
 		}
@@ -468,7 +531,7 @@ func (r *cdcReader) run(ctx context.Context) error {
 				return ctx.Err()
 			}
 			if pgconn.Timeout(err) {
-				if r.txn == nil && time.Since(quietSince) >= idleAfter {
+				if r.txn == nil && time.Since(quietSince) >= quiet {
 					nextStatus, ask = time.Time{}, true
 					quietSince = time.Now()
 				}
@@ -772,7 +835,10 @@ func convert(f func([]byte) []byte, v []byte) []byte {
 // emit adds a change to its stream's batch, after the chunk row of its key
 // if the chunk's snapshot didn't see the change.
 func (r *cdcReader) emit(st *cdcStream, key, op string, vals [][]byte, unchanged []string) error {
-	if c := r.chunk; c != nil && c.stream == st {
+	for _, c := range r.chunks {
+		if c.stream != st {
+			continue
+		}
 		if row, ok := c.rows[key]; ok && !c.snap.sees(r.txn.xid) {
 			delete(c.rows, key)
 			if err := r.add(st, source.OpInsert, seqOf(r.txn.commit, 0), row, nil); err != nil {
@@ -780,7 +846,7 @@ func (r *cdcReader) emit(st *cdcStream, key, op string, vals [][]byte, unchanged
 			}
 		}
 	}
-	if st.snapshot != nil {
+	if len(st.ranges) > 0 {
 		if r.txn.keys == nil {
 			r.txn.keys = map[*cdcStream][]string{}
 		}
@@ -799,55 +865,139 @@ func (r *cdcReader) add(st *cdcStream, op string, seq decimal128.Num, vals [][]b
 	return nil
 }
 
-// passed runs once the read has reached pos: the chunk is emitted if the
+// passed runs once the read has reached pos: each chunk is emitted if the
 // log has passed every transaction its snapshot saw.
 func (r *cdcReader) passed() error {
-	c := r.chunk
-	if c == nil || r.pos < c.lsn {
-		return nil
-	}
-	st := c.stream
-	seq := seqOf(c.lsn, 0)
-	for _, k := range c.keys {
-		if row, ok := c.rows[k]; ok {
-			if err := r.add(st, source.OpInsert, seq, row, nil); err != nil {
-				return err
+	var held []*chunk
+	var moved []*cdcStream
+	for _, c := range r.chunks {
+		if r.pos < c.lsn {
+			held = append(held, c)
+			continue
+		}
+		st := c.stream
+		seq := seqOf(c.lsn, 0)
+		for _, k := range c.keys {
+			if row, ok := c.rows[k]; ok {
+				if err := r.add(st, source.OpInsert, seq, row, nil); err != nil {
+					return err
+				}
 			}
 		}
+		if c.full {
+			c.rng.After = c.last
+		} else {
+			st.ranges = slices.DeleteFunc(st.ranges, func(rng *snapshotRange) bool { return rng == c.rng })
+			if len(st.ranges) == 0 {
+				slog.Info("read a table's snapshot", "table", st.t.name)
+			}
+		}
+		if !slices.Contains(moved, st) {
+			moved = append(moved, st)
+		}
 	}
-	r.chunk = nil
-	if c.full {
-		st.snapshot = &snapshotCursor{After: c.last}
-	} else {
-		st.snapshot = nil
-		slog.Info("read a table's snapshot", "table", st.t.name)
+	r.chunks = held
+	for _, st := range moved {
+		if err := r.resumeStream(st); err != nil {
+			return err
+		}
 	}
-	return r.resumeStream(st)
+	return nil
 }
 
 func (r *cdcReader) snapshotsRead() bool {
 	for _, st := range r.streams {
-		if st.snapshot != nil {
+		if len(st.ranges) > 0 {
 			return false
 		}
 	}
 	return true
 }
 
-// readChunk reads the next chunk of the first table whose snapshot isn't
-// read yet, if any.
-func (r *cdcReader) readChunk(ctx context.Context) error {
-	var st *cdcStream
-	for _, s := range r.streams {
-		if s.snapshot != nil {
-			st = s
-			break
+// readChunks reads the next chunk of as many key ranges not read yet as the
+// read can hold connections for, in the tables' order. Every chunk's snapshot
+// is taken with the log stopped between transactions, as one alone would be,
+// and is held until the log passes its own WAL position.
+func (r *cdcReader) readChunks(ctx context.Context) error {
+	type read struct {
+		st  *cdcStream
+		rng *snapshotRange
+	}
+	var todo []read
+	for _, st := range r.streams {
+		for _, rng := range st.ranges {
+			todo = append(todo, read{st, rng})
 		}
 	}
-	if st == nil {
+	if len(todo) == 0 {
 		r.recent = nil
+		// The log can go on for as long as it likes, on one connection.
+		r.conns.closeIdle(ctx)
 		return nil
 	}
+	conns := []*pgx.Conn{r.conn}
+	defer func() {
+		for _, c := range conns[1:] {
+			r.conns.put(ctx, c)
+		}
+	}()
+	for len(conns) < len(todo) {
+		c := r.conns.tryGet(ctx)
+		if c == nil {
+			break
+		}
+		conns = append(conns, c)
+	}
+	rctx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+	chunks := make([]*chunk, len(conns))
+	var wg sync.WaitGroup
+	for i, conn := range conns {
+		wg.Go(func() {
+			c, err := r.readChunk(rctx, conn, todo[i].st, todo[i].rng)
+			if err != nil {
+				cancel(err)
+				return
+			}
+			chunks[i] = c
+		})
+	}
+	wg.Wait()
+	if err := context.Cause(rctx); err != nil {
+		return err
+	}
+	r.reconcile(chunks)
+	r.chunks = chunks
+	return r.passed()
+}
+
+// reconcile drops from new chunks the keys of transactions read before them
+// that their snapshots didn't see yet, which changed those keys later than
+// the chunks show. It forgets transactions every later snapshot will see.
+func (r *cdcReader) reconcile(chunks []*chunk) {
+	kept := r.recent[:0]
+	for _, x := range r.recent {
+		seen := true
+		for _, c := range chunks {
+			if c.snap.full(x.xid) < c.snap.xmin {
+				continue
+			}
+			seen = false
+			if !c.snap.sees(x.xid) {
+				for _, k := range x.keys[c.stream] {
+					delete(c.rows, k)
+				}
+			}
+		}
+		if !seen {
+			kept = append(kept, x)
+		}
+	}
+	r.recent = kept
+}
+
+// readChunk reads a key range's next chunk, on a connection only it is using.
+func (r *cdcReader) readChunk(ctx context.Context, conn *pgx.Conn, st *cdcStream, rng *snapshotRange) (*chunk, error) {
 	t := st.t
 	cols := make([]string, len(t.cols))
 	for i, c := range t.cols {
@@ -855,45 +1005,48 @@ func (r *cdcReader) readChunk(ctx context.Context) error {
 	}
 	key := make([]string, len(t.key))
 	keyText := make([]string, len(t.key))
-	params := make([]string, len(t.key))
 	for i, k := range t.key {
 		key[i] = cols[k]
 		keyText[i] = cols[k] + "::text AS _openetl_key_" + strconv.Itoa(i)
-		params[i] = "$" + strconv.Itoa(i+1)
 	}
 	q := "SELECT " + strings.Join(cols, ", ") + ", " + strings.Join(keyText, ", ") + " FROM " + pgx.Identifier{r.s.cfg.Schema, t.name}.Sanitize()
 	var args [][]byte
-	if after := st.snapshot.After; after != nil {
-		q += " WHERE (" + strings.Join(key, ", ") + ") > (" + strings.Join(params, ", ") + ")"
-		for _, a := range after {
-			args = append(args, []byte(a))
-		}
+	arg := func(v string) string {
+		args = append(args, []byte(v))
+		return "$" + strconv.Itoa(len(args))
+	}
+	where := rng.where(key[0], arg)
+	if rng.After != nil {
+		where = append(where, afterKey(key, rng.After, arg))
+	}
+	if len(where) > 0 {
+		q += " WHERE " + strings.Join(where, " AND ")
 	}
 	q += " ORDER BY " + strings.Join(key, ", ") + " LIMIT " + strconv.Itoa(r.s.cfg.SnapshotChunkRows)
 
-	tx, err := r.conn.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
+	tx, err := conn.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
 	if err != nil {
-		return classify(err)
+		return nil, classify(err)
 	}
 	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
 	// The transaction's snapshot is taken by its first statement, and the
 	// WAL position after it.
 	var snapText, at string
 	if err := tx.QueryRow(ctx, "SELECT pg_current_snapshot()::text").Scan(&snapText); err != nil {
-		return classify(err)
+		return nil, classify(err)
 	}
 	if afterChunkSnapshot != nil {
 		afterChunkSnapshot()
 	}
 	if err := tx.QueryRow(ctx, "SELECT pg_current_wal_lsn()::text").Scan(&at); err != nil {
-		return classify(err)
+		return nil, classify(err)
 	}
-	c := &chunk{stream: st, rows: map[string][][]byte{}}
+	c := &chunk{stream: st, rng: rng, rows: map[string][][]byte{}}
 	if c.snap, err = parseSnapshot(snapText); err != nil {
-		return err
+		return nil, err
 	}
 	if c.lsn, err = pglogrepl.ParseLSN(at); err != nil {
-		return err
+		return nil, err
 	}
 	n := len(t.cols)
 	rr := tx.Conn().PgConn().ExecParams(ctx, q, args, nil, nil, nil)
@@ -919,30 +1072,14 @@ func (r *cdcReader) readChunk(ctx context.Context) error {
 		c.keys = append(c.keys, k)
 	}
 	if _, err := rr.Close(); err != nil {
-		return classify(fmt.Errorf("postgres: snapshot of %s: %w", t.name, err))
+		return nil, classify(fmt.Errorf("postgres: snapshot of %s: %w", t.name, err))
 	}
 	c.last = append([]string(nil), c.last...)
 	c.full = len(c.keys) == r.s.cfg.SnapshotChunkRows
 	if err := tx.Commit(ctx); err != nil {
-		return classify(err)
+		return nil, classify(err)
 	}
-	// Transactions read before the chunk that its snapshot didn't see yet
-	// changed their keys later than the chunk shows.
-	kept := r.recent[:0]
-	for _, x := range r.recent {
-		if c.snap.full(x.xid) < c.snap.xmin {
-			continue
-		}
-		kept = append(kept, x)
-		if !c.snap.sees(x.xid) {
-			for _, k := range x.keys[st] {
-				delete(c.rows, k)
-			}
-		}
-	}
-	r.recent = kept
-	r.chunk = c
-	return r.passed()
+	return c, nil
 }
 
 // resume flushes and emits resume points: for streams that emitted since
@@ -961,7 +1098,18 @@ func (r *cdcReader) resume() error {
 }
 
 func (r *cdcReader) state(st *cdcStream) ([]byte, error) {
-	return json.Marshal(cdcState{Slot: r.slot, LSN: lsn(max(st.from, r.pos)), Snapshot: st.snapshot})
+	return json.Marshal(cdcState{Slot: r.slot, LSN: lsn(max(st.from, r.pos)), Snapshot: st.cursor()})
+}
+
+// cursor is the snapshot's position, as a state spells it.
+func (st *cdcStream) cursor() *snapshotCursor {
+	switch {
+	case len(st.ranges) == 0:
+		return nil
+	case len(st.ranges) == 1 && st.ranges[0].keyRange == keyRange{}:
+		return &snapshotCursor{After: st.ranges[0].After}
+	}
+	return &snapshotCursor{Ranges: st.ranges}
 }
 
 func (r *cdcReader) resumeStream(st *cdcStream) error {
