@@ -23,4 +23,5 @@ var DestinationCapabilities = destination.Capabilities{
 	MaxIdentifierLength:   63,
 	WriteModes:            []destination.WriteMode{destination.Append, destination.Overwrite, destination.Merge},
 	Holds:                 destination.Holds{ByKey: true, ByID: true, Last: true, Guarded: true},
+	WriterLanes:           16,
 }

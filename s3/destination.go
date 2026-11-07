@@ -1,9 +1,9 @@
 // Package s3 has the Parquet on S3 destination: each stream's table is a
 // directory of Parquet files. Writes stream each stream's batches into
 // Parquet files staged under the pipeline's _openetl/{pipeline}/staging,
-// which PreCommit lists in the staged descriptor. Commit copies them to names
-// derived from the pipeline, the epoch and its generation, then writes the
-// stream's marker. A repeated or stale commit copies the same files to the
+// which PreCommit lists in the writer lane's staged descriptor. Commit copies
+// every lane's to names derived from the pipeline, the epoch, its generation
+// and the lane, then writes the stream's marker. A repeated or stale commit copies the same files to the
 // same names, so it needs no fence: an epoch is only committed once the
 // checkpoint log has recorded it, under the generation in its names.
 package s3
@@ -246,10 +246,13 @@ type part struct {
 }
 
 func (w *writer) startPart(e destination.Epoch, ef *epochFiles, sc *arrow.Schema) (*part, error) {
-	k := len(ef.files)
+	k := fmt.Sprintf("%05d", len(ef.files))
+	if w.cfg.Lane > 0 {
+		k = fmt.Sprintf("l%d-%s", w.cfg.Lane, k)
+	}
 	p := &part{schema: sc, file: stagedFile{
-		Staged: fmt.Sprintf("%s%d/%d/%s/part-%05d.parquet", w.staging(), e.Generation, e.N, ef.table, k),
-		Target: fmt.Sprintf("%s/%s-%020d-g%020d-%05d.parquet", ef.table, w.cfg.Pipeline, e.N, e.Generation, k),
+		Staged: fmt.Sprintf("%s%d/%d/%s/part-%s.parquet", w.staging(), e.Generation, e.N, ef.table, k),
+		Target: fmt.Sprintf("%s/%s-%020d-g%020d-%s.parquet", ef.table, w.cfg.Pipeline, e.N, e.Generation, k),
 	}}
 	ctx, cancel := context.WithCancel(w.ctx)
 	bw, err := w.b.NewWriter(ctx, p.file.Staged, &blob.WriterOptions{ContentType: "application/vnd.apache.parquet"})
@@ -363,24 +366,37 @@ func (w *writer) PreCommit(_ context.Context, e destination.Epoch) (_ destinatio
 	return json.Marshal(desc)
 }
 
-func (w *writer) descriptor(e destination.Epoch, s destination.Staged) (staged, error) {
-	var d staged
-	if err := json.Unmarshal(s, &d); err != nil {
-		return d, fmt.Errorf("s3: staged descriptor: %w", err)
+// descriptor merges the epoch's descriptors, one per lane of the attempt that
+// staged it, by stream.
+func (w *writer) descriptor(e destination.Epoch, committables []destination.Staged) (staged, error) {
+	out := staged{Generation: e.Generation, Epoch: e.N}
+	if len(committables) == 0 {
+		return out, errors.New("s3: no staged descriptor")
 	}
-	if d.Generation != e.Generation || d.Epoch != e.N {
-		return d, fmt.Errorf("s3: the staged descriptor is for epoch %d-g%d, not %d-g%d", d.Epoch, d.Generation, e.N, e.Generation)
+	at := map[string]int{}
+	for _, c := range committables {
+		var d staged
+		if err := json.Unmarshal(c, &d); err != nil {
+			return out, fmt.Errorf("s3: staged descriptor: %w", err)
+		}
+		if d.Generation != e.Generation || d.Epoch != e.N {
+			return out, fmt.Errorf("s3: the staged descriptor is for epoch %d-g%d, not %d-g%d", d.Epoch, d.Generation, e.N, e.Generation)
+		}
+		for _, st := range d.Streams {
+			if i, ok := at[st.Name]; ok {
+				out.Streams[i].Files = append(out.Streams[i].Files, st.Files...)
+				continue
+			}
+			at[st.Name] = len(out.Streams)
+			out.Streams = append(out.Streams, st)
+		}
 	}
-	return d, nil
+	return out, nil
 }
 
 func (w *writer) Commit(ctx context.Context, e destination.Epoch, committables []destination.Staged) (_ destination.Committed, err error) {
-	s, err := destination.One(committables)
-	if err != nil {
-		return destination.Committed{}, err
-	}
 	defer func() { err = classify(err) }()
-	d, err := w.descriptor(e, s)
+	d, err := w.descriptor(e, committables)
 	if err != nil {
 		return destination.Committed{}, err
 	}
@@ -431,12 +447,8 @@ func (w *writer) dropStaged(d staged) {
 }
 
 func (w *writer) Recover(ctx context.Context, gen uint64, e destination.Epoch, committables []destination.Staged) (_ destination.Recovery, err error) {
-	s, err := destination.One(committables)
-	if err != nil {
-		return 0, err
-	}
 	defer func() { err = classify(err) }()
-	r, err := w.recover(ctx, e, s)
+	r, err := w.recover(ctx, e, committables)
 	if err != nil {
 		return 0, err
 	}
@@ -445,11 +457,11 @@ func (w *writer) Recover(ctx context.Context, gen uint64, e destination.Epoch, c
 	return r, nil
 }
 
-func (w *writer) recover(ctx context.Context, e destination.Epoch, s destination.Staged) (destination.Recovery, error) {
+func (w *writer) recover(ctx context.Context, e destination.Epoch, committables []destination.Staged) (destination.Recovery, error) {
 	if e.IsZero() {
 		return destination.Applied, nil
 	}
-	d, err := w.descriptor(e, s)
+	d, err := w.descriptor(e, committables)
 	if err != nil {
 		return 0, err
 	}

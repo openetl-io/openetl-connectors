@@ -19,4 +19,5 @@ var DestinationCapabilities = destination.Capabilities{
 	MinCommitInterval:     time.Second,
 	NanosecondTimestamps:  true,
 	WriteModes:            []destination.WriteMode{destination.Append},
+	WriterLanes:           16,
 }
