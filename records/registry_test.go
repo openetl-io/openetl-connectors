@@ -8,10 +8,12 @@ import (
 	"errors"
 	"maps"
 	"os"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/twmb/franz-go/pkg/sr"
 	"google.golang.org/protobuf/reflect/protoreflect"
 
 	protocolv1 "github.com/openetl-io/openetl/sdk/go/protocol/v1"
@@ -36,6 +38,58 @@ func TestRegistryRefusesAnIncompatibleSchema(t *testing.T) {
 	var coded interface{ ErrorCode() protocolv1.ErrorCode }
 	if !errors.As(err, &coded) || coded.ErrorCode() != protocolv1.ErrorCode_ERROR_CODE_SCHEMA_DRIFT {
 		t.Errorf("a changed type: %v", err)
+	}
+}
+
+// A field's type doesn't change unless a person registers the schema that
+// changes it: then the encoder takes it. An added field registers by itself.
+func TestATypeChangesOnlyOnceAPersonRegistersIt(t *testing.T) {
+	ctx := t.Context()
+	for _, format := range []string{Avro, Protobuf} {
+		t.Run(format, func(t *testing.T) {
+			cfg := Config{Format: format, SchemaRegistryURL: cmp.Or(os.Getenv("OPENETL_TEST_SCHEMA_REGISTRY"), "http://127.0.0.1:8081")}
+			reg, err := cfg.Registry()
+			if err != nil {
+				t.Fatal(err)
+			}
+			subject := "widen_" + strings.ToLower(rand.Text())[:8] + "-value"
+			narrow := []Col{{name: "id", kind: kInt64}, {name: "n", kind: kInt32}}
+			wide := []Col{{name: "id", kind: kInt64}, {name: "n", kind: kInt64}, {name: "extra", kind: kString}}
+			if _, err := NewEncoder(ctx, format, reg, subject, "t", narrow); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := NewEncoder(ctx, format, reg, subject, "t", append(slices.Clone(narrow), Col{name: "extra", kind: kString})); err != nil {
+				t.Fatalf("an added field: %v", err)
+			}
+			_, err = NewEncoder(ctx, format, reg, subject, "t", wide)
+			var coded interface{ ErrorCode() protocolv1.ErrorCode }
+			if !errors.As(err, &coded) || coded.ErrorCode() != protocolv1.ErrorCode_ERROR_CODE_SCHEMA_DRIFT || !strings.Contains(err.Error(), `"n"`) {
+				t.Fatalf("a widened field: %v", err)
+			}
+			text, typ := "", sr.TypeAvro
+			if format == Avro {
+				b, err := avroSchemaText("t", wide)
+				if err != nil {
+					t.Fatal(err)
+				}
+				text = string(b)
+			} else {
+				prev, err := latestLayout(ctx, reg, subject)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if text, err = protoSchema("t", wide, prev); err != nil {
+					t.Fatal(err)
+				}
+				typ = sr.TypeProtobuf
+			}
+			if _, err := reg.CreateSchema(ctx, subject, sr.Schema{Schema: text, Type: typ}); err != nil {
+				t.Fatalf("a person registers it: %v", err)
+			}
+			if _, err := NewEncoder(ctx, format, reg, subject, "t", wide); err != nil {
+				t.Errorf("once registered: %v", err)
+			}
+		})
 	}
 }
 
