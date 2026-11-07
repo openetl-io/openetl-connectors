@@ -146,7 +146,14 @@ type stagingTable struct {
 	last []string
 	// Patches: columns that fill another held column, by that column.
 	fills map[string]string
+	// Tables of the epoch before name, each narrower than the next: a batch
+	// wider than a table starts the next one, as no table's column is ever
+	// changed to a wider type.
+	earlier []string
 }
+
+// all are the staging's tables, in order.
+func (st *stagingTable) all() []string { return append(slices.Clone(st.earlier), st.name) }
 
 // staged is the descriptor PreCommit returns.
 type staged struct {
@@ -165,6 +172,9 @@ type stagedStream struct {
 	Table string `json:"table"`
 	// Empty when an overwrite read ended in the epoch without rows in it.
 	Staging string `json:"staging"`
+	// The lane's later staging tables of the epoch, each taking batches
+	// wider than the one before.
+	Wider []string `json:"wider,omitempty"`
 	// One row per _openetl_id in the epoch, and only IDs the target doesn't
 	// have yet.
 	Dedupe bool `json:"dedupe,omitempty"`
@@ -188,6 +198,8 @@ type stagedStream struct {
 	// another held column.
 	Patch string            `json:"patch,omitempty"`
 	Fills map[string]string `json:"fills,omitempty"`
+	// As Wider, for Patch.
+	WiderPatches []string `json:"wider_patches,omitempty"`
 	// Staging and Patch, of every lane that has them, once mergeLanes has
 	// merged the lanes' descriptors.
 	stagings, patches []string
@@ -369,8 +381,16 @@ func (w *writer) stage(ctx context.Context, tables map[uint64]map[string]*stagin
 		}
 		st.cols = cols
 		byStream[stream] = st
-	} else if err := w.widen(ctx, st, cols); err != nil {
+	} else if wider, err := w.addColumns(ctx, st, cols); err != nil {
 		return nil, err
+	} else if wider != nil {
+		st.earlier = append(st.earlier, st.name)
+		st.name = name + "_" + strconv.Itoa(len(st.earlier)+1)
+		label := stagingLabel{Pipeline: w.cfg.Pipeline, Generation: e.Generation, Epoch: e.N}
+		if err := w.createLabelled(ctx, st.name, label, wider); err != nil {
+			return nil, fmt.Errorf("postgres: create staging for %s: %w", stream, err)
+		}
+		st.cols = wider
 	}
 
 	n := int(batch.NumRows())
@@ -511,31 +531,33 @@ func (w *writer) copyCast(ctx context.Context, st *stagingTable, cols []column, 
 	})
 }
 
-// widen adds columns that appeared since the staging table was created, and
-// widens those whose type widened. An older batch's narrower columns leave
-// it as it is.
-func (w *writer) widen(ctx context.Context, st *stagingTable, cols []column) error {
+// addColumns adds columns that appeared since the staging table was created.
+// If a column's type widened, it returns the columns a table must have to take
+// the batch, and the table is left as it is. An older batch's narrower columns
+// fit.
+func (w *writer) addColumns(ctx context.Context, st *stagingTable, cols []column) ([]column, error) {
+	wider := slices.Clone(st.cols)
+	changed := false
 	for _, c := range cols {
 		i := slices.IndexFunc(st.cols, func(x column) bool { return x.name == c.name })
-		q := pgx.Identifier{c.name}.Sanitize()
 		switch {
 		case i < 0:
 			if _, err := w.pool.Exec(ctx, "ALTER TABLE "+w.ident(st.name)+" ADD COLUMN IF NOT EXISTS "+columnDef(c)); err != nil {
-				return fmt.Errorf("postgres: add column %q to staging: %w", c.name, err)
+				return nil, fmt.Errorf("postgres: add column %q to staging: %w", c.name, err)
 			}
 			st.cols = append(st.cols, c)
-		case st.cols[i].typ == c.typ, c.value == nil:
+			wider = append(wider, c)
+		case st.cols[i].typ == c.typ, c.value == nil, widens(c.typ, st.cols[i].typ):
 		case widens(st.cols[i].typ, c.typ):
-			if _, err := w.pool.Exec(ctx, "ALTER TABLE "+w.ident(st.name)+" ALTER COLUMN "+q+" TYPE "+c.typ+" USING "+q+"::"+c.typ); err != nil {
-				return fmt.Errorf("postgres: widen column %q in staging: %w", c.name, err)
-			}
-			st.cols[i] = c
-		case widens(c.typ, st.cols[i].typ):
+			wider[i], changed = c, true
 		default:
-			return fmt.Errorf("postgres: column %q changed from %s to %s within an epoch", c.name, st.cols[i].typ, c.typ)
+			return nil, fmt.Errorf("postgres: column %q changed from %s to %s within an epoch", c.name, st.cols[i].typ, c.typ)
 		}
 	}
-	return nil
+	if !changed {
+		return nil, nil
+	}
+	return wider, nil
 }
 
 // columnDef is a column's definition. _openetl_deleted is false in rows from
@@ -572,10 +594,12 @@ func (w *writer) PreCommit(_ context.Context, e destination.Epoch) (destination.
 		}
 		key := []string(nil)
 		if pt != nil {
-			ss.Table, ss.Patch, ss.Fills, key = pt.target, pt.name, pt.fills, pt.key
+			tables := pt.all()
+			ss.Table, ss.Patch, ss.WiderPatches, ss.Fills, key = pt.target, tables[0], tables[1:], pt.fills, pt.key
 		}
 		if st != nil {
-			ss.Table, ss.Staging, ss.Rows, ss.Last, key = st.target, st.name, st.rows, st.last, st.key
+			tables := st.all()
+			ss.Table, ss.Staging, ss.Wider, ss.Rows, ss.Last, key = st.target, tables[0], tables[1:], st.rows, st.last, st.key
 		}
 		switch s.Mode {
 		case destination.Overwrite:
@@ -648,10 +672,10 @@ func (w *writer) mergeLanes(committables []destination.Staged) (staged, error) {
 			}
 			maps.Copy(m.Fills, s.Fills)
 			if s.Staging != "" {
-				m.stagings = append(m.stagings, s.Staging)
+				m.stagings = append(append(m.stagings, s.Staging), s.Wider...)
 			}
 			if s.Patch != "" {
-				m.patches = append(m.patches, s.Patch)
+				m.patches = append(append(m.patches, s.Patch), s.WiderPatches...)
 			}
 		}
 	}
@@ -1237,28 +1261,47 @@ func (w *writer) preparePatch(ctx context.Context, desc staged, s stagedStream) 
 	return out, rows, nil
 }
 
-// ensureRead creates the read's table, labelled, or adds its columns to
-// hold cols, and widens those narrower than cols: no one reads it yet, and
-// lanes' schemas aren't in step across epochs.
+// ensureRead creates the read's table, labelled, with the target's types
+// where it has the column, or adds its columns to hold cols. A column it has
+// narrower than the target's takes the target's type: only a person widens a
+// target, after ApplySchema refused to and said how, and the read's table
+// replaces the target's rows.
 func (w *writer) ensureRead(ctx context.Context, s stagedStream, cols []column) error {
 	have, err := w.columnTypes(ctx, s.Read)
 	if err != nil {
 		return err
 	}
-	if len(have) == 0 {
-		label := readLabel{Pipeline: w.cfg.Pipeline, Stream: s.Name, Table: s.Table}
-		if err := w.createLabelled(ctx, s.Read, label, cols); err != nil {
-			return fmt.Errorf("postgres: create the read table for %s: %w", s.Name, err)
+	var target []column
+	if s.Table != "" {
+		if target, err = w.columnTypes(ctx, s.Table); err != nil {
+			return err
 		}
 	}
-	for _, c := range cols {
-		i := slices.IndexFunc(have, func(x column) bool { return x.name == c.name })
-		if i < 0 || have[i].typ == c.typ || !widens(have[i].typ, c.typ) {
+	targetType := func(c column) column {
+		if i := slices.IndexFunc(target, func(x column) bool { return x.name == c.name }); i >= 0 && widens(c.typ, target[i].typ) {
+			c.typ = target[i].typ
+		}
+		return c
+	}
+	if len(have) == 0 {
+		want := make([]column, len(cols))
+		for i, c := range cols {
+			want[i] = targetType(c)
+		}
+		label := readLabel{Pipeline: w.cfg.Pipeline, Stream: s.Name, Table: s.Table}
+		if err := w.createLabelled(ctx, s.Read, label, want); err != nil {
+			return fmt.Errorf("postgres: create the read table for %s: %w", s.Name, err)
+		}
+		return nil
+	}
+	for _, c := range have {
+		t := targetType(c)
+		if t.typ == c.typ {
 			continue
 		}
 		q := pgx.Identifier{c.name}.Sanitize()
-		if err := w.ddl(ctx, "ALTER TABLE "+w.ident(s.Read)+" ALTER COLUMN "+q+" TYPE "+c.typ+" USING "+q+"::"+c.typ); err != nil {
-			return fmt.Errorf("postgres: widen column %q of the read table for %s: %w", c.name, s.Name, err)
+		if err := w.ddl(ctx, "ALTER TABLE "+w.ident(s.Read)+" ALTER COLUMN "+q+" TYPE "+t.typ+" USING "+q+"::"+t.typ); err != nil {
+			return fmt.Errorf("postgres: column %q of the read table for %s, as its target has it: %w", c.name, s.Name, err)
 		}
 	}
 	return w.ensureTable(ctx, s.Read, cols)

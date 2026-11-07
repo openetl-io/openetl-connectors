@@ -401,3 +401,73 @@ func TestMergeLanesRefusesOtherEpochs(t *testing.T) {
 		t.Error("merged two reads")
 	}
 }
+
+// A batch wider than its lane's staging starts a staging table of its own,
+// instead of changing a column's type; the apply reads them as one.
+func TestAWiderBatchStartsAStagingTableOfItsOwn(t *testing.T) {
+	env := newEnv(t)
+	stream := destination.Stream{Name: "users", Mode: destination.Append}
+	ws := env.openLanes(1, 1, destination.Epoch{}, nil, stream)
+	n32 := arrow.Field{Name: "n", Type: arrow.PrimitiveTypes.Int32, Nullable: true}
+	n64 := arrow.Field{Name: "n", Type: arrow.PrimitiveTypes.Int64, Nullable: true}
+	e1 := destination.Epoch{Generation: 1, N: 1}
+	write(t, ws[0], e1, "users", batch(t, []arrow.Field{idField, n32}, `[{"id": 1, "n": 1}]`))
+	write(t, ws[0], e1, "users", batch(t, []arrow.Field{idField, n64}, `[{"id": 2, "n": 5000000000}]`))
+	write(t, ws[0], e1, "users", batch(t, []arrow.Field{idField, n32}, `[{"id": 3, "n": 3}]`))
+	st := precommitAll(t, e1, ws...)
+	var d staged
+	if err := json.Unmarshal(st[0], &d); err != nil || len(d.Streams) != 1 || len(d.Streams[0].Wider) != 1 {
+		t.Fatalf("the descriptor: %s (%v)", st[0], err)
+	}
+	typeOf := func(table string) string {
+		return env.text(`SELECT format_type(atttypid, atttypmod) FROM pg_attribute WHERE attrelid = '$schema.` + table + `'::regclass AND attname = 'n'`)
+	}
+	if a, b := typeOf(d.Streams[0].Staging), typeOf(d.Streams[0].Wider[0]); a != "integer" || b != "bigint" {
+		t.Errorf("the staging tables' n: %s and %s, want integer and bigint", a, b)
+	}
+	if _, err := ws[0].Commit(t.Context(), e1, st); err != nil {
+		t.Fatal(err)
+	}
+	if got := env.text(`SELECT string_agg(id || ':' || n, ',' ORDER BY id) FROM $schema.users`); got != "1:1,2:5000000000,3:3" {
+		t.Errorf("rows: %s", got)
+	}
+	if n := env.count("SELECT count(*) FROM pg_tables WHERE schemaname = '" + env.schema + "' AND tablename LIKE '\\_openetl\\_stage\\_%'"); n != 0 {
+		t.Errorf("%d staging tables left", n)
+	}
+}
+
+// An overwrite's read table takes its target's types. A wider type reaches it
+// only once a person has changed the target's, as ApplySchema's refusal
+// says to; until then the commit is refused, with how.
+func TestTheReadTableFollowsItsTarget(t *testing.T) {
+	env := newEnv(t)
+	stream := destination.Stream{Name: "users", Mode: destination.Overwrite}
+	ws := env.openLanes(1, 1, destination.Epoch{}, nil, stream)
+	startReads(t, ws[0], map[string]time.Time{"users": time.UnixMicro(1000)})
+	n32 := arrow.Field{Name: "n", Type: arrow.PrimitiveTypes.Int32, Nullable: true}
+	n64 := arrow.Field{Name: "n", Type: arrow.PrimitiveTypes.Int64, Nullable: true}
+	applySchema(t, ws[0], "users", []arrow.Field{idField, n32})
+	e1, e2, e3 := destination.Epoch{Generation: 1, N: 1}, destination.Epoch{Generation: 1, N: 2}, destination.Epoch{Generation: 1, N: 3}
+	write(t, ws[0], e1, "users", batch(t, []arrow.Field{idField, n32}, `[{"id": 1, "n": 1}]`))
+	if _, err := ws[0].Commit(t.Context(), e1, precommitAll(t, e1, ws...)); err != nil {
+		t.Fatal(err)
+	}
+	write(t, ws[0], e2, "users", batch(t, []arrow.Field{idField, n64}, `[{"id": 2, "n": 5000000000}]`))
+	st := precommitAll(t, e2, ws...)
+	if _, err := ws[0].Commit(t.Context(), e2, st); err == nil || !strings.Contains(err.Error(), "doesn't change a column's type") {
+		t.Fatalf("a commit wider than the target: %v", err)
+	}
+	if _, err := env.conn.Exec(t.Context(), "ALTER TABLE "+env.schema+".users ALTER COLUMN n TYPE bigint"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ws[0].Commit(t.Context(), e2, st); err != nil {
+		t.Fatal(err)
+	}
+	endRead(t, ws[0].(destination.ReadTracker), e3, "users")
+	if _, err := ws[0].Commit(t.Context(), e3, precommitAll(t, e3, ws...)); err != nil {
+		t.Fatal(err)
+	}
+	if got := env.text(`SELECT string_agg(id || ':' || n, ',' ORDER BY id) FROM $schema.users`); got != "1:1,2:5000000000" {
+		t.Errorf("rows: %s", got)
+	}
+}
