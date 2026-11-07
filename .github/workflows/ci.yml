@@ -90,9 +90,9 @@ jobs:
             -e AWS_REGION=us-east-1 -e AWS_ACCESS_KEY_ID=openetl -e AWS_SECRET_ACCESS_KEY=openetl \
             apache/iceberg-rest-fixture:1.10.1
           docker run -d --name glue -p 5000:5000 motoserver/moto:5.2.5
-          until curl -sf -X PUT http://127.0.0.1:8333/iceberg; do sleep 1; done
-          until curl -sf http://127.0.0.1:8181/v1/config; do sleep 1; done
-          until curl -sf http://127.0.0.1:5000/moto-api/; do sleep 1; done
+          until curl -sf -o /dev/null -X PUT http://127.0.0.1:8333/iceberg; do sleep 1; done
+          until curl -sf -o /dev/null http://127.0.0.1:8181/v1/config; do sleep 1; done
+          until curl -sf -o /dev/null http://127.0.0.1:5000/moto-api/; do sleep 1; done
       # Kafka's: one KRaft node, and Karapace as the schema registry.
       - name: Kafka and a schema registry
         run: |
@@ -112,7 +112,7 @@ jobs:
             -e KARAPACE_PORT=8081 -e KARAPACE_ADVERTISED_HOSTNAME=registry -e KARAPACE_GROUP_ID=karapace \
             -e KARAPACE_MASTER_ELIGIBILITY=true -e KARAPACE_TOPIC_NAME=_schemas -e KARAPACE_COMPATIBILITY=BACKWARD \
             ghcr.io/aiven-open/karapace:6.2.4 -m karapace
-          until curl -sf http://127.0.0.1:8081/subjects; do sleep 1; done
+          until curl -sf -o /dev/null http://127.0.0.1:8081/subjects; do sleep 1; done
       # Kinesis's: kinesis-mock, on plain HTTP.
       - name: Kinesis
         run: |
@@ -120,7 +120,7 @@ jobs:
             -e CREATE_STREAM_DURATION=100ms -e SPLIT_SHARD_DURATION=100ms -e MERGE_SHARDS_DURATION=100ms \
             -e SHARD_LIMIT=100000 -e ON_DEMAND_STREAM_COUNT_LIMIT=10000 -e LOG_LEVEL=WARN \
             ghcr.io/etspaceman/kinesis-mock:0.6.2
-          until curl -sf http://127.0.0.1:4568/healthcheck; do sleep 1; done
+          until curl -sf -o /dev/null http://127.0.0.1:4568/healthcheck; do sleep 1; done
       - name: Tests, against Postgres, the Iceberg catalogs, Kafka and Kinesis
         working-directory: openetl-connectors
         env:

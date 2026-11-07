@@ -1,4 +1,5 @@
 name: iceberg
+title: Apache Iceberg
 description: Apache Iceberg tables, through a REST or Glue catalog
 license: Apache-2.0
 repository: https://github.com/openetl-io/openetl-connectors
