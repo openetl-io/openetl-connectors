@@ -27,5 +27,7 @@ func main() {
 		Resplit: true,
 		// Teardown drops a deleted pipeline's replication slot.
 		Setup: true,
+		// Asked about its slot while the pipeline isn't running.
+		Retention: true,
 	})
 }
