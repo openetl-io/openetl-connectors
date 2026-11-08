@@ -99,3 +99,17 @@ func TestTimestampsPastArrow(t *testing.T) {
 		cb.b.Release()
 	}
 }
+
+func TestBigEndianInts(t *testing.T) {
+	for _, n := range []int64{0, 1, -1, 300, -300, math.MaxInt16, math.MinInt16, math.MaxInt32, math.MinInt32, math.MaxInt64, math.MinInt64} {
+		if got := beInt64(binary.BigEndian.AppendUint64(nil, uint64(n))); got != n {
+			t.Errorf("int64 %d: %d", n, got)
+		}
+		if n := int32(n); beInt32(binary.BigEndian.AppendUint32(nil, uint32(n))) != n {
+			t.Errorf("int32 %d", n)
+		}
+		if n := int16(n); beInt16(binary.BigEndian.AppendUint16(nil, uint16(n))) != n {
+			t.Errorf("int16 %d", n)
+		}
+	}
+}

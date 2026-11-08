@@ -398,7 +398,9 @@ func (w *writer) stage(ctx context.Context, tables map[uint64]map[string]*stagin
 		if _, err := w.pool.Exec(ctx, "INSERT INTO "+w.ident(st.name)+" SELECT FROM generate_series(1, $1)", n); err != nil {
 			return nil, err
 		}
-		st.rows += uint64(n) //nolint:gosec // a batch's rows
+		if n > 0 {
+			st.rows += uint64(n)
+		}
 		return st, nil
 	}
 	arrs := batch.Columns()
@@ -425,7 +427,9 @@ func (w *writer) stage(ctx context.Context, tables map[uint64]map[string]*stagin
 	if err != nil {
 		return nil, fmt.Errorf("postgres: stage %s: %w", stream, err)
 	}
-	st.rows += uint64(n) //nolint:gosec // a batch's rows
+	if n > 0 {
+		st.rows += uint64(n)
+	}
 	return st, nil
 }
 
@@ -837,7 +841,11 @@ func (w *writer) applyRows(ctx context.Context, tx pgx.Tx, s stagedStream, p pre
 		if err != nil {
 			return 0, err
 		}
-		n = uint64(tag.RowsAffected()) //nolint:gosec // a row count
+		affected := tag.RowsAffected()
+		if affected < 0 {
+			return 0, fmt.Errorf("postgres: the insert reported %d rows", affected)
+		}
+		n = uint64(affected)
 	}
 	if s.Ended {
 		return n, w.replace(ctx, tx, s, p.read)
