@@ -25,5 +25,7 @@ func main() {
 		// Tables are read in key ranges, and a range's remainder divided.
 		Splits:  true,
 		Resplit: true,
+		// Asked about its slot while the pipeline isn't running.
+		Retention: true,
 	})
 }

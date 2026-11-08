@@ -22,5 +22,6 @@ func main() {
 		// Committed commits the offsets to the consumer group.
 		Acknowledges: true,
 		Splits:       true,
+		Retention:    true,
 	})
 }
