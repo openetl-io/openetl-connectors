@@ -58,6 +58,18 @@ func fixed(n int, f func(v []byte)) func([]byte) error {
 	}
 }
 
+// beInt16, beInt32 and beInt64 read big-endian two's complement integers,
+// as Postgres sends them.
+func beInt16(v []byte) int16 { return int16(v[0])<<8 | int16(v[1]) }
+
+func beInt32(v []byte) int32 {
+	return int32(beInt16(v))<<16 | int32(binary.BigEndian.Uint16(v[2:]))
+}
+
+func beInt64(v []byte) int64 {
+	return int64(beInt32(v))<<32 | int64(binary.BigEndian.Uint32(v[4:]))
+}
+
 func newColBuilder(mem memory.Allocator, c sourceColumn) (*colBuilder, error) {
 	be := binary.BigEndian
 	cb := &colBuilder{format: pgx.BinaryFormatCode}
@@ -67,13 +79,13 @@ func newColBuilder(mem memory.Allocator, c sourceColumn) (*colBuilder, error) {
 		cb.b, cb.add = b, fixed(1, func(v []byte) { b.Append(v[0] != 0) })
 	case pgtype.Int2OID:
 		b := array.NewInt16Builder(mem)
-		cb.b, cb.add = b, fixed(2, func(v []byte) { b.Append(int16(be.Uint16(v))) }) //nolint:gosec // two's complement
+		cb.b, cb.add = b, fixed(2, func(v []byte) { b.Append(beInt16(v)) })
 	case pgtype.Int4OID:
 		b := array.NewInt32Builder(mem)
-		cb.b, cb.add = b, fixed(4, func(v []byte) { b.Append(int32(be.Uint32(v))) }) //nolint:gosec // two's complement
+		cb.b, cb.add = b, fixed(4, func(v []byte) { b.Append(beInt32(v)) })
 	case pgtype.Int8OID:
 		b := array.NewInt64Builder(mem)
-		cb.b, cb.add = b, fixed(8, func(v []byte) { b.Append(int64(be.Uint64(v))) }) //nolint:gosec // two's complement
+		cb.b, cb.add = b, fixed(8, func(v []byte) { b.Append(beInt64(v)) })
 	case pgtype.OIDOID:
 		b := array.NewInt64Builder(mem)
 		cb.b, cb.add = b, fixed(4, func(v []byte) { b.Append(int64(be.Uint32(v))) })
@@ -95,7 +107,7 @@ func newColBuilder(mem memory.Allocator, c sourceColumn) (*colBuilder, error) {
 			if len(v) != 4 {
 				return fmt.Errorf("a %d-byte date", len(v))
 			}
-			d := int32(be.Uint32(v)) //nolint:gosec // two's complement
+			d := beInt32(v)
 			if d != math.MaxInt32 && d != math.MinInt32 {
 				d += pgEpochDays
 			}
@@ -104,7 +116,7 @@ func newColBuilder(mem memory.Allocator, c sourceColumn) (*colBuilder, error) {
 		}
 	case pgtype.TimeOID:
 		b := array.NewTime64Builder(mem, &arrow.Time64Type{Unit: arrow.Microsecond})
-		cb.b, cb.add = b, fixed(8, func(v []byte) { b.Append(arrow.Time64(be.Uint64(v))) }) //nolint:gosec // microseconds since midnight
+		cb.b, cb.add = b, fixed(8, func(v []byte) { b.Append(arrow.Time64(beInt64(v))) })
 	case pgtype.TimestampOID, pgtype.TimestamptzOID:
 		t := &arrow.TimestampType{Unit: arrow.Microsecond}
 		if c.oid == pgtype.TimestamptzOID {
@@ -115,7 +127,7 @@ func newColBuilder(mem memory.Allocator, c sourceColumn) (*colBuilder, error) {
 			if len(v) != 8 {
 				return fmt.Errorf("a %d-byte timestamp", len(v))
 			}
-			us := int64(be.Uint64(v)) //nolint:gosec // two's complement
+			us := beInt64(v)
 			if us != math.MaxInt64 && us != math.MinInt64 {
 				us += pgEpochMicros
 			}
@@ -126,7 +138,7 @@ func newColBuilder(mem memory.Allocator, c sourceColumn) (*colBuilder, error) {
 			if len(v) != 8 {
 				return "", false
 			}
-			us := int64(be.Uint64(v)) //nolint:gosec // two's complement
+			us := beInt64(v)
 			if us == math.MaxInt64 || us < math.MaxInt64-pgEpochMicros {
 				return "", false
 			}

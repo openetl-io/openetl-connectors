@@ -61,7 +61,7 @@ func (c *Connection) tlsConfig() (*tls.Config, error) {
 	if !c.TLS && c.TLSCA == "" && c.TLSCert == "" {
 		return nil, nil
 	}
-	cfg := &tls.Config{ServerName: c.TLSServerName, InsecureSkipVerify: c.TLSInsecureSkipVerify, MinVersion: tls.VersionTLS12} //nolint:gosec // the user's choice
+	cfg := &tls.Config{ServerName: c.TLSServerName, InsecureSkipVerify: c.TLSInsecureSkipVerify, MinVersion: tls.VersionTLS12}
 	if c.TLSCA != "" {
 		pool := x509.NewCertPool()
 		if !pool.AppendCertsFromPEM([]byte(c.TLSCA)) {

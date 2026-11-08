@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"slices"
 	"strconv"
 	"strings"
@@ -1257,9 +1258,14 @@ func parseSnapshot(s string) (pgSnapshot, error) {
 	return snap, nil
 }
 
-// full is a transaction ID with the epoch, near the snapshot's.
+// full is a transaction ID with the epoch, near the snapshot's: the ID
+// within 2^31 of xmax whose low 32 bits are xid.
 func (s pgSnapshot) full(xid uint32) uint64 {
-	return uint64(int64(s.xmax) + int64(int32(xid-uint32(s.xmax)))) //nolint:gosec // within 2^31 of xmax
+	ahead := (uint64(xid) - s.xmax) & math.MaxUint32
+	if ahead < 1<<31 {
+		return s.xmax + ahead
+	}
+	return s.xmax - (1<<32 - ahead)
 }
 
 // sees reports whether the snapshot sees a committed transaction's changes.

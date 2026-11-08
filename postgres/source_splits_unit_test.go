@@ -3,6 +3,7 @@ package postgres
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"slices"
 	"testing"
 
@@ -170,5 +171,28 @@ func TestReconcileChunks(t *testing.T) {
 	}
 	if !slices.Equal(r.recent, []*txn{x101, x105}) {
 		t.Errorf("kept %d transactions, want those some chunk's xmin doesn't pass", len(r.recent))
+	}
+}
+
+func TestSnapshotFullIDs(t *testing.T) {
+	// full's ID, by signed arithmetic.
+	want := func(xmax uint64, xid uint32) uint64 {
+		return uint64(int64(xmax) + int64(int32(xid-uint32(xmax))))
+	}
+	for _, xmax := range []uint64{0, 3, 1<<31 - 1, 1 << 31, 1<<32 - 1, 1 << 32, 5<<32 + 7, 1<<63 + 9, math.MaxUint64} {
+		for _, xid := range []uint32{0, 1, 2, 7, 1<<31 - 1, 1 << 31, 1<<31 + 1, math.MaxUint32, uint32(xmax), uint32(xmax) + 1, uint32(xmax) - 1} {
+			if got := (pgSnapshot{xmax: xmax}).full(xid); got != want(xmax, xid) {
+				t.Errorf("xmax %d, xid %d: %d, want %d", xmax, xid, got, want(xmax, xid))
+			}
+		}
+	}
+	if got := (pgSnapshot{xmax: 5<<32 + 10}).full(4); got != 5<<32+4 {
+		t.Errorf("an ID just behind xmax: %d", got)
+	}
+	if got := (pgSnapshot{xmax: 5<<32 + 10}).full(math.MaxUint32); got != 5<<32-1 {
+		t.Errorf("an ID behind xmax in the epoch before: %d", got)
+	}
+	if got := (pgSnapshot{xmax: 5<<32 - 2}).full(3); got != 5<<32+3 {
+		t.Errorf("an ID ahead of xmax in the next epoch: %d", got)
 	}
 }

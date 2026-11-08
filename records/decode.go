@@ -361,8 +361,8 @@ func avroArrow(node *avro.SchemaNode) (arrow.DataType, arrow.Metadata) {
 	case "local-timestamp-millis", "local-timestamp-micros", "local-timestamp-nanos":
 		return &arrow.TimestampType{Unit: arrow.Microsecond}, arrow.Metadata{}
 	case "decimal":
-		if node.Precision > 0 && node.Precision <= 38 {
-			return &arrow.Decimal128Type{Precision: int32(node.Precision), Scale: int32(node.Scale)}, arrow.Metadata{} //nolint:gosec // at most 38
+		if node.Precision > 0 && node.Precision <= 38 && node.Scale >= 0 && node.Scale <= 38 {
+			return &arrow.Decimal128Type{Precision: int32(node.Precision), Scale: int32(node.Scale)}, arrow.Metadata{}
 		}
 		return arrow.BinaryTypes.String, arrow.Metadata{}
 	case "uuid":
