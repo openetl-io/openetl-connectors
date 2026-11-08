@@ -6,7 +6,7 @@
   "required": ["dsn"],
   "properties": {
     "dsn": {"type": "string", "x-secret": true, "description": "A connection URL or a keyword/value connection string."},
-    "schema": {"type": "string", "default": "public"},
+    "schema": {"type": "string", "default": "public", "description": "The schema whose tables are offered as streams."},
     "tables": {"type": "array", "items": {"type": "string"}, "description": "The tables to offer as streams. Empty: every table in the schema."},
     "chunkRows": {"type": "integer", "minimum": 1, "default": 100000, "description": "Rows per query on a table with a primary key; each chunk ends at a resume point."},
     "batchBytes": {"type": "integer", "minimum": 1, "default": 4194304, "description": "Approximate bytes of values per Arrow batch."},
