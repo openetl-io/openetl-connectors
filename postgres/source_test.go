@@ -171,7 +171,7 @@ func read(t *testing.T, s *Source, streams map[string]string) *capture {
 func TestSourceDiscovers(t *testing.T) {
 	e := newSourceEnv(t)
 	e.exec("CREATE TABLE $schema.keyed (b text, a int, v text, PRIMARY KEY (a, b))")
-	e.exec("CREATE TABLE $schema.loose (v text)")
+	e.exec("CREATE TABLE $schema.loose (v text, w text NOT NULL)")
 	e.exec("CREATE TABLE $schema.parted (id int PRIMARY KEY) PARTITION BY RANGE (id)")
 	e.exec("CREATE TABLE $schema.parted_1 PARTITION OF $schema.parted FOR VALUES FROM (0) TO (100)")
 	e.exec("CREATE VIEW $schema.view AS SELECT 1 AS x")
@@ -195,6 +195,25 @@ func TestSourceDiscovers(t *testing.T) {
 	}
 	if s := got["parted"]; !slices.Equal(s.PrimaryKey, []string{"id"}) {
 		t.Errorf("parted: %+v", s)
+	}
+	// A column is nullable unless it's NOT NULL, and in a table CDC can
+	// read, also in the key: a delete's row has nulls in the rest.
+	for stream, want := range map[string]string{"keyed": "b=false a=false v=true", "loose": "v=true w=false"} {
+		var nullable []string
+		for _, f := range got[stream].Schema.Fields() {
+			nullable = append(nullable, fmt.Sprintf("%s=%v", f.Name, f.Nullable))
+		}
+		if strings.Join(nullable, " ") != want {
+			t.Errorf("%s's nullability %v, want %s", stream, nullable, want)
+		}
+	}
+	e.exec("CREATE TABLE $schema.tracked (id int PRIMARY KEY, v text NOT NULL)")
+	cat, err = e.source(`, "tables": ["tracked"]`).Discover(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f := cat.Streams[0].Schema.Field(1); !f.Nullable {
+		t.Errorf("a NOT NULL column CDC can read: %v", f)
 	}
 
 	cat, err = e.source(`, "tables": ["loose"]`).Discover(t.Context())

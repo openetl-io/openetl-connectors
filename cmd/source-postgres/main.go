@@ -25,5 +25,7 @@ func main() {
 		// Tables are read in key ranges, and a range's remainder divided.
 		Splits:  true,
 		Resplit: true,
+		// Teardown drops a deleted pipeline's replication slot.
+		Setup: true,
 	})
 }

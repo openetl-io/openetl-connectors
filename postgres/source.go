@@ -108,9 +108,10 @@ type table struct {
 }
 
 type sourceColumn struct {
-	name   string
-	oid    uint32
-	typmod int32
+	name    string
+	oid     uint32
+	typmod  int32
+	notNull bool
 }
 
 func (s *Source) Discover(ctx context.Context) (source.Catalog, error) {
@@ -130,15 +131,17 @@ func (s *Source) Discover(ctx context.Context) (source.Catalog, error) {
 			return source.Catalog{}, fmt.Errorf("postgres: %s: %w", t.name, err)
 		}
 		b.release()
-		cs := source.CatalogStream{Name: t.name, SplitsByKey: len(t.key) > 0, Replay: source.Exact, Schema: b.declared, SyncModes: []source.SyncMode{source.FullRefresh}}
+		cs := source.CatalogStream{Name: t.name, SplitsByKey: len(t.key) > 0, Replay: source.Exact, SyncModes: []source.SyncMode{source.FullRefresh}}
 		if slices.ContainsFunc(t.cols, func(c sourceColumn) bool { return cursorTypes[c.oid] }) {
 			cs.SyncModes = append(cs.SyncModes, source.Incremental)
 		}
 		// The log names an update's or delete's row by its primary key, or
 		// with replica identity full by all of it.
-		if len(t.key) > 0 && (t.replident == 'd' || t.replident == 'f') {
+		cdc := len(t.key) > 0 && (t.replident == 'd' || t.replident == 'f')
+		if cdc {
 			cs.SyncModes, cs.Seq = append(cs.SyncModes, source.CDC), seqType
 		}
+		cs.Schema = nullability(b.declared, t, cdc)
 		for _, i := range t.key {
 			cs.PrimaryKey = append(cs.PrimaryKey, t.cols[i].name)
 		}
@@ -147,9 +150,20 @@ func (s *Source) Discover(ctx context.Context) (source.Catalog, error) {
 	return c, nil
 }
 
+// nullability is decl with the columns that never hold a null marked so:
+// those NOT NULL in the table, except where a CDC read carries nulls, as a
+// delete's row does in every column but its key.
+func nullability(decl *arrow.Schema, t table, cdc bool) *arrow.Schema {
+	fields := decl.Fields()
+	for i, c := range t.cols {
+		fields[i].Nullable = !c.notNull || cdc && !slices.Contains(t.key, i)
+	}
+	return arrow.NewSchema(fields, nil)
+}
+
 // tables lists the configured tables, in name order.
 func (s *Source) tables(ctx context.Context, conn *pgx.Conn) ([]table, error) {
-	rows, err := conn.Query(ctx, `SELECT c.relname, c.relreplident::text, a.attname, a.atttypid, a.atttypmod,
+	rows, err := conn.Query(ctx, `SELECT c.relname, c.relreplident::text, a.attname, a.atttypid, a.atttypmod, a.attnotnull,
 			coalesce((SELECT k.ord FROM unnest(i.indkey::int2[]) WITH ORDINALITY AS k(attnum, ord) WHERE k.attnum = a.attnum), 0)
 		FROM pg_class c
 		JOIN pg_namespace n ON n.oid = c.relnamespace
@@ -180,7 +194,7 @@ func (s *Source) tables(ctx context.Context, conn *pgx.Conn) ([]table, error) {
 		var name, replident string
 		var c sourceColumn
 		var pos int64
-		if err := rows.Scan(&name, &replident, &c.name, &c.oid, &c.typmod, &pos); err != nil {
+		if err := rows.Scan(&name, &replident, &c.name, &c.oid, &c.typmod, &c.notNull, &pos); err != nil {
 			return nil, fmt.Errorf("postgres: list tables: %w", err)
 		}
 		if len(out) == 0 || out[len(out)-1].name != name {

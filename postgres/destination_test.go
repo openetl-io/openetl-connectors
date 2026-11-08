@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"maps"
+	"net/url"
 	"os"
 	"strings"
 	"testing"
@@ -182,6 +183,55 @@ func TestRecoverRedoesAStagedEpoch(t *testing.T) {
 	}
 	if n := env.count("SELECT count(*) FROM $schema.users") + env.count("SELECT count(*) FROM $schema.orders"); n != 3 {
 		t.Errorf("%d rows, want 3", n)
+	}
+}
+
+// A user with CREATE on its schema, as on public since Postgres 15, but not
+// on the database, passes the check and writes.
+func TestCreateOnTheSchemaIsEnough(t *testing.T) {
+	env := newEnv(t)
+	ctx := t.Context()
+	role := "w_" + strings.ToLower(rand.Text())[:10]
+	for _, q := range []string{
+		"CREATE SCHEMA " + pgx.Identifier{env.schema}.Sanitize(),
+		"CREATE ROLE " + role + " LOGIN PASSWORD 'pw'",
+		"GRANT USAGE, CREATE ON SCHEMA " + pgx.Identifier{env.schema}.Sanitize() + " TO " + role,
+	} {
+		if _, err := env.conn.Exec(ctx, q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Cleanup(func() {
+		ctx := context.Background()
+		_, _ = env.conn.Exec(ctx, "DROP SCHEMA IF EXISTS "+pgx.Identifier{env.schema}.Sanitize()+" CASCADE")
+		_, _ = env.conn.Exec(ctx, "DROP ROLE IF EXISTS "+role)
+	})
+	u, err := url.Parse(dsn())
+	if err != nil {
+		t.Fatal(err)
+	}
+	u.User = url.UserPassword(role, "pw")
+	cfg, _ := json.Marshal(map[string]string{"dsn": u.String(), "schema": env.schema})
+	d, err := NewDestination(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Check(ctx); err != nil {
+		t.Fatalf("check: %v", err)
+	}
+	env.d = d
+	w := env.open(1, destination.ScopePipeline, "users")
+	recov(t, w, 1, destination.Epoch{}, nil)
+	e := destination.Epoch{Generation: 1, N: 1}
+	if err := w.Write(ctx, e, "users", batch(t, []arrow.Field{idField}, `[{"id": 1}]`)); err != nil {
+		t.Fatal(err)
+	}
+	st := precommit(t, w, e)
+	if _, err := w.Commit(ctx, e, []destination.Staged{st}); err != nil {
+		t.Fatal(err)
+	}
+	if n := env.count("SELECT count(*) FROM $schema.users"); n != 1 {
+		t.Errorf("%d rows, want 1", n)
 	}
 }
 
