@@ -1,6 +1,6 @@
 # Working on openetl-connectors
 
-For people and coding agents. [README.md](README.md) has the connectors, how to build and test them, and the layout; this file has the rules that aren't obvious from the code.
+For people and coding agents. [CONTRIBUTING.md](CONTRIBUTING.md) has how to build and test the connectors, and the layout; each package's `README.md` is its page; this file has the rules that aren't obvious from the code.
 
 ## Before a commit
 
@@ -15,3 +15,11 @@ For people and coding agents. [README.md](README.md) has the connectors, how to 
 - Each connector runs the SDK's conformance suite (`sdk/go/conformance`) in its `conformance_test.go`. A new connector does too.
 - **Comments** only where they're needed: contracts, behaviour that isn't obvious, units, and what nil or zero means. Don't restate names, and don't point to documents outside these repositories.
 - **No `//nolint`.** Fix what the linter found; for integer conversions, bound the value first or make the types match.
+
+## Docs
+
+- **Each package's page is its `README.md`,** which GitHub shows in the package's folder and OpenETL's docs site lists under Connectors. It follows the format and style rules in [openetl's docs/AGENTS.md](https://github.com/openetl-io/openetl/blob/main/docs/AGENTS.md): frontmatter with `title` and `description`, no `# H1`, relative links that start with `./` or `../`, GitHub's alert syntax, no raw HTML.
+- A page covers, for each role: what it reads or writes and how, how to set it up (permissions, server settings, catalogs), a minimal config, the delivery guarantee it gives, how types map, what it refuses and holds, and its limits, stated plainly. Only what the code and its tests show.
+- **The config schemas are the config's reference.** The site renders `source.schema.json` and `destination.schema.json`, so a page links them, shows a minimal config, and explains only the settings that need judgment. Every property has a `description`.
+- **A change and its docs land together.** A change to what a connector reads, writes, needs or refuses updates its page and its schema's descriptions in the same pull request.
+- Pages here are about the connectors. Pipelines, the CLI and OpenETL itself are in [openetl's docs](https://github.com/openetl-io/openetl/tree/main/docs): link to them rather than explaining them again.

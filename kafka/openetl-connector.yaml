@@ -3,7 +3,7 @@ title: Apache Kafka
 description: Kafka topics, read exactly from offsets, and written in a transaction per epoch
 license: Apache-2.0
 repository: https://github.com/openetl-io/openetl-connectors
-docs: https://github.com/openetl-io/openetl-connectors#readme
+docs: https://github.com/openetl-io/openetl-connectors/blob/main/kafka/README.md
 logo: https://kafka.apache.org/logos/kafka-logo-no-text.png
 tags: [streaming]
 author: OpenETL

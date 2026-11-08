@@ -3,7 +3,7 @@ title: Amazon S3
 description: Parquet files on S3, or on a local filesystem
 license: Apache-2.0
 repository: https://github.com/openetl-io/openetl-connectors
-docs: https://github.com/openetl-io/openetl-connectors#readme
+docs: https://github.com/openetl-io/openetl-connectors/blob/main/s3/README.md
 logo: https://raw.githubusercontent.com/awslabs/aws-icons-for-plantuml/v23.1/dist/Storage/SimpleStorageService.png
 tags: [files, aws]
 author: OpenETL

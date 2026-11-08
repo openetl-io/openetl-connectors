@@ -3,7 +3,7 @@ title: Apache Iceberg
 description: Apache Iceberg tables, through a REST or Glue catalog
 license: Apache-2.0
 repository: https://github.com/openetl-io/openetl-connectors
-docs: https://github.com/openetl-io/openetl-connectors#readme
+docs: https://github.com/openetl-io/openetl-connectors/blob/main/iceberg/README.md
 logo: https://iceberg.apache.org/assets/images/favicon-96x96.png
 tags: [lakehouse]
 author: OpenETL
