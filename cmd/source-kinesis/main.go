@@ -20,5 +20,6 @@ func main() {
 		Egress:       sdk.Egress{Tier: sdk.EgressRaw},
 		Source:       func(c []byte, _ host.Host) (source.Source, error) { return kinesis.NewSource(c) },
 		Splits:       true,
+		Retention:    true,
 	})
 }

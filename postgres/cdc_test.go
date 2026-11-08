@@ -569,6 +569,35 @@ func TestCDCNewColumnsAndTruncates(t *testing.T) {
 	}
 }
 
+// Retention reports the slot's lag without a read running, and nothing once
+// the slot is gone; a read whose states were reset makes a new slot and
+// takes a snapshot again.
+func TestCDCRetentionAndReset(t *testing.T) {
+	e := newSourceEnv(t)
+	e.exec("CREATE TABLE $schema.users (id int PRIMARY KEY, name text, doc text)")
+	e.exec("INSERT INTO $schema.users VALUES (1, 'a', NULL)")
+	s, pipeline := e.cdcSource("")
+	state := readCDC(t, s, pipeline, map[string]string{"users": ""}).last("users")
+	e.exec("INSERT INTO $schema.users VALUES (2, 'b', NULL)")
+	ps, err := s.Retention(t.Context(), pipeline, map[string][]byte{"users": []byte(state)}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ps) != 1 || ps[0].LagBytes == nil {
+		t.Fatalf("retention %+v, want the slot's lag", ps)
+	}
+	if err := s.Teardown(t.Context(), pipeline); err != nil {
+		t.Fatal(err)
+	}
+	if ps, err = s.Retention(t.Context(), pipeline, map[string][]byte{"users": []byte(state)}, nil); err != nil || len(ps) != 0 {
+		t.Fatalf("retention without the slot: %+v (%v), want none", ps, err)
+	}
+	c := readCDC(t, s, pipeline, map[string]string{"users": ""})
+	if got := len(merged(c.changes(t, "users"))); got != 2 {
+		t.Fatalf("the read again from the start has %d rows, want 2", got)
+	}
+}
+
 func codeOf(err error) protocolv1.ErrorCode {
 	var c interface{ ErrorCode() protocolv1.ErrorCode }
 	if errors.As(err, &c) {

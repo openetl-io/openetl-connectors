@@ -396,22 +396,39 @@ func (r *cdcReader) ensurePublication(ctx context.Context) error {
 }
 
 // ensureSlot creates the slot, or takes it over from a connection that
-// still holds it, and returns its confirmed position. A slot that's gone
-// while a stream has a position in it is lost.
+// still holds it, and returns its confirmed position. A slot that's gone or
+// invalidated while a stream has a position in it is lost; one invalidated
+// while none has is made again.
 func (r *cdcReader) ensureSlot(ctx context.Context) (pglogrepl.LSN, error) {
+	invalidated := "coalesce(wal_status = 'lost', false)"
+	if r.version >= 170000 {
+		invalidated += " OR invalidation_reason IS NOT NULL"
+	}
 	for attempt := 0; ; attempt++ {
-		var active bool
+		var active, invalid bool
 		var pid *int32
 		var confirmed, plugin string
 		var db *string
-		err := r.conn.QueryRow(ctx, `SELECT active, active_pid, coalesce(confirmed_flush_lsn::text, ''), coalesce(plugin, ''), database
-			FROM pg_replication_slots WHERE slot_name = $1`, r.slot).Scan(&active, &pid, &confirmed, &plugin, &db)
+		err := r.conn.QueryRow(ctx, `SELECT active, active_pid, coalesce(confirmed_flush_lsn::text, ''), coalesce(plugin, ''), database, `+invalidated+`
+			FROM pg_replication_slots WHERE slot_name = $1`, r.slot).Scan(&active, &pid, &confirmed, &plugin, &db, &invalid)
 		if errors.Is(err, pgx.ErrNoRows) {
 			for _, st := range r.streams {
 				if st.from != 0 {
 					return 0, positionLost("postgres: replication slot %q is gone, as after a failover without failover slots; its tables need a snapshot again", r.slot)
 				}
 			}
+			return r.createSlot(ctx)
+		}
+		if err == nil && invalid {
+			for _, st := range r.streams {
+				if st.from != 0 {
+					return 0, positionLost("postgres: replication slot %q was invalidated, as max_slot_wal_keep_size does to a slot too far behind; its tables need a snapshot again", r.slot)
+				}
+			}
+			if _, err := r.conn.Exec(ctx, "SELECT pg_drop_replication_slot($1)", r.slot); err != nil {
+				return 0, classify(fmt.Errorf("postgres: drop invalidated replication slot %q: %w", r.slot, err))
+			}
+			slog.Info("dropped an invalidated replication slot, to read from the start", "slot", r.slot)
 			return r.createSlot(ctx)
 		}
 		if err != nil {
