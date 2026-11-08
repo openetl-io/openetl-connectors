@@ -12,6 +12,8 @@ import (
 	"gocloud.dev/gcerrors"
 
 	"github.com/openetl-io/openetl/sdk/go/destination"
+
+	"github.com/openetl-io/openetl-connectors/records"
 )
 
 var _ destination.SchemaApplier = (*writer)(nil)
@@ -57,7 +59,7 @@ func (w *writer) ApplySchema(ctx context.Context, streams []destination.StreamSc
 		}
 		changed := false
 		for _, f := range s.Schema.Fields() {
-			typ := typeName(f.Type)
+			typ := typeName(records.WithoutIntervals(f.Type))
 			was, ok := have[f.Name]
 			switch {
 			case !ok:

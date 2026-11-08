@@ -25,6 +25,7 @@ func TestIcebergTypes(t *testing.T) {
 		{arrow.Field{Name: "a", Type: &arrow.TimestampType{Unit: arrow.Millisecond, TimeZone: "Europe/Paris"}}, "timestamptz"},
 		{arrow.Field{Name: "a", Type: arrow.FixedWidthTypes.Time64ns}, "time"},
 		{arrow.Field{Name: "a", Type: arrow.ListOf(arrow.PrimitiveTypes.Int16)}, "list<int>"},
+		{arrow.Field{Name: "a", Type: arrow.FixedWidthTypes.MonthDayNanoInterval}, "struct<2: months: optional int, 3: days: optional int, 4: nanoseconds: optional long>"},
 	} {
 		sc, err := icebergSchema(arrow.NewSchema([]arrow.Field{c.field}, nil))
 		if err != nil {
@@ -35,7 +36,7 @@ func TestIcebergTypes(t *testing.T) {
 			t.Errorf("%s: %s (required %v), want optional %s", c.field.Type, f.Type, f.Required, c.want)
 		}
 	}
-	for _, dt := range []arrow.DataType{arrow.PrimitiveTypes.Uint64, arrow.FixedWidthTypes.MonthDayNanoInterval} {
+	for _, dt := range []arrow.DataType{arrow.PrimitiveTypes.Uint64} {
 		if _, err := icebergSchema(arrow.NewSchema([]arrow.Field{{Name: "a", Type: dt}}, nil)); err == nil {
 			t.Errorf("%s: no error", dt)
 		}

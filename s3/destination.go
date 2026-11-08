@@ -38,6 +38,8 @@ import (
 	sdk "github.com/openetl-io/openetl/sdk/go"
 	"github.com/openetl-io/openetl/sdk/go/destination"
 	protocolv1 "github.com/openetl-io/openetl/sdk/go/protocol/v1"
+
+	"github.com/openetl-io/openetl-connectors/records"
 )
 
 type DestinationConfig struct {
@@ -295,6 +297,9 @@ func (w *writer) Write(_ context.Context, e destination.Epoch, stream string, ba
 	if batch.NumRows() == 0 {
 		return nil
 	}
+	// Parquet has no interval of nanoseconds.
+	batch = records.IntervalsAsStructs(batch)
+	defer batch.Release()
 	byStream := w.parts[e.N]
 	if byStream == nil {
 		byStream = map[string]*epochFiles{}

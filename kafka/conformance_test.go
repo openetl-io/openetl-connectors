@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"maps"
+	"strconv"
 	"testing"
 	"time"
 
@@ -31,11 +32,31 @@ func TestSourceConformance(t *testing.T) {
 		produce(t, a, i*50, 50)
 	}
 	produce(t, b, 0, 30)
+	next := map[string]int{a: 300, b: 30}
 	conformance.SourceSuite{
 		Launch:      conformance.Exec(conformance.Build(t, "../cmd/source-kafka")),
 		Config:      config(t, map[string]any{"topics": []string{a, b}}),
 		Unreachable: config(t, map[string]any{"topics": []string{a, b}, "brokers": noBroker["brokers"]}),
+		AddRecords: func(ctx context.Context, topic string) (int, error) {
+			from := next[topic]
+			next[topic] += 7
+			return 7, produceErr(ctx, topic, from, 7)
+		},
 	}.Test(t)
+}
+
+// produceErr is produce, with an error for a caller that isn't a test.
+func produceErr(ctx context.Context, topic string, from, n int) error {
+	cl, err := kgo.NewClient(kgo.SeedBrokers(brokers()), kgo.DefaultProduceTopic(topic))
+	if err != nil {
+		return err
+	}
+	defer cl.Close()
+	var recs []*kgo.Record
+	for i := from; i < from+n; i++ {
+		recs = append(recs, &kgo.Record{Key: []byte("k" + strconv.Itoa(i)), Value: []byte(`{"id":` + strconv.Itoa(i) + `,"name":"n"}`)})
+	}
+	return cl.ProduceSync(ctx, recs...).FirstErr()
 }
 
 // Over the protocol, the connector declares splits, reads them, and commits
@@ -161,7 +182,7 @@ func TestDestinationConformance(t *testing.T) {
 			return out, nil
 		},
 		Drop: func(ctx context.Context, namespace string) error {
-			_, err := kadm.NewClient(cl).DeleteTopics(ctx, namespace+".alpha", namespace+".beta")
+			_, err := kadm.NewClient(cl).DeleteTopics(ctx, namespace+".alpha", namespace+".beta", namespace+".types")
 			return err
 		},
 	}.Test(t)
