@@ -1389,8 +1389,8 @@ func (w *writer) ensureKey(ctx context.Context, table string, key []string) erro
 // refused, and the rest applied. It reports what each table can't take.
 func (w *writer) ApplySchema(ctx context.Context, streams []destination.StreamSchema) (destination.SchemaApplied, error) {
 	var out destination.SchemaApplied
-	if _, err := w.pool.Exec(ctx, "CREATE SCHEMA IF NOT EXISTS "+pgx.Identifier{w.schema}.Sanitize()); err != nil {
-		return out, fmt.Errorf("postgres: create schema %s: %w", w.schema, err)
+	if err := w.ensureSchema(ctx); err != nil {
+		return out, err
 	}
 	tables := make([]string, len(streams))
 	want := make([][]column, len(streams))
@@ -1684,9 +1684,28 @@ func (w *writer) dropStaging(ctx context.Context, streams []stagedStream) {
 	}
 }
 
+// ensureSchema creates the schema if it's missing. CREATE SCHEMA IF NOT
+// EXISTS needs CREATE on the database even when the schema exists, which a
+// user with CREATE on only the schema, as on public, lacks.
+func (w *writer) ensureSchema(ctx context.Context) error {
+	var exists bool
+	if err := w.pool.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = $1)", w.schema).Scan(&exists); err != nil {
+		return fmt.Errorf("postgres: schema %s: %w", w.schema, err)
+	}
+	if exists {
+		return nil
+	}
+	if _, err := w.pool.Exec(ctx, "CREATE SCHEMA IF NOT EXISTS "+pgx.Identifier{w.schema}.Sanitize()); err != nil {
+		return fmt.Errorf("postgres: create schema %s: %w", w.schema, err)
+	}
+	return nil
+}
+
 func (w *writer) Recover(ctx context.Context, gen uint64, e destination.Epoch, committables []destination.Staged) (destination.Recovery, error) {
+	if err := w.ensureSchema(ctx); err != nil {
+		return 0, err
+	}
 	for _, q := range []string{
-		"CREATE SCHEMA IF NOT EXISTS " + pgx.Identifier{w.schema}.Sanitize(),
 		"CREATE TABLE IF NOT EXISTS " + w.ident("_openetl_fence") + " (pipeline text PRIMARY KEY, generation bigint NOT NULL)",
 		"CREATE TABLE IF NOT EXISTS " + w.ident("_openetl_loads") + ` (pipeline text NOT NULL, stream text NOT NULL,
 			generation bigint NOT NULL, epoch bigint NOT NULL, loaded_at timestamptz NOT NULL DEFAULT now(),

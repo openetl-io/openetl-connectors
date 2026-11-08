@@ -95,6 +95,8 @@ spec:
 | `json`, `jsonb` | JSON |
 | Anything else, such as `interval`, arrays, enums and network types | string, in Postgres's text form (intervals in ISO 8601) |
 
+`openetl discover` lists a column as nullable unless it's `NOT NULL`. In a table CDC can read, only the key's columns are listed as not nullable, since a deleted row carries only its key.
+
 ### Delivery
 
 Full refresh and CDC streams replay exactly: a read resumed from a checkpoint yields the same rows in the same order. OpenETL counts incremental streams as ones that may repeat rows, because of the rows at the cursor's last value, and the destination's capabilities decide what guarantee that leaves.
