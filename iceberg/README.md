@@ -9,7 +9,9 @@ It's tested against Apache Iceberg's REST catalog fixture 1.10, with its tables 
 
 ## What it writes
 
-Each stream becomes a table named after it, in the pipeline's `destination.namespace`, or else the config's `namespace` (`default` unless set). The namespace is created if it's missing. New tables are Iceberg format version 2, unpartitioned, with every column optional.
+Each stream becomes a table named after it, in the pipeline's `destination.namespace`, or else the config's `namespace` (`default` unless set). The namespace is created if it's missing. New tables are Iceberg format version 2, unpartitioned, with every column optional, and write Parquet compressed with zstd at level 1.
+
+A table that already exists keeps its own settings: the destination writes with the table's properties, such as `write.parquet.compression-codec`, and doesn't change them. A running job picks up a changed property at its next attempt, or when the stream's schema next changes.
 
 All three write modes work:
 
