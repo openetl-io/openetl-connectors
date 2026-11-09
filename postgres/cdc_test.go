@@ -569,6 +569,52 @@ func TestCDCNewColumnsAndTruncates(t *testing.T) {
 	}
 }
 
+// A column added after the run's Discover isn't read, though the table has
+// it when the read starts: its values would land as text. The change that
+// shows it fails the read, and the attempt that declares it reads it.
+func TestCDCReadsOnlyDeclaredColumns(t *testing.T) {
+	e := newSourceEnv(t)
+	e.exec("CREATE TABLE $schema.users (id int PRIMARY KEY, name text, doc text)")
+	e.exec("INSERT INTO $schema.users VALUES (1, 'a', NULL)")
+	s, pipeline := e.cdcSource("")
+	e.exec("ALTER TABLE $schema.users ADD COLUMN w bigint")
+	read := func(state string, columns ...string) (*capture, error) {
+		req := cdcRequest(pipeline, false, map[string]string{"users": state})
+		req.Streams[0].Columns = columns
+		c := &capture{}
+		t.Cleanup(c.release)
+		return c, s.Read(t.Context(), req, c)
+	}
+	c, err := read("", "id", "name", "doc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := c.column("users", "id"); !slices.Equal(got, []string{"1"}) {
+		t.Fatalf("the snapshot's ids: %q", got)
+	}
+	if got := c.column("users", "w"); got != nil {
+		t.Errorf("the snapshot read w: %q", got)
+	}
+	state := c.last("users")
+
+	e.exec("INSERT INTO $schema.users VALUES (2, 'b', NULL, 7)")
+	c, err = read(state, "id", "name", "doc")
+	if codeOf(err) != protocolv1.ErrorCode_ERROR_CODE_TRANSIENT || !strings.Contains(err.Error(), `new column "w"`) {
+		t.Fatalf("a read that saw a column it didn't declare: %v", err)
+	}
+	if got := c.column("users", "w"); got != nil {
+		t.Errorf("the read sent w: %q", got)
+	}
+
+	c, err = read(state, "id", "name", "doc", "w")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := c.column("users", "w"); !slices.Equal(got, []string{"7"}) {
+		t.Errorf("w is %q", got)
+	}
+}
+
 // Retention reports the slot's lag without a read running, and nothing once
 // the slot is gone; a read whose states were reset makes a new slot and
 // takes a snapshot again.
