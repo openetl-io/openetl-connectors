@@ -1,0 +1,47 @@
+name: release-candidate-test
+
+# Temporary, and removed before this branch merges: dispatching a workflow
+# needs it on main, so this runs the new ones from their branch, on a throwaway
+# version, when the head commit's message has run-test-candidate, and discards
+# it when the message has discard-test-candidate.
+on:
+  push:
+    branches: [release-candidate-flow]
+
+permissions: {}
+
+jobs:
+  candidate:
+    if: ${{ contains(github.event.head_commit.message, 'run-test-candidate') }}
+    uses: ./.github/workflows/release-candidate.yml
+    permissions:
+      actions: read
+      contents: write
+      packages: write
+    with:
+      version: 0.0.1-alpha.2
+      openetl: release-candidate-flow
+      replace: true
+      require-ci: false
+
+  private:
+    needs: candidate
+    runs-on: ubuntu-latest
+    steps:
+      - name: An anonymous pull is refused
+        run: |
+          for r in openetl-connectors/postgres openetl-connectors/kafka openetl-connectors/kinesis openetl-connectors/iceberg openetl-connectors/s3; do
+            t=$(curl -s "https://ghcr.io/token?scope=repository:openetl-io/$r:pull&service=ghcr.io" | jq -r '.token // ""')
+            code=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $t" -H 'Accept: application/vnd.oci.image.manifest.v1+json' "https://ghcr.io/v2/openetl-io/$r/manifests/0.0.1-alpha.2")
+            echo "$r: $code"
+            [ "$code" != 200 ]
+          done
+
+  discard:
+    if: ${{ contains(github.event.head_commit.message, 'discard-test-candidate') }}
+    uses: ./.github/workflows/release-discard.yml
+    permissions:
+      contents: write
+      packages: write
+    with:
+      version: 0.0.1-alpha.2
