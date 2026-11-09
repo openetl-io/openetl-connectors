@@ -238,6 +238,9 @@ func (s *Source) readCDC(ctx context.Context, conns *connPool, req source.ReadRe
 		if len(t.key) == 0 {
 			return configInvalid("postgres: %s has no primary key, so it can't be read with cdc", t.name)
 		}
+		if t, err = declaredOnly(t, cs.Columns); err != nil {
+			return err
+		}
 		st := &cdcStream{t: t}
 		var state cdcState
 		if cs.State != nil {
@@ -1319,6 +1322,34 @@ func textConv(oid uint32) func([]byte) []byte {
 		}
 	}
 	return nil
+}
+
+// declaredOnly narrows t to the columns the run declared. A column added
+// since the run's Discover has no declared type, so its text would land as
+// text. Left out here, it fails the read in relation, and the next attempt
+// declares it. No columns: the request doesn't say.
+func declaredOnly(t table, columns []string) (table, error) {
+	if len(columns) == 0 {
+		return t, nil
+	}
+	cols := make([]sourceColumn, 0, len(t.cols))
+	at := make(map[int]int, len(t.cols))
+	for i, c := range t.cols {
+		if slices.Contains(columns, c.name) {
+			at[i] = len(cols)
+			cols = append(cols, c)
+		}
+	}
+	key := make([]int, len(t.key))
+	for i, k := range t.key {
+		j, ok := at[k]
+		if !ok {
+			return t, sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_TRANSIENT, fmt.Errorf("postgres: %s has a new key column %q; the read starts again to take it", t.name, t.cols[k].name))
+		}
+		key[i] = j
+	}
+	t.cols, t.key = cols, key
+	return t, nil
 }
 
 // changeBatcher builds a CDC stream's batches: each column as text, which
