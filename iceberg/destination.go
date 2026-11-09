@@ -521,9 +521,13 @@ func (w *writer) create(ctx context.Context, ident table.Identifier, sc *ice.Sch
 	if err := w.ensureNamespace(ctx, ident[:len(ident)-1]); err != nil {
 		return nil, err
 	}
+	// Only tables created here get this compression; writes to an existing
+	// table use its own properties.
 	opts := []catalog.CreateTableOpt{catalog.WithProperties(ice.Properties{
-		table.PropertyFormatVersion: "2",
-		fenceKey(w.cfg.Pipeline):    strconv.FormatUint(w.cfg.Generation, 10),
+		table.PropertyFormatVersion:      "2",
+		table.ParquetCompressionKey:      "zstd",
+		table.ParquetCompressionLevelKey: "1",
+		fenceKey(w.cfg.Pipeline):         strconv.FormatUint(w.cfg.Generation, 10),
 	})}
 	if w.d.cfg.Catalog == "glue" && w.d.cfg.Warehouse != "" {
 		opts = append(opts, catalog.WithLocation(strings.TrimSuffix(w.d.cfg.Warehouse, "/")+"/"+strings.Join(ident, "/")))
