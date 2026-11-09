@@ -1,0 +1,28 @@
+name: release-discard
+
+# Deletes a release candidate: each package's version and draft release. It
+# refuses a version that's been published.
+on:
+  workflow_dispatch:
+    inputs: &inputs
+      version:
+        description: The candidate's version, without the v
+        required: true
+        type: string
+  workflow_call:
+    inputs: *inputs
+
+permissions: {}
+
+jobs:
+  discard:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+        run: .github/candidate-discard.sh "$VERSION"
