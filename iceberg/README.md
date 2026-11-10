@@ -76,6 +76,10 @@ spec:
     namespace: raw
 ```
 
+### AWS credentials
+
+Without `accessKeyId` and `secretAccessKey`, the destination uses the AWS default credentials that it can find itself: a shared config file in the runner's home directory, or the role of the EC2 instance that the runner is on. The runner does not pass its environment variables to the destination. So the destination does not get `AWS_*` variables, or the role that an EKS IAM role for a service account or EKS Pod Identity gives a pod. On EKS, set `accessKeyId` and `secretAccessKey`, and keep them in secrets, as `{ secret: NAME }`.
+
 The [config schema](./destination.schema.json) has every setting.
 
 ## Types
