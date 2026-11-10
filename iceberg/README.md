@@ -5,11 +5,11 @@ description: Write streams into Iceberg tables through a REST catalog or AWS Glu
 
 The `iceberg` package has a destination. It writes each stream into an Iceberg table, as Parquet data files, and commits each epoch through the table's catalog: an Iceberg REST catalog, or AWS Glue. The catalog's own compare-and-swap keeps an epoch from being committed twice.
 
-It's tested against Apache Iceberg's REST catalog fixture 1.10, with its tables in an S3-compatible store, and against moto's emulation of Glue. It hasn't been tested against AWS Glue itself.
+It's tested against Apache Iceberg's REST catalog fixture 1.10, with its tables in an S3-compatible store, and against moto's emulation of Glue. It has also run against AWS Glue with Amazon S3, which CI does not test.
 
 ## What it writes
 
-Each stream becomes a table named after it, in the pipeline's `destination.namespace`, or else the config's `namespace` (`default` unless set). The namespace is created if it's missing. New tables are Iceberg format version 2, unpartitioned, with every column optional, and write Parquet compressed with zstd at level 1.
+Each stream becomes a table in the pipeline's `destination.namespace`, or else the config's `namespace` (`default` unless set). If the pipeline's `destination.tables` gives the stream a name, the table has that name, exactly as written. Otherwise, the table has the stream's name as the pipeline's `destination.naming` gives it: by default, lowercase, with `_` in place of anything outside `a-z`, `0-9` and `_`. The namespace is created if it's missing. New tables are Iceberg format version 2, unpartitioned, with every column optional, and write Parquet compressed with zstd at level 1.
 
 A table that already exists keeps its own settings: the destination writes with the table's properties, such as `write.parquet.compression-codec`, and doesn't change them. A running job picks up a changed property at its next attempt, or when the stream's schema next changes.
 

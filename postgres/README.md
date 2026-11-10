@@ -87,7 +87,8 @@ spec:
 | `oid` | 64-bit integer |
 | `real`, `double precision` | 32- and 64-bit floats |
 | `numeric(p,s)` | a decimal of the same precision and scale, up to a precision of 38; otherwise, and without a precision, `decimal(38, 9)` |
-| `text`, `varchar`, `char`, `name` | string |
+| `text`, `varchar`, `name` | string |
+| `char(n)` | string, without the trailing spaces Postgres pads it with, as casting it to `text` gives it |
 | `bytea` | binary |
 | `date`, `time` | date, time of day in microseconds |
 | `timestamp`, `timestamptz` | timestamp in microseconds, without and with a time zone (UTC) |
@@ -105,7 +106,7 @@ Full refresh and CDC streams replay exactly: a read resumed from a checkpoint yi
 
 ### What it writes
 
-Each stream becomes a table, named after the stream in lowercase, in the pipeline's `destination.namespace`, or else in the config's `schema` (`public` unless set). The schema is created if it's missing.
+Each stream becomes a table in the pipeline's `destination.namespace`, or else in the config's `schema` (`public` unless set). If the pipeline's `destination.tables` gives the stream a name, the table has that name, exactly as written. Otherwise, the table has the stream's name as the pipeline's `destination.naming` gives it: by default, lowercase, with `_` in place of anything outside `a-z`, `0-9` and `_`. The schema is created if it's missing.
 
 All three write modes work:
 

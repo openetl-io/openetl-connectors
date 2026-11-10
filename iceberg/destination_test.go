@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -325,6 +326,116 @@ func TestStaleCommitAfterRecovery(t *testing.T) {
 		t.Errorf("stale commit: %v, want fenced", err)
 	}
 	env.wantIDs("users", 1, 2)
+}
+
+// Recover fences every table of an epoch, more than it fences at once, and
+// fails if one has a later generation's fence.
+func TestRecoverFencesEveryTable(t *testing.T) {
+	env := newEnv(t)
+	names := make([]string, 3*parallelism)
+	for i := range names {
+		names[i] = "t" + strconv.Itoa(i)
+	}
+	w := env.open(1, destination.ScopePipeline, appends(names...)...)
+	recov(t, w, 1, destination.Epoch{}, nil)
+	e := destination.Epoch{Generation: 1, N: 1}
+	for i, n := range names {
+		write(t, w, e, n, int64(i))
+	}
+	st := precommit(t, w, e)
+	commit(t, w, e, st)
+
+	w2 := env.open(2, destination.ScopePipeline, appends(names...)...)
+	if r := recov(t, w2, 2, e, st); r != destination.Applied {
+		t.Fatalf("recover: %v, want applied", r)
+	}
+	for _, n := range names {
+		if got := env.table(n).Properties()[fenceKey("p1")]; got != "2" {
+			t.Errorf("%s's fence is %q, want 2", n, got)
+		}
+	}
+
+	tx := env.table(names[len(names)/2]).NewTransaction()
+	if err := tx.SetProperties(map[string]string{fenceKey("p1"): "4"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Commit(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	w3 := env.open(3, destination.ScopePipeline, appends(names...)...)
+	if _, err := w3.Recover(t.Context(), 3, e, []destination.Staged{st}); !errors.Is(err, destination.ErrFenced) {
+		t.Fatalf("recover under a later fence: %v, want fenced", err)
+	}
+}
+
+// With stream scope, Commit prepares and commits several tables at once, of
+// every mode. A table whose commit conflicts is checked and committed again,
+// and no other is committed twice.
+func TestCommitsTablesConcurrently(t *testing.T) {
+	env := newEnv(t)
+	ctx := t.Context()
+	var streams []destination.Stream
+	starts := map[string]time.Time{}
+	for i := range 3 * parallelism {
+		name := "t" + strconv.Itoa(i)
+		switch i % 3 {
+		case 0:
+			streams = append(streams, appends(name)...)
+		case 1:
+			streams = append(streams, overwrites(name)...)
+			starts[name] = time.UnixMicro(1000)
+		default:
+			streams = append(streams, merges(destination.SoftDelete, name)...)
+		}
+	}
+	w := env.open(1, destination.ScopeStream, streams...)
+	recov(t, w, 1, destination.Epoch{}, nil)
+	if err := w.(destination.ReadTracker).StartReads(ctx, starts); err != nil {
+		t.Fatal(err)
+	}
+	e := destination.Epoch{Generation: 1, N: 1}
+	for i, s := range streams {
+		switch s.Mode {
+		case destination.Merge:
+			writeRows(t, w, e, s.Name, []arrow.Field{idField, nameField, seqField}, `[{"id": `+jsonInt(int64(i))+`, "name": "a", "_openetl_seq": 1}]`)
+		case destination.Overwrite:
+			write(t, w, e, s.Name, int64(i))
+			if err := w.(destination.ReadTracker).EndRead(ctx, e, s.Name); err != nil {
+				t.Fatal(err)
+			}
+		default:
+			write(t, w, e, s.Name, int64(i))
+		}
+	}
+	st := precommit(t, w, e)
+
+	conflicting := streams[0].Name
+	other, err := env.d.Open(ctx, destination.OpenConfig{Pipeline: "p2", Generation: 1, Scope: destination.ScopeStream, Streams: appends(conflicting)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = other.Close(context.Background()) })
+	recov(t, other, 1, destination.Epoch{}, nil)
+	oe := destination.Epoch{Generation: 1, N: 1}
+	write(t, other, oe, conflicting, 100)
+	ost := precommit(t, other, oe)
+	var once sync.Once
+	testHookBeforeCommit = func(cur *writer) {
+		if cur.cfg.Pipeline == "p1" {
+			once.Do(func() { commit(t, other, oe, ost) })
+		}
+	}
+	t.Cleanup(func() { testHookBeforeCommit = nil })
+
+	commit(t, w, e, st)
+	env.wantIDs(conflicting, 0, 100)
+	for i, s := range streams[1:] {
+		env.wantIDs(s.Name, int64(i+1))
+	}
+	w2 := env.open(2, destination.ScopeStream, streams...)
+	if r := recov(t, w2, 2, e, st); r != destination.Applied {
+		t.Fatalf("recover: %v, want applied", r)
+	}
 }
 
 // New columns are added, and a narrower type is written into a wider

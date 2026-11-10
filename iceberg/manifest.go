@@ -144,6 +144,14 @@ func (w *writer) dropManifests(ns []string, name, dir string) {
 	if err != nil {
 		return
 	}
+	w.removeManifests(tbl, dir)
+}
+
+// removeManifests is dropManifests on a table already loaded.
+func (w *writer) removeManifests(tbl *table.Table, dir string) {
+	if dir == "" {
+		return
+	}
 	store, err := tbl.FS(w.ctx)
 	if err != nil {
 		return
