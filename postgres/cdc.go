@@ -804,7 +804,7 @@ func (r *cdcReader) change(id uint32, op string, oldType uint8, old, new *pglogr
 
 var errKeyUnchanged = errors.New("postgres: a primary key value wasn't sent")
 
-// keyOf spells a tuple's key as text, as the snapshot's queries do.
+// keyOf spells a tuple's key as text, as readChunk's queries do.
 func (rel *relation) keyOf(t *pglogrepl.TupleData) (string, error) {
 	var b strings.Builder
 	for i, at := range rel.key {
@@ -1025,10 +1025,12 @@ func (r *cdcReader) readChunk(ctx context.Context, conn *pgx.Conn, st *cdcStream
 		cols[i] = pgx.Identifier{c.name}.Sanitize()
 	}
 	key := make([]string, len(t.key))
+	// The key again, unconverted and in text, which is how the log spells it
+	// for keyOf. ::text isn't, for char(n), boolean and inet.
 	keyText := make([]string, len(t.key))
 	for i, k := range t.key {
 		key[i] = cols[k]
-		keyText[i] = cols[k] + "::text AS _openetl_key_" + strconv.Itoa(i)
+		keyText[i] = cols[k] + " AS _openetl_key_" + strconv.Itoa(i)
 	}
 	q := "SELECT " + strings.Join(cols, ", ") + ", " + strings.Join(keyText, ", ") + " FROM " + pgx.Identifier{r.s.cfg.Schema, t.name}.Sanitize()
 	var args [][]byte
@@ -1295,9 +1297,12 @@ func (s pgSnapshot) sees(xid uint32) bool {
 }
 
 // textConv converts a type's text output where the engine reads another
-// spelling: booleans, and bytea's hex as base64.
+// spelling: booleans, bytea's hex as base64, and char(n) without the spaces
+// that pad it.
 func textConv(oid uint32) func([]byte) []byte {
 	switch oid {
+	case pgtype.BPCharOID:
+		return unpad
 	case pgtype.BoolOID:
 		return func(v []byte) []byte {
 			switch string(v) {

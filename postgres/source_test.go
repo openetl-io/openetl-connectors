@@ -273,7 +273,7 @@ func TestSourceReadsTypes(t *testing.T) {
 	}
 	for name, v := range map[string]string{
 		"id": "1", "flag": "true", "small": "-2", "medium": "3", "f4": "1.5", "f8": "2.25", "name": "héllo",
-		"code": "ab ", "label": "xy", "day": "2026-10-31", "at_time": "12:34:56.789000",
+		"code": "ab", "label": "xy", "day": "2026-10-31", "at_time": "12:34:56.789000",
 		"ts": "2026-10-31T12:00:00.123456", "tstz": "2026-10-31T06:30:00Z",
 		"uid": "0b0e1f2a-3c4d-4e5f-8a9b-0c1d2e3f4a5b", "doc": `{"a": [1, 2]}`, "docb": `{"b": true}`,
 		"amount": "-12345.67", "any_num": "1.000000000000000000000000000000000000001", "span": "P1DT2H", "tags": "{x,y}",

@@ -5,6 +5,7 @@ import (
 	"math"
 	"testing"
 
+	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/jackc/pgx/v5/pgtype"
 )
@@ -97,6 +98,32 @@ func TestTimestampsPastArrow(t *testing.T) {
 			t.Errorf("%d: %q, %v; want %q", c.us, got, ok, c.want)
 		}
 		cb.b.Release()
+	}
+}
+
+// char(n) arrives without its padding, from a copy or from the log.
+func TestCharUnpadded(t *testing.T) {
+	cases := []struct{ in, want string }{{"ab  ", "ab"}, {" a b ", " a b"}, {"   ", ""}, {"ab", "ab"}}
+	cb, err := newColBuilder(memory.DefaultAllocator, sourceColumn{oid: pgtype.BPCharOID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cb.b.Release()
+	conv := textConv(pgtype.BPCharOID)
+	for _, c := range cases {
+		if err := cb.add([]byte(c.in)); err != nil {
+			t.Fatal(err)
+		}
+		if got := string(conv([]byte(c.in))); got != c.want {
+			t.Errorf("the log's %q is %q, want %q", c.in, got, c.want)
+		}
+	}
+	arr := cb.b.NewArray()
+	defer arr.Release()
+	for i, c := range cases {
+		if got := arr.(*array.String).Value(i); got != c.want {
+			t.Errorf("a copy's %q is %q, want %q", c.in, got, c.want)
+		}
 	}
 }
 
