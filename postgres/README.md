@@ -106,7 +106,7 @@ Full refresh and CDC streams replay exactly: a read resumed from a checkpoint yi
 
 ### What it writes
 
-Each stream becomes a table, named after the stream in lowercase, in the pipeline's `destination.namespace`, or else in the config's `schema` (`public` unless set). The schema is created if it's missing.
+Each stream becomes a table in the pipeline's `destination.namespace`, or else in the config's `schema` (`public` unless set). If the pipeline's `destination.tables` gives the stream a name, the table has that name, exactly as written. Otherwise, the table has the stream's name as the pipeline's `destination.naming` gives it: by default, lowercase, with `_` in place of anything outside `a-z`, `0-9` and `_`. The schema is created if it's missing.
 
 All three write modes work:
 
