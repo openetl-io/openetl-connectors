@@ -5,14 +5,14 @@ description: Write streams as Parquet files on S3, an S3-compatible store or a l
 
 The `s3` package has a destination. It writes each stream as a directory of Parquet files, on Amazon S3, on another S3-compatible store, or on a local filesystem with a `file://` URL. Each epoch's files appear once, under names that can't collide, and a marker records that the epoch landed.
 
-It's tested on a local filesystem, and against SeaweedFS's S3 API; not against AWS S3 itself.
+It is tested on a local filesystem and against SeaweedFS's S3 API. It has also run against Amazon S3, which CI does not test.
 
 ## What it writes
 
-Each stream's table is a directory under `url`, named after the table, below the pipeline's `destination.namespace` if it sets one: `URL/NAMESPACE/TABLE/`. Each epoch adds one or more Parquet files to it, named after the pipeline, the epoch, its generation and the file's number, with the writer lane's before it for lanes after the first:
+Each stream's table is a directory under `url`, named after the table, below the pipeline's `destination.namespace` if it sets one: `URL/NAMESPACE/TABLE/`. Each epoch adds one or more Parquet files to it, named after the pipeline's ID, the epoch, its generation and the file's number, with the writer lane's before it for lanes after the first:
 
 ```text
-s3://my-bucket/raw/orders/app-db-to-lake-00000000000000000042-g00000000000000000001-00000.parquet
+s3://my-bucket/raw/orders/9af7d67a-fb93-45a8-9061-af62ce29978d-00000000000000000042-g00000000000000000001-00000.parquet
 ```
 
 A file closes at `fileSize` bytes, 256 MiB by default, and the next one starts. Files are compressed with `compression`: `zstd` (the default), `snappy`, `gzip` or `none`.
@@ -33,7 +33,9 @@ A continuous pipeline commits every minute unless it sets its own `delivery.comm
 
 ## Set it up
 
-`url` is `s3://BUCKET/PREFIX`, or `file://` and an absolute path. For S3, set `region`, and `accessKeyId` and `secretAccessKey`, or leave them out to use the AWS default credentials: the environment, a shared config file, or the role of the machine or pod the runner is on. For another S3-compatible store, set `endpoint` too, which uses path-style addressing.
+`url` is `s3://BUCKET/PREFIX`, or `file://` and an absolute path. For S3, set `region`, and `accessKeyId` and `secretAccessKey`. For another S3-compatible store, set `endpoint` too, which uses path-style addressing.
+
+Without `accessKeyId` and `secretAccessKey`, the destination uses the AWS default credentials that it can find itself: a shared config file in the runner's home directory, or the role of the EC2 instance that the runner is on. The runner does not pass its environment variables to the destination. So the destination does not get `AWS_*` variables, or the role that an EKS IAM role for a service account or EKS Pod Identity gives a pod. On EKS, set `accessKeyId` and `secretAccessKey`, and keep them in secrets, as `{ secret: NAME }`.
 
 The credentials need to read, write, copy, delete and list objects under the URL. The destination's check writes and deletes an object under `_openetl/`.
 

@@ -5,14 +5,14 @@ description: Read Kinesis data streams shard by shard, and write streams into Ki
 
 The `kinesis` package has a source and a destination for Amazon Kinesis Data Streams. The source reads each Kinesis stream as a stream, shard by shard, from where the last read stopped. The destination writes each stream into a Kinesis stream, a record per row, and delivers at least once: Kinesis has no transactions.
 
-Both are tested against kinesis-mock, an emulator, not against AWS, and against the Karapace schema registry for Avro and Protobuf.
+Both are tested against kinesis-mock, an emulator, and against the Karapace schema registry for Avro and Protobuf. Both have also run against Amazon Kinesis with JSON records, which CI does not test.
 
 ## Connecting
 
 The source and the destination share their connection settings:
 
 - `region`: the streams' AWS region. Unset, the AWS default configuration's.
-- `accessKeyId` and `secretAccessKey`, together. Without them, the AWS default credentials: the environment, a shared config file, or the role of the machine or pod the runner is on.
+- `accessKeyId` and `secretAccessKey`, together. Without them, the AWS default credentials that the connector can find itself: a shared config file in the runner's home directory, or the role of the EC2 instance that the runner is on. The runner does not pass its environment variables to the connector, so `AWS_*` variables and the role that EKS gives a pod do not reach it. On EKS, set `accessKeyId` and `secretAccessKey`.
 - `endpoint`: a Kinesis-compatible endpoint, such as a VPC endpoint or an emulator.
 - `format`: how each record's data is encoded: `json` (the default), `avro` or `protobuf`, the same as the [Kafka connectors](../kafka/README.md). Avro and Protobuf need `schemaRegistryUrl`.
 
