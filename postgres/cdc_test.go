@@ -11,6 +11,7 @@ import (
 	"math/big"
 	mrand "math/rand/v2"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -200,7 +201,13 @@ func merged(changes []change) map[string]change {
 
 func (e *sourceEnv) rows(table string) map[string]change {
 	e.t.Helper()
-	rows, err := e.conn.Query(e.t.Context(), "SELECT id::text, coalesce(name, '(null)'), coalesce(doc, '(null)') FROM "+pgx.Identifier{e.schema, table}.Sanitize())
+	return e.rowsBy(table, "id::text")
+}
+
+// rowsBy is rows with id spelled as key, an SQL expression, spells it.
+func (e *sourceEnv) rowsBy(table, key string) map[string]change {
+	e.t.Helper()
+	rows, err := e.conn.Query(e.t.Context(), "SELECT "+key+", coalesce(name, '(null)'), coalesce(doc, '(null)') FROM "+pgx.Identifier{e.schema, table}.Sanitize())
 	if err != nil {
 		e.t.Fatal(err)
 	}
@@ -395,29 +402,45 @@ func TestCDCFollowsConcurrentWrites(t *testing.T) {
 }
 
 // A transaction that commits after a chunk's snapshot, but before its WAL
-// position, isn't in the chunk; its change outlives the chunk's row.
+// position, isn't in the chunk; its change outlives the chunk's row. That
+// holds for keys whose text in the log isn't their ::text too.
 func TestCDCChunkMissesATransactionBeforeItsPosition(t *testing.T) {
-	e := newSourceEnv(t)
-	e.exec("CREATE TABLE $schema.users (id int PRIMARY KEY, name text, doc text)")
-	e.exec("INSERT INTO $schema.users SELECT i, 'old', NULL FROM generate_series(1, 5) i")
-	s, pipeline := e.cdcSource("")
-	once := sync.Once{}
-	afterChunkSnapshot = func() {
-		once.Do(func() { e.exec("UPDATE $schema.users SET name = 'new' WHERE id = 3") })
+	for name, c := range map[string]struct {
+		typ, val string
+		rows     int
+		// The changed row's id as it arrives, and as an SQL expression of
+		// id spells it.
+		changed, key string
+	}{
+		"int":     {"int", "i", 5, "3", "id::text"},
+		"char":    {"char(4)", "i::text", 5, "3", "id::text"},
+		"boolean": {"boolean", "i = 2", 2, "true", "id::text"},
+		"inet":    {"inet", "('10.0.0.' || i)::inet", 5, "10.0.0.3", "host(id)"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			e := newSourceEnv(t)
+			e.exec("CREATE TABLE $schema.users (id " + c.typ + " PRIMARY KEY, name text, doc text)")
+			e.exec("INSERT INTO $schema.users SELECT " + c.val + ", 'old', NULL FROM generate_series(1, " + strconv.Itoa(c.rows) + ") i")
+			s, pipeline := e.cdcSource("")
+			once := sync.Once{}
+			afterChunkSnapshot = func() {
+				once.Do(func() { e.exec("UPDATE $schema.users SET name = 'new' WHERE " + c.key + " = '" + c.changed + "'") })
+			}
+			t.Cleanup(func() { afterChunkSnapshot = nil })
+			cp := readCDC(t, s, pipeline, map[string]string{"users": ""})
+			got := cp.changes(t, "users")
+			var changed []string
+			for _, ch := range got {
+				if ch.id == c.changed {
+					changed = append(changed, ch.op+" "+ch.name)
+				}
+			}
+			if !slices.Equal(changed, []string{"insert old", "update new"}) {
+				t.Errorf("id %s: %q", c.changed, changed)
+			}
+			sameRows(t, merged(got), e.rowsBy("users", c.key))
+		})
 	}
-	t.Cleanup(func() { afterChunkSnapshot = nil })
-	c := readCDC(t, s, pipeline, map[string]string{"users": ""})
-	got := c.changes(t, "users")
-	var three []string
-	for _, ch := range got {
-		if ch.id == "3" {
-			three = append(three, ch.op+" "+ch.name)
-		}
-	}
-	if !slices.Equal(three, []string{"insert old", "update new"}) {
-		t.Errorf("id 3: %q", three)
-	}
-	sameRows(t, merged(got), e.rows("users"))
 }
 
 func TestCDCAcknowledges(t *testing.T) {

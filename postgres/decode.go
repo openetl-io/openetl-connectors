@@ -1,6 +1,7 @@
 package postgres
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -58,6 +59,10 @@ func fixed(n int, f func(v []byte)) func([]byte) error {
 	}
 }
 
+// unpad drops the spaces Postgres pads a char(n) value with, as its cast to
+// text does: they aren't part of the value.
+func unpad(v []byte) []byte { return bytes.TrimRight(v, " ") }
+
 // beInt16, beInt32 and beInt64 read big-endian two's complement integers,
 // as Postgres sends them.
 func beInt16(v []byte) int16 { return int16(v[0])<<8 | int16(v[1]) }
@@ -95,9 +100,12 @@ func newColBuilder(mem memory.Allocator, c sourceColumn) (*colBuilder, error) {
 	case pgtype.Float8OID:
 		b := array.NewFloat64Builder(mem)
 		cb.b, cb.add = b, fixed(8, func(v []byte) { b.Append(math.Float64frombits(be.Uint64(v))) })
-	case pgtype.TextOID, pgtype.VarcharOID, pgtype.BPCharOID, pgtype.NameOID:
+	case pgtype.TextOID, pgtype.VarcharOID, pgtype.NameOID:
 		b := array.NewStringBuilder(mem)
 		cb.b, cb.add = b, func(v []byte) error { b.BinaryBuilder.Append(v); return nil }
+	case pgtype.BPCharOID:
+		b := array.NewStringBuilder(mem)
+		cb.b, cb.add = b, func(v []byte) error { b.BinaryBuilder.Append(unpad(v)); return nil }
 	case pgtype.ByteaOID:
 		b := array.NewBinaryBuilder(mem, arrow.BinaryTypes.Binary)
 		cb.b, cb.add = b, func(v []byte) error { b.Append(v); return nil }
