@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -325,6 +326,46 @@ func TestStaleCommitAfterRecovery(t *testing.T) {
 		t.Errorf("stale commit: %v, want fenced", err)
 	}
 	env.wantIDs("users", 1, 2)
+}
+
+// Recover fences every table of an epoch, more than it fences at once, and
+// fails if one has a later generation's fence.
+func TestRecoverFencesEveryTable(t *testing.T) {
+	env := newEnv(t)
+	names := make([]string, 3*fenceParallelism)
+	for i := range names {
+		names[i] = "t" + strconv.Itoa(i)
+	}
+	w := env.open(1, destination.ScopePipeline, appends(names...)...)
+	recov(t, w, 1, destination.Epoch{}, nil)
+	e := destination.Epoch{Generation: 1, N: 1}
+	for i, n := range names {
+		write(t, w, e, n, int64(i))
+	}
+	st := precommit(t, w, e)
+	commit(t, w, e, st)
+
+	w2 := env.open(2, destination.ScopePipeline, appends(names...)...)
+	if r := recov(t, w2, 2, e, st); r != destination.Applied {
+		t.Fatalf("recover: %v, want applied", r)
+	}
+	for _, n := range names {
+		if got := env.table(n).Properties()[fenceKey("p1")]; got != "2" {
+			t.Errorf("%s's fence is %q, want 2", n, got)
+		}
+	}
+
+	tx := env.table(names[len(names)/2]).NewTransaction()
+	if err := tx.SetProperties(map[string]string{fenceKey("p1"): "4"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Commit(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	w3 := env.open(3, destination.ScopePipeline, appends(names...)...)
+	if _, err := w3.Recover(t.Context(), 3, e, []destination.Staged{st}); !errors.Is(err, destination.ErrFenced) {
+		t.Fatalf("recover under a later fence: %v, want fenced", err)
+	}
 }
 
 // New columns are added, and a narrower type is written into a wider
