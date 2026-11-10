@@ -42,6 +42,7 @@ import (
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/google/uuid"
+	"golang.org/x/sync/errgroup"
 
 	sdk "github.com/openetl-io/openetl/sdk/go"
 	"github.com/openetl-io/openetl/sdk/go/destination"
@@ -1224,37 +1225,67 @@ func applied(props ice.Properties, pipeline string, desc staged) bool {
 	return epoch > desc.Epoch || (epoch == desc.Epoch && gen == desc.Generation)
 }
 
-// raiseFence sets each table's fence to gen, and fails if one is higher.
-func (w *writer) raiseFence(ctx context.Context, ns []string, names []string, gen uint64) error {
+// fenceParallelism is how many tables raiseFence loads and commits at once.
+// Each is a few catalog and storage round trips, which on Glue and S3 add up
+// to most of a second.
+const fenceParallelism = 8
+
+// raiseFence sets each table's fence to gen, and fails if one is higher. It
+// returns the tables as they are after it, by name, but for those that don't
+// exist.
+func (w *writer) raiseFence(ctx context.Context, ns []string, names []string, gen uint64) (map[string]*table.Table, error) {
+	names = slices.Compact(slices.Sorted(slices.Values(names)))
+	var mu sync.Mutex
+	fenced := make(map[string]*table.Table, len(names))
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(fenceParallelism)
 	for _, name := range names {
-		ident := w.ident(ns, name)
-		for attempt := 0; ; attempt++ {
-			tbl, err := w.cat.LoadTable(ctx, ident)
-			if errors.Is(err, catalog.ErrNoSuchTable) {
-				break
-			}
-			if err != nil {
-				return fmt.Errorf("iceberg: load %s: %w", strings.Join(ident, "."), err)
-			}
-			if err := w.checkFence(tbl.Properties(), gen); err != nil {
+		g.Go(func() error {
+			tbl, err := w.fenceTable(gctx, w.ident(ns, name), gen)
+			if err != nil || tbl == nil {
 				return err
 			}
-			if tbl.Properties()[fenceKey(w.cfg.Pipeline)] == strconv.FormatUint(gen, 10) {
-				break
-			}
-			tx := tbl.NewTransaction()
-			if err := tx.SetProperties(ice.Properties{fenceKey(w.cfg.Pipeline): strconv.FormatUint(gen, 10)}); err != nil {
-				return err
-			}
-			if _, err = tx.Commit(ctx); err == nil {
-				break
-			}
-			if !conflict(err) || attempt >= commitRetries {
-				return fmt.Errorf("iceberg: raise the fence of %s: %w", strings.Join(ident, "."), err)
-			}
+			mu.Lock()
+			fenced[name] = tbl
+			mu.Unlock()
+			return nil
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return nil, err
+	}
+	return fenced, nil
+}
+
+// fenceTable sets the table's fence to gen, and returns it as it is then: nil
+// if there's no such table.
+func (w *writer) fenceTable(ctx context.Context, ident table.Identifier, gen uint64) (*table.Table, error) {
+	for attempt := 0; ; attempt++ {
+		tbl, err := w.cat.LoadTable(ctx, ident)
+		if errors.Is(err, catalog.ErrNoSuchTable) {
+			return nil, nil
+		}
+		if err != nil {
+			return nil, fmt.Errorf("iceberg: load %s: %w", strings.Join(ident, "."), err)
+		}
+		if err := w.checkFence(tbl.Properties(), gen); err != nil {
+			return nil, err
+		}
+		if tbl.Properties()[fenceKey(w.cfg.Pipeline)] == strconv.FormatUint(gen, 10) {
+			return tbl, nil
+		}
+		tx := tbl.NewTransaction()
+		if err := tx.SetProperties(ice.Properties{fenceKey(w.cfg.Pipeline): strconv.FormatUint(gen, 10)}); err != nil {
+			return nil, err
+		}
+		fenced, err := tx.Commit(ctx)
+		if err == nil {
+			return fenced, nil
+		}
+		if !conflict(err) || attempt >= commitRetries {
+			return nil, fmt.Errorf("iceberg: raise the fence of %s: %w", strings.Join(ident, "."), err)
 		}
 	}
-	return nil
 }
 
 func (w *writer) Recover(ctx context.Context, gen uint64, e destination.Epoch, committables []destination.Staged) (destination.Recovery, error) {
@@ -1271,7 +1302,7 @@ func (w *writer) Recover(ctx context.Context, gen uint64, e destination.Epoch, c
 		known = append(known, n)
 	}
 	w.mu.Unlock()
-	if err := w.raiseFence(ctx, w.ns, known, gen); err != nil {
+	if _, err := w.raiseFence(ctx, w.ns, known, gen); err != nil {
 		return 0, err
 	}
 	if e.IsZero() {
@@ -1283,7 +1314,8 @@ func (w *writer) Recover(ctx context.Context, gen uint64, e destination.Epoch, c
 			names = append(names, st.Table)
 		}
 	}
-	if err := w.raiseFence(ctx, desc.Namespace, names, gen); err != nil {
+	fenced, err := w.raiseFence(ctx, desc.Namespace, names, gen)
+	if err != nil {
 		return 0, err
 	}
 
@@ -1295,12 +1327,8 @@ func (w *writer) Recover(ctx context.Context, gen uint64, e destination.Epoch, c
 			continue
 		}
 		applying++
-		tbl, err := w.cat.LoadTable(ctx, w.ident(desc.Namespace, st.Table))
-		if errors.Is(err, catalog.ErrNoSuchTable) {
-			tbl = nil
-		} else if err != nil {
-			return 0, fmt.Errorf("iceberg: load %s: %w", st.Table, err)
-		}
+		// Nil: there's no such table.
+		tbl := fenced[st.Table]
 		if tbl != nil && applied(tbl.Properties(), w.cfg.Pipeline, desc) {
 			if st.Mode == modeMerge {
 				w.dropFiles(desc.Namespace, st.Table, st.Files)
