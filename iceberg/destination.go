@@ -27,6 +27,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/apache/arrow-go/v18/arrow"
@@ -969,9 +970,9 @@ func (w *writer) mergeLanes(committables []destination.Staged) (staged, error) {
 // snapshot holds unless it commits, and a merge's staged files, which it
 // makes unneeded once it does.
 type pending struct {
-	tx      *table.Transaction
-	ns      []string
-	table   string
+	tx *table.Transaction
+	// The table as it was checked, whose store holds the files.
+	tbl     *table.Table
 	written []string
 	staged  []string
 	// Overwrite: the stream's reads' manifests, which it makes unneeded too.
@@ -980,13 +981,13 @@ type pending struct {
 
 func (w *writer) discard(ps []pending) {
 	for _, p := range ps {
-		w.dropFiles(p.ns, p.table, p.written)
+		w.removeFiles(p.tbl, p.written)
 	}
 }
 
 func (w *writer) committed(p pending) {
-	w.dropFiles(p.ns, p.table, p.staged)
-	w.dropManifests(p.ns, p.table, p.readsDir)
+	w.removeFiles(p.tbl, p.staged)
+	w.removeManifests(p.tbl, p.readsDir)
 }
 
 // apply commits each stream that changes its table and has no marker yet:
@@ -1025,8 +1026,10 @@ func conflict(err error) bool {
 // testHookBeforeCommit runs between checking the tables and committing.
 var testHookBeforeCommit func(*writer)
 
-// commit commits txs. It drops the files of those the catalog refused or
-// that it never sent, but not of one whose outcome it doesn't know.
+// commit commits txs: in one catalog transaction with pipeline scope, or else
+// each on its own, parallelism at a time, sending none once one has failed.
+// It drops the files of those the catalog refused or that it never sent, but
+// not of one whose outcome it doesn't know.
 func (w *writer) commit(ctx context.Context, txs []pending) error {
 	if w.cfg.Scope == destination.ScopePipeline && len(txs) > 1 {
 		m, err := catalog.NewMultiTableTransaction(w.cat)
@@ -1051,77 +1054,112 @@ func (w *writer) commit(ctx context.Context, txs []pending) error {
 		}
 		return nil
 	}
-	for i, p := range txs {
-		if _, err := p.tx.Commit(ctx); err != nil {
-			if conflict(err) {
-				w.discard(txs[i : i+1])
+	var failed atomic.Bool
+	var g errgroup.Group
+	g.SetLimit(parallelism)
+	for _, p := range txs {
+		g.Go(func() error {
+			if failed.Load() {
+				w.discard([]pending{p})
+				return nil
 			}
-			w.discard(txs[i+1:])
-			return err
-		}
-		w.committed(p)
+			if _, err := p.tx.Commit(ctx); err != nil {
+				failed.Store(true)
+				if conflict(err) {
+					w.discard([]pending{p})
+				}
+				return err
+			}
+			w.committed(p)
+			return nil
+		})
 	}
-	return nil
+	return g.Wait()
 }
 
 // prepare loads each stream's table, and returns a transaction for each one
-// still to apply, on the snapshot it checked.
-func (w *writer) prepare(ctx context.Context, desc staged, streams []stagedStream) (txs []pending, err error) {
-	defer func() {
-		if err != nil {
-			w.discard(txs)
-			txs = nil
+// still to apply, on the snapshot it checked. It prepares parallelism tables
+// at once, but reads rows for one at a time, as a merge or a patch holds the
+// table's rows of the epoch in memory.
+func (w *writer) prepare(ctx context.Context, desc staged, streams []stagedStream) ([]pending, error) {
+	prepared := make([]*pending, len(streams))
+	var reading sync.Mutex
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(parallelism)
+	for i, s := range streams {
+		g.Go(func() error {
+			p, err := w.prepareStream(gctx, desc, s, &reading)
+			prepared[i] = p
+			return err
+		})
+	}
+	err := g.Wait()
+	txs := make([]pending, 0, len(streams))
+	for _, p := range prepared {
+		if p != nil {
+			txs = append(txs, *p)
 		}
-	}()
-	for _, s := range streams {
-		files, ok := s.applies()
-		if !ok {
-			continue
-		}
-		ident := w.ident(desc.Namespace, s.Table)
-		hasFiles := len(files) > 0 || len(s.Manifests) > 0
-		if s.Table == "" {
-			if hasFiles {
-				return nil, fmt.Errorf("iceberg: stream %q staged files for no table", s.Name)
-			}
-			continue
-		}
-		tbl, err := w.cat.LoadTable(ctx, ident)
-		if errors.Is(err, catalog.ErrNoSuchTable) && !hasFiles {
-			continue
-		}
-		if err != nil {
-			return nil, fmt.Errorf("iceberg: load %s: %w", strings.Join(ident, "."), err)
-		}
-		if err := w.checkFence(tbl.Properties(), w.cfg.Generation); err != nil {
-			return nil, err
-		}
-		if applied(tbl.Properties(), w.cfg.Pipeline, desc) {
-			continue
-		}
-		paths := s.adds()
-		if len(s.Manifests) > 0 {
-			earlier, err := manifestFiles(ctx, tbl, w.readDir(tbl, s.Name, s.Read), s.Manifests)
-			if err != nil {
-				return txs, fmt.Errorf("iceberg: %s: the read's earlier files: %w", strings.Join(ident, "."), err)
-			}
-			paths = append(earlier, paths...)
-		}
-		tx, written, err := w.transaction(ctx, tbl, desc, s, paths)
-		if err != nil {
-			w.dropFiles(desc.Namespace, s.Table, written)
-			return txs, fmt.Errorf("iceberg: %s: %w", strings.Join(ident, "."), err)
-		}
-		p := pending{tx: tx, ns: desc.Namespace, table: s.Table, written: written, staged: s.Patches}
-		switch s.Mode {
-		case modeMerge:
-			p.staged = append(slices.Clone(s.Files), s.Patches...)
-		case modeOverwrite:
-			p.readsDir = w.readsDir(tbl, s.Name)
-		}
-		txs = append(txs, p)
+	}
+	if err != nil {
+		w.discard(txs)
+		return nil, err
 	}
 	return txs, nil
+}
+
+// prepareStream returns the stream's transaction: nil if its table needs
+// none. It holds reading while it reads rows.
+func (w *writer) prepareStream(ctx context.Context, desc staged, s stagedStream, reading *sync.Mutex) (*pending, error) {
+	files, ok := s.applies()
+	if !ok {
+		return nil, nil
+	}
+	ident := w.ident(desc.Namespace, s.Table)
+	hasFiles := len(files) > 0 || len(s.Manifests) > 0
+	if s.Table == "" {
+		if hasFiles {
+			return nil, fmt.Errorf("iceberg: stream %q staged files for no table", s.Name)
+		}
+		return nil, nil
+	}
+	tbl, err := w.cat.LoadTable(ctx, ident)
+	if errors.Is(err, catalog.ErrNoSuchTable) && !hasFiles {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("iceberg: load %s: %w", strings.Join(ident, "."), err)
+	}
+	if err := w.checkFence(tbl.Properties(), w.cfg.Generation); err != nil {
+		return nil, err
+	}
+	if applied(tbl.Properties(), w.cfg.Pipeline, desc) {
+		return nil, nil
+	}
+	paths := s.adds()
+	if len(s.Manifests) > 0 {
+		earlier, err := manifestFiles(ctx, tbl, w.readDir(tbl, s.Name, s.Read), s.Manifests)
+		if err != nil {
+			return nil, fmt.Errorf("iceberg: %s: the read's earlier files: %w", strings.Join(ident, "."), err)
+		}
+		paths = append(earlier, paths...)
+	}
+	if s.Mode == modeMerge || len(s.Patches) > 0 {
+		reading.Lock()
+		defer reading.Unlock()
+	}
+	tx, written, err := w.transaction(ctx, tbl, desc, s, paths)
+	if err != nil {
+		w.removeFiles(tbl, written)
+		return nil, fmt.Errorf("iceberg: %s: %w", strings.Join(ident, "."), err)
+	}
+	p := &pending{tx: tx, tbl: tbl, written: written, staged: s.Patches}
+	switch s.Mode {
+	case modeMerge:
+		p.staged = append(slices.Clone(s.Files), s.Patches...)
+	case modeOverwrite:
+		p.readsDir = w.readsDir(tbl, s.Name)
+	}
+	return p, nil
 }
 
 // transaction stages the stream's epoch in a transaction on tbl. It returns
@@ -1164,11 +1202,22 @@ func (w *writer) addFiles(ctx context.Context, tx *table.Transaction, tbl *table
 	if err != nil {
 		return nil, err
 	}
+	// Each reads the file's footer.
 	files := make([]ice.DataFile, len(paths))
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(parallelism)
 	for i, p := range paths {
-		if files[i], err = table.FileToDataFile(ctx, fs, p, tbl.Schema(), tbl.Spec(), 0, tbl.Properties()); err != nil {
-			return nil, fmt.Errorf("staged file %s: %w", p, err)
-		}
+		g.Go(func() error {
+			df, err := table.FileToDataFile(gctx, fs, p, tbl.Schema(), tbl.Spec(), 0, tbl.Properties())
+			if err != nil {
+				return fmt.Errorf("staged file %s: %w", p, err)
+			}
+			files[i] = df
+			return nil
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return nil, err
 	}
 	if s.Mode == "" && len(s.Patches) > 0 {
 		return w.appendPatched(ctx, tx, tbl, s, files, marker)
@@ -1225,10 +1274,11 @@ func applied(props ice.Properties, pipeline string, desc staged) bool {
 	return epoch > desc.Epoch || (epoch == desc.Epoch && gen == desc.Generation)
 }
 
-// fenceParallelism is how many tables raiseFence loads and commits at once.
-// Each is a few catalog and storage round trips, which on Glue and S3 add up
-// to most of a second.
-const fenceParallelism = 8
+// parallelism is how many tables Recover fences and cleans up and Commit
+// prepares and commits at once, and how many of a table's staged files Commit
+// reads at once. Each is a few catalog or storage round trips, which on Glue and S3 add
+// up to most of a second for a table.
+const parallelism = 8
 
 // raiseFence sets each table's fence to gen, and fails if one is higher. It
 // returns the tables as they are after it, by name, but for those that don't
@@ -1238,7 +1288,7 @@ func (w *writer) raiseFence(ctx context.Context, ns []string, names []string, ge
 	var mu sync.Mutex
 	fenced := make(map[string]*table.Table, len(names))
 	g, gctx := errgroup.WithContext(ctx)
-	g.SetLimit(fenceParallelism)
+	g.SetLimit(parallelism)
 	for _, name := range names {
 		g.Go(func() error {
 			tbl, err := w.fenceTable(gctx, w.ident(ns, name), gen)
@@ -1321,6 +1371,9 @@ func (w *writer) Recover(ctx context.Context, gen uint64, e destination.Epoch, c
 
 	var missing []stagedStream
 	applying, needs, present := 0, 0, 0
+	// Deletes what the applied tables no longer need.
+	var cleanup errgroup.Group
+	cleanup.SetLimit(parallelism)
 	for _, st := range desc.Streams {
 		files, ok := st.applies()
 		if !ok || st.Table == "" {
@@ -1330,13 +1383,16 @@ func (w *writer) Recover(ctx context.Context, gen uint64, e destination.Epoch, c
 		// Nil: there's no such table.
 		tbl := fenced[st.Table]
 		if tbl != nil && applied(tbl.Properties(), w.cfg.Pipeline, desc) {
-			if st.Mode == modeMerge {
-				w.dropFiles(desc.Namespace, st.Table, st.Files)
-			}
-			w.dropFiles(desc.Namespace, st.Table, st.Patches)
-			if st.Mode == modeOverwrite {
-				w.dropManifests(desc.Namespace, st.Table, w.readsDir(tbl, st.Name))
-			}
+			cleanup.Go(func() error {
+				if st.Mode == modeMerge {
+					w.removeFiles(tbl, st.Files)
+				}
+				w.removeFiles(tbl, st.Patches)
+				if st.Mode == modeOverwrite {
+					w.removeManifests(tbl, w.readsDir(tbl, st.Name))
+				}
+				return nil
+			})
 			continue
 		}
 		missing = append(missing, st)
@@ -1352,6 +1408,7 @@ func (w *writer) Recover(ctx context.Context, gen uint64, e destination.Epoch, c
 			present++
 		}
 	}
+	_ = cleanup.Wait()
 	var r destination.Recovery
 	switch {
 	case len(missing) == 0:
@@ -1442,6 +1499,14 @@ func (w *writer) dropFiles(ns []string, name string, paths []string) {
 	}
 	tbl, err := w.cat.LoadTable(w.ctx, w.ident(ns, name))
 	if err != nil {
+		return
+	}
+	w.removeFiles(tbl, paths)
+}
+
+// removeFiles is dropFiles on a table already loaded.
+func (w *writer) removeFiles(tbl *table.Table, paths []string) {
+	if len(paths) == 0 {
 		return
 	}
 	fs, err := tbl.FS(w.ctx)
