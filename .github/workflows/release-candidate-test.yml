@@ -19,7 +19,7 @@ jobs:
       contents: write
       packages: write
     with:
-      version: 0.0.1-alpha.2
+      version: 0.0.1-alpha.3
       openetl: release-candidate-flow
       replace: true
       require-ci: false
@@ -32,7 +32,7 @@ jobs:
         run: |
           for r in openetl-connectors/postgres openetl-connectors/kafka openetl-connectors/kinesis openetl-connectors/iceberg openetl-connectors/s3; do
             t=$(curl -s "https://ghcr.io/token?scope=repository:openetl-io/$r:pull&service=ghcr.io" | jq -r '.token // ""')
-            code=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $t" -H 'Accept: application/vnd.oci.image.manifest.v1+json' "https://ghcr.io/v2/openetl-io/$r/manifests/0.0.1-alpha.2")
+            code=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $t" -H 'Accept: application/vnd.oci.image.manifest.v1+json' "https://ghcr.io/v2/openetl-io/$r/manifests/0.0.1-alpha.3")
             echo "$r: $code"
             [ "$code" != 200 ]
           done
