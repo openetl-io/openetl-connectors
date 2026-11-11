@@ -1,7 +1,8 @@
 name: release
 
 # Releases a tag that's already pushed, vVERSION such as v0.1.0-alpha, on a
-# commit in main that ci passed. It packages every connector at that commit
+# commit that ci passed, in main or in its release line's branch,
+# release-X.Y. It packages every connector at that commit
 # for Linux on amd64 and arm64, with openetl's CLI and SDK at openetl's tag of
 # the same name, and then, by `publish`:
 #
@@ -10,7 +11,8 @@ name: release
 #            OpenETL's github.com/OWNER/REPO/PACKAGE@VERSION references read;
 #            then, in the job that alone may sign, signs each package and its
 #            checksums with keyless cosign and publishes the releases, which
-#            makes their tags.
+#            makes their tags. Then it points release-X.Y at the release (see
+#            the branch job).
 #   private  pushes the packages to the private ghcr.io/OWNER/candidates/
 #            VERSION/openetl-connectors and puts the files on draft releases.
 #            Nothing is signed, as keyless signatures go to a public log.
@@ -64,6 +66,8 @@ jobs:
       packages: write
     outputs:
       version: ${{ steps.check.outputs.version }}
+      commit: ${{ steps.check.outputs.commit }}
+      branch: ${{ steps.check.outputs.branch }}
       packages: ${{ steps.check.outputs.packages }}
       published: ${{ steps.publish.outputs.published }}
     env:
@@ -93,8 +97,15 @@ jobs:
         run: |
           version=${TAG#v}
           commit=$(git rev-parse HEAD)
-          status=$(gh api "repos/$GITHUB_REPOSITORY/compare/main...$commit" --jq .status)
-          case $status in identical | behind) ;; *) echo "::error::$TAG ($commit) isn't a commit in main"; exit 1 ;; esac
+          branch=release-$(cut -d. -f1-2 <<< "$version")
+          # Whether the commit is in branch $1; a branch that doesn't exist has none.
+          has() {
+            case $(gh api "repos/$GITHUB_REPOSITORY/compare/$1...$commit" --jq .status 2>/dev/null || true) in
+              identical | behind) return 0 ;;
+              *) return 1 ;;
+            esac
+          }
+          has main || has "$branch" || { echo "::error::$TAG ($commit) isn't a commit in main or $branch"; exit 1; }
           if [ "$REQUIRE_CI" = true ]; then
             passed=$(gh run list -R "$GITHUB_REPOSITORY" -w ci.yml -c "$commit" -s success --json databaseId -q length)
             [ "$passed" != 0 ] || { echo "::error::ci hasn't passed on $commit"; exit 1; }
@@ -111,7 +122,7 @@ jobs:
           esac
           { echo "VERSION=$version"; echo "COMMIT=$commit"; echo "PACKAGES=$packages"; echo "NAMESPACE=$namespace"
             echo "DIST=$RUNNER_TEMP/dist"; echo "OPENETL=$RUNNER_TEMP/openetl"; } >> "$GITHUB_ENV"
-          { echo "version=$version"; echo "packages=$packages"; } >> "$GITHUB_OUTPUT"
+          { echo "version=$version"; echo "commit=$commit"; echo "branch=$branch"; echo "packages=$packages"; } >> "$GITHUB_OUTPUT"
       - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
           go-version-file: openetl-connectors/go.mod
@@ -234,3 +245,44 @@ jobs:
               echo "**ghcr.io/$repository is private:** make it public in [its settings]($settings)." >> "$GITHUB_STEP_SUMMARY"
             fi
           done
+
+  # Points the release line's branch, release-X.Y, at the release: the docs
+  # site builds each package's page from it, and fixes to them are backported
+  # to it (CONTRIBUTING.md). A new line's branch is made, with the label that
+  # backports to it. A release on the branch leaves it where it is. A release
+  # cut from main moves it forward, or, when it has commits since that main's
+  # release doesn't (backports, which came from main), starts it again at the
+  # release; the summary says where it was. openetl's release does the same.
+  branch:
+    needs: [package, publish]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      issues: write
+    env:
+      TAG: ${{ inputs.tag }}
+      COMMIT: ${{ needs.package.outputs.commit }}
+      BRANCH: ${{ needs.package.outputs.branch }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Point the release line's branch at the release
+        run: |
+          repo=repos/$GITHUB_REPOSITORY
+          if ! at=$(gh api "$repo/git/ref/heads/$BRANCH" --jq .object.sha 2>/dev/null); then
+            gh api "$repo/git/refs" -f "ref=refs/heads/$BRANCH" -f "sha=$COMMIT" > /dev/null
+            echo "Made \`$BRANCH\` at $TAG." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          case $(gh api "$repo/compare/$at...$COMMIT" --jq .status) in
+            identical | behind) ;;
+            ahead)
+              gh api -X PATCH "$repo/git/refs/heads/$BRANCH" -f "sha=$COMMIT" -F force=false > /dev/null
+              echo "Moved \`$BRANCH\` forward to $TAG." >> "$GITHUB_STEP_SUMMARY"
+              ;;
+            *)
+              gh api -X PATCH "$repo/git/refs/heads/$BRANCH" -f "sha=$COMMIT" -F force=true > /dev/null
+              echo "Started \`$BRANCH\` again at $TAG. It was at $at." >> "$GITHUB_STEP_SUMMARY"
+              ;;
+          esac
+      - name: The label that backports to it
+        run: gh label create "backport $BRANCH" -R "$GITHUB_REPOSITORY" --color 0e8a16 --description "Backport to $BRANCH once merged" --force
