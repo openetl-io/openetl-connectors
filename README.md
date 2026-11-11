@@ -3,7 +3,7 @@
 The official connectors for [OpenETL](https://github.com/openetl-io/openetl): the programs that read from and write to the systems OpenETL copies data between. Each one has a page with what it reads or writes, how to set it up, and what it does when a source's schema changes.
 
 > [!NOTE]
-> Pre-alpha, like OpenETL: nothing has been released yet, and the connectors change with OpenETL's protocols and SDK.
+> The connectors are in alpha, like OpenETL. In the alpha, they have the same version as OpenETL, such as `0.1.0-alpha`. Their config, and the protocol between OpenETL and its connectors, can change between releases.
 
 ## Connectors
 
@@ -19,7 +19,21 @@ Exactly once is what a destination gives a stream whose source replays exactly, 
 
 ## Use one
 
-A source or destination in OpenETL names its connector, such as `connector: postgres`, with the config its page describes. The [quickstart](https://github.com/openetl-io/openetl/blob/main/docs/get-started/quickstart.md) builds these connectors and runs a pipeline into Postgres, and [OpenETL's docs](https://github.com/openetl-io/openetl/blob/main/docs/index.md) cover pipelines.
+Each connector is a package in the official registry, `oci://ghcr.io/openetl-io/openetl-connectors`, which an OpenETL installation reads by default. List the connectors with OpenETL's CLI:
+
+```sh
+openetl connector catalog
+```
+
+Install one with the command that the catalog shows for it:
+
+```sh
+openetl connector apply oci://ghcr.io/openetl-io/openetl-connectors/postgres:0.1.0-alpha
+```
+
+A source or destination in OpenETL then names its connector, such as `connector: postgres`, with the config that the connector's page describes. The [quickstart](https://github.com/openetl-io/openetl/blob/main/docs/get-started/quickstart.md) installs the Postgres connector and runs a pipeline into Postgres. [Choose and manage connectors](https://github.com/openetl-io/openetl/blob/main/docs/pipelines/connectors.md) covers versions and other registries, and [OpenETL's docs](https://github.com/openetl-io/openetl/blob/main/docs/index.md) cover pipelines.
+
+Each package's executables, checksums and signatures are also on its GitHub release, such as [`postgres/v0.1.0-alpha`](https://github.com/openetl-io/openetl-connectors/releases/tag/postgres/v0.1.0-alpha).
 
 ## Contributing
 
