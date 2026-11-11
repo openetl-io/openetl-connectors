@@ -12,7 +12,7 @@ Both are tested against kinesis-mock, an emulator, and against the Karapace sche
 The source and the destination share their connection settings:
 
 - `region`: the streams' AWS region. Unset, the AWS default configuration's.
-- `accessKeyId` and `secretAccessKey`, together. Without them, the AWS default credentials that the connector can find itself: a shared config file in the runner's home directory, or the role of the EC2 instance that the runner is on. The runner does not pass its environment variables to the connector, so `AWS_*` variables and the role that EKS gives a pod do not reach it. On EKS, set `accessKeyId` and `secretAccessKey`.
+- `accessKeyId` and `secretAccessKey`, together. Without them, the AWS SDK's default credential chain, which finds only what the runner gives the connector: by default, nothing. Name an IAM role in the source's or destination's `aws.role`, which the runner assumes for the connector, on EC2 and EKS alike. [Run on AWS](https://github.com/openetl-io/openetl/blob/main/docs/self-host/aws.md#credentials-for-connectors) explains the setup. Keys in the config are used even if a role is named.
 - `endpoint`: a Kinesis-compatible endpoint, such as a VPC endpoint or an emulator.
 - `format`: how each record's data is encoded: `json` (the default), `avro` or `protobuf`, the same as the [Kafka connectors](../kafka/README.md). Avro and Protobuf need `schemaRegistryUrl`.
 
