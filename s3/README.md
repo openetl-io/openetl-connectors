@@ -37,7 +37,7 @@ A continuous pipeline commits every minute unless it sets its own `delivery.comm
 
 Without `accessKeyId` and `secretAccessKey`, the destination uses the AWS default credentials that it can find itself: a shared config file in the runner's home directory, or the role of the EC2 instance that the runner is on. The runner does not pass its environment variables to the destination. So the destination does not get `AWS_*` variables, or the role that an EKS IAM role for a service account or EKS Pod Identity gives a pod. On EKS, set `accessKeyId` and `secretAccessKey`, and keep them in secrets, as `{ secret: NAME }`.
 
-The credentials need to read, write, copy, delete and list objects under the URL. The destination's check writes and deletes an object under `_openetl/`.
+The credentials need to read, write, copy, delete and list objects under the URL. The destination's check writes and deletes an object under `_openetl/`. If the destination has no AWS credentials, or S3 refuses them, the check and syncs fail with `AUTH_INVALID`, `AUTH_EXPIRED` or `PERMISSION_DENIED`. OpenETL retries only `AUTH_EXPIRED`.
 
 ```yaml
 apiVersion: openetl.io/v1alpha1

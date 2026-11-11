@@ -29,6 +29,7 @@ import (
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	awss3 "github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/smithy-go"
 	"github.com/google/uuid"
 	"gocloud.dev/blob"
 	"gocloud.dev/blob/fileblob"
@@ -132,6 +133,7 @@ func (d *Destination) bucket(ctx context.Context) (*blob.Bucket, error) {
 		if lerr != nil {
 			return nil, fmt.Errorf("s3: AWS config: %w", lerr)
 		}
+		ac.Credentials = credentialsSource{ac.Credentials}
 		client := awss3.NewFromConfig(ac, func(o *awss3.Options) {
 			if d.cfg.Endpoint != "" {
 				o.BaseEndpoint = aws.String(d.cfg.Endpoint)
@@ -561,10 +563,51 @@ func (w *writer) Close(context.Context) error {
 	return w.b.Close()
 }
 
-// classify makes failures to reach the store TRANSIENT.
+// credentialsSource marks its provider's failures as credentialsError, so
+// classify can tell a destination without AWS credentials from one the
+// store refuses.
+type credentialsSource struct{ aws.CredentialsProvider }
+
+func (c credentialsSource) Retrieve(ctx context.Context) (aws.Credentials, error) {
+	creds, err := c.CredentialsProvider.Retrieve(ctx)
+	if err != nil {
+		return creds, &credentialsError{err}
+	}
+	return creds, nil
+}
+
+type credentialsError struct{ err error }
+
+func (e *credentialsError) Error() string {
+	return "no AWS credentials: set accessKeyId and secretAccessKey, or name a role in the destination's aws.role: " + e.err.Error()
+}
+
+func (e *credentialsError) Unwrap() error { return e.err }
+
+// classify makes failures to reach the store TRANSIENT, and gives AWS's
+// refusals and a missing credential their taxonomy codes.
 func classify(err error) error {
+	if err == nil {
+		return nil
+	}
 	if _, ok := errors.AsType[net.Error](err); ok && !errors.Is(err, context.Canceled) {
 		return sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_TRANSIENT, err)
+	}
+	code := func(c protocolv1.ErrorCode) error { return sdk.WithCode(c, err) }
+	var ae smithy.APIError
+	api := errors.As(err, &ae)
+	switch {
+	case api && (ae.ErrorCode() == "AccessDenied" || ae.ErrorCode() == "Forbidden" || ae.ErrorCode() == "AllAccessDisabled"):
+		return code(protocolv1.ErrorCode_ERROR_CODE_PERMISSION_DENIED)
+	case api && (ae.ErrorCode() == "ExpiredToken" || ae.ErrorCode() == "ExpiredTokenException"):
+		return code(protocolv1.ErrorCode_ERROR_CODE_AUTH_EXPIRED)
+	case api && (ae.ErrorCode() == "Throttling" || ae.ErrorCode() == "SlowDown"):
+		return code(protocolv1.ErrorCode_ERROR_CODE_RATE_LIMITED)
+	case api && (ae.ErrorCode() == "InvalidAccessKeyId" || ae.ErrorCode() == "SignatureDoesNotMatch" || ae.ErrorCode() == "InvalidToken"):
+		return code(protocolv1.ErrorCode_ERROR_CODE_AUTH_INVALID)
+	}
+	if _, ok := errors.AsType[*credentialsError](err); ok {
+		return code(protocolv1.ErrorCode_ERROR_CODE_AUTH_INVALID)
 	}
 	return err
 }
