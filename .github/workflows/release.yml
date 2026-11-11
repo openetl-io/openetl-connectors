@@ -1,0 +1,236 @@
+name: release
+
+# Releases a tag that's already pushed, vVERSION such as v0.1.0-alpha, on a
+# commit in main that ci passed. It packages every connector at that commit
+# for Linux on amd64 and arm64, with openetl's CLI and SDK at openetl's tag of
+# the same name, and then, by `publish`:
+#
+#   public   pushes the packages to ghcr.io/OWNER/openetl-connectors and puts
+#            each package's files on a draft release PACKAGE/vVERSION, the tag
+#            OpenETL's github.com/OWNER/REPO/PACKAGE@VERSION references read;
+#            then, in the job that alone may sign, signs each package and its
+#            checksums with keyless cosign and publishes the releases, which
+#            makes their tags.
+#   private  pushes the packages to the private ghcr.io/OWNER/candidates/
+#            VERSION/openetl-connectors and puts the files on draft releases.
+#            Nothing is signed, as keyless signatures go to a public log.
+#            release-discard VERSION removes both.
+#   skip     packages and checks everything, and pushes and uploads nothing.
+#
+# Running it again replaces the drafts; it refuses a version that's released.
+# GHCR creates a package private: after the first public release, make each
+# package and openetl-connectors/index public in its settings, once. One job
+# builds and uploads, so no build passes through a workflow artifact, which on
+# a public repository anyone signed in can download. Actions are pinned by
+# commit.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: The tag to release, pushed first, such as v0.1.0-alpha
+        required: true
+        type: string
+      publish:
+        description: "public: signed, published releases; private: drafts and private packages; skip: package and check only"
+        type: choice
+        options: [public, private, skip]
+        default: public
+      openetl:
+        description: openetl's tag, commit or branch, for the CLI that packages these and the SDK they build against; empty uses the same tag
+        type: string
+        default: ""
+      require-ci:
+        description: Require this repository's CI, which runs the conformance kit, to have passed on the tag's commit
+        type: boolean
+        default: true
+
+permissions: {}
+
+concurrency:
+  group: release-${{ inputs.tag }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      actions: read # the commit's CI
+      contents: write # the drafts, which only a token that can write sees
+      packages: write
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+      packages: ${{ steps.check.outputs.packages }}
+      published: ${{ steps.publish.outputs.published }}
+    env:
+      TAG: ${{ inputs.tag }}
+      PUBLISH: ${{ inputs.publish }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: The tag names a version
+        run: |
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || { echo "::error::$TAG isn't a tag such as v0.1.0-alpha"; exit 1; }
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: refs/tags/${{ inputs.tag }}
+          path: openetl-connectors
+      # go.mod replaces the SDK with ../openetl/sdk/go.
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          repository: openetl-io/openetl
+          ref: ${{ inputs.openetl || inputs.tag }}
+          path: openetl
+      - name: This tag can be released
+        id: check
+        working-directory: openetl-connectors
+        env:
+          REQUIRE_CI: ${{ inputs.require-ci }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          version=${TAG#v}
+          commit=$(git rev-parse HEAD)
+          status=$(gh api "repos/$GITHUB_REPOSITORY/compare/main...$commit" --jq .status)
+          case $status in identical | behind) ;; *) echo "::error::$TAG ($commit) isn't a commit in main"; exit 1 ;; esac
+          if [ "$REQUIRE_CI" = true ]; then
+            passed=$(gh run list -R "$GITHUB_REPOSITORY" -w ci.yml -c "$commit" -s success --json databaseId -q length)
+            [ "$passed" != 0 ] || { echo "::error::ci hasn't passed on $commit"; exit 1; }
+          fi
+          packages=$(dirname */openetl-connector.yaml | tr '\n' ' ')
+          for p in $packages; do
+            draft=$(gh release view "$p/v$version" -R "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>/dev/null || echo none)
+            [ "$draft" != false ] || { echo "::error::$p/v$version is already released"; exit 1; }
+          done
+          case $PUBLISH in
+            public) namespace=oci://ghcr.io/$GITHUB_REPOSITORY ;;
+            private) namespace=oci://ghcr.io/$OWNER/candidates/$version/${GITHUB_REPOSITORY#*/} ;;
+            skip) namespace= ;;
+          esac
+          { echo "VERSION=$version"; echo "COMMIT=$commit"; echo "PACKAGES=$packages"; echo "NAMESPACE=$namespace"
+            echo "DIST=$RUNNER_TEMP/dist"; echo "OPENETL=$RUNNER_TEMP/openetl"; } >> "$GITHUB_ENV"
+          { echo "version=$version"; echo "packages=$packages"; } >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: openetl-connectors/go.mod
+          cache: false
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: go-release-${{ hashFiles('openetl-connectors/go.sum') }}
+          restore-keys: go-release-
+      - uses: anchore/sbom-action/download-syft@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+      - if: inputs.publish != 'skip'
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Package each connector for Linux
+        run: |
+          go -C openetl build -o "$OPENETL" ./cmd/openetl
+          cd openetl-connectors
+          # shellcheck disable=SC2086
+          GOFLAGS="'-ldflags=-s -w'" "$OPENETL" connector package $PACKAGES \
+            --version "$VERSION" --out "$DIST" --platforms linux/amd64,linux/arm64
+          ls -l "$DIST"
+      - name: The notices, SBOMs and checksums
+        run: |
+          go -C openetl run ./internal/notices -connectors-only -connectors "$PWD/openetl-connectors" -connectors-work off \
+            -out "$DIST/THIRD-PARTY-NOTICES.txt"
+          for f in "$DIST"/*-linux-*; do
+            syft "file:$f" -o "spdx-json=$f.sbom.json"
+          done
+          for p in $PACKAGES; do
+            (cd "$DIST" && sha256sum "$p"-* "$p.connector.yaml" > "$p.checksums.txt")
+          done
+      - name: The packages
+        id: publish
+        if: inputs.publish != 'skip'
+        run: |
+          "$OPENETL" connector publish "$NAMESPACE" "$DIST"/*.connector.yaml | tee "$RUNNER_TEMP/published.txt"
+          for p in $PACKAGES; do
+            "$OPENETL" connector validate --artifact "$NAMESPACE/$p:$VERSION"
+          done
+          # Each line is "NAME VERSION: oci://REPOSITORY@DIGEST (indexed)".
+          published=$(sed -nE 's/^[^:]+: oci:\/\/([^ ]+@sha256:[0-9a-f]+) .*/\1/p' "$RUNNER_TEMP/published.txt" | tr '\n' ' ')
+          [ "$(wc -w <<<"$published")" = "$(wc -w <<<"$PACKAGES")" ] || { echo "::error::publish didn't print a digest for every package"; exit 1; }
+          echo "published=$published" >> "$GITHUB_OUTPUT"
+          echo "Packages: \`$published\`" >> "$GITHUB_STEP_SUMMARY"
+      - name: A draft release per package
+        if: inputs.publish != 'skip'
+        run: |
+          prerelease=()
+          [[ "$VERSION" != *-* ]] || prerelease=(--prerelease)
+          for p in $PACKAGES; do
+            if [ "$(gh release view "$p/v$VERSION" -R "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>/dev/null || echo none)" = true ]; then
+              gh release delete "$p/v$VERSION" -R "$GITHUB_REPOSITORY" --yes
+            fi
+            title="$p v$VERSION"
+            [ "$PUBLISH" = public ] || title="$title (private)"
+            notes="The $p connector, version $VERSION, from commit $COMMIT, for Linux on amd64 and arm64. Apply it with \`openetl connector apply ${NAMESPACE}/$p:$VERSION\`, or \`openetl connector apply github.com/$GITHUB_REPOSITORY/$p@$VERSION\` from this release. \`$p.checksums.txt\` lists each file's SHA-256; in a published release, it and the package are signed with keyless cosign by this repository's release workflow."
+            gh release create "$p/v$VERSION" -R "$GITHUB_REPOSITORY" --draft "${prerelease[@]}" --target "$COMMIT" \
+              --title "$title" --notes "$notes" \
+              "$DIST/$p"-* "$DIST/$p.connector.yaml" "$DIST/$p.checksums.txt" "$DIST/THIRD-PARTY-NOTICES.txt"
+          done
+
+  # The only job that can sign, in the release environment.
+  publish:
+    if: inputs.publish == 'public'
+    needs: package
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: write
+      packages: write
+      id-token: write
+    env:
+      VERSION: ${{ needs.package.outputs.version }}
+      PACKAGES: ${{ needs.package.outputs.packages }}
+      PUBLISHED: ${{ needs.package.outputs.published }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v3.1.3
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Sign each package and its checksums
+        run: |
+          for ref in $PUBLISHED; do
+            cosign sign --yes "$ref"
+          done
+          for p in $PACKAGES; do
+            mkdir -p "sig/$p"
+            gh release download "$p/v$VERSION" -R "$GITHUB_REPOSITORY" -p "$p.checksums.txt" -D "sig/$p"
+            cosign sign-blob --yes --bundle "sig/$p/$p.checksums.txt.sigstore.json" "sig/$p/$p.checksums.txt"
+            gh release upload "$p/v$VERSION" -R "$GITHUB_REPOSITORY" --clobber "sig/$p/$p.checksums.txt.sigstore.json"
+          done
+      - name: Publish the releases
+        run: |
+          for p in $PACKAGES; do
+            gh release edit "$p/v$VERSION" -R "$GITHUB_REPOSITORY" --draft=false
+            echo "Released: $(gh release view "$p/v$VERSION" -R "$GITHUB_REPOSITORY" --json url --jq .url)" >> "$GITHUB_STEP_SUMMARY"
+          done
+      - name: Anyone can pull the packages
+        run: |
+          for p in $PACKAGES index; do
+            repository=$GITHUB_REPOSITORY/$p
+            reference=$VERSION
+            [ "$p" != index ] || reference=$(echo "$PACKAGES" | awk '{print $1}')
+            t=$(curl -s "https://ghcr.io/token?scope=repository:$repository:pull&service=ghcr.io" | jq -r '.token // ""')
+            code=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $t" \
+              -H 'Accept: application/vnd.oci.image.manifest.v1+json' "https://ghcr.io/v2/$repository/manifests/$reference")
+            if [ "$code" != 200 ]; then
+              settings="https://github.com/orgs/$GITHUB_REPOSITORY_OWNER/packages/container/${GITHUB_REPOSITORY#*/}%2F$p/settings"
+              echo "::warning::ghcr.io/$repository is private: make it public in $settings"
+              echo "**ghcr.io/$repository is private:** make it public in [its settings]($settings)." >> "$GITHUB_STEP_SUMMARY"
+            fi
+          done

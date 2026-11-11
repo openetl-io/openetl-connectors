@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Deletes a release candidate, from the repository's root: each package's
 # version in the registry, its index card when that was the package's only
-# version, and its draft release. Needs gh with write access to the repository
-# and to its packages. It refuses a version that's been published.
+# version, the packages a private release put in candidates/VERSION/, and the
+# draft releases. Needs gh with write access to the repository and to its
+# packages. It refuses a version that's been published.
 set -euo pipefail
 
 version=${1:?usage: candidate-discard.sh VERSION}
@@ -49,6 +50,8 @@ done
 for p in $packages; do
   remove "$namespace/$p" "$version"
   remove "$namespace/index" "$p"
+  remove "candidates/$version/$namespace/$p" "$version"
+  remove "candidates/$version/$namespace/index" "$p"
 done
 for p in $packages; do
   if [ "$(gh release view "$p/v$version" -R "$repo" --json isDraft --jq .isDraft 2>/dev/null || echo none)" = true ]; then
