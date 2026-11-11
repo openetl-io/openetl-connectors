@@ -37,7 +37,7 @@ A continuous pipeline commits every minute unless it sets its own `delivery.comm
 
 Without `accessKeyId` and `secretAccessKey`, the destination uses the AWS SDK's default credential chain, which finds only what the runner gives it. By default, the runner gives it no AWS credentials. Name an IAM role in the destination's `aws.role`, which the runner assumes for it, on EC2 and EKS alike. [Run on AWS](https://github.com/openetl-io/openetl/blob/main/docs/self-host/aws.md#credentials-for-connectors) explains the setup, and the runner's `inherit` setting. With keys, keep them in secrets, as `{ secret: NAME }`. Keys in the config are used even if the destination names a role.
 
-The credentials need to read, write, copy, delete and list objects under the URL. The destination's check writes and deletes an object under `_openetl/`.
+The credentials need to read, write, copy, delete and list objects under the URL. The destination's check writes and deletes an object under `_openetl/`. If the destination has no AWS credentials, or S3 refuses them, the check and syncs fail with `AUTH_INVALID`, `AUTH_EXPIRED` or `PERMISSION_DENIED`. OpenETL retries only `AUTH_EXPIRED`.
 
 ```yaml
 apiVersion: openetl.io/v1alpha1
