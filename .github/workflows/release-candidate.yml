@@ -1,0 +1,148 @@
+name: release-candidate
+
+# Packages a chosen commit once, with its final version in it, into this
+# repository's packages, ghcr.io/openetl-io/openetl-connectors, with a draft
+# release per package, which makes no tag until it's published. The packages
+# stay private until the release is published. One job, so no build passes
+# through a workflow artifact, which on a public repository anyone signed in
+# can download. Nothing is signed here: keyless signatures go to a public log,
+# so signing waits for publishing. release-discard removes a candidate.
+# Actions are pinned by commit.
+on:
+  workflow_dispatch:
+    inputs: &inputs
+      version:
+        description: The version, without the v, such as 0.1.0-alpha
+        required: true
+        type: string
+      commit:
+        description: The commit to package; empty packages the head of the branch this runs on
+        type: string
+        default: ""
+      openetl:
+        description: openetl's commit or branch, for the CLI that packages these and the SDK they build against
+        type: string
+        default: main
+      replace:
+        description: Discard this version's existing candidate first
+        type: boolean
+        default: false
+      require-ci:
+        description: Require this repository's CI, which runs the conformance kit, to have passed on the commit
+        type: boolean
+        default: true
+  workflow_call:
+    inputs: *inputs
+
+permissions: {}
+
+concurrency:
+  group: release-candidate-${{ inputs.version }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  candidate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      actions: read # the commit's CI
+      contents: write # the drafts, which only a token that can write sees
+      packages: write
+    env:
+      VERSION: ${{ inputs.version }}
+      NAMESPACE: oci://ghcr.io/${{ github.repository }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ inputs.commit || github.sha }}
+          path: openetl-connectors
+      # go.mod replaces the SDK with ../openetl/sdk/go.
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          repository: openetl-io/openetl
+          ref: ${{ inputs.openetl }}
+          path: openetl
+      - name: This version can be released from this commit
+        working-directory: openetl-connectors
+        env:
+          REPLACE: ${{ inputs.replace }}
+          REQUIRE_CI: ${{ inputs.require-ci }}
+        run: |
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || { echo "::error::$VERSION isn't a version such as 0.1.0-alpha"; exit 1; }
+          commit=$(git rev-parse HEAD)
+          if [ "$REQUIRE_CI" = true ]; then
+            passed=$(gh run list -R "$GITHUB_REPOSITORY" -w ci.yml -c "$commit" -s success --json databaseId -q length)
+            [ "$passed" != 0 ] || { echo "::error::ci hasn't passed on $commit"; exit 1; }
+          fi
+          packages=$(dirname */openetl-connector.yaml | tr '\n' ' ')
+          for p in $packages; do
+            if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$p/v$VERSION" > /dev/null 2>&1; then
+              echo "::error::$p/v$VERSION is already tagged"; exit 1
+            fi
+            draft=$(gh release view "$p/v$VERSION" -R "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>/dev/null || echo none)
+            if [ "$draft" = false ]; then
+              echo "::error::$p/v$VERSION is already published"; exit 1
+            fi
+            if [ "$draft" = true ] && [ "$REPLACE" != true ]; then
+              echo "::error::$p/v$VERSION has a candidate; discard it with release-discard, or set replace"; exit 1
+            fi
+          done
+          { echo "COMMIT=$commit"; echo "PACKAGES=$packages"; echo "DIST=$RUNNER_TEMP/dist"; echo "OPENETL=$RUNNER_TEMP/openetl"; } >> "$GITHUB_ENV"
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: openetl-connectors/go.mod
+          cache: false
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: go-release-${{ hashFiles('openetl-connectors/go.sum') }}
+          restore-keys: go-release-
+      - uses: anchore/sbom-action/download-syft@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Package each connector for Linux
+        run: |
+          go -C openetl build -o "$OPENETL" ./cmd/openetl
+          cd openetl-connectors
+          # shellcheck disable=SC2086
+          GOFLAGS="'-ldflags=-s -w'" "$OPENETL" connector package $PACKAGES \
+            --version "$VERSION" --out "$DIST" --platforms linux/amd64,linux/arm64
+          ls -l "$DIST"
+      - name: The notices and SBOMs
+        run: |
+          go -C openetl run ./internal/notices -connectors-only -connectors "$PWD/openetl-connectors" -connectors-work off \
+            -out "$DIST/THIRD-PARTY-NOTICES.txt"
+          for f in "$DIST"/*-linux-*; do
+            syft "file:$f" -o "spdx-json=$f.sbom.json"
+          done
+      - name: Discard the version's previous candidate
+        if: inputs.replace
+        working-directory: openetl-connectors
+        run: .github/candidate-discard.sh "$VERSION"
+      - name: The packages, private until the release is published
+        run: |
+          "$OPENETL" connector publish "$NAMESPACE" "$DIST"/*.connector.yaml
+          for p in $PACKAGES; do
+            "$OPENETL" connector validate --artifact "$NAMESPACE/$p:$VERSION"
+          done
+      - name: A draft release per package
+        run: |
+          prerelease=()
+          [[ "$VERSION" != *-* ]] || prerelease=(--prerelease)
+          for p in $PACKAGES; do
+            (cd "$DIST" && sha256sum "$p"-* "$p.connector.yaml" > "$p.checksums.txt")
+            gh release create "$p/v$VERSION" -R "$GITHUB_REPOSITORY" --draft "${prerelease[@]}" --target "$COMMIT" \
+              --title "$p v$VERSION (candidate)" \
+              --notes "Release candidate of $p v$VERSION: commit $COMMIT. Not published, and no tag exists yet." \
+              "$DIST/$p"-* "$DIST/$p.connector.yaml" "$DIST/$p.checksums.txt" "$DIST/THIRD-PARTY-NOTICES.txt"
+          done

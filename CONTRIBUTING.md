@@ -43,6 +43,23 @@ openetl connector package --tag postgres/v0.2.0
 
 `package` picks the directory whose package is `postgres`, builds each role for every platform into `dist/` (`postgres-source-linux-amd64` and the like), and writes `dist/postgres.connector.yaml`, whose binaries point at the `postgres/v0.2.0` release's assets. The executables and the descriptor are that release's assets, and `openetl connector apply -f postgres.connector.yaml` pins the version. Tags are per package: `postgres/v0.2.0`, `kafka/v0.1.3`.
 
+**A release** is a tag, `vVERSION` such as `v0.1.0-alpha`, on a commit in `main` that `ci` passed, released with the `release` workflow. In the alpha, openetl has the same tag, and its CLI and SDK at that tag build the packages, so tag openetl first.
+
+```sh
+git tag v0.1.0-alpha && git push origin v0.1.0-alpha
+gh workflow run release.yml -f tag=v0.1.0-alpha -f publish=public
+```
+
+It packages every connector for Linux on amd64 and arm64, with checksums, SBOMs and third-party notices. `publish` says what happens to them:
+
+- `public` pushes the packages to `ghcr.io/openetl-io/openetl-connectors` and publishes a release per package, `postgres/v0.1.0-alpha` and so on, which makes those tags. A job in the `release` environment signs each package and its checksums with keyless cosign first. GHCR creates a package private: after the first public release, make each package and `openetl-connectors/index` public in their settings, once.
+- `private` pushes the packages to the private `ghcr.io/openetl-io/candidates/VERSION/openetl-connectors` and puts the files on draft releases. Nothing is signed. `gh workflow run release-discard.yml -f version=VERSION` removes both.
+- `skip` packages and checks everything, and pushes nothing.
+
+Running it again replaces the drafts. It refuses a version that's already released.
+
+**A release candidate** is built once and tested as built. `gh workflow run release-candidate.yml -f version=0.1.0-alpha -f commit=SHA -f openetl=SHA` packages that commit, once `ci` has passed on it, for Linux on amd64 and arm64. The packages go to `ghcr.io/openetl-io/openetl-connectors`, private until the release is published, and each gets a draft release, which makes no tag until it's published. OpenETL's test suites install them from there, as a user does. `gh workflow run release-discard.yml -f version=VERSION` deletes a candidate's versions and drafts, and refuses a version that's been published.
+
 ## Layout
 
 Each package directory holds its `openetl-connector.yaml`, its config schemas and its page, `README.md`.
