@@ -2,12 +2,12 @@ name: release
 
 # Releases one package when its tag is pushed: PACKAGE/vX.Y.Z, or a
 # prerelease, PACKAGE/vX.Y.Z-alpha.N, -beta.N or -rc.N. The tag's commit must
-# be in main or in a branch release-*, and ci must have passed on it; a run of
-# ci still going on it is waited for. It packages that package alone, at the
-# tag, for Linux on amd64 and arm64, pushes it to
-# ghcr.io/OWNER/openetl-connectors/PACKAGE, and puts its files on a draft
-# release, with notes generated from the pull requests since the package's
-# previous tag. Then the job that alone can sign, in the release environment,
+# be in main or in a release branch, release-PACKAGE-X.Y (or release-X.Y), and
+# ci must have passed on it; a run of ci still going on it is waited for. It
+# packages that package alone, at the tag, for Linux on amd64 and arm64,
+# pushes it to ghcr.io/OWNER/openetl-connectors/PACKAGE, and puts its files on
+# a draft release, with notes generated from the pull requests since the
+# package's previous tag. Then the job that alone can sign, in the release environment,
 # signs the package and its checksums with keyless cosign and publishes the
 # release, a prerelease when the version has a suffix. Running it again
 # replaces the draft; it refuses a version that's released.
@@ -98,10 +98,11 @@ jobs:
             esac
           }
           on=
-          for b in main $(gh api --paginate "repos/$GITHUB_REPOSITORY/branches" --jq '.[].name | select(startswith("release-"))'); do
+          branches=$(gh api --paginate "repos/$GITHUB_REPOSITORY/branches" --jq '.[].name | select(test("^release-([a-z0-9-]+-)?[0-9]+\\.[0-9]+$"))')
+          for b in main $branches; do
             if has "$b"; then on=$b; break; fi
           done
-          [ -n "$on" ] || fail "$TAG ($commit) isn't a commit in main or in a branch release-*"
+          [ -n "$on" ] || fail "$TAG ($commit) isn't a commit in main or in a release branch, release-PACKAGE-X.Y"
 
           # ci on the commit: passed, or still running, which is waited for
           # up to an hour.
