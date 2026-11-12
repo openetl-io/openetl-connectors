@@ -87,5 +87,10 @@ runs:
         if has iceberg; then until curl -sf -o /dev/null http://127.0.0.1:8181/v1/config; do sleep 1; done; fi
         if has glue; then until curl -sf -o /dev/null http://127.0.0.1:5000/moto-api/; do sleep 1; done; fi
         if has kafka; then until docker exec kafka /opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 > /dev/null 2>&1; do sleep 1; done; fi
-        if has registry; then until curl -sf -o /dev/null http://127.0.0.1:8081/subjects; do sleep 1; done; fi
+        # Karapace answers reads before it's the primary that takes writes:
+        # it's ready once it registers a schema.
+        if has registry; then
+          until curl -sf -o /dev/null -X POST -H 'Content-Type: application/vnd.schemaregistry.v1+json' \
+            --data '{"schema": "\"string\""}' http://127.0.0.1:8081/subjects/openetl-ready/versions; do sleep 1; done
+        fi
         if has kinesis; then until curl -sf -o /dev/null http://127.0.0.1:4568/healthcheck; do sleep 1; done; fi
