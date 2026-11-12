@@ -3,7 +3,8 @@ name: nightly
 # Runs ci on main, every package, and checks each package's newest released
 # version, from its registry, ghcr.io/OWNER/openetl-connectors/PACKAGE, with
 # the conformance kit of openetl's main: the CLI from openetl's edge image,
-# which starts each connector as openetl's runner does. The checks are
+# which starts each connector as openetl's runner does, and without which the
+# run fails. The checks are
 # .github/test-packages.sh's, as ci runs them on what main would release. A
 # package with no release yet is left out.
 #
@@ -58,6 +59,8 @@ jobs:
           echo "released=$released" >> "$GITHUB_OUTPUT"
           echo "Checked: $released." >> "$GITHUB_STEP_SUMMARY"
       - uses: ./.github/actions/openetl
+        with:
+          from: edge
       - uses: ./.github/actions/services
       - name: The releases, through the conformance kit
         run: |

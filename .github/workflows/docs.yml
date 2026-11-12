@@ -4,8 +4,8 @@ name: docs
 # secret CLOUDFLARE_DEPLOY_HOOK, and skips when that isn't set. It runs on a
 # push to main that changes what the site reads from here: a package's page
 # and the pages under it, its openetl-connector.yaml, schemas and logo; and
-# from release, once a package's release is published, as the site builds a
-# released package's page from its newest release.
+# from release, once a package's release is published, as the site lists
+# each package's releases. The pages themselves come from main.
 on:
   push:
     branches: [main]

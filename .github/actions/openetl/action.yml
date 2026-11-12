@@ -1,41 +1,91 @@
 name: openetl CLI
 description: >-
-  Copies the openetl CLI of openetl's main out of its image
-  ghcr.io/openetl-io/openetl:edge into $RUNNER_TEMP/openetl-cli, and sets
-  OPENETL to it. Until openetl publishes edge, it takes the CLI of openetl's
-  newest release instead, checked against the release's checksums.
+  Puts the openetl CLI in $RUNNER_TEMP/openetl-cli and sets OPENETL to it.
+  With from edge, it's the CLI of openetl's main, copied out of the image
+  ghcr.io/openetl-io/openetl:edge, and the step fails when that can't be
+  pulled. With from release, it's the CLI of an openetl release, checked
+  against the release's checksums: by default the newest, the first release
+  of openetl that isn't a draft and whose tag is vX.Y.Z or a prerelease's,
+  vX.Y.Z-alpha.N, -beta.N or -rc.N.
+inputs:
+  from:
+    description: edge or release
+    required: true
+  version:
+    description: With from release, the tag of the release to take instead of the newest, such as v0.1.0-alpha
+    required: false
+    default: ""
+outputs:
+  version:
+    description: What the CLI says its version is
+    value: ${{ steps.cli.outputs.version }}
+  source:
+    description: Where the CLI came from, the image's digest or the release's tag
+    value: ${{ steps.cli.outputs.source }}
 runs:
   using: composite
   steps:
-    - shell: bash
+    - id: cli
+      shell: bash
       env:
+        FROM: ${{ inputs.from }}
+        VERSION: ${{ inputs.version }}
         IMAGE: ghcr.io/openetl-io/openetl:edge
         GH_TOKEN: ${{ github.token }}
       run: |
         set -euo pipefail
         dir=$RUNNER_TEMP/openetl-cli
         mkdir -p "$dir"
-        if docker pull --quiet "$IMAGE" > /dev/null; then
-          id=$(docker create "$IMAGE")
-          docker cp "$id:/opt/openetl/openetl" "$dir/openetl"
-          docker rm "$id" > /dev/null
-          from="$IMAGE ($(docker image inspect --format '{{index .RepoDigests 0}}' "$IMAGE"))"
-        else
-          # The fallback goes once openetl publishes edge.
-          case $RUNNER_ARCH in
-            X64) arch=amd64 ;;
-            ARM64) arch=arm64 ;;
-            *) echo "::error::openetl has no CLI for $RUNNER_ARCH"; exit 1 ;;
-          esac
-          tag=$(gh release list -R openetl-io/openetl --exclude-drafts --limit 1 --json tagName --jq '.[0].tagName')
-          name=openetl-cli_${tag#v}_linux_$arch
-          gh release download "$tag" -R openetl-io/openetl -p "$name.tar.gz" -p checksums.txt -D "$dir/release"
-          (cd "$dir/release" && awk -v f="$name.tar.gz" '$2 == f' checksums.txt | sha256sum -c -)
-          tar -xzf "$dir/release/$name.tar.gz" -C "$dir/release"
-          mv "$dir/release/$name/openetl" "$dir/openetl"
-          rm -rf "$dir/release"
-          from="openetl's release $tag, as $IMAGE can't be pulled"
-          echo "::notice::The openetl CLI is $from"
-        fi
+        case $FROM in
+          edge)
+            [ -z "$VERSION" ] || { echo "::error::version is for from release; edge is openetl's main"; exit 1; }
+            pulled=
+            for attempt in 1 2 3; do
+              if docker pull --quiet "$IMAGE" > /dev/null; then pulled=1; break; fi
+              [ "$attempt" = 3 ] || sleep $((attempt * 15))
+            done
+            [ -n "$pulled" ] || {
+              echo "::error::Can't pull $IMAGE, the image of openetl's main that this job checks against; there's no fallback. Check that openetl's edge workflow published it and that the image is public."
+              exit 1
+            }
+            id=$(docker create "$IMAGE")
+            docker cp "$id:/opt/openetl/openetl" "$dir/openetl"
+            docker rm "$id" > /dev/null
+            source="$IMAGE ($(docker image inspect --format '{{index .RepoDigests 0}}' "$IMAGE"))"
+            ;;
+          release)
+            case $RUNNER_ARCH in
+              X64) arch=amd64 ;;
+              ARM64) arch=arm64 ;;
+              *) echo "::error::openetl has no CLI for $RUNNER_ARCH"; exit 1 ;;
+            esac
+            # A release's tag, or a prerelease's; the SDK's, sdk/go/v*, aren't.
+            re='^v[0-9]+\.[0-9]+\.[0-9]+(-(alpha|beta|rc)(\.[0-9]+)?)?$'
+            tag=$VERSION
+            if [ -z "$tag" ]; then
+              tag=$(gh release list -R openetl-io/openetl --exclude-drafts --limit 100 --json tagName --jq '.[].tagName' |
+                grep -E -m 1 "$re" || true)
+              [ -n "$tag" ] || { echo "::error::openetl has no published release"; exit 1; }
+            fi
+            [[ "$tag" =~ $re ]] || { echo "::error::$tag isn't an openetl release's tag, such as v0.1.0 or v0.1.0-alpha.1"; exit 1; }
+            name=openetl-cli_${tag#v}_linux_$arch
+            gh release download "$tag" -R openetl-io/openetl -p "$name.tar.gz" -p checksums.txt -D "$dir/release"
+            sum=$(awk -v f="$name.tar.gz" '$2 == f' "$dir/release/checksums.txt")
+            if [ -z "$sum" ] || ! (cd "$dir/release" && sha256sum -c - <<<"$sum"); then
+              echo "::error::$name.tar.gz isn't in $tag's checksums.txt, or doesn't match it"
+              exit 1
+            fi
+            tar -xzf "$dir/release/$name.tar.gz" -C "$dir/release"
+            mv "$dir/release/$name/openetl" "$dir/openetl"
+            rm -rf "$dir/release"
+            source="openetl's release $tag"
+            ;;
+          *)
+            echo "::error::from is edge or release, not '$FROM'"
+            exit 1
+            ;;
+        esac
+        version=$("$dir/openetl" version)
         echo "OPENETL=$dir/openetl" >> "$GITHUB_ENV"
-        echo "The openetl CLI: $("$dir/openetl" version), from $from." | tee -a "$GITHUB_STEP_SUMMARY"
+        { echo "version=$version"; echo "source=$source"; } >> "$GITHUB_OUTPUT"
+        echo "The openetl CLI: $version, from $source." | tee -a "$GITHUB_STEP_SUMMARY"

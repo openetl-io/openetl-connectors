@@ -22,8 +22,9 @@ name: ci
 # ci passed, and release checks that its package's job passed.
 #
 # The SDK is the version go.mod requires, and the openetl CLI is main's, from
-# openetl's edge image (.github/actions/openetl). Caches are saved from pushes
-# alone; pull requests restore them.
+# openetl's edge image (.github/actions/openetl); a package's job fails when
+# that image can't be pulled. Caches are saved from pushes alone; pull
+# requests restore them.
 on:
   pull_request:
   push:
@@ -195,6 +196,8 @@ jobs:
             go-
       - if: matrix.kind == 'package'
         uses: ./.github/actions/openetl
+        with:
+          from: edge
       - name: Its openetl-connector.yaml
         if: matrix.kind == 'package'
         run: |

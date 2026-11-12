@@ -11,13 +11,16 @@ name: release
 # previous tag. Then the job that alone can sign, in the release environment,
 # signs the package and its checksums with keyless cosign and publishes the
 # release, a prerelease when the version has a suffix, and the docs site
-# builds again (docs.yml). Running it again replaces the draft; it refuses a
-# version that's released. The SDK is the version go.mod requires, and the
-# openetl CLI the one ci uses, main's (.github/actions/openetl).
+# builds again (docs.yml), as it lists each package's releases. Running it
+# again replaces the draft; it refuses a version that's released. The SDK is
+# the version go.mod requires, and the openetl CLI the one of openetl's newest
+# release, not ci's edge (.github/actions/openetl), so the package's
+# descriptor is one a released openetld reads; the run's summary names it.
 #
 # Dispatched on a branch, it's a dry run of the tag given: it packages that
 # package at the branch's head and runs the checks, which only warn, and
-# pushes, uploads and signs nothing.
+# pushes, uploads and signs nothing. Its input openetl packages with another
+# openetl release's CLI.
 #
 # GHCR creates a package private: after a package's first release, make it
 # public in its settings, once; the run's summary says so. One job builds and
@@ -33,6 +36,10 @@ on:
       tag:
         description: The tag a push would release, such as postgres/v0.2.0-alpha.1; packaged at this branch's head, and nothing is published
         required: true
+        type: string
+      openetl:
+        description: The openetl release whose CLI packages it, such as v0.1.0-alpha; by default the newest
+        required: false
         type: string
 
 permissions: {}
@@ -147,8 +154,12 @@ jobs:
             ~/go/pkg/mod
           key: go-release-${{ hashFiles('openetl-connectors/go.sum') }}
           restore-keys: go-release-
-      # The CLI ci checks the packages with.
-      - uses: ./openetl-connectors/.github/actions/openetl
+      # The CLI of openetl's newest release, or on a dry run the one asked for.
+      - id: openetl
+        uses: ./openetl-connectors/.github/actions/openetl
+        with:
+          from: release
+          version: ${{ github.event_name == 'push' && '' || inputs.openetl }}
       - uses: anchore/sbom-action/download-syft@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
       - if: env.DRY_RUN != 'true'
         uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
@@ -157,10 +168,14 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ github.token }}
       - name: Package it for Linux
+        env:
+          OPENETL_VERSION: ${{ steps.openetl.outputs.version }}
+          OPENETL_SOURCE: ${{ steps.openetl.outputs.source }}
         run: |
           cd openetl-connectors
           GOFLAGS="'-ldflags=-s -w'" "$OPENETL" connector package --tag "$TAG" --out "$DIST" --platforms linux/amd64,linux/arm64
           ls -l "$DIST"
+          echo "Packaged with the openetl CLI $OPENETL_VERSION, from $OPENETL_SOURCE." >> "$GITHUB_STEP_SUMMARY"
       # The notices cover every connector's dependencies, a superset of this
       # package's.
       - name: The notices, SBOMs and checksums
@@ -251,7 +266,8 @@ jobs:
             fi
           done
 
-  # The docs site builds a released package's page from its newest release.
+  # The docs site lists each package's releases and their notes; its pages
+  # come from main.
   docs:
     needs: publish
     uses: ./.github/workflows/docs.yml
