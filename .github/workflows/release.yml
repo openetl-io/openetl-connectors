@@ -7,12 +7,12 @@ name: release
 # packages that package alone, at the tag, for Linux on amd64 and arm64,
 # pushes it to ghcr.io/OWNER/openetl-connectors/PACKAGE, and puts its files on
 # a draft release, with notes generated from the pull requests since the
-# package's previous tag. Then the job that alone can sign, in the release environment,
-# signs the package and its checksums with keyless cosign and publishes the
-# release, a prerelease when the version has a suffix. Running it again
-# replaces the draft; it refuses a version that's released. The SDK is the
-# version go.mod requires, and the openetl CLI the one ci uses, main's
-# (.github/actions/openetl).
+# package's previous tag. Then the job that alone can sign, in the release
+# environment, signs the package and its checksums with keyless cosign and
+# publishes the release, a prerelease when the version has a suffix, and the
+# docs site builds again (docs.yml). Running it again replaces the draft; it
+# refuses a version that's released. The SDK is the version go.mod requires,
+# and the openetl CLI the one ci uses, main's (.github/actions/openetl).
 #
 # Dispatched on a branch, it's a dry run of the tag given: it packages that
 # package at the branch's head and runs the checks, which only warn, and
@@ -240,3 +240,10 @@ jobs:
               echo "**ghcr.io/$repository is private:** make it public in [its settings]($settings)." >> "$GITHUB_STEP_SUMMARY"
             fi
           done
+
+  # The docs site builds a released package's page from its newest release.
+  docs:
+    needs: publish
+    uses: ./.github/workflows/docs.yml
+    secrets:
+      CLOUDFLARE_DEPLOY_HOOK: ${{ secrets.CLOUDFLARE_DEPLOY_HOOK }}

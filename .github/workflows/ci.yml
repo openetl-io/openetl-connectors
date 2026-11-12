@@ -2,9 +2,7 @@ name: ci
 
 # The one check a pull request needs is the job ci, which fails when a job it
 # needs failed or was cancelled. It runs on a release branch too, release-X.Y
-# or release-PACKAGE-X.Y, as a release is tagged where ci passed; and on a
-# backport's branch, which the backport workflow pushes before it opens the
-# pull request, which then starts no run of its own.
+# or release-PACKAGE-X.Y, as a release is tagged where ci passed.
 #
 # The SDK is the version go.mod requires, and the openetl CLI is main's, from
 # openetl's edge image (.github/actions/openetl). Caches are saved from pushes
@@ -12,7 +10,7 @@ name: ci
 on:
   pull_request:
   push:
-    branches: [main, "release-[0-9]+.[0-9]+", "release-*-[0-9]+.[0-9]+", "backport/**"]
+    branches: [main, "release-[0-9]+.[0-9]+", "release-*-[0-9]+.[0-9]+"]
 
 permissions:
   contents: read
