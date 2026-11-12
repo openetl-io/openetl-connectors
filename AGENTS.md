@@ -13,7 +13,7 @@ For people and coding agents. [CONTRIBUTING.md](CONTRIBUTING.md) has how to buil
 - **A destination's commit is its own:** staging, applying, markers, fencing and catalogs live in its `Writer` (`PreCommit`, `Commit`, `Recover`), not in openetl's runner or engine.
 - **No connector changes a column's type by itself,** on targets, staging or anything that becomes the user's table, topic schema or files, unless the pipeline's spec allows the change. A destination refuses it through `destination.RefusedColumn`, whose `Fix` says what a person can do to make the change (Postgres's `ALTER TABLE … ALTER COLUMN … TYPE`), and the stream holds the column where it can. New columns still land.
 - **Each package has versions of its own.** A release is its tag, `PACKAGE/vX.Y.Z` or a prerelease's `PACKAGE/vX.Y.Z-alpha.N`, `-beta.N` or `-rc.N`, pushed; nothing committed names a version. [CONTRIBUTING.md](CONTRIBUTING.md#release) has how.
-- Each connector runs the SDK's conformance suite (`sdk/go/conformance`) in its `conformance_test.go`. A new connector does too.
+- Each connector runs the SDK's conformance suite (`sdk/go/conformance`) in its `conformance_test.go`. A new connector does too, and needs what [CONTRIBUTING.md](CONTRIBUTING.md#a-new-connector) lists for CI to check it.
 - **Comments** only where they're needed: contracts, behaviour that isn't obvious, units, and what nil or zero means. Don't restate names, and don't point to documents outside these repositories.
 - **No `//nolint`.** Fix what the linter found; for integer conversions, bound the value first or make the types match.
 

@@ -1,8 +1,25 @@
 name: ci
 
-# The one check a pull request needs is the job ci, which fails when a job it
-# needs failed or was cancelled. It runs on a release branch too, release-X.Y
-# or release-PACKAGE-X.Y, as a release is tagged where ci passed.
+# The one check a pull request needs is the job ci: it fails when a job it
+# needs failed or was cancelled, and passes over one that had nothing to run.
+#
+# check runs on the whole repository: gofmt, vet and a build of everything.
+# Then a job per package, "package NAME", where a package is a top-level
+# directory holding an openetl-connector.yaml: its openetl-connector.yaml,
+# checked by the openetl CLI; the unit tests of its directory and of its
+# executables, cmd/ROLE-NAME; its integration tests, the SDK's conformance
+# suite in its conformance_test.go among them, against only the services it
+# needs (SERVICES below); and the conformance kit on it, packaged as a release
+# packages it (.github/test-packages.sh). Each shared Go package, another
+# top-level directory with Go files, such as records, has a job "shared NAME"
+# with its tests.
+#
+# A pull request runs the packages whose directory or cmd/ROLE-NAME it
+# changes, and every package and shared package when it changes anything else
+# but a file at the root: shared code, go.mod, go.sum, .github/. A push runs
+# them all, as does nightly, which calls this workflow. It runs on a release
+# branch too, release-X.Y or release-PACKAGE-X.Y, as a release is tagged where
+# ci passed, and release checks that its package's job passed.
 #
 # The SDK is the version go.mod requires, and the openetl CLI is main's, from
 # openetl's edge image (.github/actions/openetl). Caches are saved from pushes
@@ -11,6 +28,7 @@ on:
   pull_request:
   push:
     branches: [main, "release-[0-9]+.[0-9]+", "release-*-[0-9]+.[0-9]+"]
+  workflow_call:
 
 permissions:
   contents: read
@@ -56,15 +74,98 @@ jobs:
         run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
       - name: Vet
         run: go vet -tags integration ./...
-      - uses: ./.github/actions/openetl
-      # Each package's openetl-connector.yaml, checked by the openetl CLI.
-      - name: Packages
+      - name: Build
+        run: go build ./...
+
+  packages:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read # the files a pull request changes
+    outputs:
+      matrix: ${{ steps.packages.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v5
+      - name: The packages to check
+        id: packages
+        env:
+          # The services each package's tests need, of what
+          # .github/actions/services starts: postgres, s3, iceberg (which
+          # needs s3), glue, kafka, registry (which needs kafka) and kinesis.
+          # A package that isn't listed gets them all. records is shared.
+          SERVICES: |
+            postgres: postgres
+            kafka: kafka registry
+            kinesis: kinesis kafka registry
+            iceberg: s3 iceberg glue
+            s3: s3
+            records: kafka registry
+          ALL_SERVICES: postgres s3 iceberg glue kafka registry kinesis
+          EVENT: ${{ github.event_name }}
+          PR: ${{ github.event.pull_request.number }}
+          GH_TOKEN: ${{ github.token }}
         run: |
-          # shellcheck disable=SC2046
-          "$OPENETL" connector validate --require author,logo,description,license $(dirname ./*/openetl-connector.yaml)
+          # Each package in the checkout, NAME=DIR; and the shared Go
+          # packages, the other top-level directories with Go files but cmd.
+          packages=() shared=()
+          for f in */openetl-connector.yaml; do
+            packages+=("$(sed -n 's/^name: *//p' "$f")=${f%%/*}")
+          done
+          for d in */; do
+            d=${d%/}
+            if [ "$d" != cmd ] && [ ! -f "$d/openetl-connector.yaml" ] && compgen -G "$d/*.go" > /dev/null; then shared+=("$d"); fi
+          done
+
+          every=true want=" "
+          if [ "$EVENT" = pull_request ]; then
+            every=false
+            files=$(gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/$PR/files" --jq '.[] | .filename, (.previous_filename // empty)')
+            while IFS= read -r f; do
+              [ -n "$f" ] || continue
+              mine=false
+              for p in "${packages[@]}"; do
+                case $f in
+                  "${p#*=}"/* | cmd/*-"${p%%=*}"/*) want="$want${p%%=*} "; mine=true ;;
+                esac
+              done
+              case $mine:$f in
+                true:*) ;;
+                false:go.mod | false:go.sum | false:*/*) every=true; echo "$f is shared: every package" ;;
+              esac
+            done <<<"$files"
+          fi
+
+          # entry KIND NAME DIR is a job of the matrix.
+          entry() {
+            local needs
+            needs=$(awk -v p="$2" -F': *' '$1 == p { print $2 }' <<<"$SERVICES")
+            jq -nc --arg kind "$1" --arg name "$2" --arg dir "$3" --arg services "${needs:-$ALL_SERVICES}" \
+              '{job: "\($kind) \($name)", kind: $kind, name: $name, dir: $dir, services: $services}'
+          }
+          {
+            for p in "${packages[@]}"; do
+              if [ "$every" = true ] || [[ "$want" == *" ${p%%=*} "* ]]; then entry package "${p%%=*}" "${p#*=}"; fi
+            done
+            if [ "$every" = true ]; then
+              for d in "${shared[@]}"; do entry shared "$d" "$d"; done
+            fi
+          } | jq -sc . > "$RUNNER_TEMP/matrix.json"
+          echo "matrix=$(cat "$RUNNER_TEMP/matrix.json")" >> "$GITHUB_OUTPUT"
+          echo "Jobs: $(jq -r 'map(.job) | join(", ") | if . == "" then "none" else . end' "$RUNNER_TEMP/matrix.json")" | tee -a "$GITHUB_STEP_SUMMARY"
 
   test:
+    needs: packages
+    if: needs.packages.outputs.matrix != '[]'
+    name: ${{ matrix.job }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.packages.outputs.matrix) }}
     runs-on: ubuntu-latest
+    env:
+      KIND: ${{ matrix.kind }}
+      NAME: ${{ matrix.name }}
+      DIR: ${{ matrix.dir }}
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-go@v6
@@ -77,9 +178,9 @@ jobs:
           path: |
             ~/.cache/go-build
             ~/go/pkg/mod
-          key: go-test-${{ hashFiles('go.sum') }}
+          key: go-${{ matrix.name }}-${{ hashFiles('go.sum') }}
           restore-keys: |
-            go-test-
+            go-${{ matrix.name }}-
             go-
       - if: github.event_name != 'push'
         uses: actions/cache/restore@v6
@@ -87,24 +188,44 @@ jobs:
           path: |
             ~/.cache/go-build
             ~/go/pkg/mod
-          key: go-test-${{ hashFiles('go.sum') }}
+          key: go-${{ matrix.name }}-${{ hashFiles('go.sum') }}
           restore-keys: |
-            go-test-
+            go-${{ matrix.name }}-
             go-
-      - uses: ./.github/actions/openetl
+      - if: matrix.kind == 'package'
+        uses: ./.github/actions/openetl
+      - name: Its openetl-connector.yaml
+        if: matrix.kind == 'package'
+        run: |
+          "$OPENETL" connector validate --require author,logo,description,license "./$DIR"
+      # A package's directory and its executables, cmd/ROLE-NAME.
+      - name: Its Go packages
+        run: |
+          shopt -s nullglob
+          pkgs=("./$DIR/...")
+          [ "$KIND" != package ] || pkgs+=(./cmd/*-"$NAME")
+          echo "PKGS=${pkgs[*]}" >> "$GITHUB_ENV"
+          echo "${pkgs[*]}"
+      - name: Unit tests
+        run: |
+          # shellcheck disable=SC2086
+          go test -race $PKGS
       - uses: ./.github/actions/services
-      - name: Tests, against Postgres, the Iceberg catalogs, Kafka and Kinesis
+        with:
+          services: ${{ matrix.services }}
+      - name: Integration tests, and the SDK's conformance suite
         env:
-          OPENETL_TEST_GLUE_ENDPOINT: http://127.0.0.1:5000
-        run: go test -race -tags integration -count=1 ./...
-      # What a release publishes, for this runner's platform, checked with
-      # the conformance kit as anyone checks a package.
-      - name: Packages, through the conformance kit
-        run: .github/test-packages.sh
+          OPENETL_TEST_GLUE_ENDPOINT: ${{ contains(format(' {0} ', matrix.services), ' glue ') && 'http://127.0.0.1:5000' || '' }}
+        run: |
+          # shellcheck disable=SC2086
+          go test -race -tags integration -count=1 $PKGS
+      - name: Packaged as a release packages it, through the conformance kit
+        if: matrix.kind == 'package'
+        run: .github/test-packages.sh "$NAME"
 
   ci:
     if: always()
-    needs: [check, test]
+    needs: [check, packages, test]
     runs-on: ubuntu-latest
     steps:
       - name: Every job it needs passed
