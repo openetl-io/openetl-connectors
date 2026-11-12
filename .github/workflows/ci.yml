@@ -17,8 +17,11 @@ on:
 permissions:
   contents: read
 
+# A newer push to a pull request cancels its older run. A push to a branch
+# runs in a group of its own, so it never waits behind another or is
+# cancelled by one: a release needs ci to have passed on its commit.
 concurrency:
-  group: ci-${{ github.event.pull_request.number || github.ref }}
+  group: ${{ github.event_name == 'pull_request' && format('ci-pr-{0}', github.event.pull_request.number) || format('ci-run-{0}', github.run_id) }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
