@@ -3,7 +3,7 @@
 The official connectors for [OpenETL](https://github.com/openetl-io/openetl): the programs that read from and write to the systems OpenETL copies data between. Each one has a page with what it reads or writes, how to set it up, and what it does when a source's schema changes.
 
 > [!NOTE]
-> The connectors are in alpha, like OpenETL. In the alpha, they have the same version as OpenETL, such as `0.1.0-alpha`. Their config, and the protocol between OpenETL and its connectors, can change between releases.
+> The connectors are in alpha, like OpenETL. Each has versions of its own, such as `0.1.0-alpha`, released when it changes. Their config, and the protocol between OpenETL and its connectors, can change between releases.
 
 ## Connectors
 
@@ -25,15 +25,15 @@ Each connector is a package in the official registry, `oci://ghcr.io/openetl-io/
 openetl connector catalog
 ```
 
-Install one with the command that the catalog shows for it:
+Install one with the command that the catalog shows for it, which names its newest version:
 
 ```sh
-openetl connector apply oci://ghcr.io/openetl-io/openetl-connectors/postgres:0.1.0-alpha
+openetl connector apply oci://ghcr.io/openetl-io/openetl-connectors/postgres:VERSION
 ```
 
 A source or destination in OpenETL then names its connector, such as `connector: postgres`, with the config that the connector's page describes. The [quickstart](https://github.com/openetl-io/openetl/blob/main/docs/get-started/quickstart.md) installs the Postgres connector and runs a pipeline into Postgres. [Choose and manage connectors](https://github.com/openetl-io/openetl/blob/main/docs/pipelines/connectors.md) covers versions and other registries, and [OpenETL's docs](https://github.com/openetl-io/openetl/blob/main/docs/index.md) cover pipelines.
 
-Each package's executables, checksums and signatures are also on its GitHub release, such as [`postgres/v0.1.0-alpha`](https://github.com/openetl-io/openetl-connectors/releases/tag/postgres/v0.1.0-alpha).
+Each version's executables, checksums and signatures are also on its [GitHub release](https://github.com/openetl-io/openetl-connectors/releases), such as `postgres/v0.1.0-alpha`, with what changed in it.
 
 ## Contributing
 
