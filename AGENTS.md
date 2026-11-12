@@ -5,7 +5,7 @@ For people and coding agents. [CONTRIBUTING.md](CONTRIBUTING.md) has how to buil
 ## Before a commit
 
 - `git config core.hooksPath .githooks` once: the pre-commit hook runs gofmt and `go vet -tags integration` on the packages a commit touches, as CI does.
-- Work on a branch from `main` and open a pull request. A change that needs openetl's SDK or protocol too goes on a branch of the same name in both repositories: CI checks a pull request here against openetl's branch of its name when there is one, and against `main` otherwise.
+- Work on a branch from `main` and open a pull request. A change that needs openetl's SDK or protocol too lands in openetl first, compatibly; then a pull request here moves `go.mod` to the SDK that has it, a release or a pseudo-version of openetl's commit (`go get github.com/openetl-io/openetl/sdk/go@COMMIT`). CI checks a pull request against that SDK, with the `openetl` CLI of openetl's `main`.
 
 ## Rules
 

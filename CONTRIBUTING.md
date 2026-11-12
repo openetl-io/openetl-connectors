@@ -4,10 +4,14 @@ Thanks for helping. For a large change, open an issue first, so we can agree on 
 
 ## Build
 
-The connectors build against the Go SDK in a checkout of openetl next to this one (`../openetl`):
-
 ```sh
 go build -o bin/ ./cmd/...
+```
+
+The connectors build against the version of openetl's Go SDK, `github.com/openetl-io/openetl/sdk/go`, that `go.mod` requires: a release, `sdk/go/vX.Y.Z`, or between releases a pseudo-version of an openetl commit. To build against a checkout of openetl instead, while changing the SDK, say, use a workspace, which git ignores here:
+
+```sh
+go work init . ../openetl/sdk/go
 ```
 
 From openetl, `make connectors` builds them into its `bin/connectors`, against that checkout's SDK.
@@ -32,6 +36,10 @@ The Kafka tests need a broker at `OPENETL_TEST_KAFKA_BROKERS` (default `127.0.0.
 
 The Kinesis tests need a Kinesis endpoint at `OPENETL_TEST_KINESIS_ENDPOINT` (default `http://127.0.0.1:4568`), such as kinesis-mock's, which openetl's compose file runs, and the schema registry.
 
+## CI
+
+`ci` runs on every pull request and on pushes to `main` and release branches: gofmt, `go vet`, `openetl connector validate`, the tests against Postgres, the Iceberg catalogs, Kafka and Kinesis, and each package, as a release packages it, through the conformance kit (`.github/test-packages.sh`). Its job `ci` passes when every other job did, and is the one check a pull request needs. The `openetl` CLI it uses is openetl's `main`, copied out of the image `ghcr.io/openetl-io/openetl:edge`, which openetl publishes from `main`; until that image exists, it's the CLI of openetl's newest release. Caches are saved from pushes, and pull requests restore them.
+
 ## Release
 
 Each package directory has an `openetl-connector.yaml`: its name, metadata, and how each role is built. The `openetl` CLI does the rest, so nothing here is specific to this repository:
@@ -49,7 +57,7 @@ openetl connector package --tag postgres/v0.2.0
 git tag postgres/v0.2.0-alpha.1 origin/main && git push origin postgres/v0.2.0-alpha.1
 ```
 
-The push starts the `release` workflow, which releases that package alone. It refuses a tag on a commit that isn't in `main` or in a release branch (below), or that `ci` hasn't passed on, and waits up to an hour for a run of `ci` that's still going; it refuses a version that's released already. Then it packages the package at the tag for Linux on amd64 and arm64, against the SDK and with the CLI of openetl's `main`, as `ci` does, with checksums, SBOMs and third-party notices, pushes it to `ghcr.io/openetl-io/openetl-connectors/PACKAGE`, and publishes the release `PACKAGE/vX.Y.Z` with its files and notes generated from the pull requests since the package's previous tag, as a prerelease when the version has a suffix. A job in the `release` environment signs the package and its checksums with keyless cosign first. GHCR creates a new package private: after its first release, make it public in its settings, once; the run's summary says so. A run that failed can run again: it replaces its draft release.
+The push starts the `release` workflow, which releases that package alone. It refuses a tag on a commit that isn't in `main` or in a release branch (below), or that `ci` hasn't passed on, and waits up to an hour for a run of `ci` that's still going; it refuses a version that's released already. Then it packages the package at the tag for Linux on amd64 and arm64, with the SDK that `go.mod` requires and the CLI that `ci` uses, with checksums, SBOMs and third-party notices, pushes it to `ghcr.io/openetl-io/openetl-connectors/PACKAGE`, and publishes the release `PACKAGE/vX.Y.Z` with its files and notes generated from the pull requests since the package's previous tag, as a prerelease when the version has a suffix. A job in the `release` environment signs the package and its checksums with keyless cosign first. GHCR creates a new package private: after its first release, make it public in its settings, once; the run's summary says so. A run that failed can run again: it replaces its draft release.
 
 `gh workflow run release.yml --ref BRANCH -f tag=postgres/v0.2.0-alpha.1` is a dry run: it packages that package at the branch's head and runs the checks, which only warn, and pushes, uploads and signs nothing.
 

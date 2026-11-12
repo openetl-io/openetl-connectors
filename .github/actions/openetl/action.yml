@@ -1,0 +1,41 @@
+name: openetl CLI
+description: >-
+  Copies the openetl CLI of openetl's main out of its image
+  ghcr.io/openetl-io/openetl:edge into $RUNNER_TEMP/openetl-cli, and sets
+  OPENETL to it. Until openetl publishes edge, it takes the CLI of openetl's
+  newest release instead, checked against the release's checksums.
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        IMAGE: ghcr.io/openetl-io/openetl:edge
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        set -euo pipefail
+        dir=$RUNNER_TEMP/openetl-cli
+        mkdir -p "$dir"
+        if docker pull --quiet "$IMAGE" > /dev/null; then
+          id=$(docker create "$IMAGE")
+          docker cp "$id:/opt/openetl/openetl" "$dir/openetl"
+          docker rm "$id" > /dev/null
+          from="$IMAGE ($(docker image inspect --format '{{index .RepoDigests 0}}' "$IMAGE"))"
+        else
+          # The fallback goes once openetl publishes edge.
+          case $RUNNER_ARCH in
+            X64) arch=amd64 ;;
+            ARM64) arch=arm64 ;;
+            *) echo "::error::openetl has no CLI for $RUNNER_ARCH"; exit 1 ;;
+          esac
+          tag=$(gh release list -R openetl-io/openetl --exclude-drafts --limit 1 --json tagName --jq '.[0].tagName')
+          name=openetl-cli_${tag#v}_linux_$arch
+          gh release download "$tag" -R openetl-io/openetl -p "$name.tar.gz" -p checksums.txt -D "$dir/release"
+          (cd "$dir/release" && awk -v f="$name.tar.gz" '$2 == f' checksums.txt | sha256sum -c -)
+          tar -xzf "$dir/release/$name.tar.gz" -C "$dir/release"
+          mv "$dir/release/$name/openetl" "$dir/openetl"
+          rm -rf "$dir/release"
+          from="openetl's release $tag, as $IMAGE can't be pulled"
+          echo "::notice::The openetl CLI is $from"
+        fi
+        echo "OPENETL=$dir/openetl" >> "$GITHUB_ENV"
+        echo "The openetl CLI: $("$dir/openetl" version), from $from." | tee -a "$GITHUB_STEP_SUMMARY"
