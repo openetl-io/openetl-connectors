@@ -1,55 +1,41 @@
 name: release
 
-# Releases a tag that's already pushed, vVERSION such as v0.1.0-alpha, on a
-# commit that ci passed, in main or in its release line's branch,
-# release-X.Y. It packages every connector at that commit
-# for Linux on amd64 and arm64, with openetl's CLI and SDK at openetl's tag of
-# the same name, and then, by `publish`:
+# Releases one package when its tag is pushed: PACKAGE/vX.Y.Z, or a
+# prerelease, PACKAGE/vX.Y.Z-alpha.N, -beta.N or -rc.N. The tag's commit must
+# be in main or in a release branch, release-PACKAGE-X.Y (or release-X.Y), and
+# ci must have passed on it; a run of ci still going on it is waited for. It
+# packages that package alone, at the tag, for Linux on amd64 and arm64,
+# pushes it to ghcr.io/OWNER/openetl-connectors/PACKAGE, and puts its files on
+# a draft release, with notes generated from the pull requests since the
+# package's previous tag. Then the job that alone can sign, in the release environment,
+# signs the package and its checksums with keyless cosign and publishes the
+# release, a prerelease when the version has a suffix. Running it again
+# replaces the draft; it refuses a version that's released.
 #
-#   public   pushes the packages to ghcr.io/OWNER/openetl-connectors and puts
-#            each package's files on a draft release PACKAGE/vVERSION, the tag
-#            OpenETL's github.com/OWNER/REPO/PACKAGE@VERSION references read;
-#            then, in the job that alone may sign, signs each package and its
-#            checksums with keyless cosign and publishes the releases, which
-#            makes their tags. Then it points release-X.Y at the release (see
-#            the branch job).
-#   private  pushes the packages to the private ghcr.io/OWNER/candidates/
-#            VERSION/openetl-connectors and puts the files on draft releases.
-#            Nothing is signed, as keyless signatures go to a public log.
-#            release-discard VERSION removes both.
-#   skip     packages and checks everything, and pushes and uploads nothing.
+# Dispatched on a branch, it's a dry run of the tag given: it packages that
+# package at the branch's head and runs the checks, which only warn, and
+# pushes, uploads and signs nothing.
 #
-# Running it again replaces the drafts; it refuses a version that's released.
-# GHCR creates a package private: after the first public release, make each
-# package and openetl-connectors/index public in its settings, once. One job
-# builds and uploads, so no build passes through a workflow artifact, which on
-# a public repository anyone signed in can download. Actions are pinned by
-# commit.
+# GHCR creates a package private: after a package's first release, make it
+# public in its settings, once; the run's summary says so. One job builds and
+# uploads, so no build passes through a workflow artifact, which on a public
+# repository anyone signed in can download. Actions are pinned by commit.
 on:
+  push:
+    tags:
+      - "*/v[0-9]+.[0-9]+.[0-9]+"
+      - "*/v[0-9]+.[0-9]+.[0-9]+-*"
   workflow_dispatch:
     inputs:
       tag:
-        description: The tag to release, pushed first, such as v0.1.0-alpha
+        description: The tag a push would release, such as postgres/v0.2.0-alpha.1; packaged at this branch's head, and nothing is published
         required: true
         type: string
-      publish:
-        description: "public: signed, published releases; private: drafts and private packages; skip: package and check only"
-        type: choice
-        options: [public, private, skip]
-        default: public
-      openetl:
-        description: openetl's tag, commit or branch, for the CLI that packages these and the SDK they build against; empty uses the same tag
-        type: string
-        default: ""
-      require-ci:
-        description: Require this repository's CI, which runs the conformance kit, to have passed on the tag's commit
-        type: boolean
-        default: true
 
 permissions: {}
 
 concurrency:
-  group: release-${{ inputs.tag }}
+  group: release-${{ github.event_name == 'push' && github.ref_name || inputs.tag }}
   cancel-in-progress: false
 
 defaults:
@@ -59,70 +45,84 @@ defaults:
 jobs:
   package:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 120
     permissions:
-      actions: read # the commit's CI
-      contents: write # the drafts, which only a token that can write sees
+      actions: read # the commit's ci
+      contents: write # the draft, which only a token that can write sees
       packages: write
     outputs:
+      tag: ${{ steps.check.outputs.tag }}
+      package: ${{ steps.check.outputs.package }}
       version: ${{ steps.check.outputs.version }}
-      commit: ${{ steps.check.outputs.commit }}
-      branch: ${{ steps.check.outputs.branch }}
-      packages: ${{ steps.check.outputs.packages }}
       published: ${{ steps.publish.outputs.published }}
     env:
-      TAG: ${{ inputs.tag }}
-      PUBLISH: ${{ inputs.publish }}
+      TAG: ${{ github.event_name == 'push' && github.ref_name || inputs.tag }}
+      DRY_RUN: ${{ github.event_name != 'push' }}
+      NAMESPACE: oci://ghcr.io/${{ github.repository }}
       GH_TOKEN: ${{ github.token }}
     steps:
-      - name: The tag names a version
+      - name: The tag names a package's version
         run: |
-          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || { echo "::error::$TAG isn't a tag such as v0.1.0-alpha"; exit 1; }
+          re='^([a-z0-9][a-z0-9-]*)/v([0-9]+\.[0-9]+\.[0-9]+(-(alpha|beta|rc)\.[0-9]+)?)$'
+          [[ "$TAG" =~ $re ]] || { echo "::error::$TAG isn't a tag such as postgres/v0.2.0 or postgres/v0.2.0-alpha.1"; exit 1; }
+          { echo "PACKAGE=${BASH_REMATCH[1]}"; echo "VERSION=${BASH_REMATCH[2]}"
+            echo "DIST=$RUNNER_TEMP/dist"; echo "OPENETL=$RUNNER_TEMP/openetl"; } >> "$GITHUB_ENV"
+      # The tag, or on a dry run the branch.
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
-          ref: refs/tags/${{ inputs.tag }}
           path: openetl-connectors
-      # go.mod replaces the SDK with ../openetl/sdk/go.
+      # go.mod replaces the SDK with ../openetl/sdk/go: main's, as ci builds
+      # against, with the CLI that packages it.
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           repository: openetl-io/openetl
-          ref: ${{ inputs.openetl || inputs.tag }}
+          ref: main
           path: openetl
       - name: This tag can be released
         id: check
         working-directory: openetl-connectors
-        env:
-          REQUIRE_CI: ${{ inputs.require-ci }}
-          OWNER: ${{ github.repository_owner }}
         run: |
-          version=${TAG#v}
+          # On a dry run, a check that fails only warns.
+          fail() {
+            if [ "$DRY_RUN" = true ]; then echo "::warning::$1"; else echo "::error::$1"; exit 1; fi
+          }
           commit=$(git rev-parse HEAD)
-          branch=release-$(cut -d. -f1-2 <<< "$version")
-          # Whether the commit is in branch $1; a branch that doesn't exist has none.
+          grep -qx "name: $PACKAGE" ./*/openetl-connector.yaml 2>/dev/null ||
+            { echo "::error::no openetl-connector.yaml here names the package $PACKAGE"; exit 1; }
+
+          # Whether the commit is in branch $1.
           has() {
             case $(gh api "repos/$GITHUB_REPOSITORY/compare/$1...$commit" --jq .status 2>/dev/null || true) in
               identical | behind) return 0 ;;
               *) return 1 ;;
             esac
           }
-          has main || has "$branch" || { echo "::error::$TAG ($commit) isn't a commit in main or $branch"; exit 1; }
-          if [ "$REQUIRE_CI" = true ]; then
-            passed=$(gh run list -R "$GITHUB_REPOSITORY" -w ci.yml -c "$commit" -s success --json databaseId -q length)
-            [ "$passed" != 0 ] || { echo "::error::ci hasn't passed on $commit"; exit 1; }
-          fi
-          packages=$(dirname */openetl-connector.yaml | tr '\n' ' ')
-          for p in $packages; do
-            draft=$(gh release view "$p/v$version" -R "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>/dev/null || echo none)
-            [ "$draft" != false ] || { echo "::error::$p/v$version is already released"; exit 1; }
+          on=
+          branches=$(gh api --paginate "repos/$GITHUB_REPOSITORY/branches" --jq '.[].name | select(test("^release-([a-z0-9-]+-)?[0-9]+\\.[0-9]+$"))')
+          for b in main $branches; do
+            if has "$b"; then on=$b; break; fi
           done
-          case $PUBLISH in
-            public) namespace=oci://ghcr.io/$GITHUB_REPOSITORY ;;
-            private) namespace=oci://ghcr.io/$OWNER/candidates/$version/${GITHUB_REPOSITORY#*/} ;;
-            skip) namespace= ;;
-          esac
-          { echo "VERSION=$version"; echo "COMMIT=$commit"; echo "PACKAGES=$packages"; echo "NAMESPACE=$namespace"
-            echo "DIST=$RUNNER_TEMP/dist"; echo "OPENETL=$RUNNER_TEMP/openetl"; } >> "$GITHUB_ENV"
-          { echo "version=$version"; echo "commit=$commit"; echo "branch=$branch"; echo "packages=$packages"; } >> "$GITHUB_OUTPUT"
+          [ -n "$on" ] || fail "$TAG ($commit) isn't a commit in main or in a release branch, release-PACKAGE-X.Y"
+
+          # ci on the commit: passed, or still running, which is waited for
+          # up to an hour.
+          deadline=$((SECONDS + 3600))
+          while :; do
+            runs=$(gh run list -R "$GITHUB_REPOSITORY" -w ci.yml -c "$commit" --json status,conclusion)
+            if jq -e 'any(.[]; .conclusion == "success")' <<<"$runs" > /dev/null; then break; fi
+            if [ "$DRY_RUN" != true ] && [ "$SECONDS" -lt "$deadline" ] && jq -e 'any(.[]; .status != "completed")' <<<"$runs" > /dev/null; then
+              echo "ci is running on $commit; waiting for it"
+              sleep 60
+              continue
+            fi
+            fail "ci hasn't passed on $commit"
+            break
+          done
+
+          draft=$(gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>/dev/null || echo none)
+          [ "$draft" != false ] || fail "$TAG is already released"
+          { echo "COMMIT=$commit"; echo "DRAFT=$draft"; } >> "$GITHUB_ENV"
+          { echo "tag=$TAG"; echo "package=$PACKAGE"; echo "version=$VERSION"; } >> "$GITHUB_OUTPUT"
       - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
           go-version-file: openetl-connectors/go.mod
@@ -135,63 +135,61 @@ jobs:
           key: go-release-${{ hashFiles('openetl-connectors/go.sum') }}
           restore-keys: go-release-
       - uses: anchore/sbom-action/download-syft@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
-      - if: inputs.publish != 'skip'
+      - if: env.DRY_RUN != 'true'
         uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ github.token }}
-      - name: Package each connector for Linux
+      - name: Package it for Linux
         run: |
           go -C openetl build -o "$OPENETL" ./cmd/openetl
           cd openetl-connectors
-          # shellcheck disable=SC2086
-          GOFLAGS="'-ldflags=-s -w'" "$OPENETL" connector package $PACKAGES \
-            --version "$VERSION" --out "$DIST" --platforms linux/amd64,linux/arm64
+          GOFLAGS="'-ldflags=-s -w'" "$OPENETL" connector package --tag "$TAG" --out "$DIST" --platforms linux/amd64,linux/arm64
           ls -l "$DIST"
+      # The notices cover every connector's dependencies, a superset of this
+      # package's.
       - name: The notices, SBOMs and checksums
         run: |
           go -C openetl run ./internal/notices -connectors-only -connectors "$PWD/openetl-connectors" -connectors-work off \
             -out "$DIST/THIRD-PARTY-NOTICES.txt"
-          for f in "$DIST"/*-linux-*; do
+          for f in "$DIST/$PACKAGE"-*-linux-*; do
             syft "file:$f" -o "spdx-json=$f.sbom.json"
           done
-          for p in $PACKAGES; do
-            (cd "$DIST" && sha256sum "$p"-* "$p.connector.yaml" > "$p.checksums.txt")
-          done
-      - name: The packages
+          (cd "$DIST" && sha256sum "$PACKAGE"-* "$PACKAGE.connector.yaml" > "$PACKAGE.checksums.txt")
+      - name: The package
         id: publish
-        if: inputs.publish != 'skip'
+        if: env.DRY_RUN != 'true'
         run: |
-          "$OPENETL" connector publish "$NAMESPACE" "$DIST"/*.connector.yaml | tee "$RUNNER_TEMP/published.txt"
-          for p in $PACKAGES; do
-            "$OPENETL" connector validate --artifact "$NAMESPACE/$p:$VERSION"
-          done
-          # Each line is "NAME VERSION: oci://REPOSITORY@DIGEST (indexed)".
-          published=$(sed -nE 's/^[^:]+: oci:\/\/([^ ]+@sha256:[0-9a-f]+) .*/\1/p' "$RUNNER_TEMP/published.txt" | tr '\n' ' ')
-          [ "$(wc -w <<<"$published")" = "$(wc -w <<<"$PACKAGES")" ] || { echo "::error::publish didn't print a digest for every package"; exit 1; }
+          "$OPENETL" connector publish "$NAMESPACE" "$DIST/$PACKAGE.connector.yaml" | tee "$RUNNER_TEMP/published.txt"
+          "$OPENETL" connector validate --artifact "$NAMESPACE/$PACKAGE:$VERSION"
+          # The line is "NAME VERSION: oci://REPOSITORY@DIGEST (indexed)".
+          published=$(sed -nE 's/^[^:]+: oci:\/\/([^ ]+@sha256:[0-9a-f]+) .*/\1/p' "$RUNNER_TEMP/published.txt")
+          [ -n "$published" ] || { echo "::error::publish didn't print the package's digest"; exit 1; }
           echo "published=$published" >> "$GITHUB_OUTPUT"
-          echo "Packages: \`$published\`" >> "$GITHUB_STEP_SUMMARY"
-      - name: A draft release per package
-        if: inputs.publish != 'skip'
+          echo "Package: \`$published\`" >> "$GITHUB_STEP_SUMMARY"
+      - name: A draft release
+        if: env.DRY_RUN != 'true'
         run: |
+          [ "$DRAFT" != true ] || gh release delete "$TAG" -R "$GITHUB_REPOSITORY" --yes
           prerelease=()
           [[ "$VERSION" != *-* ]] || prerelease=(--prerelease)
-          for p in $PACKAGES; do
-            if [ "$(gh release view "$p/v$VERSION" -R "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>/dev/null || echo none)" = true ]; then
-              gh release delete "$p/v$VERSION" -R "$GITHUB_REPOSITORY" --yes
-            fi
-            title="$p v$VERSION"
-            [ "$PUBLISH" = public ] || title="$title (private)"
-            notes="The $p connector, version $VERSION, from commit $COMMIT, for Linux on amd64 and arm64. Apply it with \`openetl connector apply ${NAMESPACE}/$p:$VERSION\`, or \`openetl connector apply github.com/$GITHUB_REPOSITORY/$p@$VERSION\` from this release. \`$p.checksums.txt\` lists each file's SHA-256; in a published release, it and the package are signed with keyless cosign by this repository's release workflow."
-            gh release create "$p/v$VERSION" -R "$GITHUB_REPOSITORY" --draft "${prerelease[@]}" --target "$COMMIT" \
-              --title "$title" --notes "$notes" \
-              "$DIST/$p"-* "$DIST/$p.connector.yaml" "$DIST/$p.checksums.txt" "$DIST/THIRD-PARTY-NOTICES.txt"
-          done
+          # The notes start at the package's previous version among its tags,
+          # in semantic version order: sort -V with a prerelease's - as ~,
+          # which sorts before the end of a string.
+          previous=$( { git ls-remote --tags --refs "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" "refs/tags/$PACKAGE/v*" |
+            sed -n "s|.*refs/tags/$PACKAGE/v||p"; echo "$VERSION"; } | grep -E '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$' |
+            sed 's/-/~/' | sort -V | sed 's/~/-/' | grep -x -B1 -F "$VERSION" | head -n 1 || true)
+          start=()
+          [ -z "$previous" ] || [ "$previous" = "$VERSION" ] || start=(--notes-start-tag "$PACKAGE/v$previous")
+          notes="The $PACKAGE connector, version $VERSION, from commit $COMMIT, for Linux on amd64 and arm64. Apply it with \`openetl connector apply $NAMESPACE/$PACKAGE:$VERSION\`, or \`openetl connector apply github.com/$GITHUB_REPOSITORY/$PACKAGE@$VERSION\` from this release. \`$PACKAGE.checksums.txt\` lists each file's SHA-256; it and the package are signed with keyless cosign by this repository's release workflow."
+          gh release create "$TAG" -R "$GITHUB_REPOSITORY" --verify-tag --draft "${prerelease[@]}" \
+            --title "$PACKAGE v$VERSION" --notes "$notes" --generate-notes "${start[@]}" \
+            "$DIST/$PACKAGE"-* "$DIST/$PACKAGE.connector.yaml" "$DIST/$PACKAGE.checksums.txt" "$DIST/THIRD-PARTY-NOTICES.txt"
 
   # The only job that can sign, in the release environment.
   publish:
-    if: inputs.publish == 'public'
+    if: github.event_name == 'push'
     needs: package
     runs-on: ubuntu-latest
     environment: release
@@ -200,8 +198,9 @@ jobs:
       packages: write
       id-token: write
     env:
+      TAG: ${{ needs.package.outputs.tag }}
+      PACKAGE: ${{ needs.package.outputs.package }}
       VERSION: ${{ needs.package.outputs.version }}
-      PACKAGES: ${{ needs.package.outputs.packages }}
       PUBLISHED: ${{ needs.package.outputs.published }}
       GH_TOKEN: ${{ github.token }}
     steps:
@@ -213,76 +212,27 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ github.token }}
-      - name: Sign each package and its checksums
+      - name: Sign the package and its checksums
         run: |
-          for ref in $PUBLISHED; do
-            cosign sign --yes "$ref"
-          done
-          for p in $PACKAGES; do
-            mkdir -p "sig/$p"
-            gh release download "$p/v$VERSION" -R "$GITHUB_REPOSITORY" -p "$p.checksums.txt" -D "sig/$p"
-            cosign sign-blob --yes --bundle "sig/$p/$p.checksums.txt.sigstore.json" "sig/$p/$p.checksums.txt"
-            gh release upload "$p/v$VERSION" -R "$GITHUB_REPOSITORY" --clobber "sig/$p/$p.checksums.txt.sigstore.json"
-          done
-      - name: Publish the releases
+          cosign sign --yes "$PUBLISHED"
+          gh release download "$TAG" -R "$GITHUB_REPOSITORY" -p "$PACKAGE.checksums.txt" -D sig
+          cosign sign-blob --yes --bundle "sig/$PACKAGE.checksums.txt.sigstore.json" "sig/$PACKAGE.checksums.txt"
+          gh release upload "$TAG" -R "$GITHUB_REPOSITORY" --clobber "sig/$PACKAGE.checksums.txt.sigstore.json"
+      - name: Publish the release
         run: |
-          for p in $PACKAGES; do
-            gh release edit "$p/v$VERSION" -R "$GITHUB_REPOSITORY" --draft=false
-            echo "Released: $(gh release view "$p/v$VERSION" -R "$GITHUB_REPOSITORY" --json url --jq .url)" >> "$GITHUB_STEP_SUMMARY"
-          done
-      - name: Anyone can pull the packages
+          gh release edit "$TAG" -R "$GITHUB_REPOSITORY" --draft=false
+          echo "Released: $(gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json url --jq .url)" >> "$GITHUB_STEP_SUMMARY"
+      - name: Anyone can pull the package
         run: |
-          for p in $PACKAGES index; do
-            repository=$GITHUB_REPOSITORY/$p
-            reference=$VERSION
-            [ "$p" != index ] || reference=$(echo "$PACKAGES" | awk '{print $1}')
+          # The package's version, and its card in the index.
+          for p in "$PACKAGE:$VERSION" "index:$PACKAGE"; do
+            repository=$GITHUB_REPOSITORY/${p%%:*}
             t=$(curl -s "https://ghcr.io/token?scope=repository:$repository:pull&service=ghcr.io" | jq -r '.token // ""')
             code=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $t" \
-              -H 'Accept: application/vnd.oci.image.manifest.v1+json' "https://ghcr.io/v2/$repository/manifests/$reference")
+              -H 'Accept: application/vnd.oci.image.manifest.v1+json' "https://ghcr.io/v2/$repository/manifests/${p#*:}")
             if [ "$code" != 200 ]; then
-              settings="https://github.com/orgs/$GITHUB_REPOSITORY_OWNER/packages/container/${GITHUB_REPOSITORY#*/}%2F$p/settings"
+              settings="https://github.com/orgs/$GITHUB_REPOSITORY_OWNER/packages/container/${GITHUB_REPOSITORY#*/}%2F${p%%:*}/settings"
               echo "::warning::ghcr.io/$repository is private: make it public in $settings"
               echo "**ghcr.io/$repository is private:** make it public in [its settings]($settings)." >> "$GITHUB_STEP_SUMMARY"
             fi
           done
-
-  # Points the release line's branch, release-X.Y, at the release: the docs
-  # site builds each package's page from it, and fixes to them are backported
-  # to it (CONTRIBUTING.md). A new line's branch is made, with the label that
-  # backports to it. A release on the branch leaves it where it is. A release
-  # cut from main moves it forward, or, when it has commits since that main's
-  # release doesn't (backports, which came from main), starts it again at the
-  # release; the summary says where it was. openetl's release does the same.
-  branch:
-    needs: [package, publish]
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-      issues: write
-    env:
-      TAG: ${{ inputs.tag }}
-      COMMIT: ${{ needs.package.outputs.commit }}
-      BRANCH: ${{ needs.package.outputs.branch }}
-      GH_TOKEN: ${{ github.token }}
-    steps:
-      - name: Point the release line's branch at the release
-        run: |
-          repo=repos/$GITHUB_REPOSITORY
-          if ! at=$(gh api "$repo/git/ref/heads/$BRANCH" --jq .object.sha 2>/dev/null); then
-            gh api "$repo/git/refs" -f "ref=refs/heads/$BRANCH" -f "sha=$COMMIT" > /dev/null
-            echo "Made \`$BRANCH\` at $TAG." >> "$GITHUB_STEP_SUMMARY"
-            exit 0
-          fi
-          case $(gh api "$repo/compare/$at...$COMMIT" --jq .status) in
-            identical | behind) ;;
-            ahead)
-              gh api -X PATCH "$repo/git/refs/heads/$BRANCH" -f "sha=$COMMIT" -F force=false > /dev/null
-              echo "Moved \`$BRANCH\` forward to $TAG." >> "$GITHUB_STEP_SUMMARY"
-              ;;
-            *)
-              gh api -X PATCH "$repo/git/refs/heads/$BRANCH" -f "sha=$COMMIT" -F force=true > /dev/null
-              echo "Started \`$BRANCH\` again at $TAG. It was at $at." >> "$GITHUB_STEP_SUMMARY"
-              ;;
-          esac
-      - name: The label that backports to it
-        run: gh label create "backport $BRANCH" -R "$GITHUB_REPOSITORY" --color 0e8a16 --description "Backport to $BRANCH once merged" --force

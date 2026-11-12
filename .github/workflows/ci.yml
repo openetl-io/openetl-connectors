@@ -1,12 +1,13 @@
 name: ci
 
-# On a release branch too, as a release is tagged where ci passed; and on a
-# backport's branch, which the backport workflow pushes before it opens the
-# pull request, which then starts no run of its own.
+# On a release branch too, release-X.Y or release-PACKAGE-X.Y, as a release
+# is tagged where ci passed; and on a backport's branch, which the backport
+# workflow pushes before it opens the pull request, which then starts no run
+# of its own.
 on:
   pull_request:
   push:
-    branches: [main, "release-[0-9]+.[0-9]+", "backport/**"]
+    branches: [main, "release-[0-9]+.[0-9]+", "release-*-[0-9]+.[0-9]+", "backport/**"]
 
 permissions:
   contents: read
