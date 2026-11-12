@@ -1,0 +1,40 @@
+name: docs
+
+# Asks the docs site to build again, through its deploy hook, the URL in the
+# secret CLOUDFLARE_DEPLOY_HOOK, and skips when that isn't set. It runs on a
+# push to main that changes what the site reads from here: a package's page
+# and the pages under it, its openetl-connector.yaml, schemas and logo; and
+# from release, once a package's release is published, as the site builds a
+# released package's page from its newest release.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "*/README.md"
+      - "*/docs/**"
+      - "*/openetl-connector.yaml"
+      - "*/*.schema.json"
+      - "*/**.svg"
+      - "*/**.png"
+  workflow_call:
+    secrets:
+      CLOUDFLARE_DEPLOY_HOOK:
+        required: false
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Call the docs site's deploy hook
+        env:
+          HOOK: ${{ secrets.CLOUDFLARE_DEPLOY_HOOK }}
+        run: |
+          if [ -z "$HOOK" ]; then
+            echo "No CLOUDFLARE_DEPLOY_HOOK, so no deploy"
+            exit 0
+          fi
+          curl -fsS -o /dev/null -X POST "$HOOK"
+          echo "The docs site is building." >> "$GITHUB_STEP_SUMMARY"

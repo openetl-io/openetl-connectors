@@ -59,21 +59,17 @@ openetl connector package --tag postgres/v0.2.0
 git tag postgres/v0.2.0-alpha.1 origin/main && git push origin postgres/v0.2.0-alpha.1
 ```
 
-The push starts the `release` workflow, which releases that package alone. It refuses a tag on a commit that isn't in `main` or in a release branch (below), or that `ci` hasn't passed on, and waits up to an hour for a run of `ci` that's still going; it refuses a version that's released already. Then it packages the package at the tag for Linux on amd64 and arm64, with the SDK that `go.mod` requires and the CLI that `ci` uses, with checksums, SBOMs and third-party notices, pushes it to `ghcr.io/openetl-io/openetl-connectors/PACKAGE`, and publishes the release `PACKAGE/vX.Y.Z` with its files and notes generated from the pull requests since the package's previous tag, as a prerelease when the version has a suffix. A job in the `release` environment signs the package and its checksums with keyless cosign first. GHCR creates a new package private: after its first release, make it public in its settings, once; the run's summary says so. A run that failed can run again: it replaces its draft release.
+The push starts the `release` workflow, which releases that package alone. It refuses a tag on a commit that isn't in `main` or in a release branch (below), or that `ci` hasn't passed on, and waits up to an hour for a run of `ci` that's still going; it refuses a version that's released already. Then it packages the package at the tag for Linux on amd64 and arm64, with the SDK that `go.mod` requires and the CLI that `ci` uses, with checksums, SBOMs and third-party notices, pushes it to `ghcr.io/openetl-io/openetl-connectors/PACKAGE`, and publishes the release `PACKAGE/vX.Y.Z` with its files and notes generated from the pull requests since the package's previous tag, as a prerelease when the version has a suffix. A job in the `release` environment signs the package and its checksums with keyless cosign first. GHCR creates a new package private: after its first release, make it public in its settings, once; the run's summary says so. A run that failed can run again: it replaces its draft release. Once the release is published, the docs site builds again ([Docs](#docs)).
 
 `gh workflow run release.yml --ref BRANCH -f tag=postgres/v0.2.0-alpha.1` is a dry run: it packages that package at the branch's head and runs the checks, which only warn, and pushes, uploads and signs nothing.
 
 A fix to a release that `main` has moved past goes on a branch `release-PACKAGE-X.Y`, made from the release's tag when it's first needed, and cherry-picked from `main`. The patch release is tagged there once `ci` passes on it.
 
-### Backports
+## Docs
 
-A fix goes to `main` first. When it also fixes a released package, label its pull request `backport release-X.Y`, before it's merged or after. The `backport` workflow then opens a pull request of it against `release-X.Y`. Where it doesn't apply cleanly, the workflow comments with the commands to backport it by hand.
+The [docs site](https://github.com/openetl-io/docs-web) shows each package as released: its page (`README.md` and any `docs/`), its schemas and its logo come from the tag of its newest published release, and from `main` for a package that has no release yet. So a fix to a released package's page shows on the site with the package's next release.
 
-Backport a change to a page that corrects or completes what the released package does: a wrong setting, type mapping or permission, a missing step, a limit the release has. Don't backport what only `main` does, or a schema description of a setting the release doesn't have. A fix to text that `main` no longer has is a pull request to the release branch alone. When the next release is close, the fix can wait for it instead.
-
-The workflow pushes a backport with the deploy key in the secret `BACKPORT_DEPLOY_KEY`, which has write access, so `ci` runs on it: GitHub starts no workflow for what a workflow's own token pushes. It opens the pull request with its own token, which **Allow GitHub Actions to create and approve pull requests**, in the repository's Actions settings, permits. Without the key, `ci` runs on a backport once it's merged; without the setting, the workflow comments with a link to open the pull request.
-
-The docs site checks this repository every 15 minutes, and builds when a package's page, schemas or `openetl-connector.yaml` changed on its release branch, or a release was published.
+The `docs` workflow calls the site's deploy hook, the secret `CLOUDFLARE_DEPLOY_HOOK`, on a push to `main` that changes a package's page, `docs/`, `openetl-connector.yaml`, schemas or logo, and `release` calls it once a release is published. Without the secret, it skips. `gh workflow run docs.yml` deploys now.
 
 ## Layout
 
