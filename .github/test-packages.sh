@@ -5,6 +5,11 @@
 # that write need a way to read them back, which Postgres has here (psql);
 # the integration tests run those checks on every destination.
 #
+# Given arguments, NAME=TARGET each, it packages nothing and checks those
+# packages alone, each at its TARGET, such as a released version:
+#
+#   test-packages.sh postgres=oci://ghcr.io/openetl-io/openetl-connectors/postgres:0.1.0-alpha
+#
 # OPENETL is the openetl CLI. KAFKA_CONTAINER is the Kafka container, whose
 # scripts produce records.
 set -uo pipefail
@@ -30,15 +35,32 @@ cleanup() {
 }
 trap cleanup EXIT
 
-"$openetl" connector package --version 0.0.0-ci --platforms "$(go env GOOS)/$(go env GOARCH)" --out "$dist" \
-  postgres kafka kinesis iceberg s3 || exit 1
+# target NAME is what package NAME's checks run against; nothing for a
+# package that isn't checked.
+target() { local v=target_$1; echo "${!v:-}"; }
+if (($#)); then
+  for a in "$@"; do
+    name=${a%%=*}
+    [[ "$a" == *=?* && "$name" =~ ^[a-z0-9]+$ ]] || { echo "$a isn't NAME=TARGET" >&2; exit 2; }
+    printf -v "target_$name" '%s' "${a#*=}"
+  done
+else
+  "$openetl" connector package --version 0.0.0-ci --platforms "$(go env GOOS)/$(go env GOARCH)" --out "$dist" \
+    postgres kafka kinesis iceberg s3 || exit 1
+  for p in postgres kafka kinesis iceberg s3; do
+    printf -v "target_$p" '%s' "$dist/$p.connector.yaml"
+  done
+fi
 
 failed=()
+# check NAME PACKAGE FLAGS... runs the kit on PACKAGE's target with FLAGS.
 check() {
-  local name=$1
-  shift
+  local name=$1 at
+  at=$(target "$2")
+  shift 2
+  [ -n "$at" ] || return 0
   echo "::group::$name"
-  if ! "$openetl" connector test -q "$@"; then
+  if ! "$openetl" connector test -q "$@" "$at"; then
     failed+=("$name")
   fi
   echo "::endgroup::"
@@ -58,7 +80,7 @@ INSERT INTO $run.orders SELECT i, i * 1.25, timestamptz '2026-03-01 00:00Z' + i 
 SQL
 pg_source() { printf '{"dsn": "%s", "schema": "%s", "chunkRows": 25, "snapshotChunkRows": 20, "publication": "%s"}' "$1" "$run" "$run"; }
 bad_pg=${PG/:openetl@/:not-the-password@}
-closed_pg=postgres://openetl:openetl@127.0.0.1:1/openetl?connect_timeout=2
+closed_pg="postgres://openetl:openetl@127.0.0.1:1/openetl?connect_timeout=2"
 script pg-add <<'SH'
 case $OPENETL_STREAM in
 orders)
@@ -78,21 +100,19 @@ SH
 config pg-source "$(pg_source "$PG")"
 config pg-source-bad "$(pg_source "$bad_pg")"
 config pg-source-closed "$(pg_source "$closed_pg")"
-check source-postgres --role source \
+check source-postgres postgres --role source \
   --config "$work/pg-source.json" \
   --bad-credentials "$work/pg-source-bad.json" \
   --unreachable "$work/pg-source-closed.json" \
-  --stream users:full_refresh --stream orders:cdc --add-records-command "$work/pg-add" \
-  "$dist/postgres.connector.yaml"
+  --stream users:full_refresh --stream orders:cdc --add-records-command "$work/pg-add"
 config pg-dest "{\"dsn\": \"$PG\"}"
 config pg-dest-bad "{\"dsn\": \"$bad_pg\"}"
 config pg-dest-closed "{\"dsn\": \"$closed_pg\"}"
-check destination-postgres --role destination \
+check destination-postgres postgres --role destination \
   --config "$work/pg-dest.json" \
   --bad-credentials "$work/pg-dest-bad.json" \
   --unreachable "$work/pg-dest-closed.json" \
-  --read-command "$work/pg-read" --drop-command "$work/pg-drop" \
-  "$dist/postgres.connector.yaml"
+  --read-command "$work/pg-read" --drop-command "$work/pg-drop"
 
 # Kafka: two topics of JSON records.
 produce() { # topic, first id, count
@@ -112,17 +132,15 @@ seq 1 5 | sed "s/.*/{\"id\":${n}00&,\"name\":\"n\"}/" |
 SH
 config kafka-source "{\"brokers\": [\"$kafka\"], \"topics\": [\"$run.a\", \"$run.b\"]}"
 config kafka-source-closed "{\"brokers\": [\"127.0.0.1:1\"], \"topics\": [\"$run.a\", \"$run.b\"]}"
-check source-kafka --role source \
+check source-kafka kafka --role source \
   --config "$work/kafka-source.json" \
   --unreachable "$work/kafka-source-closed.json" \
-  --add-records-command "$work/kafka-add" \
-  "$dist/kafka.connector.yaml"
+  --add-records-command "$work/kafka-add"
 config kafka-dest "{\"brokers\": [\"$kafka\"]}"
 config kafka-dest-closed '{"brokers": ["127.0.0.1:1"]}'
-check destination-kafka --role destination \
+check destination-kafka kafka --role destination \
   --config "$work/kafka-dest.json" \
-  --unreachable "$work/kafka-dest-closed.json" \
-  "$dist/kafka.connector.yaml"
+  --unreachable "$work/kafka-dest-closed.json"
 
 # Kinesis: two streams of JSON records.
 records() { # first id, count
@@ -154,34 +172,30 @@ aws --endpoint-url "$KINESIS" --cli-binary-format raw-in-base64-out kinesis put-
 SH
 config kinesis-source "$(kinesis_config "$kinesis" "$streams")"
 config kinesis-source-closed "$(kinesis_config http://127.0.0.1:1 "$streams")"
-check source-kinesis --role source \
+check source-kinesis kinesis --role source \
   --config "$work/kinesis-source.json" \
   --unreachable "$work/kinesis-source-closed.json" \
-  --add-records-command "$work/kinesis-add" \
-  "$dist/kinesis.connector.yaml"
+  --add-records-command "$work/kinesis-add"
 config kinesis-dest "$(kinesis_config "$kinesis" "")"
 config kinesis-dest-closed "$(kinesis_config http://127.0.0.1:1 "")"
-check destination-kinesis --role destination \
+check destination-kinesis kinesis --role destination \
   --config "$work/kinesis-dest.json" \
-  --unreachable "$work/kinesis-dest-closed.json" \
-  "$dist/kinesis.connector.yaml"
+  --unreachable "$work/kinesis-dest-closed.json"
 
 # S3 and Iceberg.
 curl -s -o /dev/null -X PUT "$s3/packages"
 s3_config() { printf '{"url": "s3://packages/%s", "endpoint": "%s", "region": "us-east-1", "accessKeyId": "openetl", "secretAccessKey": "openetl"}' "$run" "$1"; }
 config s3 "$(s3_config "$s3")"
 config s3-closed "$(s3_config http://127.0.0.1:1)"
-check destination-s3 --role destination \
+check destination-s3 s3 --role destination \
   --config "$work/s3.json" \
-  --unreachable "$work/s3-closed.json" \
-  "$dist/s3.connector.yaml"
+  --unreachable "$work/s3-closed.json"
 iceberg_config() { printf '{"uri": "%s", "s3Endpoint": "%s", "region": "us-east-1", "accessKeyId": "openetl", "secretAccessKey": "openetl"}' "$1" "$s3"; }
 config iceberg "$(iceberg_config "$iceberg")"
 config iceberg-closed "$(iceberg_config http://127.0.0.1:1)"
-check destination-iceberg --role destination \
+check destination-iceberg iceberg --role destination \
   --config "$work/iceberg.json" \
-  --unreachable "$work/iceberg-closed.json" \
-  "$dist/iceberg.connector.yaml"
+  --unreachable "$work/iceberg-closed.json"
 
 if ((${#failed[@]})); then
   echo "failed: ${failed[*]}"

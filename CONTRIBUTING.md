@@ -38,7 +38,9 @@ The Kinesis tests need a Kinesis endpoint at `OPENETL_TEST_KINESIS_ENDPOINT` (de
 
 ## CI
 
-`ci` runs on every pull request and on pushes to `main` and release branches: gofmt, `go vet`, `openetl connector validate`, the tests against Postgres, the Iceberg catalogs, Kafka and Kinesis, and each package, as a release packages it, through the conformance kit (`.github/test-packages.sh`). Its job `ci` passes when every other job did, and is the one check a pull request needs. The `openetl` CLI it uses is openetl's `main`, copied out of the image `ghcr.io/openetl-io/openetl:edge`, which openetl publishes from `main`; until that image exists, it's the CLI of openetl's newest release. Caches are saved from pushes, and pull requests restore them.
+`ci` runs on every pull request and on pushes to `main` and release branches: gofmt, `go vet`, `openetl connector validate`, the tests against Postgres, the Iceberg catalogs, Kafka and Kinesis, and each package, as a release packages it, through the conformance kit (`.github/test-packages.sh`). Its job `ci` passes when every other job did, and is the one check a pull request needs. The `openetl` CLI it uses is openetl's `main`, copied out of the image `ghcr.io/openetl-io/openetl:edge`, which openetl publishes from `main`; until that image exists, it's the CLI of openetl's newest release. Caches are saved from pushes, and pull requests restore them. `.github/actions/services` starts the services for `ci` and `nightly` alike.
+
+`nightly` checks what's released against what's coming in openetl: each package's newest version in the registry, through the same conformance kit, with the CLI of openetl's `main`. When a scheduled run fails, it opens an issue, or comments on the open one, and it closes the issue when a run passes again. `gh workflow run nightly.yml` runs it now, and touches no issue. `.github/test-packages.sh NAME=TARGET...` checks given packages, such as a released version (`postgres=oci://ghcr.io/openetl-io/openetl-connectors/postgres:0.1.0-alpha`), instead of packaging this checkout.
 
 ## Release
 
