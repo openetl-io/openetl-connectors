@@ -1,9 +1,14 @@
 name: ci
 
-# On a release branch too, release-X.Y or release-PACKAGE-X.Y, as a release
-# is tagged where ci passed; and on a backport's branch, which the backport
-# workflow pushes before it opens the pull request, which then starts no run
-# of its own.
+# The one check a pull request needs is the job ci, which fails when a job it
+# needs failed or was cancelled. It runs on a release branch too, release-X.Y
+# or release-PACKAGE-X.Y, as a release is tagged where ci passed; and on a
+# backport's branch, which the backport workflow pushes before it opens the
+# pull request, which then starts no run of its own.
+#
+# The SDK is the version go.mod requires, and the openetl CLI is main's, from
+# openetl's edge image (.github/actions/openetl). Caches are saved from pushes
+# alone; pull requests restore them.
 on:
   pull_request:
   push:
@@ -12,8 +17,55 @@ on:
 permissions:
   contents: read
 
+# A newer push to a pull request cancels its older run. A push to a branch
+# runs in a group of its own, so it never waits behind another or is
+# cancelled by one: a release needs ci to have passed on its commit.
+concurrency:
+  group: ${{ github.event_name == 'pull_request' && format('ci-pr-{0}', github.event.pull_request.number) || format('ci-run-{0}', github.run_id) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
-  go:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: false
+      # Restores the last cache when go.sum changes; setup-go's starts over.
+      - if: github.event_name == 'push'
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: go-check-${{ hashFiles('go.sum') }}
+          restore-keys: |
+            go-check-
+            go-
+      - if: github.event_name != 'push'
+        uses: actions/cache/restore@v6
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: go-check-${{ hashFiles('go.sum') }}
+          restore-keys: |
+            go-check-
+            go-
+      - name: Format
+        run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+      - name: Vet
+        run: go vet -tags integration ./...
+      - uses: ./.github/actions/openetl
+      # Each package's openetl-connector.yaml, checked by the openetl CLI.
+      - name: Packages
+        run: |
+          # shellcheck disable=SC2046
+          "$OPENETL" connector validate --require author,logo,description,license $(dirname ./*/openetl-connector.yaml)
+
+  test:
     runs-on: ubuntu-latest
     services:
       postgres:
@@ -27,53 +79,31 @@ jobs:
           --health-cmd "pg_isready -U openetl" --health-interval 2s --health-timeout 5s --health-retries 15
     steps:
       - uses: actions/checkout@v5
-        with:
-          path: openetl-connectors
-      # go.mod replaces the SDK with ../openetl/sdk/go.
-      - uses: actions/checkout@v5
-        with:
-          repository: openetl-io/openetl
-          ref: main
-          path: openetl
-          ssh-key: ${{ secrets.OPENETL_DEPLOY_KEY }}
-      # A pull request takes the SDK from openetl's branch of its name, when
-      # there is one, so a change across both repositories is checked whole.
-      - name: SDK of the same branch
-        if: github.event_name == 'pull_request'
-        working-directory: openetl
-        env:
-          BRANCH: ${{ github.head_ref }}
-        run: |
-          if git fetch --depth=1 origin "refs/heads/$BRANCH"; then
-            git checkout --detach FETCH_HEAD
-          else
-            echo "openetl has no branch $BRANCH, so main's SDK"
-          fi
       - uses: actions/setup-go@v6
         with:
-          go-version-file: openetl-connectors/go.mod
+          go-version-file: go.mod
           cache: false
-      # Restores the last cache when go.sum changes; setup-go's starts over.
-      - uses: actions/cache@v6
+      - if: github.event_name == 'push'
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cache/go-build
             ~/go/pkg/mod
-          key: go-${{ hashFiles('openetl-connectors/go.sum') }}
-          restore-keys: go-
-      - name: Format
-        working-directory: openetl-connectors
-        run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
-      - name: Vet
-        working-directory: openetl-connectors
-        run: go vet -tags integration ./...
-      # Each package's openetl-connector.yaml, checked by the openetl CLI.
-      - name: Packages
-        working-directory: openetl
-        run: |
-          go build -o "$RUNNER_TEMP/openetl" ./cmd/openetl
-          cd ../openetl-connectors
-          "$RUNNER_TEMP/openetl" connector validate --require author,logo,description,license postgres kafka kinesis iceberg s3
+          key: go-test-${{ hashFiles('go.sum') }}
+          restore-keys: |
+            go-test-
+            go-
+      - if: github.event_name != 'push'
+        uses: actions/cache/restore@v6
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: go-test-${{ hashFiles('go.sum') }}
+          restore-keys: |
+            go-test-
+            go-
+      - uses: ./.github/actions/openetl
       # Services take no server flags, and CDC needs logical replication.
       - name: Logical replication
         run: |
@@ -126,14 +156,22 @@ jobs:
             ghcr.io/etspaceman/kinesis-mock:0.6.2
           until curl -sf -o /dev/null http://127.0.0.1:4568/healthcheck; do sleep 1; done
       - name: Tests, against Postgres, the Iceberg catalogs, Kafka and Kinesis
-        working-directory: openetl-connectors
         env:
           OPENETL_TEST_GLUE_ENDPOINT: http://127.0.0.1:5000
         run: go test -race -tags integration -count=1 ./...
       # What a release publishes, for this runner's platform, checked with
       # the conformance kit as anyone checks a package.
       - name: Packages, through the conformance kit
-        working-directory: openetl-connectors
-        env:
-          OPENETL: ${{ runner.temp }}/openetl
         run: .github/test-packages.sh
+
+  ci:
+    if: always()
+    needs: [check, test]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Every job it needs passed
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          jq -r 'to_entries[] | "\(.key): \(.value.result)"' <<<"$NEEDS"
+          jq -e 'all(.[]; .result == "success" or .result == "skipped")' <<<"$NEEDS" > /dev/null

@@ -10,7 +10,9 @@ name: release
 # package's previous tag. Then the job that alone can sign, in the release environment,
 # signs the package and its checksums with keyless cosign and publishes the
 # release, a prerelease when the version has a suffix. Running it again
-# replaces the draft; it refuses a version that's released.
+# replaces the draft; it refuses a version that's released. The SDK is the
+# version go.mod requires, and the openetl CLI the one ci uses, main's
+# (.github/actions/openetl).
 #
 # Dispatched on a branch, it's a dry run of the tag given: it packages that
 # package at the branch's head and runs the checks, which only warn, and
@@ -66,18 +68,19 @@ jobs:
           re='^([a-z0-9][a-z0-9-]*)/v([0-9]+\.[0-9]+\.[0-9]+(-(alpha|beta|rc)\.[0-9]+)?)$'
           [[ "$TAG" =~ $re ]] || { echo "::error::$TAG isn't a tag such as postgres/v0.2.0 or postgres/v0.2.0-alpha.1"; exit 1; }
           { echo "PACKAGE=${BASH_REMATCH[1]}"; echo "VERSION=${BASH_REMATCH[2]}"
-            echo "DIST=$RUNNER_TEMP/dist"; echo "OPENETL=$RUNNER_TEMP/openetl"; } >> "$GITHUB_ENV"
+            echo "DIST=$RUNNER_TEMP/dist"; } >> "$GITHUB_ENV"
       # The tag, or on a dry run the branch.
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           path: openetl-connectors
-      # go.mod replaces the SDK with ../openetl/sdk/go: main's, as ci builds
-      # against, with the CLI that packages it.
+      # openetl's notices tool, which lists the connectors' third-party
+      # dependencies and their licenses.
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           repository: openetl-io/openetl
           ref: main
           path: openetl
+          sparse-checkout: internal/notices
       - name: This tag can be released
         id: check
         working-directory: openetl-connectors
@@ -134,6 +137,8 @@ jobs:
             ~/go/pkg/mod
           key: go-release-${{ hashFiles('openetl-connectors/go.sum') }}
           restore-keys: go-release-
+      # The CLI ci checks the packages with.
+      - uses: ./openetl-connectors/.github/actions/openetl
       - uses: anchore/sbom-action/download-syft@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
       - if: env.DRY_RUN != 'true'
         uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
@@ -143,7 +148,6 @@ jobs:
           password: ${{ github.token }}
       - name: Package it for Linux
         run: |
-          go -C openetl build -o "$OPENETL" ./cmd/openetl
           cd openetl-connectors
           GOFLAGS="'-ldflags=-s -w'" "$OPENETL" connector package --tag "$TAG" --out "$DIST" --platforms linux/amd64,linux/arm64
           ls -l "$DIST"
