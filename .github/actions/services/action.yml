@@ -1,0 +1,65 @@
+name: Test services
+description: >-
+  Starts what the integration tests and .github/test-packages.sh run against,
+  at the addresses they default to: Postgres with logical replication; an S3
+  store, an Iceberg REST catalog keeping its tables in the store's iceberg
+  bucket, and moto's Glue; Kafka, one KRaft node, in the container kafka, with
+  Karapace as the schema registry; and kinesis-mock, on plain HTTP.
+runs:
+  using: composite
+  steps:
+    - name: Postgres
+      shell: bash
+      run: |
+        docker run -d --name postgres -p 5432:5432 \
+          -e POSTGRES_USER=openetl -e POSTGRES_PASSWORD=openetl -e POSTGRES_DB=openetl \
+          postgres:18 -c wal_level=logical
+    - name: The Iceberg catalogs
+      shell: bash
+      run: |
+        docker network create iceberg
+        docker run -d --name s3 --network iceberg -p 8333:8333 -e WEED_MASTER_VOLUME_GROWTH_COPY_1=1 \
+          chrislusf/seaweedfs:4.51 server -dir=/data -s3 -s3.port=8333 -master.volumeSizeLimitMB=64
+        docker run -d --name iceberg --network iceberg -p 8181:8181 \
+          -e CATALOG_WAREHOUSE=s3://iceberg/ -e CATALOG_IO__IMPL=org.apache.iceberg.aws.s3.S3FileIO \
+          -e CATALOG_S3_ENDPOINT=http://s3:8333 -e CATALOG_S3_PATH__STYLE__ACCESS=true \
+          -e AWS_REGION=us-east-1 -e AWS_ACCESS_KEY_ID=openetl -e AWS_SECRET_ACCESS_KEY=openetl \
+          apache/iceberg-rest-fixture:1.10.1
+        docker run -d --name glue -p 5000:5000 motoserver/moto:5.2.5
+    - name: Kafka and a schema registry
+      shell: bash
+      run: |
+        docker network create kafka
+        docker run -d --name kafka --network kafka -p 9092:9092 \
+          -e KAFKA_NODE_ID=1 -e KAFKA_PROCESS_ROLES=broker,controller \
+          -e KAFKA_LISTENERS=PLAINTEXT://:9092,INTERNAL://:29092,CONTROLLER://:9093 \
+          -e KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://127.0.0.1:9092,INTERNAL://kafka:29092 \
+          -e KAFKA_LISTENER_SECURITY_PROTOCOL_MAP=PLAINTEXT:PLAINTEXT,INTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT \
+          -e KAFKA_INTER_BROKER_LISTENER_NAME=INTERNAL -e KAFKA_CONTROLLER_LISTENER_NAMES=CONTROLLER \
+          -e KAFKA_CONTROLLER_QUORUM_VOTERS=1@localhost:9093 -e KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR=1 \
+          -e KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR=1 -e KAFKA_TRANSACTION_STATE_LOG_MIN_ISR=1 \
+          -e KAFKA_NUM_PARTITIONS=3 apache/kafka:4.3.2
+        until docker exec kafka /opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 > /dev/null 2>&1; do sleep 1; done
+        docker run -d --name registry --network kafka -p 8081:8081 --entrypoint python3 \
+          -e KARAPACE_KARAPACE_REGISTRY=true -e KARAPACE_BOOTSTRAP_URI=kafka:29092 -e KARAPACE_HOST=0.0.0.0 \
+          -e KARAPACE_PORT=8081 -e KARAPACE_ADVERTISED_HOSTNAME=registry -e KARAPACE_GROUP_ID=karapace \
+          -e KARAPACE_MASTER_ELIGIBILITY=true -e KARAPACE_TOPIC_NAME=_schemas -e KARAPACE_COMPATIBILITY=BACKWARD \
+          ghcr.io/aiven-open/karapace:6.2.4 -m karapace
+    - name: Kinesis
+      shell: bash
+      run: |
+        docker run -d --name kinesis -p 4568:4568 -e KINESIS_MOCK_PLAIN_PORT=4568 \
+          -e CREATE_STREAM_DURATION=100ms -e SPLIT_SHARD_DURATION=100ms -e MERGE_SHARDS_DURATION=100ms \
+          -e SHARD_LIMIT=100000 -e ON_DEMAND_STREAM_COUNT_LIMIT=10000 -e LOG_LEVEL=WARN \
+          ghcr.io/etspaceman/kinesis-mock:0.6.2
+    - name: Every one answers
+      shell: bash
+      run: |
+        # Over TCP: while the image initializes, its server takes the socket
+        # alone, and then restarts.
+        until docker exec postgres pg_isready -h 127.0.0.1 -U openetl > /dev/null 2>&1; do sleep 1; done
+        until curl -sf -o /dev/null -X PUT http://127.0.0.1:8333/iceberg; do sleep 1; done
+        until curl -sf -o /dev/null http://127.0.0.1:8181/v1/config; do sleep 1; done
+        until curl -sf -o /dev/null http://127.0.0.1:5000/moto-api/; do sleep 1; done
+        until curl -sf -o /dev/null http://127.0.0.1:8081/subjects; do sleep 1; done
+        until curl -sf -o /dev/null http://127.0.0.1:4568/healthcheck; do sleep 1; done
