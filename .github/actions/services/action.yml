@@ -60,7 +60,10 @@ runs:
       if: contains(format(' {0} ', inputs.services), ' registry ')
       shell: bash
       run: |
-        until docker exec kafka /opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 > /dev/null 2>&1; do sleep 1; done
+        for _ in $(seq 300); do
+          docker exec kafka /opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 > /dev/null 2>&1 && break
+          sleep 1
+        done
         docker run -d --name registry --network kafka -p 8081:8081 --entrypoint python3 \
           -e KARAPACE_KARAPACE_REGISTRY=true -e KARAPACE_BOOTSTRAP_URI=kafka:29092 -e KARAPACE_HOST=0.0.0.0 \
           -e KARAPACE_PORT=8081 -e KARAPACE_ADVERTISED_HOSTNAME=registry -e KARAPACE_GROUP_ID=karapace \
@@ -80,17 +83,32 @@ runs:
         SERVICES: ${{ inputs.services }}
       run: |
         has() { [[ " $SERVICES " == *" $1 "* ]]; }
+        # answers NAME COMMAND... runs COMMAND until it succeeds, and fails
+        # with the container NAME's logs after five minutes in all.
+        deadline=$((SECONDS + 300))
+        answers() {
+          local name=$1
+          shift
+          until "$@" > /dev/null 2>&1; do
+            if [ "$SECONDS" -ge "$deadline" ]; then
+              echo "::error::$name didn't answer"
+              docker logs --tail 100 "$name"
+              exit 1
+            fi
+            sleep 1
+          done
+        }
         # Over TCP: while the image initializes, its server takes the socket
         # alone, and then restarts.
-        if has postgres; then until docker exec postgres pg_isready -h 127.0.0.1 -U openetl > /dev/null 2>&1; do sleep 1; done; fi
-        if has s3; then until curl -sf -o /dev/null -X PUT http://127.0.0.1:8333/iceberg; do sleep 1; done; fi
-        if has iceberg; then until curl -sf -o /dev/null http://127.0.0.1:8181/v1/config; do sleep 1; done; fi
-        if has glue; then until curl -sf -o /dev/null http://127.0.0.1:5000/moto-api/; do sleep 1; done; fi
-        if has kafka; then until docker exec kafka /opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 > /dev/null 2>&1; do sleep 1; done; fi
+        if has postgres; then answers postgres docker exec postgres pg_isready -h 127.0.0.1 -U openetl; fi
+        if has s3; then answers s3 curl -sf -m 5 -o /dev/null -X PUT http://127.0.0.1:8333/iceberg; fi
+        if has iceberg; then answers iceberg curl -sf -m 5 -o /dev/null http://127.0.0.1:8181/v1/config; fi
+        if has glue; then answers glue curl -sf -m 5 -o /dev/null http://127.0.0.1:5000/moto-api/; fi
+        if has kafka; then answers kafka docker exec kafka /opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092; fi
         # Karapace answers reads before it's the primary that takes writes:
         # it's ready once it registers a schema.
         if has registry; then
-          until curl -sf -o /dev/null -X POST -H 'Content-Type: application/vnd.schemaregistry.v1+json' \
-            --data '{"schema": "\"string\""}' http://127.0.0.1:8081/subjects/openetl-ready/versions; do sleep 1; done
+          answers registry curl -sf -m 5 -o /dev/null -X POST -H 'Content-Type: application/vnd.schemaregistry.v1+json' \
+            --data '{"schema": "\"string\""}' http://127.0.0.1:8081/subjects/openetl-ready/versions
         fi
-        if has kinesis; then until curl -sf -o /dev/null http://127.0.0.1:4568/healthcheck; do sleep 1; done; fi
+        if has kinesis; then answers kinesis curl -sf -m 5 -o /dev/null http://127.0.0.1:4568/healthcheck; fi
