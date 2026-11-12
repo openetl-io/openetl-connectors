@@ -3,16 +3,17 @@ name: release
 # Releases one package when its tag is pushed: PACKAGE/vX.Y.Z, or a
 # prerelease, PACKAGE/vX.Y.Z-alpha.N, -beta.N or -rc.N. The tag's commit must
 # be in main or in a release branch, release-PACKAGE-X.Y (or release-X.Y), and
-# ci must have passed on it; a run of ci still going on it is waited for. It
-# packages that package alone, at the tag, for Linux on amd64 and arm64,
-# pushes it to ghcr.io/OWNER/openetl-connectors/PACKAGE, and puts its files on
-# a draft release, with notes generated from the pull requests since the
-# package's previous tag. Then the job that alone can sign, in the release
-# environment, signs the package and its checksums with keyless cosign and
-# publishes the release, a prerelease when the version has a suffix, and the
-# docs site builds again (docs.yml). Running it again replaces the draft; it
-# refuses a version that's released. The SDK is the version go.mod requires,
-# and the openetl CLI the one ci uses, main's (.github/actions/openetl).
+# ci must have passed on it, with the package's job, "package PACKAGE", among
+# the jobs that ran; a run of ci still going on it is waited for. It packages
+# that package alone, at the tag, for Linux on amd64 and arm64, pushes it to
+# ghcr.io/OWNER/openetl-connectors/PACKAGE, and puts its files on a draft
+# release, with notes generated from the pull requests since the package's
+# previous tag. Then the job that alone can sign, in the release environment,
+# signs the package and its checksums with keyless cosign and publishes the
+# release, a prerelease when the version has a suffix, and the docs site
+# builds again (docs.yml). Running it again replaces the draft; it refuses a
+# version that's released. The SDK is the version go.mod requires, and the
+# openetl CLI the one ci uses, main's (.github/actions/openetl).
 #
 # Dispatched on a branch, it's a dry run of the tag given: it packages that
 # package at the branch's head and runs the checks, which only warn, and
@@ -107,18 +108,27 @@ jobs:
           done
           [ -n "$on" ] || fail "$TAG ($commit) isn't a commit in main or in a release branch, release-PACKAGE-X.Y"
 
-          # ci on the commit: passed, or still running, which is waited for
-          # up to an hour.
+          # A run of ci on the commit that passed, with this package's job
+          # among those that ran; one still running is waited for, up to an
+          # hour.
+          passed() {
+            local id
+            for id in $(jq -r '.[] | select(.conclusion == "success") | .databaseId' <<<"$runs"); do
+              gh run view "$id" -R "$GITHUB_REPOSITORY" --json jobs --jq '.jobs[] | select(.name == "package " + env.PACKAGE) | .conclusion' |
+                grep -qx success && return 0
+            done
+            return 1
+          }
           deadline=$((SECONDS + 3600))
           while :; do
-            runs=$(gh run list -R "$GITHUB_REPOSITORY" -w ci.yml -c "$commit" --json status,conclusion)
-            if jq -e 'any(.[]; .conclusion == "success")' <<<"$runs" > /dev/null; then break; fi
+            runs=$(gh run list -R "$GITHUB_REPOSITORY" -w ci.yml -c "$commit" --json databaseId,status,conclusion)
+            if passed; then break; fi
             if [ "$DRY_RUN" != true ] && [ "$SECONDS" -lt "$deadline" ] && jq -e 'any(.[]; .status != "completed")' <<<"$runs" > /dev/null; then
               echo "ci is running on $commit; waiting for it"
               sleep 60
               continue
             fi
-            fail "ci hasn't passed on $commit"
+            fail "ci hasn't passed on $commit with the job package $PACKAGE"
             break
           done
 

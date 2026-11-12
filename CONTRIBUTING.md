@@ -38,9 +38,27 @@ The Kinesis tests need a Kinesis endpoint at `OPENETL_TEST_KINESIS_ENDPOINT` (de
 
 ## CI
 
-`ci` runs on every pull request and on pushes to `main` and release branches: gofmt, `go vet`, `openetl connector validate`, the tests against Postgres, the Iceberg catalogs, Kafka and Kinesis, and each package, as a release packages it, through the conformance kit (`.github/test-packages.sh`). Its job `ci` passes when every other job did, and is the one check a pull request needs. The `openetl` CLI it uses is openetl's `main`, copied out of the image `ghcr.io/openetl-io/openetl:edge`, which openetl publishes from `main`; until that image exists, it's the CLI of openetl's newest release. Caches are saved from pushes, and pull requests restore them. `.github/actions/services` starts the services for `ci` and `nightly` alike.
+`ci` runs on every pull request and on pushes to `main` and release branches. Its job `ci` passes when every job it needs passed or had nothing to run, and is the one check a pull request needs.
 
-`nightly` checks what's released against what's coming in openetl: each package's newest version in the registry, through the same conformance kit, with the CLI of openetl's `main`. When a scheduled run fails, it opens an issue, or comments on the open one, and it closes the issue when a run passes again. `gh workflow run nightly.yml` runs it now, and touches no issue. `.github/test-packages.sh NAME=TARGET...` checks given packages, such as a released version (`postgres=oci://ghcr.io/openetl-io/openetl-connectors/postgres:0.1.0-alpha`), instead of packaging this checkout.
+- `check` runs on the whole repository, always: gofmt, `go vet -tags integration` and `go build`.
+- `package NAME` checks one package: its `openetl-connector.yaml` with `openetl connector validate --require author,logo,description,license`; the unit tests of its directory and of `cmd/ROLE-NAME`; its integration tests, the SDK's conformance suite among them, against only the services it needs; and the package, built as a release builds it, through the conformance kit (`.github/test-packages.sh NAME`).
+- `shared NAME` runs the tests of a shared Go package, such as `records`.
+
+A pull request runs `package NAME` for each package whose directory or `cmd/*-NAME` it changes. A change to anything shared, another Go package, `go.mod`, `go.sum` or `.github/`, runs every package and shared package; a file at the root, such as this one, runs none. A push runs them all, and so does `nightly`. A release of a package needs its `package NAME` job to have passed on the tagged commit.
+
+The `openetl` CLI is openetl's `main`, copied out of the image `ghcr.io/openetl-io/openetl:edge`, which openetl publishes from `main`; until that image exists, it's the CLI of openetl's newest release. `.github/actions/services` starts the services a job needs, and caches are saved from pushes, and pull requests restore them.
+
+`nightly` runs `ci` on `main`, every package, and checks what's released against what's coming in openetl: each package's newest version in the registry, through the same conformance kit, with the CLI of openetl's `main`. When a scheduled run fails, it opens an issue, or comments on the open one, and it closes the issue when a run passes again. `gh workflow run nightly.yml` runs it now, and touches no issue. `.github/test-packages.sh NAME=TARGET...` checks given packages, such as a released version (`postgres=oci://ghcr.io/openetl-io/openetl-connectors/postgres:0.1.0-alpha`), instead of packaging this checkout.
+
+### A new connector
+
+`ci` finds a package by its directory, so a new one is checked once it has:
+
+- a top-level directory with its `openetl-connector.yaml`, with `author`, `logo`, `description` and `license`, its `README.md` and its config schemas;
+- its executables in `cmd/source-NAME` and `cmd/destination-NAME`, which `openetl-connector.yaml` builds;
+- a `conformance_test.go` that runs the SDK's conformance suite, and integration tests behind `//go:build integration` that read their service's address from an `OPENETL_TEST_…` variable, defaulting to the address `.github/actions/services` serves it at;
+- its services in `SERVICES` in `.github/workflows/ci.yml`; a package not listed there gets every service, which works but is slower. A service that isn't there yet goes in `.github/actions/services`, and in `ALL_SERVICES`;
+- a function `checks_NAME` in `.github/test-packages.sh`, which runs the conformance kit on each of its roles. Without one, its job fails.
 
 ## Release
 
@@ -59,7 +77,7 @@ openetl connector package --tag postgres/v0.2.0
 git tag postgres/v0.2.0-alpha.1 origin/main && git push origin postgres/v0.2.0-alpha.1
 ```
 
-The push starts the `release` workflow, which releases that package alone. It refuses a tag on a commit that isn't in `main` or in a release branch (below), or that `ci` hasn't passed on, and waits up to an hour for a run of `ci` that's still going; it refuses a version that's released already. Then it packages the package at the tag for Linux on amd64 and arm64, with the SDK that `go.mod` requires and the CLI that `ci` uses, with checksums, SBOMs and third-party notices, pushes it to `ghcr.io/openetl-io/openetl-connectors/PACKAGE`, and publishes the release `PACKAGE/vX.Y.Z` with its files and notes generated from the pull requests since the package's previous tag, as a prerelease when the version has a suffix. A job in the `release` environment signs the package and its checksums with keyless cosign first. GHCR creates a new package private: after its first release, make it public in its settings, once; the run's summary says so. A run that failed can run again: it replaces its draft release. Once the release is published, the docs site builds again ([Docs](#docs)).
+The push starts the `release` workflow, which releases that package alone. It refuses a tag on a commit that isn't in `main` or in a release branch (below), or on which `ci` hasn't passed with the package's job, `package PACKAGE`, and waits up to an hour for a run of `ci` that's still going; it refuses a version that's released already. Then it packages the package at the tag for Linux on amd64 and arm64, with the SDK that `go.mod` requires and the CLI that `ci` uses, with checksums, SBOMs and third-party notices, pushes it to `ghcr.io/openetl-io/openetl-connectors/PACKAGE`, and publishes the release `PACKAGE/vX.Y.Z` with its files and notes generated from the pull requests since the package's previous tag, as a prerelease when the version has a suffix. A job in the `release` environment signs the package and its checksums with keyless cosign first. GHCR creates a new package private: after its first release, make it public in its settings, once; the run's summary says so. A run that failed can run again: it replaces its draft release. Once the release is published, the docs site builds again ([Docs](#docs)).
 
 `gh workflow run release.yml --ref BRANCH -f tag=postgres/v0.2.0-alpha.1` is a dry run: it packages that package at the branch's head and runs the checks, which only warn, and pushes, uploads and signs nothing.
 

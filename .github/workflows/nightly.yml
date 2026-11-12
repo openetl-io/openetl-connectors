@@ -1,11 +1,11 @@
 name: nightly
 
-# Checks each package's newest released version, from its registry,
-# ghcr.io/OWNER/openetl-connectors/PACKAGE, with the conformance kit of
-# openetl's main: the CLI from openetl's edge image, which starts each
-# connector as openetl's runner does. The checks are .github/test-packages.sh's,
-# as ci runs them on what main would release. A package with no release yet
-# is left out.
+# Runs ci on main, every package, and checks each package's newest released
+# version, from its registry, ghcr.io/OWNER/openetl-connectors/PACKAGE, with
+# the conformance kit of openetl's main: the CLI from openetl's edge image,
+# which starts each connector as openetl's runner does. The checks are
+# .github/test-packages.sh's, as ci runs them on what main would release. A
+# package with no release yet is left out.
 #
 # A scheduled run that fails opens an issue, or comments on the one that's
 # open, and one that passes closes it. A dispatched run touches no issue.
@@ -17,6 +17,12 @@ on:
 permissions: {}
 
 jobs:
+  main:
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+      pull-requests: read
+
   conformance:
     runs-on: ubuntu-latest
     timeout-minutes: 60
@@ -59,31 +65,32 @@ jobs:
           .github/test-packages.sh $ARGS
 
   issue:
-    needs: conformance
+    needs: [main, conformance]
     if: >-
       always() && github.event_name == 'schedule' &&
-      (needs.conformance.result == 'success' || needs.conformance.result == 'failure')
+      !contains(needs.*.result, 'cancelled') && !contains(needs.*.result, 'skipped')
     runs-on: ubuntu-latest
     permissions:
       issues: write
     env:
       GH_TOKEN: ${{ github.token }}
-      RESULT: ${{ needs.conformance.result }}
+      MAIN: ${{ needs.main.result }}
+      CONFORMANCE: ${{ needs.conformance.result }}
       RELEASED: ${{ needs.conformance.outputs.released }}
       RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-      TITLE: "nightly: the released connectors fail openetl main's conformance kit"
+      TITLE: "nightly: ci on main or the released connectors failed"
     steps:
       - name: Open, update or close the issue
         run: |
           number=$(gh issue list -R "$GITHUB_REPOSITORY" --state open --limit 500 --json number,title |
             jq -r --arg t "$TITLE" 'map(select(.title == $t)) | .[0].number // empty')
-          if [ "$RESULT" = success ]; then
+          what="ci on main: $MAIN. The released connectors (${RELEASED:-none found}) through the conformance kit of openetl's main: $CONFORMANCE."
+          if [ "$MAIN" = success ] && [ "$CONFORMANCE" = success ]; then
             [ -z "$number" ] || gh issue close "$number" -R "$GITHUB_REPOSITORY" --comment "Passed again: $RUN"
           elif [ -n "$number" ]; then
-            gh issue comment "$number" -R "$GITHUB_REPOSITORY" --body "Failed again: $RUN"
+            gh issue comment "$number" -R "$GITHUB_REPOSITORY" --body "Failed again: $RUN. $what"
           else
             gh issue create -R "$GITHUB_REPOSITORY" --title "$TITLE" --body "$(printf '%s\n\n%s\n\n%s' \
-              "The nightly run of the conformance kit, with the openetl CLI of openetl's main (its edge image), failed: $RUN" \
-              "Released versions checked: ${RELEASED:-none, as the run failed before finding them}." \
-              "Either openetl's main broke a released connector, which a change in openetl fixes, or the checks in .github/test-packages.sh no longer fit a released version. The nightly closes this issue when it passes again.")"
+              "The nightly run failed: $RUN" "$what" \
+              "A failure of the released connectors means openetl's main broke one, which a change in openetl fixes, or the checks in .github/test-packages.sh no longer fit a released version. The nightly closes this issue when it passes again.")"
           fi
