@@ -544,9 +544,39 @@ func TestASourceReadEndsWhereItIsAsked(t *testing.T) {
 		t.Errorf("the whole stream ended with %v", ev)
 	}
 
-	// Without an end, the read goes to the topic's.
+	// Without an end, the read goes to the topic's, and completes where it
+	// ended. Its completion's state, given as an end, ends a read there too.
 	got = read(source.ConfiguredStream{Name: topic, Splits: []source.Split{{ID: "p0", State: encodeOffset(5)}}})
-	if ev := got["p0"]; ev[len(ev)-1] != "complete "+string(encodeOffset(30)) {
+	ev = got["p0"]
+	if ev[len(ev)-1] != "complete "+string(encodeOffset(30)) {
 		t.Errorf("a split without an end ended with %v", ev)
+	}
+	produceMore(t, addrs, topic, 0, 5)
+	got = read(source.ConfiguredStream{Name: topic, Splits: []source.Split{{ID: "p0", State: encodeOffset(5), Until: encodeOffset(30)}}})
+	rows0 = nil
+	for _, e := range got["p0"] {
+		if e[0] == 'p' {
+			rows0 = append(rows0, e)
+		}
+	}
+	if ev := collapse(got["p0"]); !slices.Equal(rows0, at(0, 5, 30)) || ev[len(ev)-1] != "complete "+string(encodeOffset(30)) {
+		t.Errorf("a split read to its completion's state read %v, and ended with %v", rows0, ev)
+	}
+}
+
+// produceMore adds n records to partition p of topic.
+func produceMore(t *testing.T, addrs []string, topic string, p int32, n int) {
+	t.Helper()
+	cl, err := kgo.NewClient(kgo.SeedBrokers(addrs...), kgo.RecordPartitioner(kgo.ManualPartitioner()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cl.Close()
+	var recs []*kgo.Record
+	for i := range n {
+		recs = append(recs, &kgo.Record{Topic: topic, Partition: p, Value: fmt.Appendf(nil, `{"more":%d}`, i)})
+	}
+	if err := cl.ProduceSync(t.Context(), recs...).FirstErr(); err != nil {
+		t.Fatal(err)
 	}
 }

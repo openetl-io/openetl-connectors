@@ -77,6 +77,8 @@ Reads replay exactly: a read resumed from a checkpoint yields the same records, 
 
 From 0.2.0, a read that OpenETL gives an end stops there: it reads each partition up to the offset it was given, sends a resume point there, and completes. OpenETL does this when it reads a writer lane's part of an epoch again on [several workers](#jobs-on-several-workers), so the second read returns the same records as the first, as long as the topic still has them.
 
+OpenETL gives no end for a partition whose read completed in that epoch, as a scheduled pipeline's does in its last epoch. The second read then goes to the partition's end, as it is then. It returns the same records only if none were added since, and otherwise fails with `POSITION_LOST`.
+
 ## Destination
 
 ### What it writes
@@ -106,7 +108,7 @@ From 0.2.0, the destination declares lane commits and up to 64 writer lanes, so 
 - **A transaction per lane.** Each writer lane writes its part of an epoch in a transaction of its own, and commits it on its own. Consumers that read with `read_committed` isolation can see one lane's part of an epoch before another's.
 - **Producers per lane.** Writer lane L has three transactional producers of its own, numbered 3L to 3L+2, so lane 0's are those of a job on one pod. A lane's transactional IDs are the same in every attempt: a new attempt's writer of a lane fences the old writer of that lane, and no other.
 - **A marker per lane.** Each lane's transaction writes its marker of the epoch to `markerTopic`, keyed by the pipeline for lane 0 and by `PIPELINE/L` for lane L.
-- **Recovery.** If a pod fails after a checkpoint and before every lane committed, the next attempt settles each lane of that epoch before it reads anything new. A lane whose marker committed is done. The destination keeps no copy of a lane's part, so for any other lane OpenETL reads the lane's part of the epoch again from the source and commits it in a new transaction of that lane. That is exact only if the source returns the same records, as this package's source does while the topic still has them. [When a pod fails](https://github.com/openetl-io/openetl/blob/main/docs/pipelines/workers.md#when-a-pod-fails) has what else it depends on.
+- **Recovery.** If a pod fails after a checkpoint and before every lane committed, the next attempt settles each lane of that epoch before it reads anything new. A lane whose marker committed is done. The destination keeps no copy of a lane's part, so for any other lane OpenETL reads the lane's part of the epoch again from the source and commits it in a new transaction of that lane. That is exact only if the source returns the same records, as this package's source does while the topic still has them, with the exception its [Delivery](#delivery) gives. [When a pod fails](https://github.com/openetl-io/openetl/blob/main/docs/pipelines/workers.md#when-a-pod-fails) has what else it depends on.
 
 Do not add partitions to the marker topic. Recovery looks for a lane's marker of an epoch in the partition where the lane's first marker of that epoch went. With more partitions, a lane's part that was written again after a failure can be written once more.
 

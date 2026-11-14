@@ -17,7 +17,7 @@ require (
 	github.com/google/uuid v1.6.0
 	github.com/jackc/pglogrepl v0.0.0-20261003132456-662581bb6bb6
 	github.com/jackc/pgx/v5 v5.12.0
-	github.com/openetl-io/openetl/sdk/go v0.1.0-alpha.0.20261114195854-a7d0dc4f5ef2
+	github.com/openetl-io/openetl/sdk/go v0.1.0-alpha.0.20261114205500-e470ff8d332d
 	github.com/twmb/avro v1.9.0
 	github.com/twmb/franz-go v1.22.3
 	github.com/twmb/franz-go/pkg/kadm v1.19.0
