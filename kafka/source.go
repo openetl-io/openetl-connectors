@@ -273,6 +273,9 @@ type topicRead struct {
 	// Bounded reads: where each partition ends, and the partitions done.
 	end  map[int32]int64
 	done map[int32]bool
+	// Bounded reads: the partitions whose read stops at an offset the
+	// request gives, reading no record from it on.
+	until map[int32]int64
 	// Bounded reads: when each partition last moved.
 	moved map[int32]time.Time
 	hwm   map[int32]int64
@@ -309,6 +312,11 @@ func (s *Source) Read(ctx context.Context, req source.ReadRequest, out source.Em
 			if r.next, err = parseState(st.State); err != nil {
 				return err
 			}
+			if st.Until != nil && !req.Continuous {
+				if r.until, err = parseState(st.Until); err != nil {
+					return err
+				}
+			}
 		} else {
 			if r.next, err = splitOffsets(st.Splits); err != nil {
 				return err
@@ -320,6 +328,16 @@ func (s *Source) Read(ctx context.Context, req source.ReadRequest, out source.Em
 					return err
 				}
 				r.splits[p] = out.Split(st.Name, sp.ID)
+				if sp.Until != nil && !req.Continuous {
+					var u splitState
+					if err := json.Unmarshal(sp.Until, &u); err != nil {
+						return fmt.Errorf("kafka: until of split %s: %w", sp.ID, err)
+					}
+					if r.until == nil {
+						r.until = map[int32]int64{}
+					}
+					r.until[p] = u.Offset
+				}
 			}
 		}
 		reads[st.Name] = r
@@ -327,6 +345,16 @@ func (s *Source) Read(ctx context.Context, req source.ReadRequest, out source.Em
 	}
 	if err := s.position(ctx, adm, reads, topics); err != nil {
 		return err
+	}
+	for _, r := range reads {
+		if r.whole != nil && r.until != nil {
+			// The partitions the read's end has, as it had them.
+			for p := range r.next {
+				if _, ok := r.until[p]; !ok {
+					delete(r.next, p)
+				}
+			}
+		}
 	}
 	retentions(ctx, adm, reads, topics)
 	bounded := !req.Continuous
@@ -340,6 +368,9 @@ func (s *Source) Read(ctx context.Context, req source.ReadRequest, out source.Em
 				r.end[o.Partition] = o.Offset
 			}
 		})
+		for _, r := range reads {
+			maps.Copy(r.end, r.until)
+		}
 	}
 	consume := map[string]map[int32]kgo.Offset{}
 	now := time.Now()
@@ -418,6 +449,9 @@ func (s *Source) Read(ctx context.Context, req source.ReadRequest, out source.Em
 		for _, rec := range fs.Records() {
 			r := reads[rec.Topic]
 			if r == nil || r.done[rec.Partition] || rec.Offset < r.next[rec.Partition] {
+				continue
+			}
+			if u, ok := r.until[rec.Partition]; ok && rec.Offset >= u {
 				continue
 			}
 			r.next[rec.Partition] = rec.Offset + 1
@@ -512,7 +546,8 @@ func (r *topicRead) finish(consumer *kgo.Client) error {
 		r.done[p] = true
 		pause = append(pause, p)
 		if r.splits != nil {
-			if err := r.splits[p].Complete(encodeOffset(r.next[p])); err != nil {
+			_, until := r.until[p]
+			if err := completeAt(r.splits[p], encodeOffset(r.next[p]), until); err != nil {
 				return err
 			}
 		}
@@ -525,9 +560,20 @@ func (r *topicRead) finish(consumer *kgo.Client) error {
 	}
 	r.complete = true
 	if r.splits == nil {
-		return r.whole.Complete(encodeState(r.next))
+		return completeAt(r.whole, encodeState(r.next), r.until != nil)
 	}
 	return nil
+}
+
+// completeAt completes a split, or the whole stream, at state, after a
+// resume point there if the request said where its read ends.
+func completeAt(em source.SplitEmitter, state []byte, until bool) error {
+	if until {
+		if err := em.ResumePoint(state); err != nil {
+			return err
+		}
+	}
+	return em.Complete(state)
 }
 
 // position gives each partition read its next offset: the state's, or else

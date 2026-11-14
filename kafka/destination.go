@@ -15,6 +15,7 @@ import (
 	"github.com/twmb/franz-go/pkg/kadm"
 	"github.com/twmb/franz-go/pkg/kerr"
 	"github.com/twmb/franz-go/pkg/kgo"
+	"github.com/twmb/franz-go/pkg/kmsg"
 	"github.com/twmb/franz-go/pkg/sr"
 
 	"github.com/openetl-io/openetl-connectors/records"
@@ -33,10 +34,10 @@ type DestinationConfig struct {
 	// For created topics; 0: the broker's default.
 	Partitions        int32 `json:"partitions"`
 	ReplicationFactor int16 `json:"replicationFactor"`
-	// The compacted topic holding each epoch's marker. Default
-	// _openetl_markers.
+	// The compacted topic holding each writer lane's marker of each epoch.
+	// Default _openetl_markers.
 	MarkerTopic string `json:"markerTopic"`
-	// Transactional IDs are this, the pipeline, and the producer's slot.
+	// Transactional IDs are this, the pipeline, and the producer's number.
 	// Default openetl-.
 	TransactionalIDPrefix string `json:"transactionalIdPrefix"`
 	// Follow each delete with a tombstone for its key.
@@ -45,8 +46,11 @@ type DestinationConfig struct {
 
 const (
 	defaultMarkerTopic = "_openetl_markers"
-	// Epoch N's transaction is on producer N mod slots: while N commits,
-	// N+1 can be pre-committed and N+2 written.
+	// A writer lane's part of epoch N is a transaction on its producer N mod
+	// slots: while N commits, N+1 can be pre-committed and N+2 written. Lane
+	// L's producers are numbered L*slots to L*slots+slots-1, so every lane's
+	// transactional IDs stay the same across attempts, and a lane's new
+	// writer fences the lane's old one and no other.
 	slots = 3
 	// Without the platform's interval, as a continuous pipeline commits.
 	defaultInterval = 10 * time.Second
@@ -135,6 +139,9 @@ func unreachable(err error) bool {
 }
 
 func (d *Destination) Open(ctx context.Context, cfg destination.OpenConfig) (destination.Writer, error) {
+	if cfg.Lane < 0 || cfg.Lane >= DestinationCapabilities.WriterLanes {
+		return nil, fmt.Errorf("kafka: writer lane %d of %d", cfg.Lane, DestinationCapabilities.WriterLanes)
+	}
 	for _, s := range cfg.Streams {
 		if !DestinationCapabilities.SupportsMode(s.Mode) {
 			return nil, sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_CONFIG_INVALID, fmt.Errorf("kafka: stream %q: Kafka only appends", s.Name))
@@ -233,12 +240,12 @@ func (w *writer) open(ctx context.Context) error {
 	return nil
 }
 
-// newSlot starts slot i's producer. Initializing it fences the producer an
-// earlier attempt had with its transactional ID, and settles that
-// producer's transaction: an open one is aborted, one being committed
-// finishes.
+// newSlot starts the producer of the writer's lane's slot i. Initializing
+// it fences the producer an earlier attempt had with its transactional ID,
+// and settles that producer's transaction: an open one is aborted, one
+// being committed finishes.
 func (w *writer) newSlot(ctx context.Context, i int) (*slot, error) {
-	id := w.d.cfg.TransactionalIDPrefix + w.cfg.Pipeline + "-" + strconv.Itoa(i)
+	id := w.d.cfg.TransactionalIDPrefix + w.cfg.Pipeline + "-" + strconv.Itoa(w.cfg.Lane*slots+i)
 	cl, err := w.d.cfg.client(
 		kgo.TransactionalID(id),
 		kgo.TransactionTimeout(timeout(w.cfg.CommitInterval)),
@@ -455,33 +462,47 @@ func (w *writer) Write(ctx context.Context, e destination.Epoch, stream string, 
 	return nil
 }
 
-// marker is each epoch's record on the marker topic, keyed by the pipeline.
+// marker is a writer lane's record of an epoch on the marker topic, in
+// the transaction that holds the lane's part of the epoch.
 type marker struct {
 	Pipeline   string `json:"pipeline"`
 	Generation uint64 `json:"generation"`
 	Epoch      uint64 `json:"epoch"`
+	Lane       int    `json:"lane,omitempty"`
 }
 
+// markerKey is the key of a lane's markers: the pipeline, and the lane
+// after the first. Compaction keeps each lane's newest.
+func markerKey(pipeline string, lane int) []byte {
+	if lane == 0 {
+		return []byte(pipeline)
+	}
+	return []byte(pipeline + "/" + strconv.Itoa(lane))
+}
+
+// staged is a writer lane's committable.
 type staged struct {
 	Slot       int    `json:"slot"`
 	Generation uint64 `json:"generation"`
 	Epoch      uint64 `json:"epoch"`
+	Lane       int    `json:"lane,omitempty"`
 	// Where the marker is.
 	Partition int32 `json:"partition"`
 	Offset    int64 `json:"offset"`
 }
 
-// PreCommit adds the epoch's marker to its transaction and flushes it.
+// PreCommit adds the lane's marker of the epoch to its transaction and
+// flushes it.
 func (w *writer) PreCommit(ctx context.Context, e destination.Epoch) (destination.Staged, error) {
 	s, err := w.txn(e)
 	if err != nil {
 		return nil, err
 	}
-	value, err := json.Marshal(marker{Pipeline: w.cfg.Pipeline, Generation: e.Generation, Epoch: e.N})
+	value, err := json.Marshal(marker{Pipeline: w.cfg.Pipeline, Generation: e.Generation, Epoch: e.N, Lane: w.cfg.Lane})
 	if err != nil {
 		return nil, err
 	}
-	res := s.cl.ProduceSync(ctx, &kgo.Record{Topic: w.d.cfg.MarkerTopic, Key: []byte(w.cfg.Pipeline), Value: value})
+	res := s.cl.ProduceSync(ctx, &kgo.Record{Topic: w.d.cfg.MarkerTopic, Key: markerKey(w.cfg.Pipeline, w.cfg.Lane), Value: value})
 	if err := s.cl.Flush(ctx); err != nil {
 		return nil, err
 	}
@@ -495,22 +516,36 @@ func (w *writer) PreCommit(ctx context.Context, e destination.Epoch) (destinatio
 	if err != nil {
 		return nil, classify(fmt.Errorf("kafka: epoch %d: %w", e.N, err))
 	}
-	return json.Marshal(staged{Slot: int(e.N % slots), Generation: e.Generation, Epoch: e.N, Partition: rec.Partition, Offset: rec.Offset})
+	return json.Marshal(staged{Slot: int(e.N % slots), Generation: e.Generation, Epoch: e.N, Lane: w.cfg.Lane, Partition: rec.Partition, Offset: rec.Offset})
 }
 
-// Commit commits the epoch's transaction. A fenced producer means a newer
-// attempt owns the pipeline. A commit franz-go can't confirm is settled by
-// aborting it on the same producer, which leaves a commit that reached the
-// broker in place; Commit then looks for the epoch's marker, as it does
-// without a transaction open for the epoch, after an earlier Commit.
-func (w *writer) Commit(ctx context.Context, e destination.Epoch, committables []destination.Staged) (destination.Committed, error) {
+// committable is the writer's lane's committable of epoch e, the only one
+// it takes.
+func (w *writer) committable(e destination.Epoch, committables []destination.Staged) (staged, error) {
 	st, err := destination.One(committables)
 	if err != nil {
-		return destination.Committed{}, err
+		return staged{}, err
 	}
 	var desc staged
 	if err := json.Unmarshal(st, &desc); err != nil {
-		return destination.Committed{}, fmt.Errorf("kafka: staged descriptor: %w", err)
+		return staged{}, fmt.Errorf("kafka: staged descriptor: %w", err)
+	}
+	if desc.Lane != w.cfg.Lane {
+		return staged{}, fmt.Errorf("kafka: writer lane %d was given lane %d's part of epoch %d", w.cfg.Lane, desc.Lane, e.N)
+	}
+	return desc, nil
+}
+
+// Commit commits the lane's transaction of the epoch. A fenced producer
+// means a newer attempt owns the lane. A commit franz-go can't confirm is
+// settled by aborting it on the same producer, which leaves a commit that
+// reached the broker in place; Commit then looks for the lane's marker of
+// the epoch, as it does without a transaction open for the epoch, after an
+// earlier Commit.
+func (w *writer) Commit(ctx context.Context, e destination.Epoch, committables []destination.Staged) (destination.Committed, error) {
+	desc, err := w.committable(e, committables)
+	if err != nil {
+		return destination.Committed{}, err
 	}
 	s := w.slots[desc.Slot%slots]
 	s.mu.Lock()
@@ -519,7 +554,11 @@ func (w *writer) Commit(ctx context.Context, e destination.Epoch, committables [
 	if open {
 		err := s.cl.EndTransaction(ctx, kgo.TryCommit)
 		if err != nil && !fenced(err) {
-			err = s.cl.EndTransaction(ctx, kgo.TryAbort)
+			// The abort's success says nothing of the commit's: the marker
+			// does.
+			if aerr := s.cl.EndTransaction(ctx, kgo.TryAbort); fenced(aerr) {
+				err = aerr
+			}
 		}
 		s.mu.Lock()
 		s.epoch = destination.Epoch{}
@@ -545,19 +584,17 @@ func fenced(err error) bool {
 	return errors.Is(err, kerr.ProducerFenced) || errors.Is(err, kerr.InvalidProducerEpoch)
 }
 
-// Recover reports whether the epoch's marker is visible. Open has settled
-// every transaction an earlier attempt left, so the answer is final.
+// Recover reports whether the lane's part of the epoch committed: Applied
+// if its marker is visible, else Lost, since the destination keeps no copy
+// of it. Open has settled every transaction an earlier writer of the lane
+// left, so the answer is final, and touched no other lane's.
 func (w *writer) Recover(ctx context.Context, _ uint64, e destination.Epoch, committables []destination.Staged) (destination.Recovery, error) {
-	st, err := destination.One(committables)
-	if err != nil {
-		return 0, err
-	}
 	if e.IsZero() {
 		return destination.Applied, nil
 	}
-	var desc staged
-	if err := json.Unmarshal(st, &desc); err != nil {
-		return 0, fmt.Errorf("kafka: staged descriptor: %w", err)
+	desc, err := w.committable(e, committables)
+	if err != nil {
+		return 0, err
 	}
 	ok, err := w.applied(ctx, e, desc)
 	switch {
@@ -569,13 +606,19 @@ func (w *writer) Recover(ctx context.Context, _ uint64, e destination.Epoch, com
 	return destination.Lost, nil
 }
 
-// applied reads the marker topic from the epoch's marker, read_committed:
-// the marker comes first if its transaction committed, and otherwise a later
-// record, or the abort's control record, does.
+// applied says whether a committed transaction holds the lane's marker of
+// epoch e: at desc's offset, where the lane's PreCommit put it, or later in
+// the partition, where a redo of the lane's part of e puts it again. It
+// reads the partition uncommitted, up to the end it has when applied
+// starts, and settles each such marker by its producer's next control
+// record, so that no other transaction open in the partition holds it up.
+// The lane's own transactions have ended by then, or are ending: opening
+// the writer fenced the lane's earlier producers, and Commit ended its own.
 func (w *writer) applied(ctx context.Context, e destination.Epoch, desc staged) (bool, error) {
+	topic := w.d.cfg.MarkerTopic
 	cl, err := w.d.cfg.client(
-		kgo.ConsumePartitions(map[string]map[int32]kgo.Offset{w.d.cfg.MarkerTopic: {desc.Partition: kgo.NewOffset().At(desc.Offset)}}),
-		kgo.FetchIsolationLevel(kgo.ReadCommitted()),
+		kgo.ConsumePartitions(map[string]map[int32]kgo.Offset{topic: {desc.Partition: kgo.NewOffset().At(desc.Offset)}}),
+		kgo.FetchIsolationLevel(kgo.ReadUncommitted()),
 		kgo.KeepControlRecords(),
 		kgo.ConsumeResetOffset(kgo.NoResetOffset()),
 	)
@@ -585,10 +628,28 @@ func (w *writer) applied(ctx context.Context, e destination.Epoch, desc staged) 
 	defer cl.Close()
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
 	defer cancel()
+	ends, err := kadm.NewClient(cl).ListEndOffsets(ctx, topic)
+	if err == nil {
+		err = ends.Error()
+	}
+	if err != nil {
+		return false, classify(fmt.Errorf("kafka: the end of %s: %w", topic, err))
+	}
+	end, ok := ends.Lookup(topic, desc.Partition)
+	switch {
+	case !ok:
+		return false, fmt.Errorf("kafka: %s has no partition %d", topic, desc.Partition)
+	case end.Offset <= desc.Offset:
+		return false, nil
+	}
+	want := marker{Pipeline: w.cfg.Pipeline, Generation: e.Generation, Epoch: e.N, Lane: desc.Lane}
+	key := markerKey(w.cfg.Pipeline, desc.Lane)
+	// The producers whose open transaction holds the marker.
+	holding := map[int64]bool{}
 	for {
 		fs := cl.PollFetches(ctx)
 		if err := ctx.Err(); err != nil {
-			return false, sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_TRANSIENT, fmt.Errorf("kafka: epoch %d's marker: %w", e.N, err))
+			return false, sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_TRANSIENT, fmt.Errorf("kafka: lane %d's marker of epoch %d: %w", desc.Lane, e.N, err))
 		}
 		var ferr error
 		fs.EachError(func(_ string, _ int32, err error) { ferr = errors.Join(ferr, err) })
@@ -596,22 +657,38 @@ func (w *writer) applied(ctx context.Context, e destination.Epoch, desc staged) 
 			if errors.Is(ferr, kerr.OffsetOutOfRange) {
 				return false, nil
 			}
-			return false, classify(fmt.Errorf("kafka: epoch %d's marker: %w", e.N, ferr))
+			return false, classify(fmt.Errorf("kafka: lane %d's marker of epoch %d: %w", desc.Lane, e.N, ferr))
 		}
 		for _, r := range fs.Records() {
-			if r.Offset < desc.Offset {
+			switch {
+			case r.Offset < desc.Offset:
 				continue
+			case r.Attrs.IsControl():
+				if holding[r.ProducerID] {
+					if commits(r) {
+						return true, nil
+					}
+					delete(holding, r.ProducerID)
+				}
+			case r.Attrs.IsTransactional() && bytes.Equal(r.Key, key) && isMarker(r.Value, want):
+				holding[r.ProducerID] = true
 			}
-			if r.Offset > desc.Offset || r.Attrs.IsControl() {
+			if r.Offset >= end.Offset-1 && len(holding) == 0 {
 				return false, nil
 			}
-			var m marker
-			if err := json.Unmarshal(r.Value, &m); err != nil {
-				return false, nil
-			}
-			return m == marker{Pipeline: w.cfg.Pipeline, Generation: e.Generation, Epoch: e.N}, nil
 		}
 	}
+}
+
+// commits says whether a control record commits its transaction.
+func commits(r *kgo.Record) bool {
+	var k kmsg.ControlRecordKey
+	return k.ReadFrom(r.Key) == nil && k.Type == kmsg.ControlRecordKeyTypeCommit
+}
+
+func isMarker(value []byte, want marker) bool {
+	var m marker
+	return json.Unmarshal(value, &m) == nil && m == want
 }
 
 func (w *writer) Close(context.Context) error {
