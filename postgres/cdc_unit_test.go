@@ -5,6 +5,8 @@ import (
 	"slices"
 	"testing"
 
+	"github.com/jackc/pglogrepl"
+
 	protocolv1 "github.com/openetl-io/openetl/sdk/go/protocol/v1"
 )
 
@@ -35,5 +37,34 @@ func TestDeclaredOnly(t *testing.T) {
 	var coded interface{ ErrorCode() protocolv1.ErrorCode }
 	if !errors.As(err, &coded) || coded.ErrorCode() != protocolv1.ErrorCode_ERROR_CODE_TRANSIENT {
 		t.Errorf("a key column it didn't declare: %v", err)
+	}
+}
+
+// An update's value that the log left out, as an unchanged TOAST value, is
+// named as unchanged; with the whole old row, as replica identity full
+// sends it, it's filled from that.
+func TestAnUnsentValueIsFilledFromAWholeOldRow(t *testing.T) {
+	rel := &relation{
+		stream: &cdcStream{t: table{name: "users", cols: []sourceColumn{{name: "id"}, {name: "name"}, {name: "doc"}}}},
+		at:     []int{0, 1, 2},
+		conv:   make([]func([]byte) []byte, 3),
+		names:  []string{"id", "name", "doc"},
+	}
+	col := func(kind byte, v string) *pglogrepl.TupleDataColumn {
+		return &pglogrepl.TupleDataColumn{DataType: kind, Data: []byte(v)}
+	}
+	update := &pglogrepl.TupleData{Columns: []*pglogrepl.TupleDataColumn{
+		col(pglogrepl.TupleDataTypeText, "3"), col(pglogrepl.TupleDataTypeText, "renamed"), col(pglogrepl.TupleDataTypeToast, ""),
+	}}
+	vals, unchanged := rel.values(update, nil)
+	if vals[2] != nil || !slices.Equal(unchanged, []string{"doc"}) {
+		t.Errorf("without the old row: doc %q, unchanged %v", vals[2], unchanged)
+	}
+	old := &pglogrepl.TupleData{Columns: []*pglogrepl.TupleDataColumn{
+		col(pglogrepl.TupleDataTypeText, "3"), col(pglogrepl.TupleDataTypeText, "before"), col(pglogrepl.TupleDataTypeText, "big"),
+	}}
+	vals, unchanged = rel.values(update, old)
+	if string(vals[1]) != "renamed" || string(vals[2]) != "big" || len(unchanged) != 0 {
+		t.Errorf("with the whole old row: %q, unchanged %v", vals, unchanged)
 	}
 }

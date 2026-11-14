@@ -342,6 +342,26 @@ func TestCDCSnapshotsThenReadsChanges(t *testing.T) {
 	}
 }
 
+// With replica identity full, the log sends an update's old row whole, and
+// the source fills the TOAST value the update left out from it.
+func TestCDCFillsAnUnchangedTOASTValueFromTheWholeOldRow(t *testing.T) {
+	e := newSourceEnv(t)
+	e.exec("CREATE TABLE $schema.users (id int PRIMARY KEY, name text, doc text)")
+	e.exec("ALTER TABLE $schema.users ALTER COLUMN doc SET STORAGE EXTERNAL")
+	e.exec("ALTER TABLE $schema.users REPLICA IDENTITY FULL")
+	big := strings.Repeat("x", 9000)
+	e.exec("INSERT INTO $schema.users VALUES (1, 'a', '" + big + "')")
+	s, pipeline := e.cdcSource("")
+	c := readCDC(t, s, pipeline, map[string]string{"users": ""})
+	state := c.last("users")
+
+	e.exec("UPDATE $schema.users SET name = 'b' WHERE id = 1")
+	got := readCDC(t, s, pipeline, map[string]string{"users": state}).changes(t, "users")
+	if len(got) != 1 || got[0].op != "update" || got[0].name != "b" || got[0].doc != big || got[0].unchanged != "(null)" {
+		t.Fatalf("changes: %+v", got)
+	}
+}
+
 // Writers change the table throughout a continuous read with small chunks.
 // Merged by key and seq, what's emitted is the table.
 func TestCDCFollowsConcurrentWrites(t *testing.T) {

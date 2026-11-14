@@ -98,6 +98,22 @@ spec:
 
 `openetl discover` lists a column as nullable unless it's `NOT NULL`. In a table CDC can read, only the key's columns are listed as not nullable, since a deleted row carries only its key.
 
+### Large values in updates
+
+Postgres keeps a large value out of the row, in the table's TOAST storage, as it does with a long `text` or `jsonb` that doesn't fit in about 2 kB even compressed. Under a table's default replica identity, the log leaves such a value out of an update that didn't change it, to save writing it again.
+
+The source then sends that column as null, and names it as a column the update didn't send. Written with `merge`, the destination keeps the value it has for it; other write modes store the update as it came, with the column null and named in `_openetl_unchanged`.
+
+With a SQL transform whose `WHERE` reads the table, such an update can bring a row into the `WHERE` that failed it before. The destination doesn't have that column's current value then, and the row lands without it, as [Statements that run](https://github.com/openetl-io/openetl/blob/main/docs/reference/specs/pipeline.md#statements-that-run) explains.
+
+To have every update arrive whole, give such tables the `FULL` replica identity:
+
+```sql
+ALTER TABLE public.orders REPLICA IDENTITY FULL;
+```
+
+The log then carries each updated or deleted row's old values in full, large values included, and the source fills each value an update left out from them. That costs more write-ahead log for each update and delete, and more for the slot to read. The other choices are to accept the behaviour above, or to read such tables with `full_refresh` or `incremental` in a scheduled pipeline, which read whole rows.
+
 ### Delivery
 
 Full refresh and CDC streams replay exactly: a read resumed from a checkpoint yields the same rows in the same order. OpenETL counts incremental streams as ones that may repeat rows, because of the rows at the cursor's last value, and the destination's capabilities decide what guarantee that leaves.
