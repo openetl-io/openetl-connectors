@@ -609,3 +609,49 @@ func TestSubscribeFails(t *testing.T) {
 		t.Fatalf("%v isn't PERMISSION_DENIED", err)
 	}
 }
+
+// The preflight names streams as the writer does.
+func TestTarget(t *testing.T) {
+	md := arrow.NewMetadata([]string{records.TableKey}, []string{"orders"})
+	withTable := arrow.NewSchema(nil, &md)
+	for _, c := range []struct {
+		pipeline, config, stream string
+		sc                       *arrow.Schema
+		want                     string
+	}{
+		{"", "", "public.orders", withTable, "orders"},
+		{"cdc", "", "public.orders", withTable, "cdc.orders"},
+		{"cdc", "cfg", "public.orders", withTable, "cdc.orders"},
+		{"", "cfg", "public.orders", withTable, "cfg.orders"},
+		{"", "", "public.orders", nil, records.AvroName("public.orders")},
+	} {
+		if got := target(c.pipeline, c.config, tableOf(c.stream, c.sc)); got != c.want {
+			t.Errorf("%+v: %s", c, got)
+		}
+	}
+}
+
+func TestKeyColumns(t *testing.T) {
+	sc := arrow.NewSchema([]arrow.Field{{Name: "id", Type: arrow.PrimitiveTypes.Int64}, {Name: "name", Type: arrow.BinaryTypes.String}}, nil)
+	for _, c := range []struct {
+		mode    string
+		primary []string
+		fields  []string
+		hasID   bool
+		want    []string
+		ok      bool
+	}{
+		{partitionByKey, []string{"id"}, nil, false, []string{"id"}, true},
+		{partitionByKey, nil, nil, true, nil, true},
+		{partitionByKey, nil, nil, false, nil, false},
+		{partitionByKey, []string{"nope"}, nil, true, nil, false},
+		{partitionByFields, nil, []string{"name"}, false, []string{"name"}, true},
+		{partitionByFields, nil, []string{"name", "nope"}, true, nil, false},
+		{partitionRandom, nil, nil, false, nil, true},
+	} {
+		got, err := keyColumns(c.mode, sc, c.primary, c.fields, c.hasID)
+		if (err == nil) != c.ok || c.ok && !slices.Equal(got, c.want) {
+			t.Errorf("%+v: %v, %v", c, got, err)
+		}
+	}
+}

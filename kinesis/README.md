@@ -24,13 +24,19 @@ Keep `accessKeyId`, `secretAccessKey` and `schemaRegistryPassword` in secrets, a
 
 From 0.2.0. Kinesis throttles a shard or an account that goes over its limits. Both connectors retry a throttled call, and one that fails for a moment, after a random wait up to `retry.initialBackoff` (100 ms), doubled for each retry in a row, up to `retry.maxBackoff` (10 s). The AWS SDK tries each call up to `retry.maxAttempts` (10) times. After that, the connector keeps waiting and trying again while Kinesis keeps throttling, for up to `retry.maxElapsed` (5 minutes) without a call getting through. Then the read or the write fails with `RATE_LIMITED`, and OpenETL retries the attempt later. A call that gets through starts the count again.
 
-### Check
+### Check and preflight
 
-From 0.2.0, checking a source or a destination runs a pre-flight. It says what it checked, item by item, and what to do about each item that fails, such as the IAM action to allow. It reads no records and writes nothing:
+From 0.2.0, both say what they looked at, item by item, and what to do about each item that fails, such as the IAM action to allow. Neither reads records or writes anything.
+
+A **check** is about the connection alone, and runs from a source's or a destination's page:
 
 - Both reach Kinesis by listing streams, and the schema registry by listing its subjects if `schemaRegistryUrl` is set.
-- The source then looks at each stream in `streams`, or the first five that match `streamPattern`. It describes the stream (its status, open shards, retention and encryption), lists its shards, and reads one shard from its newest record with `GetShardIterator` and `GetRecords`, which returns nothing. It warns if `startTimestamp` is older than the stream's retention. With enhanced fan-out, it lists the stream's consumers, or describes `consumer.name`, in place of the read. It doesn't register a consumer, so it lists what registering and subscribing need.
-- The destination compares the streams already named `NAMESPACE.*`, up to ten, with what it would create, and warns of each that differs. It can't check creating streams or putting records without doing it, so it skips those items and lists the IAM actions they need.
+- The source also finds the streams it offers, and warns if `streams` and `streamPattern` match none.
+
+A **preflight** is about a pipeline: OpenETL runs it with the streams a sync of the pipeline would read and write, after both checks pass.
+
+- For each stream the pipeline reads, the source describes the Kinesis stream (its status, open shards, retention and encryption), lists its shards, and reads one shard from its newest record with `GetShardIterator` and `GetRecords`, which returns nothing. It fails a stream that doesn't exist, or that the pipeline reads in a sync mode other than `stream`. It warns if `startTimestamp` is older than the stream's retention, and if the pipeline's schedule can leave more time between syncs than the stream keeps records. With enhanced fan-out, it describes the pipeline's consumer. If the consumer isn't registered yet, it says the first read registers it, and fails if the stream already has Kinesis's 20 consumers. It doesn't register a consumer, so it lists what registering and subscribing need.
+- For each stream the pipeline writes, the destination checks the write mode is append, and that it can make partition keys: `partitionKey.fields` must be columns of the stream. It looks up the Kinesis stream the writer would use, `NAMESPACE.TABLE`. One that exists must be active, and the preflight warns if it differs from `streamMode`, `shards`, `retentionHours` or `kmsKeyId`. One that doesn't fails if `createStreams` is `false`, and otherwise the preflight says how the first write creates it and what that needs. It can't check putting records without doing it, so it skips that item and lists the IAM actions it needs.
 
 ## Source
 
@@ -108,7 +114,7 @@ Reads replay exactly within the stream's retention period: a read resumed from a
 
 ### What it writes
 
-Each stream goes to a Kinesis stream named after its table, prefixed with the pipeline's `destination.namespace` or the config's `namespace` if either is set: `NAMESPACE.TABLE`. A missing stream is created unless `createStreams` is `false`: on-demand by default, or with `streamMode: provisioned` and `shards` shards. From 0.2.0, `streamMode` picks the mode, which `shards` alone did before; `retentionHours` (24 to 8,760; 24 by default) sets its retention, and `kmsKeyId` encrypts it. These settings apply only to streams the destination creates. An existing stream is written to as it is, and a check warns of one that differs.
+Each stream goes to a Kinesis stream named after its table, prefixed with the pipeline's `destination.namespace` or the config's `namespace` if either is set: `NAMESPACE.TABLE`. A missing stream is created unless `createStreams` is `false`: on-demand by default, or with `streamMode: provisioned` and `shards` shards. From 0.2.0, `streamMode` picks the mode, which `shards` alone did before; `retentionHours` (24 to 8,760; 24 by default) sets its retention, and `kmsKeyId` encrypts it. These settings apply only to streams the destination creates. An existing stream is written to as it is, and a preflight warns of one that differs.
 
 Each row is one record. Its data is the row in `format`, with Avro and Protobuf schemas registered under `<stream>-value`. A row over Kinesis's 1 MiB per record, once encoded, fails the write.
 

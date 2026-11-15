@@ -94,7 +94,10 @@ type Destination struct {
 	records, bytes *rate.Limiter
 }
 
-var _ destination.Preflighter = (*Destination)(nil)
+var (
+	_ destination.CheckReporter = (*Destination)(nil)
+	_ destination.Preflighter   = (*Destination)(nil)
+)
 
 func NewDestination(config []byte) (*Destination, error) {
 	var cfg DestinationConfig
@@ -231,9 +234,15 @@ type streamEncoder struct {
 }
 
 func (w *writer) target(table string) string {
-	ns := w.cfg.Namespace
+	return target(w.cfg.Namespace, w.d.cfg.Namespace, table)
+}
+
+// target is the Kinesis stream a table goes to: namespace.table, with the
+// pipeline's namespace or else the config's, or table without either.
+func target(pipeline, config, table string) string {
+	ns := pipeline
 	if ns == "" {
-		ns = w.d.cfg.Namespace
+		ns = config
 	}
 	if ns == "" {
 		return table
@@ -241,14 +250,21 @@ func (w *writer) target(table string) string {
 	return ns + "." + table
 }
 
+// tableOf is the table a stream's schema names, or its name made a table.
+func tableOf(stream string, sc *arrow.Schema) string {
+	if sc != nil {
+		if t, ok := sc.Metadata().GetValue(records.TableKey); ok {
+			return t
+		}
+	}
+	return records.AvroName(stream)
+}
+
 func (w *writer) encoder(ctx context.Context, stream string, sc *arrow.Schema) (*streamEncoder, error) {
 	if e := w.encs[stream]; e != nil && e.schema.Equal(sc) {
 		return e, nil
 	}
-	table, ok := sc.Metadata().GetValue(records.TableKey)
-	if !ok {
-		table = records.AvroName(stream)
-	}
+	table := tableOf(stream, sc)
 	e := &streamEncoder{schema: sc, target: w.target(table), id: -1, mode: w.d.cfg.PartitionKey.Mode}
 	if err := w.ensureStream(ctx, e.target); err != nil {
 		return nil, err
@@ -275,23 +291,9 @@ func (w *writer) encoder(ctx context.Context, stream string, sc *arrow.Schema) (
 
 // keys settles the columns partition keys are made of.
 func (e *streamEncoder) keys(sc *arrow.Schema, primary, fields []string) error {
-	var names []string
-	switch e.mode {
-	case partitionByKey:
-		var err error
-		if names, err = records.KeyColumns(sc, primary); err != nil {
-			return err
-		}
-		if len(names) == 0 && e.id < 0 {
-			return fmt.Errorf("neither a primary key nor %s for partition keys", idColumn)
-		}
-	case partitionByFields:
-		names = fields
-		for _, n := range names {
-			if len(sc.FieldIndices(n)) == 0 {
-				return invalid(fmt.Errorf("no column %s, which partitionKey.fields names", n))
-			}
-		}
+	names, err := keyColumns(e.mode, sc, primary, fields, e.id >= 0)
+	if err != nil {
+		return err
 	}
 	for _, n := range names {
 		i := sc.FieldIndices(n)[0]
@@ -299,6 +301,30 @@ func (e *streamEncoder) keys(sc *arrow.Schema, primary, fields []string) error {
 		e.keyCols = append(e.keyCols, e.cols[i])
 	}
 	return nil
+}
+
+// keyColumns are the columns of sc partition keys are made of in mode;
+// none for random keys, or for _openetl_id's, which hasID says sc has.
+func keyColumns(mode string, sc *arrow.Schema, primary, fields []string, hasID bool) ([]string, error) {
+	switch mode {
+	case partitionByKey:
+		names, err := records.KeyColumns(sc, primary)
+		if err != nil {
+			return nil, invalid(err)
+		}
+		if len(names) == 0 && !hasID {
+			return nil, fmt.Errorf("neither a primary key nor %s for partition keys", idColumn)
+		}
+		return names, nil
+	case partitionByFields:
+		for _, n := range fields {
+			if len(sc.FieldIndices(n)) == 0 {
+				return nil, invalid(fmt.Errorf("no column %s, which partitionKey.fields names", n))
+			}
+		}
+		return fields, nil
+	}
+	return nil, nil
 }
 
 // ensureStream waits for a Kinesis stream to be active, creating it unless

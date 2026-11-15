@@ -27,7 +27,7 @@ import (
 
 	"github.com/openetl-io/openetl-connectors/records"
 	sdk "github.com/openetl-io/openetl/sdk/go"
-	"github.com/openetl-io/openetl/sdk/go/preflight"
+	"github.com/openetl-io/openetl/sdk/go/check"
 	protocolv1 "github.com/openetl-io/openetl/sdk/go/protocol/v1"
 )
 
@@ -193,22 +193,22 @@ func (c *Connection) client(ctx context.Context) (*awskinesis.Client, error) {
 
 // connect checks the credentials reach Kinesis, and the schema registry if
 // there is one. It reports whether Kinesis was reached.
-func connect(ctx context.Context, c *Connection, cl *awskinesis.Client, r *preflight.Report) bool {
+func connect(ctx context.Context, c *Connection, cl *awskinesis.Client, r *check.Report) bool {
 	ok := r.Run("connect", "Reach Kinesis and list streams", func() error {
 		_, err := cl.ListStreams(ctx, &awskinesis.ListStreamsInput{Limit: aws.Int32(1)})
 		return allow(classify(wrap("list streams", err)), "kinesis:ListStreams", "*")
-	}, preflight.Field("region"))
+	}, check.Field("region"))
 	reg, err := c.Registry()
 	switch {
 	case err != nil:
-		r.Fail("schema-registry", "Reach the schema registry", invalid(err), preflight.Field("schemaRegistryUrl"))
+		r.Fail("schema-registry", "Reach the schema registry", invalid(err), check.Field("schemaRegistryUrl"))
 	case reg != nil:
 		r.Run("schema-registry", "Reach the schema registry and list its subjects", func() error {
 			if _, err := reg.Subjects(ctx); err != nil {
-				return preflight.Fix(fmt.Errorf("kinesis: schema registry: %w", err), "Check schemaRegistryUrl, and the user and password if the registry needs them.")
+				return check.Fix(fmt.Errorf("kinesis: schema registry: %w", err), "Check schemaRegistryUrl, and the user and password if the registry needs them.")
 			}
 			return nil
-		}, preflight.Field("schemaRegistryUrl"))
+		}, check.Field("schemaRegistryUrl"))
 	}
 	return ok
 }
@@ -229,11 +229,11 @@ func allow(err error, action, resource string) error {
 	}
 	switch codeOf(err) {
 	case protocolv1.ErrorCode_ERROR_CODE_PERMISSION_DENIED:
-		return preflight.Fix(err, fmt.Sprintf("Allow %s on %s in the IAM policy of the credentials, or of the role in aws.role.", action, resource))
+		return check.Fix(err, fmt.Sprintf("Allow %s on %s in the IAM policy of the credentials, or of the role in aws.role.", action, resource))
 	case protocolv1.ErrorCode_ERROR_CODE_AUTH_INVALID, protocolv1.ErrorCode_ERROR_CODE_AUTH_EXPIRED:
-		return preflight.Fix(err, "Check accessKeyId and secretAccessKey, or the role in aws.role, and the region.")
+		return check.Fix(err, "Check accessKeyId and secretAccessKey, or the role in aws.role, and the region.")
 	case protocolv1.ErrorCode_ERROR_CODE_TRANSIENT:
-		return preflight.Fix(err, "Check that the runner reaches Kinesis in the region, or endpoint if it's set.")
+		return check.Fix(err, "Check that the runner reaches Kinesis in the region, or endpoint if it's set.")
 	}
 	return err
 }

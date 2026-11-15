@@ -29,8 +29,8 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/openetl-io/openetl-connectors/records"
+	"github.com/openetl-io/openetl/sdk/go/check"
 	"github.com/openetl-io/openetl/sdk/go/destination"
-	"github.com/openetl-io/openetl/sdk/go/preflight"
 	protocolv1 "github.com/openetl-io/openetl/sdk/go/protocol/v1"
 	"github.com/openetl-io/openetl/sdk/go/source"
 )
@@ -437,8 +437,8 @@ func newDest(t *testing.T, extra map[string]any) *Destination {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var r preflight.Report
-	d.Preflight(t.Context(), &r)
+	var r check.Report
+	d.CheckReport(t.Context(), &r)
 	if err := r.Err(); err != nil {
 		t.Fatalf("check (is kinesis-mock running? make deps-up): %v", err)
 	}
