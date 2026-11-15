@@ -23,8 +23,8 @@
     "createTopics": {"type": "boolean", "default": true, "description": "Create missing topics."},
     "partitions": {"type": "integer", "minimum": 1, "description": "Created topics' partitions. Default: the brokers'."},
     "replicationFactor": {"type": "integer", "minimum": 1, "description": "Created topics' replication factor. Default: the brokers'."},
-    "markerTopic": {"type": "string", "minLength": 1, "default": "_openetl_markers", "description": "The compacted topic each epoch's transaction writes its marker to. Created if missing."},
-    "transactionalIdPrefix": {"type": "string", "default": "openetl-", "description": "Transactional IDs are this, the pipeline and the producer's slot."},
+    "markerTopic": {"type": "string", "minLength": 1, "default": "_openetl_markers", "description": "The compacted topic each transaction writes its marker of the epoch to: from 0.2.0, its writer lane's (one writer lane before). Created if missing. Don't add partitions to it: recovery looks for a lane's marker of an epoch in the partition its first one went to."},
+    "transactionalIdPrefix": {"type": "string", "default": "openetl-", "description": "Transactional IDs are this, the pipeline and the producer's number. Writer lane L's producers are numbered 3L to 3L+2 (from 0.2.0; one writer lane before)."},
     "tombstones": {"type": "boolean", "default": false, "description": "Follow each delete with a tombstone for its key, for compacted topics."}
   }
 }
