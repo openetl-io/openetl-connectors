@@ -3,17 +3,339 @@
   "title": "Kinesis destination",
   "type": "object",
   "additionalProperties": false,
+  "x-groups": [
+    {
+      "id": "connection",
+      "title": "Connection",
+      "description": "The AWS account and region, and how to sign in."
+    },
+    {
+      "id": "streams",
+      "title": "Streams",
+      "description": "Which Kinesis streams rows go to, and how missing ones are created."
+    },
+    {
+      "id": "writing",
+      "title": "Writing",
+      "description": "Partition keys, ordering and limits."
+    },
+    {
+      "id": "records",
+      "title": "Records",
+      "description": "How each record's data is encoded."
+    },
+    {
+      "id": "retries",
+      "title": "Retries",
+      "description": "Backoff and limits for throttled calls."
+    }
+  ],
   "properties": {
-    "region": {"type": "string", "description": "The streams' AWS region. Default: the AWS default config's."},
-    "endpoint": {"type": "string", "description": "A Kinesis-compatible endpoint: an emulator's, or a VPC endpoint."},
-    "accessKeyId": {"type": "string", "x-secret": true, "description": "An AWS access key. Without one, the AWS default credentials."},
-    "secretAccessKey": {"type": "string", "x-secret": true, "description": "The access key's secret."},
-    "schemaRegistryUrl": {"type": "string", "description": "A Confluent-compatible schema registry. Avro and Protobuf need one."},
-    "schemaRegistryUsername": {"type": "string", "description": "A user for the schema registry's basic authentication. Unset: none."},
-    "schemaRegistryPassword": {"type": "string", "x-secret": true, "description": "The schema registry user's password."},
-    "format": {"type": "string", "enum": ["json", "avro", "protobuf"], "default": "json", "description": "How records' data is encoded. Avro and Protobuf register each stream's schema under <stream>-value."},
-    "namespace": {"type": "string", "description": "Used when the pipeline names no namespace: streams are named namespace.table."},
-    "createStreams": {"type": "boolean", "default": true, "description": "Create missing streams."},
-    "shards": {"type": "integer", "minimum": 1, "description": "Created streams are provisioned with this many shards. Unset: on-demand."}
+    "region": {
+      "type": "string",
+      "title": "Region",
+      "x-group": "connection",
+      "examples": [
+        "eu-west-1"
+      ],
+      "description": "The streams' AWS region. Unset: the AWS default configuration's."
+    },
+    "accessKeyId": {
+      "type": "string",
+      "title": "Access key ID",
+      "x-secret": true,
+      "x-group": "connection",
+      "description": "An AWS access key, with secretAccessKey. Without one, the credentials of the role in aws.role, or the AWS default credentials."
+    },
+    "secretAccessKey": {
+      "type": "string",
+      "title": "Secret access key",
+      "x-secret": true,
+      "x-group": "connection",
+      "description": "The access key's secret."
+    },
+    "endpoint": {
+      "type": "string",
+      "title": "Endpoint",
+      "format": "uri",
+      "x-group": "connection",
+      "x-advanced": true,
+      "examples": [
+        "https://vpce-0abc.kinesis.eu-west-1.vpce.amazonaws.com"
+      ],
+      "description": "A Kinesis-compatible endpoint: a VPC endpoint's, or an emulator's. Unset: the region's."
+    },
+    "namespace": {
+      "type": "string",
+      "title": "Namespace",
+      "x-group": "streams",
+      "examples": [
+        "cdc"
+      ],
+      "description": "Used when the pipeline names no namespace: streams are named namespace.table."
+    },
+    "createStreams": {
+      "type": "boolean",
+      "title": "Create missing streams",
+      "x-group": "streams",
+      "default": true,
+      "description": "Create a stream that doesn't exist, with the settings below. Off: a missing stream fails the write."
+    },
+    "streamMode": {
+      "type": "string",
+      "title": "Capacity mode",
+      "x-group": "streams",
+      "x-when": {
+        "createStreams": true
+      },
+      "default": "onDemand",
+      "oneOf": [
+        {
+          "const": "onDemand",
+          "title": "On-demand",
+          "description": "Kinesis scales the stream's shards with its traffic."
+        },
+        {
+          "const": "provisioned",
+          "title": "Provisioned",
+          "description": "The stream has shards shards."
+        }
+      ],
+      "description": "From 0.2.0. Created streams' capacity mode. An existing stream is left as it is."
+    },
+    "shards": {
+      "type": "integer",
+      "title": "Shards",
+      "minimum": 1,
+      "x-group": "streams",
+      "x-when": {
+        "createStreams": true,
+        "streamMode": "provisioned"
+      },
+      "description": "With streamMode provisioned: created streams' shards."
+    },
+    "retentionHours": {
+      "type": "integer",
+      "title": "Retention",
+      "minimum": 24,
+      "maximum": 8760,
+      "default": 24,
+      "x-group": "streams",
+      "x-when": {
+        "createStreams": true
+      },
+      "x-advanced": true,
+      "description": "From 0.2.0. Created streams' retention period, in hours, from 24 to 8760."
+    },
+    "kmsKeyId": {
+      "type": "string",
+      "title": "KMS key",
+      "x-group": "streams",
+      "x-when": {
+        "createStreams": true
+      },
+      "x-advanced": true,
+      "examples": [
+        "alias/aws/kinesis"
+      ],
+      "description": "From 0.2.0. Created streams are encrypted with this KMS key: its ID, ARN or alias. Unset: not encrypted."
+    },
+    "partitionKey": {
+      "type": "object",
+      "title": "Partition key",
+      "x-group": "writing",
+      "additionalProperties": false,
+      "description": "From 0.2.0. What each record's partition key is made of, which picks its shard.",
+      "properties": {
+        "mode": {
+          "type": "string",
+          "title": "Partition by",
+          "default": "key",
+          "oneOf": [
+            {
+              "const": "key",
+              "title": "Primary key",
+              "description": "The row's primary key, or its _openetl_id without one: a key's rows go to one shard, in order."
+            },
+            {
+              "const": "fields",
+              "title": "Columns",
+              "description": "The columns in fields: rows with the same values go to one shard, in order."
+            },
+            {
+              "const": "random",
+              "title": "Random",
+              "description": "A random key: rows spread evenly over shards, with no order between them."
+            }
+          ],
+          "description": "What partition keys are made of."
+        },
+        "fields": {
+          "type": "array",
+          "title": "Columns",
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1,
+          "x-when": {
+            "partitionKey.mode": "fields"
+          },
+          "examples": [
+            [
+              "customer_id"
+            ]
+          ],
+          "description": "With mode fields: the columns whose values, as text, make the partition key."
+        }
+      }
+    },
+    "ordering": {
+      "type": "string",
+      "title": "Ordering",
+      "x-group": "writing",
+      "default": "key",
+      "oneOf": [
+        {
+          "const": "key",
+          "title": "Per partition key",
+          "description": "A request holds one record of each partition key, so retrying part of one can't put a key's records out of order."
+        },
+        {
+          "const": "none",
+          "title": "None",
+          "description": "Requests are filled freely: faster when a few keys have most rows, but retries can reorder a key's records."
+        }
+      ],
+      "description": "From 0.2.0. Whether a key's records stay in order when Kinesis takes part of a request and the rest is sent again."
+    },
+    "rateLimit": {
+      "type": "object",
+      "title": "Rate limit",
+      "x-group": "writing",
+      "x-advanced": true,
+      "additionalProperties": false,
+      "description": "From 0.2.0. Caps on what one destination process sends, on average. Unset: none.",
+      "properties": {
+        "recordsPerSecond": {
+          "type": "integer",
+          "title": "Records a second",
+          "minimum": 1,
+          "description": "The most records sent a second."
+        },
+        "bytesPerSecond": {
+          "type": "integer",
+          "title": "Bytes a second",
+          "minimum": 1,
+          "description": "The most bytes of data and partition keys sent a second."
+        }
+      }
+    },
+    "format": {
+      "type": "string",
+      "title": "Format",
+      "x-group": "records",
+      "default": "json",
+      "oneOf": [
+        {
+          "const": "json",
+          "title": "JSON",
+          "description": "Each row as a JSON object."
+        },
+        {
+          "const": "avro",
+          "title": "Avro",
+          "description": "Registered under <stream>-value."
+        },
+        {
+          "const": "protobuf",
+          "title": "Protobuf",
+          "description": "Registered under <stream>-value."
+        }
+      ],
+      "description": "How records' data is encoded. Avro and Protobuf register each stream's schema under <stream>-value."
+    },
+    "schemaRegistryUrl": {
+      "type": "string",
+      "title": "Schema registry URL",
+      "format": "uri",
+      "x-group": "records",
+      "x-when": {
+        "format": [
+          "avro",
+          "protobuf"
+        ]
+      },
+      "examples": [
+        "https://registry.example.com:8081"
+      ],
+      "description": "A Confluent-compatible schema registry. Avro and Protobuf need one."
+    },
+    "schemaRegistryUsername": {
+      "type": "string",
+      "title": "Schema registry user",
+      "x-group": "records",
+      "x-when": {
+        "format": [
+          "avro",
+          "protobuf"
+        ]
+      },
+      "description": "A user for the schema registry's basic authentication. Unset: none."
+    },
+    "schemaRegistryPassword": {
+      "type": "string",
+      "title": "Schema registry password",
+      "x-secret": true,
+      "x-group": "records",
+      "x-when": {
+        "format": [
+          "avro",
+          "protobuf"
+        ]
+      },
+      "description": "The schema registry user's password."
+    },
+    "retry": {
+      "type": "object",
+      "title": "Retries",
+      "x-group": "retries",
+      "x-advanced": true,
+      "additionalProperties": false,
+      "description": "From 0.2.0. How calls that Kinesis throttles, or that fail for a moment, are retried.",
+      "properties": {
+        "initialBackoff": {
+          "type": "string",
+          "x-format": "duration",
+          "pattern": "^([0-9]+(\\.[0-9]+)?(ns|us|µs|ms|s|m|h))+$",
+          "default": "100ms",
+          "description": "The first wait before a retry. Each wait is drawn at random up to this, doubled for each retry in a row, up to maxBackoff.",
+          "title": "Initial backoff"
+        },
+        "maxBackoff": {
+          "type": "string",
+          "x-format": "duration",
+          "pattern": "^([0-9]+(\\.[0-9]+)?(ns|us|µs|ms|s|m|h))+$",
+          "default": "10s",
+          "description": "The longest wait before a retry.",
+          "title": "Longest backoff"
+        },
+        "maxAttempts": {
+          "type": "integer",
+          "title": "Attempts per call",
+          "minimum": 1,
+          "maximum": 100,
+          "default": 10,
+          "description": "How many times the AWS SDK tries one call, the first included, before it gives up on it."
+        },
+        "maxElapsed": {
+          "type": "string",
+          "x-format": "duration",
+          "pattern": "^([0-9]+(\\.[0-9]+)?(ns|us|µs|ms|s|m|h))+$",
+          "default": "5m",
+          "description": "How long records may keep being throttled without a break before the write fails with RATE_LIMITED.",
+          "title": "Longest throttling"
+        }
+      }
+    }
   }
 }
