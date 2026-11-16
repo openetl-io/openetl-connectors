@@ -244,6 +244,26 @@ func TestCDCStopsAtUntil(t *testing.T) {
 	}
 }
 
+// A redo of a CDC read's last part, from its last resume point with no
+// until, completes where the read did, though the log has moved since.
+func TestCDCRedoOfTheLastPartEndsWhereTheReadDid(t *testing.T) {
+	e := newSourceEnv(t)
+	e.exec("CREATE TABLE $schema.users (id int PRIMARY KEY, name text, doc text)")
+	e.exec("INSERT INTO $schema.users SELECT i, 'n' || i, NULL FROM generate_series(1, 10) i")
+	s, pipeline := e.cdcSource("")
+	first := readCDC(t, s, pipeline, map[string]string{"users": ""})
+	points, end := first.resumes("users"), first.last("users")
+	e.exec("CREATE TABLE $schema.other (id int)")
+	again := readCDC(t, s, pipeline, map[string]string{"users": points[len(points)-1]})
+	if got := again.last("users"); got != end {
+		t.Errorf("the redo completed at %s, want %s", got, end)
+	}
+	// The read after it reads on.
+	if next := stateOf(t, readCDC(t, s, pipeline, map[string]string{"users": end}).last("users")); next.LSN <= stateOf(t, end).LSN {
+		t.Errorf("the next read completed at %s, not past %s", pglogrepl.LSN(next.LSN), end)
+	}
+}
+
 // A redo from a position the slot was acknowledged past fails with
 // POSITION_LOST, rather than reading from the slot's position and missing
 // the changes between.

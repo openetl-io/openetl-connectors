@@ -73,14 +73,22 @@ func TestChecksAndPreflights(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer cl.Close()
-	if _, err := kadm.NewClient(cl).CreateTopic(t.Context(), 1, 1, map[string]*string{"retention.ms": kadm.StringPtr("60000")}, short); err != nil {
+	adm := kadm.NewClient(cl)
+	if _, err := adm.CreateTopic(t.Context(), 1, 1, map[string]*string{"retention.ms": kadm.StringPtr("60000")}, short); err != nil {
+		t.Fatal(err)
+	}
+	// group.commit passes only for a group that exists: a commit creates it.
+	pipeline := uniq("p")
+	var offs kadm.Offsets
+	offs.Add(kadm.Offset{Topic: topic, Partition: 0, At: 0, LeaderEpoch: -1})
+	if err := adm.CommitAllOffsets(t.Context(), "openetl-"+pipeline, offs); err != nil {
 		t.Fatal(err)
 	}
 
 	s := newSource(t, map[string]any{"topics": []string{topic, short}})
 	allPass(t, "source check", check.Run(t.Context(), s.Checks()))
 	gone := uniq("missing")
-	r := check.Run(t.Context(), s.Preflight(source.PreflightRequest{Pipeline: "p", Interval: time.Hour, Streams: []source.ConfiguredStream{
+	r := check.Run(t.Context(), s.Preflight(source.PreflightRequest{Pipeline: pipeline, Interval: time.Hour, Streams: []source.ConfiguredStream{
 		{Name: topic, SyncMode: source.Stream}, {Name: short, SyncMode: source.Stream}, {Name: gone, SyncMode: source.Stream}, {Name: "full", SyncMode: source.FullRefresh},
 	}}))
 	want(t, "source preflight", r, map[string]string{
@@ -124,7 +132,11 @@ func TestChecksAndPreflights(t *testing.T) {
 		"stream.merged.mode":                     "failed:write_mode_unsupported",
 		"transactions.id":                        "passed",
 	})
-	noCreate := newDest(t, map[string]any{"createTopics": false})
+	// Not newDest: its checks fail where the markers topic doesn't exist yet.
+	noCreate, err := NewDestination(config(t, map[string]any{"createTopics": false}))
+	if err != nil {
+		t.Fatal(err)
+	}
 	r = check.Run(t.Context(), noCreate.Preflight(destination.PreflightRequest{Pipeline: "p", Streams: []destination.Stream{{Name: "absent", Mode: destination.Append}}}))
 	want(t, "createTopics off", r, map[string]string{"stream.absent.write": "failed:topic_missing"})
 }

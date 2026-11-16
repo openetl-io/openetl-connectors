@@ -75,6 +75,9 @@ type cdcState struct {
 	LSN lsn `json:"lsn"`
 	// Until the table's snapshot has been read: where it continues.
 	Snapshot *snapshotCursor `json:"snapshot,omitempty"`
+	// Set in the resume point a bounded read sends where it completes: a
+	// bounded read from it ends there too, wherever the log has got since.
+	End lsn `json:"end,omitempty"`
 }
 
 type snapshotCursor struct {
@@ -145,14 +148,15 @@ type cdcStream struct {
 	resumedAt time.Time
 	// Where its read ends, if it's given one.
 	until *cdcUntil
+	// In a bounded read given one, an until's or a state's End: transactions
+	// that committed at or after it aren't read.
+	end pglogrepl.LSN
 }
 
 // cdcUntil is where a stream's read ends: the state of a resume point an
 // earlier read sent, which a redo of its part of an epoch gives.
 type cdcUntil struct {
 	state []byte
-	// Transactions that committed at or after it aren't read.
-	lsn pglogrepl.LSN
 }
 
 // relation is a table as the log describes it.
@@ -277,6 +281,9 @@ func (s *Source) readCDC(ctx context.Context, conns *connPool, req source.ReadRe
 		if st.ranges, err = r.snapshotRanges(ctx, t, state); err != nil {
 			return err
 		}
+		if !req.Continuous {
+			st.end = pglogrepl.LSN(state.End)
+		}
 		if cs.Until != nil && !req.Continuous {
 			var u cdcState
 			if err := json.Unmarshal(cs.Until, &u); err != nil {
@@ -285,7 +292,8 @@ func (s *Source) readCDC(ctx context.Context, conns *connPool, req source.ReadRe
 			if u.Slot != r.slot {
 				return positionLost("postgres: %s was read through replication slot %q, and the source now reads %q", t.name, u.Slot, r.slot)
 			}
-			st.until = &cdcUntil{state: cs.Until, lsn: pglogrepl.LSN(u.LSN)}
+			st.until = &cdcUntil{state: cs.Until}
+			st.end = pglogrepl.LSN(u.LSN)
 			st.ranges = boundRanges(st.ranges, fresh(state), u.Snapshot)
 		}
 		for _, rng := range st.ranges {
@@ -328,14 +336,14 @@ func (s *Source) readCDC(ctx context.Context, conns *connPool, req source.ReadRe
 		if r.target, err = pglogrepl.ParseLSN(at); err != nil {
 			return err
 		}
-		// Streams that end at an until need the log no further.
+		// Streams given an end need the log no further.
 		ends := pglogrepl.LSN(0)
 		for _, st := range r.streams {
-			if st.until == nil {
+			if st.end == 0 {
 				ends = r.target
 				break
 			}
-			ends = max(ends, st.until.lsn)
+			ends = max(ends, st.end)
 		}
 		r.target = ends
 	}
@@ -868,7 +876,7 @@ func (r *cdcReader) change(id uint32, op string, oldType uint8, old, new *pglogr
 		return fmt.Errorf("postgres: replication: a change to relation %d, which the log hasn't described", id)
 	}
 	st := rel.stream
-	if st == nil || r.txn == nil || r.txn.commit < st.from || st.until != nil && r.txn.commit >= st.until.lsn {
+	if st == nil || r.txn == nil || r.txn.commit < st.from || st.end != 0 && r.txn.commit >= st.end {
 		return nil
 	}
 	var oldKey string
@@ -1188,7 +1196,7 @@ func (r *cdcReader) readChunk(ctx context.Context, conn *pgx.Conn, st *cdcStream
 		return nil, err
 	}
 	if st.until != nil {
-		c.lsn = min(c.lsn, st.until.lsn)
+		c.lsn = min(c.lsn, st.end)
 	}
 	n := len(t.cols)
 	rr := tx.Conn().PgConn().ExecParams(ctx, q, args, nil, nil, nil)
@@ -1240,12 +1248,18 @@ func (r *cdcReader) resume() error {
 	return nil
 }
 
-func (r *cdcReader) state(st *cdcStream) ([]byte, error) {
+// state is st's position; with end, as the resume point a bounded read
+// sends where it completes.
+func (r *cdcReader) state(st *cdcStream, end bool) ([]byte, error) {
 	at := max(st.from, r.pos)
-	if st.until != nil {
-		at = min(at, max(st.from, st.until.lsn))
+	if st.end != 0 {
+		at = min(at, max(st.from, st.end))
 	}
-	return json.Marshal(cdcState{Slot: r.slot, LSN: lsn(at), Snapshot: st.cursor()})
+	s := cdcState{Slot: r.slot, LSN: lsn(at), Snapshot: st.cursor()}
+	if end {
+		s.End = s.LSN
+	}
+	return json.Marshal(s)
 }
 
 // cursor is the snapshot's position, as a state spells it.
@@ -1263,7 +1277,7 @@ func (r *cdcReader) resumeStream(st *cdcStream) error {
 	if err := st.b.flush(st.t.name, r.out); err != nil {
 		return err
 	}
-	b, err := r.state(st)
+	b, err := r.state(st, false)
 	if err != nil {
 		return err
 	}
@@ -1275,7 +1289,8 @@ func (r *cdcReader) resumeStream(st *cdcStream) error {
 }
 
 // complete ends a bounded read: each stream's next sync starts where this
-// one ended, or for one given an until, there, after a resume point there.
+// one ended, after a resume point there that a redo of the read's last part
+// ends at, or for one given an until, there, after a resume point there.
 func (r *cdcReader) complete() error {
 	for _, st := range r.streams {
 		if err := st.b.flush(st.t.name, r.out); err != nil {
@@ -1290,7 +1305,14 @@ func (r *cdcReader) complete() error {
 			}
 			continue
 		}
-		b, err := r.state(st)
+		rp, err := r.state(st, true)
+		if err != nil {
+			return err
+		}
+		if err := r.out.ResumePoint(st.t.name, rp); err != nil {
+			return err
+		}
+		b, err := r.state(st, false)
 		if err != nil {
 			return err
 		}
