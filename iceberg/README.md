@@ -33,7 +33,9 @@ A continuous pipeline commits every minute unless it sets its own `delivery.comm
 
 ## Delivery
 
-Streams whose source replays exactly land exactly once. A stream whose source may send rows again, such as a Postgres table read incrementally, lands effectively once when it's merged: the repeat lands on its key's row. Appended or overwritten, such a stream gets at least once, because the destination can't drop the rows sent again.
+Streams whose source replays exactly land exactly once. A stream whose source may send rows again, such as a Postgres table read incrementally, lands effectively once when it's merged: the repeat lands on its key's row. From 0.2.0, appended or overwritten, such a stream is deduped at commit and lands exactly once, unless the pipeline requires only `at_least_once`, or the stream has no primary key and doesn't collapse: the commit leaves out each row whose `_openetl_id` an earlier row of the epoch has, and each one the table already has. An overwrite's target is its own read, so it keeps one row per `_openetl_id` across the read. With `at_least_once`, a stream without a primary key that collapses is deduped within each epoch only.
+
+Deduping costs reads, since Iceberg has no index to look IDs up in: the commit reads the `_openetl_id` column of the epoch's staged files, and against the table, scans the table's `_openetl_id` column, filtered by the epoch's IDs when there are at most 1,000 of them and in full when there are more. A staged file that loses rows is written again without them. The pipeline's status counts the rows it left out as collapsed.
 
 ## Set it up
 
@@ -82,6 +84,12 @@ Without `accessKeyId` and `secretAccessKey`, the destination uses the AWS SDK's 
 
 The [config schema](./destination.schema.json) has every setting.
 
+### Checks
+
+From 0.2.0, `openetl check` runs the destination's checks, in order: it resolves and connects to the catalog's host, and, over HTTPS, completes a TLS handshake (`net.dns`, `net.connect`, `net.tls`; for Glue at AWS's own endpoint these only advise, since the AWS SDK may reach it through a proxy a dial doesn't take); signs in and lists namespaces (`catalog.auth`); finds the namespace, which the first write creates if it's missing (`catalog.namespace`); creates a table `_openetl_check_…` there, creating the namespace if needed (`catalog.create`); commits a property change to it (`catalog.commit`); with `s3Endpoint`, reaches the store (`store.dns`, `store.connect`, `store.tls`); and writes and deletes a file in the table's location (`store.write`, `store.delete`). It then purges the table, and drops a namespace it created.
+
+From 0.2.0, a pipeline's preflight signs in, finds the namespace, and checks each stream: that its write mode is append, overwrite or merge and that a merge has a primary key of columns that aren't floating-point (`stream.NAME.mode`), and that its table, if it exists, takes the stream's columns without a type change the stream doesn't allow, and, for a merge, is format 2 or later, partitioned by nothing outside the key, and holds no files of an earlier partitioning (`stream.NAME.table`).
+
 ## Types
 
 Columns take the Iceberg type of their Arrow type, with two exceptions:
@@ -102,3 +110,21 @@ ALTER TABLE `raw`.`orders` ALTER COLUMN `amount` TYPE DECIMAL(20, 2)
 Run it in an engine that can change the table, then release the hold. Or let the destination make those promotions itself with the pipeline's `destination.typeChanges: allow`, for every stream or one. A change Iceberg can't make, such as a `long` to a `string`, is refused either way, with no statement to run.
 
 Columns of the table's partition spec can't be held, and nor can a required column take the nulls a hold leaves; a table the destination created has neither.
+
+## Partitioned tables
+
+From 0.2.0.
+
+The destination creates its tables unpartitioned, and doesn't change a table's partitioning. It writes into a table that's already partitioned, by any of Iceberg's transforms, with each data file in one partition. At commit, it reads each file's partition columns to find its partition; if the table's partitioning changed after the file was written, so that its rows span partitions, it writes the rows again, by partition.
+
+A merge writes equality deletes in the partition of the key's new row, so it needs every column the table is partitioned by in the stream's primary key. It refuses a table partitioned by another column, and the preflight says so.
+
+A delete written in a table's current partitioning doesn't reach files of an earlier one. So a merge, or a patch of an appended stream's held cells, fails on a partitioned table that still holds files written before its partitioning last changed, until they're rewritten into the current one, as Spark's `rewrite_data_files` procedure does.
+
+## Limits
+
+- New tables are unpartitioned and unsorted: the destination has no setting for a new table's partitioning or sort order. Partition a table with an engine that can, such as Spark's `ALTER TABLE … ADD PARTITION FIELD`, and the destination writes into its partitions from then on.
+- New tables are format 2, and timestamps are kept in microseconds: the destination neither creates format 3 tables nor writes `timestamp_ns`. From 0.2.0, it appends to and overwrites a format 3 table that exists, giving its rows their row IDs; merges and held cells' patches into a format 3 table are untested.
+- Deduping holds every `_openetl_id` of the epoch in memory, and of the whole read for an overwrite, and a staged file that loses rows is read whole to be written again.
+- The destination writes; it doesn't read tables back as a source.
+- Glue commits one table at a time, so a pipeline into Glue needs stream scope, and an epoch's tables may land a few moments apart.
