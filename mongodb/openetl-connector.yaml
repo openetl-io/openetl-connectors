@@ -1,0 +1,14 @@
+name: mongodb
+title: MongoDB
+description: MongoDB collections, in full, incrementally or by change streams, and MongoDB as a destination
+license: Apache-2.0
+repository: https://github.com/openetl-io/openetl-connectors
+docs: https://github.com/openetl-io/openetl-connectors/blob/main/mongodb/README.md
+logo: https://upload.wikimedia.org/wikipedia/commons/9/93/MongoDB_Logo.svg
+tags: [database, cdc]
+author: OpenETL
+roles:
+  source:
+    build: { go: ../cmd/source-mongodb }
+  destination:
+    build: { go: ../cmd/destination-mongodb }
