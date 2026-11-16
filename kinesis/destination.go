@@ -2,9 +2,13 @@ package kinesis
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
+	"log/slog"
+	"strings"
 	"time"
 	"unicode/utf8"
 
@@ -14,6 +18,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/kinesis/types"
 	"github.com/aws/smithy-go"
 	"github.com/twmb/franz-go/pkg/sr"
+	"golang.org/x/time/rate"
 
 	"github.com/openetl-io/openetl-connectors/records"
 	sdk "github.com/openetl-io/openetl/sdk/go"
@@ -28,9 +33,49 @@ type DestinationConfig struct {
 	Namespace string `json:"namespace"`
 	// Create missing streams. Default true.
 	CreateStreams *bool `json:"createStreams"`
-	// Created streams' shards, provisioned; 0: on-demand.
-	Shards int32 `json:"shards"`
+	// Created streams' capacity mode: onDemand (default) or provisioned,
+	// with Shards shards.
+	StreamMode string `json:"streamMode"`
+	Shards     int32  `json:"shards"`
+	// Created streams' retention, in hours; 0: Kinesis's 24.
+	RetentionHours int32 `json:"retentionHours"`
+	// Created streams are encrypted with this KMS key; empty: not encrypted.
+	KMSKeyID     string       `json:"kmsKeyId"`
+	PartitionKey PartitionKey `json:"partitionKey"`
+	// key (default): a request holds one record of each partition key, so a
+	// retry can't reorder a key's records. none: requests are filled
+	// freely.
+	Ordering  string    `json:"ordering"`
+	RateLimit RateLimit `json:"rateLimit"`
 }
+
+// PartitionKey is what a record's partition key is made of.
+type PartitionKey struct {
+	// key (default): the row's primary key, or its _openetl_id. fields: the
+	// columns in Fields. random: a random key, spreading rows evenly over
+	// shards with no order between a key's rows.
+	Mode   string   `json:"mode"`
+	Fields []string `json:"fields"`
+}
+
+// RateLimit caps what one destination process sends, on average; 0: no
+// cap.
+type RateLimit struct {
+	RecordsPerSecond int `json:"recordsPerSecond"`
+	BytesPerSecond   int `json:"bytesPerSecond"`
+}
+
+const (
+	streamOnDemand    = "onDemand"
+	streamProvisioned = "provisioned"
+
+	partitionByKey    = "key"
+	partitionByFields = "fields"
+	partitionRandom   = "random"
+
+	orderingKey  = "key"
+	orderingNone = "none"
+)
 
 // Kinesis's limits.
 const (
@@ -38,38 +83,103 @@ const (
 	maxRequestBytes    = 5 << 20
 	maxRecordBytes     = 1 << 20
 	maxPartitionKeyLen = 256
+	minRetentionHours  = 24
+	maxRetentionHours  = 8760
 	idColumn           = "_openetl_id"
 )
 
 type Destination struct {
 	cfg DestinationConfig
+	// Shared by every writer of the process; nil: no cap.
+	records, bytes *rate.Limiter
 }
-
-var _ destination.Checker = (*Destination)(nil)
 
 func NewDestination(config []byte) (*Destination, error) {
 	var cfg DestinationConfig
 	if err := decodeConfig(config, &cfg); err != nil {
 		return nil, err
 	}
-	if err := cfg.validate(records.JSON, records.Avro, records.Protobuf); err != nil {
-		return nil, sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_CONFIG_INVALID, err)
+	if err := cfg.validate(); err != nil {
+		return nil, invalid(err)
 	}
-	if cfg.Shards < 0 {
-		return nil, sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_CONFIG_INVALID, fmt.Errorf("kinesis: shards %d is below 1", cfg.Shards))
+	d := &Destination{cfg: cfg}
+	if n := cfg.RateLimit.RecordsPerSecond; n > 0 {
+		d.records = rate.NewLimiter(rate.Limit(n), max(n, maxRequestRecords))
 	}
-	return &Destination{cfg: cfg}, nil
+	if n := cfg.RateLimit.BytesPerSecond; n > 0 {
+		d.bytes = rate.NewLimiter(rate.Limit(n), max(n, maxRequestBytes))
+	}
+	return d, nil
+}
+
+// validate checks the config and fills in its defaults.
+func (c *DestinationConfig) validate() error {
+	if err := c.Connection.validate(records.JSON, records.Avro, records.Protobuf); err != nil {
+		return err
+	}
+	switch c.StreamMode {
+	case "", streamOnDemand:
+		c.StreamMode = streamOnDemand
+		if c.Shards != 0 {
+			return errors.New("kinesis: shards needs streamMode provisioned")
+		}
+	case streamProvisioned:
+		if c.Shards < 1 {
+			return fmt.Errorf("kinesis: streamMode provisioned needs shards, 1 or more, not %d", c.Shards)
+		}
+	default:
+		return fmt.Errorf("kinesis: streamMode %q isn't onDemand or provisioned", c.StreamMode)
+	}
+	if h := c.RetentionHours; h != 0 && (h < minRetentionHours || h > maxRetentionHours) {
+		return fmt.Errorf("kinesis: retentionHours %d isn't between %d and %d", h, minRetentionHours, maxRetentionHours)
+	}
+	switch c.PartitionKey.Mode {
+	case "", partitionByKey, partitionRandom:
+		if c.PartitionKey.Mode == "" {
+			c.PartitionKey.Mode = partitionByKey
+		}
+		if len(c.PartitionKey.Fields) > 0 {
+			return errors.New("kinesis: partitionKey.fields needs partitionKey.mode fields")
+		}
+	case partitionByFields:
+		if len(c.PartitionKey.Fields) == 0 {
+			return errors.New("kinesis: partitionKey.mode fields needs partitionKey.fields")
+		}
+	default:
+		return fmt.Errorf("kinesis: partitionKey.mode %q isn't key, fields or random", c.PartitionKey.Mode)
+	}
+	switch c.Ordering {
+	case "":
+		c.Ordering = orderingKey
+	case orderingKey, orderingNone:
+	default:
+		return fmt.Errorf("kinesis: ordering %q isn't key or none", c.Ordering)
+	}
+	if c.RateLimit.RecordsPerSecond < 0 || c.RateLimit.BytesPerSecond < 0 {
+		return errors.New("kinesis: rateLimit's values are negative")
+	}
+	return nil
+}
+
+func (c *DestinationConfig) createsStreams() bool { return c.CreateStreams == nil || *c.CreateStreams }
+
+// setup says the streams the destination creates need more than
+// CreateStream gives them: retention or encryption.
+func (c *DestinationConfig) setup() bool {
+	return c.RetentionHours > minRetentionHours || c.KMSKeyID != ""
 }
 
 func (d *Destination) Capabilities() destination.Capabilities { return DestinationCapabilities }
 
-// Check lists streams and, if there is one, the schema registry's subjects.
-func (d *Destination) Check(ctx context.Context) error { return check(ctx, &d.cfg.Connection) }
+// putter is the part of the Kinesis client a writer sends with.
+type putter interface {
+	PutRecords(ctx context.Context, in *awskinesis.PutRecordsInput, opts ...func(*awskinesis.Options)) (*awskinesis.PutRecordsOutput, error)
+}
 
 func (d *Destination) Open(ctx context.Context, cfg destination.OpenConfig) (destination.Writer, error) {
 	for _, s := range cfg.Streams {
 		if !DestinationCapabilities.SupportsMode(s.Mode) {
-			return nil, sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_CONFIG_INVALID, fmt.Errorf("kinesis: stream %q: Kinesis only appends", s.Name))
+			return nil, invalid(fmt.Errorf("kinesis: stream %q: Kinesis only appends", s.Name))
 		}
 	}
 	reg, err := d.cfg.Registry()
@@ -80,7 +190,7 @@ func (d *Destination) Open(ctx context.Context, cfg destination.OpenConfig) (des
 	if err != nil {
 		return nil, err
 	}
-	w := &writer{d: d, cfg: cfg, reg: reg, cl: cl, streams: map[string]destination.Stream{}, encs: map[string]*streamEncoder{}, ready: map[string]bool{}, pending: map[string]*request{}}
+	w := &writer{d: d, cfg: cfg, reg: reg, cl: cl, put: cl, streams: map[string]destination.Stream{}, encs: map[string]*streamEncoder{}, ready: map[string]bool{}, pending: map[string]*queue{}}
 	for _, s := range cfg.Streams {
 		w.streams[s.Name] = s
 	}
@@ -92,17 +202,25 @@ type writer struct {
 	cfg destination.OpenConfig
 	reg *sr.Client
 	cl  *awskinesis.Client
+	put putter
 
 	streams map[string]destination.Stream
 	encs    map[string]*streamEncoder
 	// Kinesis streams that exist and are active.
 	ready map[string]bool
-	// Each Kinesis stream's request being filled.
-	pending map[string]*request
+	// Each Kinesis stream's records not sent yet, in order.
+	pending map[string]*queue
 }
 
-type request struct {
-	entries []types.PutRecordsRequestEntry
+type entry struct {
+	data []byte
+	key  string
+}
+
+func (e entry) size() int { return len(e.data) + len(e.key) }
+
+type queue struct {
+	entries []entry
 	bytes   int
 }
 
@@ -111,6 +229,7 @@ type streamEncoder struct {
 	schema  *arrow.Schema
 	target  string
 	cols    []records.Col
+	mode    string
 	key     []int
 	keyCols []records.Col
 	enc     records.Encoder
@@ -118,9 +237,15 @@ type streamEncoder struct {
 }
 
 func (w *writer) target(table string) string {
-	ns := w.cfg.Namespace
+	return target(w.cfg.Namespace, w.d.cfg.Namespace, table)
+}
+
+// target is the Kinesis stream a table goes to: namespace.table, with the
+// pipeline's namespace or else the config's, or table without either.
+func target(pipeline, config, table string) string {
+	ns := pipeline
 	if ns == "" {
-		ns = w.d.cfg.Namespace
+		ns = config
 	}
 	if ns == "" {
 		return table
@@ -128,15 +253,22 @@ func (w *writer) target(table string) string {
 	return ns + "." + table
 }
 
+// tableOf is the table a stream's schema names, or its name made a table.
+func tableOf(stream string, sc *arrow.Schema) string {
+	if sc != nil {
+		if t, ok := sc.Metadata().GetValue(records.TableKey); ok {
+			return t
+		}
+	}
+	return records.AvroName(stream)
+}
+
 func (w *writer) encoder(ctx context.Context, stream string, sc *arrow.Schema) (*streamEncoder, error) {
 	if e := w.encs[stream]; e != nil && e.schema.Equal(sc) {
 		return e, nil
 	}
-	table, ok := sc.Metadata().GetValue(records.TableKey)
-	if !ok {
-		table = records.AvroName(stream)
-	}
-	e := &streamEncoder{schema: sc, target: w.target(table), id: -1}
+	table := tableOf(stream, sc)
+	e := &streamEncoder{schema: sc, target: w.target(table), id: -1, mode: w.d.cfg.PartitionKey.Mode}
 	if err := w.ensureStream(ctx, e.target); err != nil {
 		return nil, err
 	}
@@ -150,17 +282,8 @@ func (w *writer) encoder(ctx context.Context, stream string, sc *arrow.Schema) (
 			e.id = i
 		}
 	}
-	names, err := records.KeyColumns(sc, w.streams[stream].PrimaryKey)
-	if err != nil {
+	if err := e.keys(sc, w.streams[stream].PrimaryKey, w.d.cfg.PartitionKey.Fields); err != nil {
 		return nil, fmt.Errorf("kinesis: stream %q: %w", stream, err)
-	}
-	for _, n := range names {
-		i := sc.FieldIndices(n)[0]
-		e.key = append(e.key, i)
-		e.keyCols = append(e.keyCols, cols[i])
-	}
-	if len(e.key) == 0 && e.id < 0 {
-		return nil, fmt.Errorf("kinesis: stream %q has neither a primary key nor %s for partition keys", stream, idColumn)
 	}
 	if e.enc, err = records.NewEncoder(ctx, w.d.cfg.Format, w.reg, e.target+"-value", table, cols, w.streams[stream].AllowTypeChanges); err != nil {
 		return nil, fmt.Errorf("kinesis: stream %q: %w", stream, err)
@@ -169,41 +292,226 @@ func (w *writer) encoder(ctx context.Context, stream string, sc *arrow.Schema) (
 	return e, nil
 }
 
+// keys settles the columns partition keys are made of.
+func (e *streamEncoder) keys(sc *arrow.Schema, primary, fields []string) error {
+	names, err := keyColumns(e.mode, sc, primary, fields, e.id >= 0)
+	if err != nil {
+		return err
+	}
+	for _, n := range names {
+		i := sc.FieldIndices(n)[0]
+		e.key = append(e.key, i)
+		e.keyCols = append(e.keyCols, e.cols[i])
+	}
+	return nil
+}
+
+// keyColumns are the columns of sc partition keys are made of in mode;
+// none for random keys, or for _openetl_id's, which hasID says sc has.
+func keyColumns(mode string, sc *arrow.Schema, primary, fields []string, hasID bool) ([]string, error) {
+	switch mode {
+	case partitionByKey:
+		names, err := records.KeyColumns(sc, primary)
+		if err != nil {
+			return nil, invalid(err)
+		}
+		if len(names) == 0 && !hasID {
+			return nil, fmt.Errorf("neither a primary key nor %s for partition keys", idColumn)
+		}
+		return names, nil
+	case partitionByFields:
+		for _, n := range fields {
+			if len(sc.FieldIndices(n)) == 0 {
+				return nil, invalid(fmt.Errorf("no column %s, which partitionKey.fields names", n))
+			}
+		}
+		return fields, nil
+	}
+	return nil, nil
+}
+
+// setupTag marks a stream the destination created and hasn't finished
+// setting up: CreateStream sets it, and it's removed once the stream has
+// the config's retention and encryption.
+const (
+	setupTag     = "openetl.io/setup"
+	setupPending = "pending"
+)
+
 // ensureStream waits for a Kinesis stream to be active, creating it unless
-// it exists or createStreams is off.
+// it exists or createStreams is off. Only a stream it creates gets the
+// config's mode, retention and encryption; an existing one is left as it
+// is, unless the destination created it and its setup didn't finish, which
+// ensureStream then finishes.
 func (w *writer) ensureStream(ctx context.Context, name string) error {
 	if w.ready[name] {
 		return nil
 	}
-	_, err := w.cl.DescribeStreamSummary(ctx, &awskinesis.DescribeStreamSummaryInput{StreamName: aws.String(name)})
+	cfg := &w.d.cfg
+	sum, err := w.cl.DescribeStreamSummary(ctx, &awskinesis.DescribeStreamSummaryInput{StreamName: aws.String(name)})
+	created := false
 	if apiCode(err) == "ResourceNotFoundException" {
-		if c := w.d.cfg.CreateStreams; c != nil && !*c {
-			return sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_CONFIG_INVALID, fmt.Errorf("kinesis: stream %s doesn't exist, and createStreams is off", name))
+		sum = nil
+		if !cfg.createsStreams() {
+			return invalid(fmt.Errorf("kinesis: stream %s doesn't exist, and createStreams is off", name))
 		}
 		in := &awskinesis.CreateStreamInput{StreamName: aws.String(name), StreamModeDetails: &types.StreamModeDetails{StreamMode: types.StreamModeOnDemand}}
-		if w.d.cfg.Shards > 0 {
-			in.ShardCount, in.StreamModeDetails = aws.Int32(w.d.cfg.Shards), &types.StreamModeDetails{StreamMode: types.StreamModeProvisioned}
+		if cfg.StreamMode == streamProvisioned {
+			in.ShardCount, in.StreamModeDetails = aws.Int32(cfg.Shards), &types.StreamModeDetails{StreamMode: types.StreamModeProvisioned}
 		}
-		if _, err = w.cl.CreateStream(ctx, in); apiCode(err) == "ResourceInUseException" {
+		if cfg.setup() {
+			in.Tags = map[string]string{setupTag: setupPending}
+		}
+		_, err = w.cl.CreateStream(ctx, in)
+		switch apiCode(err) {
+		case "":
+			created = err == nil
+		case "ResourceInUseException":
 			err = nil
 		}
 	}
 	if err != nil {
 		return classify(fmt.Errorf("kinesis: stream %s: %w", name, err))
 	}
-	waiter := awskinesis.NewStreamExistsWaiter(w.cl, func(o *awskinesis.StreamExistsWaiterOptions) { o.MinDelay = time.Second })
-	if err := waiter.Wait(ctx, &awskinesis.DescribeStreamInput{StreamName: aws.String(name)}, 5*time.Minute); err != nil {
-		return classify(fmt.Errorf("kinesis: stream %s didn't become active: %w", name, err))
+	if err := w.active(ctx, name); err != nil {
+		return err
+	}
+	if cfg.setup() {
+		pending := created
+		if !created {
+			var err error
+			pending, err = pendingSetup(ctx, w.cl, name)
+			switch {
+			case accessDenied(apiCode(err)) && sum != nil && encrypted(cfg, sum.StreamDescriptionSummary):
+				// Without its tags, the stream counts as one the
+				// destination didn't create. That holds only while it
+				// has the config's encryption: a stream whose setup
+				// failed before encrypting it would take records in
+				// the clear.
+			case err != nil:
+				return classify(fmt.Errorf("kinesis: stream %s: list its tags: %w", name, err))
+			}
+		}
+		if pending {
+			if err := w.configure(ctx, name); err != nil {
+				return err
+			}
+			sum = nil
+		}
+	}
+	if sum != nil {
+		if diff := differs(cfg, sum.StreamDescriptionSummary); diff != "" {
+			slog.WarnContext(ctx, "kinesis: an existing stream differs from the config, which applies only to streams the destination creates", "stream", name, "differs", diff)
+		}
 	}
 	w.ready[name] = true
 	return nil
 }
 
-// partitionKey is a row's key as text, or its _openetl_id, hashed if it's
-// longer than Kinesis allows.
+// encrypted says the stream has the config's key, or the config has none.
+func encrypted(cfg *DestinationConfig, sum *types.StreamDescriptionSummary) bool {
+	return cfg.KMSKeyID == "" || sum.EncryptionType == types.EncryptionTypeKms && aws.ToString(sum.KeyId) == cfg.KMSKeyID
+}
+
+// tagLister is the part of the Kinesis client that lists a stream's tags.
+type tagLister interface {
+	ListTagsForStream(ctx context.Context, in *awskinesis.ListTagsForStreamInput, opts ...func(*awskinesis.Options)) (*awskinesis.ListTagsForStreamOutput, error)
+}
+
+// pendingSetup says the destination created the stream and hasn't finished
+// setting it up.
+func pendingSetup(ctx context.Context, cl tagLister, name string) (bool, error) {
+	in := &awskinesis.ListTagsForStreamInput{StreamName: aws.String(name), Limit: aws.Int32(50)}
+	for {
+		res, err := cl.ListTagsForStream(ctx, in)
+		if err != nil {
+			return false, err
+		}
+		for _, t := range res.Tags {
+			if aws.ToString(t.Key) == setupTag {
+				return aws.ToString(t.Value) == setupPending, nil
+			}
+		}
+		if !aws.ToBool(res.HasMoreTags) || len(res.Tags) == 0 {
+			return false, nil
+		}
+		in.ExclusiveStartTagKey = res.Tags[len(res.Tags)-1].Key
+	}
+}
+
+func (w *writer) active(ctx context.Context, name string) error {
+	waiter := awskinesis.NewStreamExistsWaiter(w.cl, func(o *awskinesis.StreamExistsWaiterOptions) { o.MinDelay = time.Second })
+	if err := waiter.Wait(ctx, &awskinesis.DescribeStreamInput{StreamName: aws.String(name)}, 5*time.Minute); err != nil {
+		return classify(fmt.Errorf("kinesis: stream %s didn't become active: %w", name, err))
+	}
+	return nil
+}
+
+// configure gives a stream the destination created the config's retention
+// and encryption, what it doesn't have of them yet, then takes away its
+// setup tag.
+func (w *writer) configure(ctx context.Context, name string) error {
+	cfg := &w.d.cfg
+	res, err := w.cl.DescribeStreamSummary(ctx, &awskinesis.DescribeStreamSummaryInput{StreamName: aws.String(name)})
+	if err != nil {
+		return classify(fmt.Errorf("kinesis: stream %s: %w", name, err))
+	}
+	sum := res.StreamDescriptionSummary
+	if h := cfg.RetentionHours; h > aws.ToInt32(sum.RetentionPeriodHours) {
+		if _, err := w.cl.IncreaseStreamRetentionPeriod(ctx, &awskinesis.IncreaseStreamRetentionPeriodInput{StreamName: aws.String(name), RetentionPeriodHours: aws.Int32(h)}); err != nil {
+			return classify(fmt.Errorf("kinesis: stream %s: set retention: %w", name, err))
+		}
+		if err := w.active(ctx, name); err != nil {
+			return err
+		}
+	}
+	if k := cfg.KMSKeyID; k != "" && (sum.EncryptionType != types.EncryptionTypeKms || aws.ToString(sum.KeyId) != k) {
+		if _, err := w.cl.StartStreamEncryption(ctx, &awskinesis.StartStreamEncryptionInput{StreamName: aws.String(name), EncryptionType: types.EncryptionTypeKms, KeyId: aws.String(k)}); err != nil {
+			return classify(fmt.Errorf("kinesis: stream %s: start encryption: %w", name, err))
+		}
+		if err := w.active(ctx, name); err != nil {
+			return err
+		}
+	}
+	if _, err := w.cl.RemoveTagsFromStream(ctx, &awskinesis.RemoveTagsFromStreamInput{StreamName: aws.String(name), TagKeys: []string{setupTag}}); err != nil {
+		return classify(fmt.Errorf("kinesis: stream %s: remove its setup tag: %w", name, err))
+	}
+	return nil
+}
+
+// differs says how an existing stream differs from what the config would
+// create; empty if it doesn't.
+func differs(cfg *DestinationConfig, sum *types.StreamDescriptionSummary) string {
+	var out []string
+	if m := sum.StreamModeDetails; m != nil {
+		switch {
+		case cfg.StreamMode == streamOnDemand && m.StreamMode == types.StreamModeProvisioned:
+			out = append(out, "provisioned, not on-demand")
+		case cfg.StreamMode == streamProvisioned && m.StreamMode == types.StreamModeOnDemand:
+			out = append(out, "on-demand, not provisioned")
+		case cfg.StreamMode == streamProvisioned && aws.ToInt32(sum.OpenShardCount) != cfg.Shards:
+			out = append(out, fmt.Sprintf("%d open shards, not %d", aws.ToInt32(sum.OpenShardCount), cfg.Shards))
+		}
+	}
+	if h := cfg.RetentionHours; h != 0 && aws.ToInt32(sum.RetentionPeriodHours) != h {
+		out = append(out, fmt.Sprintf("%dh of retention, not %dh", aws.ToInt32(sum.RetentionPeriodHours), h))
+	}
+	if cfg.KMSKeyID != "" && (sum.EncryptionType != types.EncryptionTypeKms || aws.ToString(sum.KeyId) != cfg.KMSKeyID) {
+		out = append(out, "not encrypted with kmsKeyId")
+	}
+	return strings.Join(out, ", ")
+}
+
+// partitionKey is a row's partition key, hashed if it's longer than Kinesis
+// allows.
 func (e *streamEncoder) partitionKey(vals []any) (string, error) {
 	var k string
-	if len(e.key) > 0 {
+	switch {
+	case e.mode == partitionRandom:
+		var b [16]byte
+		_, _ = rand.Read(b[:])
+		return hex.EncodeToString(b[:]), nil
+	case len(e.key) > 0:
 		kv := make([]any, len(e.key))
 		for j, i := range e.key {
 			kv[j] = vals[i]
@@ -212,7 +520,7 @@ func (e *streamEncoder) partitionKey(vals []any) (string, error) {
 		if k, err = records.KeyText(e.keyCols, kv); err != nil {
 			return "", err
 		}
-	} else {
+	default:
 		k, _ = vals[e.id].(string)
 	}
 	if k == "" {
@@ -236,6 +544,11 @@ func (w *writer) Write(ctx context.Context, _ destination.Epoch, stream string, 
 	if err != nil {
 		return err
 	}
+	q := w.pending[enc.target]
+	if q == nil {
+		q = &queue{}
+		w.pending[enc.target] = q
+	}
 	vals := make([]any, len(enc.cols))
 	for i := range int(batch.NumRows()) {
 		for j := range enc.cols {
@@ -251,56 +564,126 @@ func (w *writer) Write(ctx context.Context, _ destination.Epoch, stream string, 
 		if err != nil {
 			return fmt.Errorf("kinesis: stream %q: partition key: %w", stream, err)
 		}
-		size := len(data) + len(key)
-		if size > maxRecordBytes {
-			return sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_DATA_INVALID, fmt.Errorf("kinesis: stream %q: a row of %d bytes, over Kinesis's 1 MiB a record", stream, size))
+		if err := w.add(ctx, enc.target, q, entry{data: data, key: key}); err != nil {
+			return fmt.Errorf("kinesis: stream %q: %w", stream, err)
 		}
-		r := w.pending[enc.target]
-		if r != nil && (len(r.entries) == maxRequestRecords || r.bytes+size > maxRequestBytes) {
-			if err := w.put(ctx, enc.target, r.entries); err != nil {
-				return err
-			}
-			r = nil
-		}
-		if r == nil {
-			r = &request{}
-			w.pending[enc.target] = r
-		}
-		r.entries = append(r.entries, types.PutRecordsRequestEntry{Data: data, PartitionKey: aws.String(key)})
-		r.bytes += size
 	}
 	return nil
 }
 
-// put sends entries to a Kinesis stream, and sends the ones it fails again,
-// with backoff, until Kinesis has accepted all of them.
-func (w *writer) put(ctx context.Context, target string, entries []types.PutRecordsRequestEntry) error {
-	backoff := 100 * time.Millisecond
+// add queues e, and sends requests while the queue holds a full one.
+func (w *writer) add(ctx context.Context, target string, q *queue, e entry) error {
+	if e.size() > maxRecordBytes {
+		return sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_DATA_INVALID, fmt.Errorf("a row of %d bytes, over Kinesis's 1 MiB a record", e.size()))
+	}
+	q.entries = append(q.entries, e)
+	q.bytes += e.size()
+	for len(q.entries) >= maxRequestRecords || q.bytes >= maxRequestBytes {
+		if err := w.putAll(ctx, target, w.take(q)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// take takes the next request's entries from q. With ordering key, a request
+// holds one entry of each partition key, and the entries of a key it
+// already holds wait, in order, for a later one.
+func (w *writer) take(q *queue) []entry {
+	var out []entry
+	var keys map[string]bool
+	if w.d.cfg.Ordering == orderingKey {
+		keys = map[string]bool{}
+	}
+	size := 0
+	var rest []entry
+	for i, e := range q.entries {
+		if len(out) == maxRequestRecords || size+e.size() > maxRequestBytes {
+			rest = append(rest, q.entries[i:]...)
+			break
+		}
+		if keys[e.key] {
+			rest = append(rest, e)
+			continue
+		}
+		if keys != nil {
+			keys[e.key] = true
+		}
+		out = append(out, e)
+		size += e.size()
+	}
+	q.entries, q.bytes = rest, q.bytes-size
+	return out
+}
+
+// putAll sends entries to a Kinesis stream, and sends the ones it fails
+// again, with backoff, until Kinesis has accepted all of them. Throttled for
+// longer than retry.maxElapsed, it fails with RATE_LIMITED.
+func (w *writer) putAll(ctx context.Context, target string, entries []entry) error {
+	th := throttle{retry: &w.d.cfg.Retry}
+	failed := func(err error) error { return classify(fmt.Errorf("kinesis: put records to %s: %w", target, err)) }
 	for len(entries) > 0 {
-		res, err := w.cl.PutRecords(ctx, &awskinesis.PutRecordsInput{StreamName: aws.String(target), Records: entries})
+		if err := w.limit(ctx, entries); err != nil {
+			return err
+		}
+		in := &awskinesis.PutRecordsInput{StreamName: aws.String(target), Records: make([]types.PutRecordsRequestEntry, len(entries))}
+		for i, e := range entries {
+			in.Records[i] = types.PutRecordsRequestEntry{Data: e.data, PartitionKey: aws.String(e.key)}
+		}
+		res, err := w.put.PutRecords(ctx, in)
+		if throttled(err) {
+			if err := th.wait(ctx, err); err != nil {
+				return failed(err)
+			}
+			continue
+		}
 		if err != nil {
-			return classify(fmt.Errorf("kinesis: put records to %s: %w", target, err))
+			return failed(err)
 		}
 		if aws.ToInt32(res.FailedRecordCount) == 0 {
 			return nil
 		}
-		var failed []types.PutRecordsRequestEntry
+		var again []entry
+		var last error
 		for i, r := range res.Records {
 			switch code := aws.ToString(r.ErrorCode); code {
 			case "":
 			case "ProvisionedThroughputExceededException", "InternalFailure":
-				failed = append(failed, entries[i])
+				again = append(again, entries[i])
+				last = &smithy.GenericAPIError{Code: code, Message: aws.ToString(r.ErrorMessage)}
 			default:
-				return classify(fmt.Errorf("kinesis: put records to %s: %w", target, &smithy.GenericAPIError{Code: code, Message: aws.ToString(r.ErrorMessage)}))
+				return failed(&smithy.GenericAPIError{Code: code, Message: aws.ToString(r.ErrorMessage)})
 			}
 		}
-		entries = failed
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(backoff):
+		if len(again) == 0 {
+			return nil
 		}
-		backoff = min(2*backoff, 5*time.Second)
+		if len(again) < len(entries) {
+			th.ok()
+		}
+		entries = again
+		if err := th.wait(ctx, last); err != nil {
+			return failed(err)
+		}
+	}
+	return nil
+}
+
+// limit waits until the rate limits let entries go.
+func (w *writer) limit(ctx context.Context, entries []entry) error {
+	if w.d.records != nil {
+		if err := w.d.records.WaitN(ctx, len(entries)); err != nil {
+			return err
+		}
+	}
+	if w.d.bytes != nil {
+		n := 0
+		for _, e := range entries {
+			n += e.size()
+		}
+		if err := w.d.bytes.WaitN(ctx, n); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -308,9 +691,11 @@ func (w *writer) put(ctx context.Context, target string, entries []types.PutReco
 // PreCommit sends what's left, and returns once Kinesis has accepted every
 // record of the epoch.
 func (w *writer) PreCommit(ctx context.Context, _ destination.Epoch) (destination.Staged, error) {
-	for target, r := range w.pending {
-		if err := w.put(ctx, target, r.entries); err != nil {
-			return nil, err
+	for target, q := range w.pending {
+		for len(q.entries) > 0 {
+			if err := w.putAll(ctx, target, w.take(q)); err != nil {
+				return nil, err
+			}
 		}
 		delete(w.pending, target)
 	}

@@ -17,7 +17,8 @@ require (
 	github.com/google/uuid v1.6.0
 	github.com/jackc/pglogrepl v0.0.0-20261003132456-662581bb6bb6
 	github.com/jackc/pgx/v5 v5.12.0
-	github.com/openetl-io/openetl/sdk/go v0.1.0-alpha.0.20261115042459-27ca5b298c33
+	github.com/openetl-io/openetl/sdk/go v0.1.0-alpha.0.20261116144249-1fdca4434725
+	github.com/santhosh-tekuri/jsonschema/v6 v6.0.3
 	github.com/twmb/avro v1.9.0
 	github.com/twmb/franz-go v1.22.3
 	github.com/twmb/franz-go/pkg/kadm v1.19.0
@@ -26,6 +27,7 @@ require (
 	github.com/twmb/franz-go/pkg/sr v1.8.0
 	gocloud.dev v0.46.0
 	golang.org/x/sync v0.22.0
+	golang.org/x/time v0.15.0
 	google.golang.org/protobuf v1.36.12
 )
 
@@ -97,7 +99,6 @@ require (
 	github.com/pierrec/lz4/v4 v4.1.33 // indirect
 	github.com/pkg/browser v0.0.0-20240102092130-5ac0b6a4141c // indirect
 	github.com/planetscale/vtprotobuf v0.6.1-0.20240319094008-0393e58bdf10 // indirect
-	github.com/santhosh-tekuri/jsonschema/v6 v6.0.3 // indirect
 	github.com/spiffe/go-spiffe/v2 v2.8.1 // indirect
 	github.com/stretchr/objx v0.5.3 // indirect
 	github.com/stretchr/testify v1.12.1 // indirect
@@ -123,7 +124,6 @@ require (
 	golang.org/x/oauth2 v0.36.0 // indirect
 	golang.org/x/sys v0.47.0 // indirect
 	golang.org/x/text v0.41.0 // indirect
-	golang.org/x/time v0.15.0 // indirect
 	golang.org/x/xerrors v0.0.0-20240903120638-7835f813f4da // indirect
 	google.golang.org/api v0.295.0 // indirect
 	google.golang.org/genproto v0.0.0-20260715232425-e75dac1f907d // indirect

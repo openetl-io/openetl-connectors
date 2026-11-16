@@ -3,17 +3,334 @@
   "title": "Kinesis source",
   "type": "object",
   "additionalProperties": false,
+  "x-groups": [
+    {
+      "id": "connection",
+      "title": "Connection",
+      "description": "The AWS account and region, and how to sign in."
+    },
+    {
+      "id": "streams",
+      "title": "Streams",
+      "description": "Which streams the source offers, and where their first read starts."
+    },
+    {
+      "id": "reading",
+      "title": "Reading",
+      "description": "How shards are read."
+    },
+    {
+      "id": "records",
+      "title": "Records",
+      "description": "How each record's data is encoded."
+    },
+    {
+      "id": "retries",
+      "title": "Retries",
+      "description": "Backoff and limits for throttled calls."
+    }
+  ],
   "properties": {
-    "region": {"type": "string", "description": "The streams' AWS region. Default: the AWS default config's."},
-    "endpoint": {"type": "string", "description": "A Kinesis-compatible endpoint: an emulator's, or a VPC endpoint."},
-    "accessKeyId": {"type": "string", "x-secret": true, "description": "An AWS access key. Without one, the AWS default credentials."},
-    "secretAccessKey": {"type": "string", "x-secret": true, "description": "The access key's secret."},
-    "schemaRegistryUrl": {"type": "string", "description": "A Confluent-compatible schema registry. Avro and Protobuf need one."},
-    "schemaRegistryUsername": {"type": "string", "description": "A user for the schema registry's basic authentication. Unset: none."},
-    "schemaRegistryPassword": {"type": "string", "x-secret": true, "description": "The schema registry user's password."},
-    "format": {"type": "string", "enum": ["json", "avro", "protobuf", "string"], "default": "json", "description": "How records' data is encoded. Avro and Protobuf use the schema registry's wire format; string reads each record as text."},
-    "streams": {"type": "array", "items": {"type": "string"}, "description": "The Kinesis streams to offer as streams. Empty: every stream the credentials can list."},
-    "streamPattern": {"type": "string", "description": "A regular expression streams must match to be offered."},
-    "startPosition": {"type": "string", "enum": ["earliest", "latest"], "default": "earliest", "description": "Where a shard's first read starts: its oldest record, or records that arrive after the read starts."}
+    "region": {
+      "type": "string",
+      "title": "Region",
+      "x-group": "connection",
+      "examples": [
+        "eu-west-1"
+      ],
+      "description": "The streams' AWS region. Unset: the AWS default configuration's."
+    },
+    "accessKeyId": {
+      "type": "string",
+      "title": "Access key ID",
+      "x-secret": true,
+      "x-group": "connection",
+      "description": "An AWS access key, with secretAccessKey. Without one, the credentials of the role in aws.role, or the AWS default credentials."
+    },
+    "secretAccessKey": {
+      "type": "string",
+      "title": "Secret access key",
+      "x-secret": true,
+      "x-group": "connection",
+      "description": "The access key's secret."
+    },
+    "endpoint": {
+      "type": "string",
+      "title": "Endpoint",
+      "format": "uri",
+      "x-group": "connection",
+      "x-advanced": true,
+      "examples": [
+        "https://vpce-0abc.kinesis.eu-west-1.vpce.amazonaws.com"
+      ],
+      "description": "A Kinesis-compatible endpoint: a VPC endpoint's, or an emulator's. Unset: the region's."
+    },
+    "streams": {
+      "type": "array",
+      "title": "Streams",
+      "x-group": "streams",
+      "items": {
+        "type": "string"
+      },
+      "examples": [
+        [
+          "clicks",
+          "orders"
+        ]
+      ],
+      "description": "The Kinesis streams to offer as streams. Empty: every stream the credentials can list."
+    },
+    "streamPattern": {
+      "type": "string",
+      "title": "Stream pattern",
+      "x-format": "regex",
+      "x-group": "streams",
+      "examples": [
+        "^prod\\."
+      ],
+      "description": "A regular expression, in Go's syntax, that streams must match to be offered."
+    },
+    "startPosition": {
+      "type": "string",
+      "title": "Start position",
+      "x-group": "streams",
+      "default": "earliest",
+      "oneOf": [
+        {
+          "const": "earliest",
+          "title": "Earliest",
+          "description": "Each shard's oldest record the stream still holds."
+        },
+        {
+          "const": "latest",
+          "title": "Latest",
+          "description": "Records that arrive after the first read starts."
+        },
+        {
+          "const": "timestamp",
+          "title": "At a time",
+          "description": "From 0.2.0. Records that arrived at or after startTimestamp."
+        }
+      ],
+      "description": "Where a stream's first read starts. Later reads resume where the last one stopped."
+    },
+    "startTimestamp": {
+      "type": "string",
+      "title": "Start time",
+      "format": "date-time",
+      "x-group": "streams",
+      "x-when": {
+        "startPosition": "timestamp"
+      },
+      "examples": [
+        "2026-11-01T00:00:00Z"
+      ],
+      "description": "From 0.2.0. With startPosition timestamp: the first read starts at the records that arrived at or after this time, in RFC 3339. Records older than the stream's retention are gone. It must have passed: Kinesis starts a read only at a time that has, so a time in the future fails the preflight, and a first read fails with CONFIG_INVALID."
+    },
+    "consumer": {
+      "type": "object",
+      "title": "Consumer",
+      "x-group": "reading",
+      "additionalProperties": false,
+      "description": "From 0.2.0. How shards are read.",
+      "properties": {
+        "type": {
+          "type": "string",
+          "title": "Consumer type",
+          "default": "polling",
+          "oneOf": [
+            {
+              "const": "polling",
+              "title": "Shared throughput",
+              "description": "GetRecords, polling each shard. Readers of a shard share its 2 MB a second and 5 calls a second."
+            },
+            {
+              "const": "efo",
+              "title": "Enhanced fan-out",
+              "description": "A consumer registered for the pipeline, with 2 MB a second of its own per shard, pushed with SubscribeToShard. Kinesis charges for it, and allows 20 per stream, or 50 for an On-demand Advantage stream."
+            }
+          ],
+          "description": "How shards are read: by polling, sharing each shard's throughput, or with enhanced fan-out."
+        },
+        "name": {
+          "type": "string",
+          "title": "Consumer name",
+          "pattern": "^[a-zA-Z0-9_.-]{1,128}$",
+          "x-when": {
+            "consumer.type": "efo"
+          },
+          "examples": [
+            "openetl-orders"
+          ],
+          "description": "The enhanced fan-out consumer's name. The first read registers it on each stream it reads. Unset: openetl- and the pipeline's name, or where that name has characters a consumer's can't or is longer than 120 characters, those replaced with - or cut, then - and a hash of the whole name. Give each pipeline its own: a shard takes one subscription per consumer."
+        },
+        "deregisterOnTeardown": {
+          "type": "boolean",
+          "title": "Deregister on teardown",
+          "default": true,
+          "x-when": {
+            "consumer.type": "efo"
+          },
+          "x-advanced": true,
+          "description": "Deregister the consumer from the streams once the pipeline is deleted."
+        }
+      }
+    },
+    "polling": {
+      "type": "object",
+      "title": "Polling",
+      "x-group": "reading",
+      "x-advanced": true,
+      "x-when": {
+        "consumer.type": "polling"
+      },
+      "additionalProperties": false,
+      "description": "From 0.2.0. How each shard is polled with GetRecords.",
+      "properties": {
+        "maxRecords": {
+          "type": "integer",
+          "title": "Records per call",
+          "minimum": 1,
+          "maximum": 10000,
+          "default": 10000,
+          "description": "The most records one GetRecords returns."
+        },
+        "interval": {
+          "type": "string",
+          "x-format": "duration",
+          "pattern": "^([0-9]+(\\.[0-9]+)?(ns|us|µs|ms|s|m|h))+$",
+          "default": "200ms",
+          "description": "The least time between two GetRecords of a shard. Kinesis allows five a second per shard, shared by every reader of the shard.",
+          "title": "Interval"
+        },
+        "idleInterval": {
+          "type": "string",
+          "x-format": "duration",
+          "pattern": "^([0-9]+(\\.[0-9]+)?(ns|us|µs|ms|s|m|h))+$",
+          "description": "The time between two GetRecords of a shard after one returned nothing. At least interval. Unset: 1s, or interval if that's longer.",
+          "title": "Idle interval"
+        }
+      }
+    },
+    "deaggregate": {
+      "type": "boolean",
+      "title": "De-aggregate KPL records",
+      "x-group": "reading",
+      "x-advanced": true,
+      "default": true,
+      "description": "From 0.2.0. Split records the Kinesis Producer Library aggregated into their user records, a row each. Off: an aggregated record fails the read, whatever the format."
+    },
+    "format": {
+      "type": "string",
+      "title": "Format",
+      "x-group": "records",
+      "default": "json",
+      "oneOf": [
+        {
+          "const": "json",
+          "title": "JSON",
+          "description": "Each record's data is a JSON value."
+        },
+        {
+          "const": "avro",
+          "title": "Avro",
+          "description": "The schema registry's wire format."
+        },
+        {
+          "const": "protobuf",
+          "title": "Protobuf",
+          "description": "The schema registry's wire format."
+        },
+        {
+          "const": "string",
+          "title": "Text",
+          "description": "Each record's data is read as text, in value."
+        }
+      ],
+      "description": "How records' data is encoded. Avro and Protobuf use the schema registry's wire format; string reads each record as text."
+    },
+    "schemaRegistryUrl": {
+      "type": "string",
+      "title": "Schema registry URL",
+      "format": "uri",
+      "x-group": "records",
+      "x-when": {
+        "format": [
+          "avro",
+          "protobuf"
+        ]
+      },
+      "examples": [
+        "https://registry.example.com:8081"
+      ],
+      "description": "A Confluent-compatible schema registry. Avro and Protobuf need one."
+    },
+    "schemaRegistryUsername": {
+      "type": "string",
+      "title": "Schema registry user",
+      "x-group": "records",
+      "x-when": {
+        "format": [
+          "avro",
+          "protobuf"
+        ]
+      },
+      "description": "A user for the schema registry's basic authentication. Unset: none."
+    },
+    "schemaRegistryPassword": {
+      "type": "string",
+      "title": "Schema registry password",
+      "x-secret": true,
+      "x-group": "records",
+      "x-when": {
+        "format": [
+          "avro",
+          "protobuf"
+        ]
+      },
+      "description": "The schema registry user's password."
+    },
+    "retry": {
+      "type": "object",
+      "title": "Retries",
+      "x-group": "retries",
+      "x-advanced": true,
+      "additionalProperties": false,
+      "description": "From 0.2.0. How calls that Kinesis throttles, or that fail for a moment, are retried.",
+      "properties": {
+        "initialBackoff": {
+          "type": "string",
+          "x-format": "duration",
+          "pattern": "^([0-9]+(\\.[0-9]+)?(ns|us|µs|ms|s|m|h))+$",
+          "default": "100ms",
+          "description": "The first wait before a retry. Each wait is drawn at random up to this, doubled for each retry in a row, up to maxBackoff.",
+          "title": "Initial backoff"
+        },
+        "maxBackoff": {
+          "type": "string",
+          "x-format": "duration",
+          "pattern": "^([0-9]+(\\.[0-9]+)?(ns|us|µs|ms|s|m|h))+$",
+          "default": "10s",
+          "description": "The longest wait before a retry.",
+          "title": "Longest backoff"
+        },
+        "maxAttempts": {
+          "type": "integer",
+          "title": "Attempts per call",
+          "minimum": 1,
+          "maximum": 100,
+          "default": 10,
+          "description": "How many times the AWS SDK tries one call, the first included, before it gives up on it."
+        },
+        "maxElapsed": {
+          "type": "string",
+          "x-format": "duration",
+          "pattern": "^([0-9]+(\\.[0-9]+)?(ns|us|µs|ms|s|m|h))+$",
+          "default": "5m",
+          "description": "How long a shard's reads may be throttled without a call getting through before the read fails with RATE_LIMITED. No wait between retries runs past it.",
+          "title": "Longest throttling"
+        }
+      }
+    }
   }
 }

@@ -2,12 +2,15 @@ package kinesis
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"maps"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -29,23 +32,61 @@ type SourceConfig struct {
 	// Empty: every stream the credentials can list.
 	Streams       []string `json:"streams"`
 	StreamPattern string   `json:"streamPattern"`
-	// earliest (default) or latest.
-	StartPosition string `json:"startPosition"`
+	// Where a shard's first read starts: earliest (default), latest or
+	// timestamp, at StartTimestamp.
+	StartPosition  string     `json:"startPosition"`
+	StartTimestamp *time.Time `json:"startTimestamp"`
+	Consumer       Consumer   `json:"consumer"`
+	Polling        Polling    `json:"polling"`
+	// Split records the Kinesis Producer Library aggregated into their user
+	// records. Default true.
+	Deaggregate *bool `json:"deaggregate"`
 }
+
+// Consumer is how shards are read.
+type Consumer struct {
+	// polling (default): GetRecords, sharing each shard's 2 MB/s with other
+	// readers. efo: enhanced fan-out, a registered consumer with 2 MB/s of
+	// its own per shard, pushed over SubscribeToShard.
+	Type string `json:"type"`
+	// The efo consumer's name. Empty: openetl-PIPELINE.
+	Name string `json:"name"`
+	// Deregister the efo consumer once the pipeline is deleted. Default
+	// true.
+	DeregisterOnTeardown *bool `json:"deregisterOnTeardown"`
+}
+
+// Polling is how often GetRecords is called, per shard.
+type Polling struct {
+	MaxRecords   int32    `json:"maxRecords"`
+	Interval     Duration `json:"interval"`
+	IdleInterval Duration `json:"idleInterval"`
+}
+
+const (
+	startEarliest  = "earliest"
+	startLatest    = "latest"
+	startTimestamp = "timestamp"
+
+	consumerPolling = "polling"
+	consumerEFO     = "efo"
+)
 
 // The columns every row has, besides its data's fields.
 const (
 	shardColumn        = "_kinesis_shard"
 	sequenceColumn     = "_kinesis_sequence"
+	subsequenceColumn  = "_kinesis_subsequence"
 	arrivalColumn      = "_kinesis_arrival"
 	partitionKeyColumn = "_kinesis_partition_key"
 )
 
 const (
-	getRecordsLimit = 10000
+	maxGetRecords = 10000
 	// Kinesis allows five GetRecords a second per shard.
-	minPoll  = 200 * time.Millisecond
-	idlePoll = time.Second
+	minPollInterval = 200 * time.Millisecond
+	// How often a shard that ended waits between listings for its children.
+	listEvery = time.Second
 	// How often a caught-up stream's state is emitted, to keep its time
 	// current.
 	idleResumeEvery = time.Minute
@@ -55,6 +96,8 @@ const (
 	trimHorizonCalls = 20
 	// How many listings a shard that ended waits for its children through.
 	listTries = 5
+	// The most rows one Rows call carries.
+	rowsPerEmit = 5000
 )
 
 type Source struct {
@@ -65,22 +108,18 @@ type Source struct {
 }
 
 var (
-	_ source.Source   = (*Source)(nil)
-	_ source.Checker  = (*Source)(nil)
-	_ source.Splitter = (*Source)(nil)
+	_ source.Source     = (*Source)(nil)
+	_ source.Splitter   = (*Source)(nil)
+	_ source.Teardowner = (*Source)(nil)
 )
 
 func NewSource(config []byte) (*Source, error) {
-	cfg := SourceConfig{StartPosition: "earliest"}
+	cfg := SourceConfig{StartPosition: startEarliest}
 	if err := decodeConfig(config, &cfg); err != nil {
 		return nil, err
 	}
-	invalid := func(err error) error { return sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_CONFIG_INVALID, err) }
-	if err := cfg.validate(records.JSON, records.Avro, records.Protobuf, records.String); err != nil {
+	if err := cfg.validate(); err != nil {
 		return nil, invalid(err)
-	}
-	if cfg.StartPosition != "earliest" && cfg.StartPosition != "latest" {
-		return nil, invalid(fmt.Errorf("kinesis: startPosition %q is neither earliest nor latest", cfg.StartPosition))
 	}
 	s := &Source{cfg: cfg}
 	if cfg.StreamPattern != "" {
@@ -99,7 +138,102 @@ func NewSource(config []byte) (*Source, error) {
 	return s, nil
 }
 
-func (s *Source) Check(ctx context.Context) error { return check(ctx, &s.cfg.Connection) }
+// validate checks the config and fills in its defaults.
+func (c *SourceConfig) validate() error {
+	if err := c.Connection.validate(records.JSON, records.Avro, records.Protobuf, records.String); err != nil {
+		return err
+	}
+	switch c.StartPosition {
+	case startEarliest, startLatest:
+		if c.StartTimestamp != nil {
+			return fmt.Errorf("kinesis: startTimestamp needs startPosition timestamp, not %s", c.StartPosition)
+		}
+	case startTimestamp:
+		if c.StartTimestamp == nil {
+			return errors.New("kinesis: startPosition timestamp needs startTimestamp")
+		}
+	default:
+		return fmt.Errorf("kinesis: startPosition %q isn't earliest, latest or timestamp", c.StartPosition)
+	}
+	switch c.Consumer.Type {
+	case "":
+		c.Consumer.Type = consumerPolling
+	case consumerPolling, consumerEFO:
+	default:
+		return fmt.Errorf("kinesis: consumer.type %q isn't polling or efo", c.Consumer.Type)
+	}
+	if c.Consumer.Name != "" && !validConsumerName(c.Consumer.Name) {
+		return fmt.Errorf("kinesis: consumer.name %q isn't 1 to 128 of a-z, A-Z, 0-9, _, . and -", c.Consumer.Name)
+	}
+	if c.Consumer.Type != consumerEFO && c.Consumer.Name != "" {
+		return errors.New("kinesis: consumer.name needs consumer.type efo")
+	}
+	p := &c.Polling
+	if p.MaxRecords == 0 {
+		p.MaxRecords = maxGetRecords
+	}
+	if p.Interval == 0 {
+		p.Interval = Duration(minPollInterval)
+	}
+	if p.IdleInterval == 0 {
+		p.IdleInterval = max(Duration(time.Second), p.Interval)
+	}
+	switch {
+	case p.MaxRecords < 1 || p.MaxRecords > maxGetRecords:
+		return fmt.Errorf("kinesis: polling.maxRecords %d isn't between 1 and %d", p.MaxRecords, maxGetRecords)
+	case time.Duration(p.Interval) < minPollInterval:
+		return fmt.Errorf("kinesis: polling.interval %s is under %s, Kinesis's five GetRecords a second per shard", time.Duration(p.Interval), minPollInterval)
+	case p.IdleInterval < p.Interval:
+		return errors.New("kinesis: polling.idleInterval is under polling.interval")
+	}
+	return nil
+}
+
+func (c *SourceConfig) deaggregate() bool { return c.Deaggregate == nil || *c.Deaggregate }
+
+// consumerName is the efo consumer a pipeline reads with: consumer.name, or
+// openetl- and the pipeline's name. Where the pipeline's name has characters
+// a consumer's can't, or is too long, they're replaced or cut, and a hash of
+// the whole name follows, so two pipelines' names don't make one consumer's.
+func (c *SourceConfig) consumerName(pipeline string) (string, error) {
+	if c.Consumer.Name != "" {
+		return c.Consumer.Name, nil
+	}
+	if pipeline == "" {
+		return "", invalid(errors.New("kinesis: consumer.type efo needs consumer.name, or a pipeline to name the consumer after"))
+	}
+	const prefix, most = "openetl-", 128
+	b := []byte(prefix)
+	for _, r := range pipeline {
+		if r < 0x80 && consumerNameChar(byte(r)) {
+			b = append(b, byte(r))
+		} else {
+			b = append(b, '-')
+		}
+	}
+	if string(b[len(prefix):]) == pipeline && len(b) <= most {
+		return string(b), nil
+	}
+	sum := sha256.Sum256([]byte(pipeline))
+	tag := "-" + hex.EncodeToString(sum[:4])
+	return string(b[:min(len(b), most-len(tag))]) + tag, nil
+}
+
+func validConsumerName(n string) bool {
+	if n == "" || len(n) > 128 {
+		return false
+	}
+	for i := range len(n) {
+		if !consumerNameChar(n[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+func consumerNameChar(c byte) bool {
+	return c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '_' || c == '.' || c == '-'
+}
 
 func (s *Source) offered(name string) bool {
 	if len(s.cfg.Streams) > 0 && !slices.Contains(s.cfg.Streams, name) {
@@ -143,6 +277,7 @@ func (s *Source) declared(ctx context.Context, stream string) (*arrow.Schema, er
 	fields := []arrow.Field{
 		{Name: shardColumn, Type: arrow.BinaryTypes.String},
 		{Name: sequenceColumn, Type: arrow.BinaryTypes.String},
+		{Name: subsequenceColumn, Type: arrow.PrimitiveTypes.Int64},
 		{Name: arrivalColumn, Type: &arrow.TimestampType{Unit: arrow.Microsecond, TimeZone: "UTC"}},
 		{Name: partitionKeyColumn, Type: arrow.BinaryTypes.String},
 	}
@@ -167,7 +302,8 @@ type shardState struct {
 	// The last sequence number read. Empty: from From, or else the shard's
 	// start.
 	After string `json:"after,omitempty"`
-	// startPosition latest: records that arrived after this.
+	// startPosition latest or timestamp: records that arrived at or after
+	// this.
 	From time.Time `json:"from,omitzero"`
 	// Read to its end.
 	Done bool `json:"done,omitempty"`
@@ -240,7 +376,10 @@ func positionLost(err error) error {
 // streamRead is one stream's read.
 type streamRead struct {
 	name      string
+	arn       string
 	retention time.Duration
+	// The efo consumer's ARN; empty when polling.
+	consumer string
 	// Where it's read in splits, the shards the read was given; nil where
 	// it's read whole.
 	splits map[string]bool
@@ -268,6 +407,11 @@ type reading struct {
 	start   time.Time
 	wg      sync.WaitGroup
 	fail    context.CancelCauseFunc
+	// A token for each split that may fetch and emit at once: the read's
+	// lanes. A stream read whole is one lane, its shards fetching together.
+	lanes chan struct{}
+	// SubscribeToShard, for efo.
+	subscribe func(context.Context, *awskinesis.SubscribeToShardInput) (eventStream, error)
 }
 
 func (s *Source) Read(ctx context.Context, req source.ReadRequest, out source.Emitter) error {
@@ -278,7 +422,7 @@ func (s *Source) Read(ctx context.Context, req source.ReadRequest, out source.Em
 	if err != nil {
 		return err
 	}
-	rd := &reading{s: s, cl: cl, out: out, bounded: !req.Continuous, start: time.Now()}
+	rd := &reading{s: s, cl: cl, out: out, bounded: !req.Continuous, start: time.Now(), lanes: make(chan struct{}, max(req.Lanes, 1)), subscribe: subscriber(cl)}
 	var reads []*streamRead
 	for _, st := range req.Streams {
 		r := &streamRead{name: st.Name, running: map[string]bool{}, stopped: map[string]bool{}, behind: map[string]time.Duration{}}
@@ -299,6 +443,15 @@ func (s *Source) Read(ctx context.Context, req source.ReadRequest, out source.Em
 		}
 		if r.splits != nil {
 			r.settleSplits(rd.bounded)
+		}
+		if s.cfg.Consumer.Type == consumerEFO {
+			name, err := s.cfg.consumerName(req.Pipeline)
+			if err != nil {
+				return err
+			}
+			if r.consumer, err = s.register(ctx, cl, r.arn, name); err != nil {
+				return err
+			}
 		}
 		reads = append(reads, r)
 	}
@@ -396,16 +549,18 @@ func (r *streamRead) stateOf(shard string) []byte {
 	return encodeShard(r.shards[shard])
 }
 
-// emit sends what one GetRecords of shard returned, and moves it to st.
+// emit sends what one fetch of shard returned, and moves it to st.
 func (r *streamRead) emit(em source.SplitEmitter, shard string, st shardState, behind time.Duration, rows []json.RawMessage, resume bool) error {
 	if r.splits == nil {
 		r.serial.Lock()
 		defer r.serial.Unlock()
 	}
-	if len(rows) > 0 {
-		if err := em.Rows(rows); err != nil {
+	for len(rows) > 0 {
+		n := min(len(rows), rowsPerEmit)
+		if err := em.Rows(rows[:n]); err != nil {
 			return err
 		}
+		rows = rows[n:]
 	}
 	r.mu.Lock()
 	r.shards[shard], r.behind[shard] = st, behind
@@ -500,7 +655,7 @@ func (rd *reading) listChildren(ctx context.Context, r *streamRead, shard string
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(idlePoll):
+		case <-time.After(listEvery):
 		}
 	}
 	return nil
@@ -638,6 +793,7 @@ func (s *Source) position(ctx context.Context, cl *awskinesis.Client, r *streamR
 		return classify(fmt.Errorf("kinesis: describe stream %s: %w", r.name, err))
 	}
 	r.retention = time.Duration(aws.ToInt32(sum.StreamDescriptionSummary.RetentionPeriodHours)) * time.Hour
+	r.arn = aws.ToString(sum.StreamDescriptionSummary.StreamARN)
 	if err := s.list(ctx, cl, r); err != nil {
 		return err
 	}
@@ -679,11 +835,16 @@ func (s *Source) position(ctx context.Context, cl *awskinesis.Client, r *streamR
 			continue
 		}
 		st := shardState{Since: start}
-		if fresh && s.cfg.StartPosition == "latest" {
-			if sh.SequenceNumberRange != nil && sh.SequenceNumberRange.EndingSequenceNumber != nil {
-				st.Done = true
-			} else {
-				st.From = start
+		if fresh {
+			switch s.cfg.StartPosition {
+			case startLatest:
+				if sh.SequenceNumberRange != nil && sh.SequenceNumberRange.EndingSequenceNumber != nil {
+					st.Done = true
+				} else {
+					st.From = start
+				}
+			case startTimestamp:
+				st.From = *s.cfg.StartTimestamp
 			}
 		}
 		r.shards[id] = st
@@ -728,11 +889,19 @@ func (s *Source) checkRetained(ctx context.Context, cl *awskinesis.Client, r *st
 func (s *Source) list(ctx context.Context, cl *awskinesis.Client, r *streamRead) error {
 	listed := map[string]types.Shard{}
 	in := &awskinesis.ListShardsInput{StreamName: aws.String(r.name)}
+	th := throttle{retry: &s.cfg.Retry}
 	for {
 		res, err := cl.ListShards(ctx, in)
+		if throttled(err) {
+			if err := th.wait(ctx, err); err != nil {
+				return classify(fmt.Errorf("kinesis: list %s's shards: %w", r.name, err))
+			}
+			continue
+		}
 		if err != nil {
 			return classify(fmt.Errorf("kinesis: list %s's shards: %w", r.name, err))
 		}
+		th.ok()
 		for _, sh := range res.Shards {
 			listed[aws.ToString(sh.ShardId)] = sh
 		}
@@ -790,8 +959,41 @@ func (r *streamRead) parentDone(parent *string) bool {
 	return r.shards[*parent].Done
 }
 
-// poll reads one shard on its own goroutine, emitting what each GetRecords
-// returns, until the shard ends, a bounded read stops, or ctx is done.
+// lane waits for a lane for one fetch of a split, and returns its release.
+// The shards of a stream read whole share the stream's lane, so they don't
+// wait.
+func (rd *reading) lane(ctx context.Context, r *streamRead) (func(), error) {
+	if r.splits == nil {
+		return func() {}, nil
+	}
+	select {
+	case rd.lanes <- struct{}{}:
+		return func() { <-rd.lanes }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+// shardRead is one shard's read, on its own goroutine.
+type shardRead struct {
+	rd    *reading
+	r     *streamRead
+	shard string
+	em    source.SplitEmitter
+	// Where the read is.
+	st shardState
+	// The shard was closed when listed, so a bounded read goes to its end.
+	closed bool
+	// The shard has no more records.
+	ended bool
+
+	lastResume   time.Time
+	sinceChanged bool
+	th           throttle
+}
+
+// poll reads one shard, emitting what each fetch returns, until the shard
+// ends, a bounded read stops, or ctx is done.
 func (rd *reading) poll(ctx context.Context, r *streamRead, shard string) error {
 	r.mu.Lock()
 	st := r.shards[shard]
@@ -800,100 +1002,160 @@ func (rd *reading) poll(ctx context.Context, r *streamRead, shard string) error 
 	if st.Done {
 		return rd.finish(ctx, r, shard, st, true)
 	}
-	closed := sh.SequenceNumberRange != nil && sh.SequenceNumberRange.EndingSequenceNumber != nil
-	failed := func(err error) error {
-		return classify(fmt.Errorf("kinesis: %s's shard %s: %w", r.name, shard, err))
+	sr := &shardRead{
+		rd: rd, r: r, shard: shard, em: rd.emitter(r, shard), st: st,
+		closed: sh.SequenceNumberRange != nil && sh.SequenceNumberRange.EndingSequenceNumber != nil,
+		th:     throttle{retry: &rd.s.cfg.Retry},
 	}
-	iterator := func() (*string, error) {
-		in := &awskinesis.GetShardIteratorInput{StreamName: aws.String(r.name), ShardId: aws.String(shard)}
-		switch {
-		case st.After != "":
-			in.ShardIteratorType, in.StartingSequenceNumber = types.ShardIteratorTypeAfterSequenceNumber, aws.String(st.After)
-		case !st.From.IsZero():
-			in.ShardIteratorType, in.Timestamp = types.ShardIteratorTypeAtTimestamp, aws.Time(st.From)
-		default:
-			in.ShardIteratorType = types.ShardIteratorTypeTrimHorizon
-		}
-		res, err := rd.cl.GetShardIterator(ctx, in)
-		if err != nil {
-			return nil, err
-		}
-		return res.ShardIterator, nil
+	var over bool
+	var err error
+	if r.consumer != "" {
+		over, err = sr.subscribe(ctx)
+	} else {
+		over, err = sr.getRecords(ctx)
 	}
-	it, err := iterator()
+	switch {
+	case ctx.Err() != nil:
+		return nil
+	case err != nil:
+		return err
+	case over:
+		return rd.finish(ctx, r, shard, sr.st, sr.ended)
+	}
+	return nil
+}
+
+// startRefused is err, or if Kinesis refused to start the shard's read at
+// startTimestamp, a config error that says so: Kinesis refuses a time later
+// than its clock.
+func (sr *shardRead) startRefused(err error, at types.ShardIteratorType) error {
+	if at != types.ShardIteratorTypeAtTimestamp || apiCode(err) != "InvalidArgumentException" {
+		return err
+	}
+	return invalid(fmt.Errorf("startTimestamp %s is later than Kinesis's clock, and a read starts only at a time that has passed: set startTimestamp to a past time, or startPosition to latest: %w", sr.st.From.UTC().Format(time.RFC3339), err))
+}
+
+func (sr *shardRead) failed(err error) error {
+	if codeOf(err) != protocolv1.ErrorCode_ERROR_CODE_UNSPECIFIED {
+		return fmt.Errorf("kinesis: %s's shard %s: %w", sr.r.name, sr.shard, err)
+	}
+	return classify(fmt.Errorf("kinesis: %s's shard %s: %w", sr.r.name, sr.shard, err))
+}
+
+// batch handles what one fetch at at returned: it emits the records and
+// moves the shard's position. ended: the shard has nothing after them. It
+// reports whether the shard's read is over.
+func (sr *shardRead) batch(ctx context.Context, at time.Time, recs []types.Record, behind time.Duration, ended bool) (bool, error) {
+	rd := sr.rd
+	stop := false
+	if rd.bounded {
+		if i := slices.IndexFunc(recs, func(rec types.Record) bool { return aws.ToTime(rec.ApproximateArrivalTimestamp).After(rd.start) }); i >= 0 {
+			recs, stop, ended = recs[:i], true, false
+		}
+	}
+	if !stop {
+		stop = rd.bounded && !sr.closed && behind == 0 && len(recs) == 0
+	}
+	rows, err := rd.s.rows(ctx, sr.shard, recs)
 	if err != nil {
-		if ctx.Err() != nil {
-			return nil
-		}
-		return failed(err)
+		return false, err
 	}
-	em := rd.emitter(r, shard)
-	var lastResume time.Time
-	sinceChanged := false
-	for {
-		at := time.Now()
-		res, err := rd.cl.GetRecords(ctx, &awskinesis.GetRecordsInput{ShardIterator: it, Limit: aws.Int32(getRecordsLimit)})
-		if ctx.Err() != nil {
-			return nil
+	st := &sr.st
+	if n := len(recs); n > 0 {
+		last := recs[n-1]
+		st.After = aws.ToString(last.SequenceNumber)
+		if a := aws.ToTime(last.ApproximateArrivalTimestamp); a.After(st.Since) {
+			st.Since = a
 		}
-		if apiCode(err) == "ExpiredIteratorException" {
-			if it, err = iterator(); err != nil {
-				return failed(err)
+	}
+	if behind == 0 && len(recs) == 0 && at.After(st.Since) {
+		st.Since = at
+		sr.sinceChanged = true
+	}
+	resume := !ended && !stop && (len(recs) > 0 || sr.sinceChanged && time.Since(sr.lastResume) > idleResumeEvery)
+	if err := sr.r.emit(sr.em, sr.shard, *st, behind, rows, resume); err != nil {
+		return false, err
+	}
+	if resume {
+		sr.lastResume, sr.sinceChanged = time.Now(), false
+	}
+	sr.ended = ended
+	return ended || stop, nil
+}
+
+// iterator is a shard iterator from where the read is.
+func (sr *shardRead) iterator(ctx context.Context) (*string, error) {
+	in := &awskinesis.GetShardIteratorInput{StreamName: aws.String(sr.r.name), ShardId: aws.String(sr.shard)}
+	switch {
+	case sr.st.After != "":
+		in.ShardIteratorType, in.StartingSequenceNumber = types.ShardIteratorTypeAfterSequenceNumber, aws.String(sr.st.After)
+	case !sr.st.From.IsZero():
+		in.ShardIteratorType, in.Timestamp = types.ShardIteratorTypeAtTimestamp, aws.Time(sr.st.From)
+	default:
+		in.ShardIteratorType = types.ShardIteratorTypeTrimHorizon
+	}
+	for {
+		res, err := sr.rd.cl.GetShardIterator(ctx, in)
+		if throttled(err) {
+			if err := sr.th.wait(ctx, err); err != nil {
+				return nil, sr.failed(err)
 			}
 			continue
 		}
 		if err != nil {
-			return failed(err)
+			return nil, sr.failed(sr.startRefused(err, in.ShardIteratorType))
 		}
-		records := res.Records
-		behind := time.Duration(aws.ToInt64(res.MillisBehindLatest)) * time.Millisecond
-		stop, ended := false, false
-		if rd.bounded {
-			if i := slices.IndexFunc(records, func(rec types.Record) bool { return aws.ToTime(rec.ApproximateArrivalTimestamp).After(rd.start) }); i >= 0 {
-				records, stop = records[:i], true
+		sr.th.ok()
+		return res.ShardIterator, nil
+	}
+}
+
+// getRecords polls the shard with GetRecords.
+func (sr *shardRead) getRecords(ctx context.Context) (bool, error) {
+	p := sr.rd.s.cfg.Polling
+	it, err := sr.iterator(ctx)
+	if err != nil {
+		return false, err
+	}
+	for {
+		release, err := sr.rd.lane(ctx, sr.r)
+		if err != nil {
+			return false, nil
+		}
+		at := time.Now()
+		res, err := sr.rd.cl.GetRecords(ctx, &awskinesis.GetRecordsInput{ShardIterator: it, Limit: aws.Int32(p.MaxRecords)})
+		if err != nil {
+			release()
+			switch {
+			case ctx.Err() != nil:
+				return false, nil
+			case apiCode(err) == "ExpiredIteratorException":
+				if it, err = sr.iterator(ctx); err != nil {
+					return false, err
+				}
+			case throttled(err):
+				if err := sr.th.wait(ctx, err); err != nil {
+					return false, sr.failed(err)
+				}
+			default:
+				return false, sr.failed(err)
 			}
+			continue
 		}
-		if !stop {
-			ended = res.NextShardIterator == nil
-			stop = rd.bounded && !closed && behind == 0 && len(res.Records) == 0
-		}
-		rows := make([]json.RawMessage, 0, len(records))
-		for i := range records {
-			row, err := rd.s.row(ctx, shard, &records[i])
-			if err != nil {
-				return err
-			}
-			rows = append(rows, row)
-		}
-		if n := len(records); n > 0 {
-			last := records[n-1]
-			st.After = aws.ToString(last.SequenceNumber)
-			if a := aws.ToTime(last.ApproximateArrivalTimestamp); a.After(st.Since) {
-				st.Since = a
-			}
-		}
-		if behind == 0 && len(records) == 0 && at.After(st.Since) {
-			st.Since = at
-			sinceChanged = true
-		}
-		resume := !ended && !stop && (len(records) > 0 || sinceChanged && time.Since(lastResume) > idleResumeEvery)
-		if err := r.emit(em, shard, st, behind, rows, resume); err != nil {
-			return err
-		}
-		if ended || stop {
-			return rd.finish(ctx, r, shard, st, ended)
-		}
-		if resume {
-			lastResume, sinceChanged = time.Now(), false
+		sr.th.ok()
+		over, err := sr.batch(ctx, at, res.Records, time.Duration(aws.ToInt64(res.MillisBehindLatest))*time.Millisecond, res.NextShardIterator == nil)
+		release()
+		if err != nil || over {
+			return over, err
 		}
 		it = res.NextShardIterator
-		wait := minPoll - time.Since(at)
+		wait := time.Duration(p.Interval) - time.Since(at)
 		if len(res.Records) == 0 {
-			wait = idlePoll
+			wait = time.Duration(p.IdleInterval)
 		}
 		select {
 		case <-ctx.Done():
-			return nil
+			return false, nil
 		case <-time.After(wait):
 		}
 	}
@@ -913,21 +1175,47 @@ func (r *streamRead) progress(now time.Time) source.Progress {
 	return source.Progress{Stream: r.name, Lag: &lag, RetentionLeft: &left}
 }
 
-// kplMagic starts a record the Kinesis Producer Library aggregated.
-var kplMagic = []byte{0xf3, 0x89, 0x9a, 0xc2}
-
-// row is a record as a JSON object: its data's fields, or its data as
-// "value", and the record's own columns.
-func (s *Source) row(ctx context.Context, shard string, rec *types.Record) (json.RawMessage, error) {
-	seq := aws.ToString(rec.SequenceNumber)
-	b := make([]byte, 0, len(rec.Data)+160)
-	b = append(b, '{')
-	if len(rec.Data) > 0 {
-		v, err := s.values.Decode(ctx, rec.Data)
-		if err != nil {
-			if len(rec.Data) >= len(kplMagic) && string(rec.Data[:len(kplMagic)]) == string(kplMagic) {
-				err = errors.New("a record the Kinesis Producer Library aggregated, which the source doesn't deaggregate yet")
+// rows are records as rows: each record's, or each of its user records' if
+// the Kinesis Producer Library aggregated it.
+func (s *Source) rows(ctx context.Context, shard string, recs []types.Record) ([]json.RawMessage, error) {
+	out := make([]json.RawMessage, 0, len(recs))
+	for i := range recs {
+		rec := &recs[i]
+		if aggregated(rec.Data) {
+			if !s.cfg.deaggregate() {
+				return nil, sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_DATA_INVALID, fmt.Errorf("kinesis: shard %s sequence %s: a record the Kinesis Producer Library aggregated, and deaggregate is off", shard, aws.ToString(rec.SequenceNumber)))
 			}
+			users, err := deaggregate(rec.Data)
+			if err != nil {
+				return nil, sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_DATA_INVALID, fmt.Errorf("kinesis: shard %s sequence %s: an aggregated record: %w", shard, aws.ToString(rec.SequenceNumber), err))
+			}
+			for j, u := range users {
+				row, err := s.row(ctx, shard, rec, j, u.partitionKey, u.data)
+				if err != nil {
+					return nil, err
+				}
+				out = append(out, row)
+			}
+			continue
+		}
+		row, err := s.row(ctx, shard, rec, 0, aws.ToString(rec.PartitionKey), rec.Data)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, row)
+	}
+	return out, nil
+}
+
+// row is a record, or its user record sub, as a JSON object: its data's
+// fields, or its data as "value", and the record's own columns.
+func (s *Source) row(ctx context.Context, shard string, rec *types.Record, sub int, key string, data []byte) (json.RawMessage, error) {
+	seq := aws.ToString(rec.SequenceNumber)
+	b := make([]byte, 0, len(data)+180)
+	b = append(b, '{')
+	if len(data) > 0 {
+		v, err := s.values.Decode(ctx, data)
+		if err != nil {
 			return nil, sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_DATA_INVALID, fmt.Errorf("kinesis: shard %s sequence %s: %w", shard, seq, err))
 		}
 		b = records.AppendFields(b, v)
@@ -936,13 +1224,16 @@ func (s *Source) row(ctx context.Context, shard string, rec *types.Record) (json
 		{shardColumn, shard},
 		{sequenceColumn, seq},
 		{arrivalColumn, aws.ToTime(rec.ApproximateArrivalTimestamp).UTC().Format(time.RFC3339Nano)},
-		{partitionKeyColumn, aws.ToString(rec.PartitionKey)},
+		{partitionKeyColumn, key},
 	} {
 		b = records.AppendJSONString(b, kv[0])
 		b = append(b, ':')
 		b = records.AppendJSONString(b, kv[1])
 		b = append(b, ',')
 	}
-	b[len(b)-1] = '}'
+	b = records.AppendJSONString(b, subsequenceColumn)
+	b = append(b, ':')
+	b = strconv.AppendInt(b, int64(sub), 10)
+	b = append(b, '}')
 	return b, nil
 }

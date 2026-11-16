@@ -21,5 +21,7 @@ func main() {
 		Source:       func(c []byte, _ host.Host) (source.Source, error) { return kinesis.NewSource(c) },
 		Splits:       true,
 		Retention:    true,
+		// Teardown deregisters the pipeline's efo consumers.
+		Setup: true,
 	})
 }
