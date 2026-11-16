@@ -382,9 +382,12 @@ func (w *writer) ensureStream(ctx context.Context, name string) error {
 			var err error
 			pending, err = pendingSetup(ctx, w.cl, name)
 			switch {
-			case accessDenied(apiCode(err)) && sum != nil:
+			case accessDenied(apiCode(err)) && sum != nil && encrypted(cfg, sum.StreamDescriptionSummary):
 				// Without its tags, the stream counts as one the
-				// destination didn't create.
+				// destination didn't create. That holds only while it
+				// has the config's encryption: a stream whose setup
+				// failed before encrypting it would take records in
+				// the clear.
 			case err != nil:
 				return classify(fmt.Errorf("kinesis: stream %s: list its tags: %w", name, err))
 			}
@@ -403,6 +406,11 @@ func (w *writer) ensureStream(ctx context.Context, name string) error {
 	}
 	w.ready[name] = true
 	return nil
+}
+
+// encrypted says the stream has the config's key, or the config has none.
+func encrypted(cfg *DestinationConfig, sum *types.StreamDescriptionSummary) bool {
+	return cfg.KMSKeyID == "" || sum.EncryptionType == types.EncryptionTypeKms && aws.ToString(sum.KeyId) == cfg.KMSKeyID
 }
 
 // tagLister is the part of the Kinesis client that lists a stream's tags.

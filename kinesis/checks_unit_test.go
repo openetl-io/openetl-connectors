@@ -464,6 +464,9 @@ func TestEnsureStreamFinishesSetup(t *testing.T) {
 			add(name, 24, t)
 			return http.StatusOK, nil
 		case "ListTagsForStream":
+			if strings.HasPrefix(name, "untold") {
+				return apiError("AccessDeniedException", "no")
+			}
 			var out []any
 			for k, v := range tags[name] {
 				out = append(out, map[string]any{"Key": k, "Value": v})
@@ -535,6 +538,20 @@ func TestEnsureStreamFinishesSetup(t *testing.T) {
 	}
 	if h := retentionOf("theirs"); h != 24 {
 		t.Errorf("theirs: %dh", h)
+	}
+
+	// Its tags can't be listed: it counts as someone else's, unless the
+	// config has a key the stream isn't encrypted with.
+	mu.Lock()
+	add("untold", 24, nil)
+	mu.Unlock()
+	if err := writer(48).ensureStream(t.Context(), "untold"); err != nil {
+		t.Fatal(err)
+	}
+	keyed := writer(48)
+	keyed.d.cfg.KMSKeyID = "alias/orders"
+	if err := keyed.ensureStream(t.Context(), "untold"); codeOf(err) != protocolv1.ErrorCode_ERROR_CODE_PERMISSION_DENIED {
+		t.Fatalf("untold, with a key: %v", err)
 	}
 
 	// Without retention or encryption to set, nothing is tagged or listed.
