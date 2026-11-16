@@ -125,7 +125,7 @@
       "examples": [
         "2026-11-01T00:00:00Z"
       ],
-      "description": "From 0.2.0. With startPosition timestamp: the first read starts at the records that arrived at or after this time, in RFC 3339. Records older than the stream's retention are gone."
+      "description": "From 0.2.0. With startPosition timestamp: the first read starts at the records that arrived at or after this time, in RFC 3339. Records older than the stream's retention are gone. It must have passed: Kinesis starts a read only at a time that has, so a time in the future fails the preflight, and a first read fails with CONFIG_INVALID."
     },
     "consumer": {
       "type": "object",
@@ -147,7 +147,7 @@
             {
               "const": "efo",
               "title": "Enhanced fan-out",
-              "description": "A consumer registered for the pipeline, with 2 MB a second of its own per shard, pushed with SubscribeToShard. Kinesis charges for it, and allows 20 per stream."
+              "description": "A consumer registered for the pipeline, with 2 MB a second of its own per shard, pushed with SubscribeToShard. Kinesis charges for it, and allows 20 per stream, or 50 for an On-demand Advantage stream."
             }
           ],
           "description": "How shards are read: by polling, sharing each shard's throughput, or with enhanced fan-out."
@@ -162,7 +162,7 @@
           "examples": [
             "openetl-orders"
           ],
-          "description": "The enhanced fan-out consumer's name. The first read registers it on each stream it reads. Unset: openetl- and the pipeline's name. Give each pipeline its own: a shard takes one subscription per consumer."
+          "description": "The enhanced fan-out consumer's name. The first read registers it on each stream it reads. Unset: openetl- and the pipeline's name, or where that name has characters a consumer's can't or is longer than 120 characters, those replaced with - or cut, then - and a hash of the whole name. Give each pipeline its own: a shard takes one subscription per consumer."
         },
         "deregisterOnTeardown": {
           "type": "boolean",
@@ -207,8 +207,7 @@
           "type": "string",
           "x-format": "duration",
           "pattern": "^([0-9]+(\\.[0-9]+)?(ns|us|µs|ms|s|m|h))+$",
-          "default": "1s",
-          "description": "The time between two GetRecords of a shard after one returned nothing. At least interval.",
+          "description": "The time between two GetRecords of a shard after one returned nothing. At least interval. Unset: 1s, or interval if that's longer.",
           "title": "Idle interval"
         }
       }
@@ -219,7 +218,7 @@
       "x-group": "reading",
       "x-advanced": true,
       "default": true,
-      "description": "From 0.2.0. Split records the Kinesis Producer Library aggregated into their user records, a row each. Off: an aggregated record fails the read."
+      "description": "From 0.2.0. Split records the Kinesis Producer Library aggregated into their user records, a row each. Off: an aggregated record fails the read, whatever the format."
     },
     "format": {
       "type": "string",
@@ -328,7 +327,7 @@
           "x-format": "duration",
           "pattern": "^([0-9]+(\\.[0-9]+)?(ns|us|µs|ms|s|m|h))+$",
           "default": "5m",
-          "description": "How long a shard's reads may be throttled without a break before the read fails with RATE_LIMITED.",
+          "description": "How long a shard's reads may be throttled without a call getting through before the read fails with RATE_LIMITED. No wait between retries runs past it.",
           "title": "Longest throttling"
         }
       }
