@@ -407,10 +407,6 @@ func TestSplitsReadEveryRowOnce(t *testing.T) {
 	}
 }
 
-func sameBound(a, b *string) bool {
-	return (a == nil) == (b == nil) && (a == nil || *a == *b)
-}
-
 // Keys beyond every bound the statistics saw belong to the first and last
 // ranges.
 func TestSplitsCoverKeysOutsideTheHistogram(t *testing.T) {

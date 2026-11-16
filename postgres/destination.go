@@ -40,6 +40,7 @@ type DestinationConfig struct {
 	DSN sdk.Secret `json:"dsn"`
 	// Used when the pipeline names no namespace. Default "public".
 	Schema string `json:"schema"`
+	TLS
 }
 
 type Destination struct {
@@ -67,6 +68,9 @@ func NewDestination(config []byte) (*Destination, error) {
 	pc, err := pgxpool.ParseConfig(cfg.DSN.Reveal())
 	if err != nil {
 		return nil, fmt.Errorf("postgres: dsn: %w", err)
+	}
+	if err := cfg.TLS.apply(&pc.ConnConfig.Config); err != nil {
+		return nil, err
 	}
 	pc.MaxConns = 4
 	// COPY encodes values for the column types a statement description

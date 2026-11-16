@@ -26,10 +26,11 @@ type SourceConfig struct {
 	DSN sdk.Secret `json:"dsn"`
 	// Default "public".
 	Schema string `json:"schema"`
-	// The tables to offer as streams. Empty: every table in the schema.
+	// The tables and views to offer as streams. Empty: every one in the
+	// schema.
 	Tables []string `json:"tables"`
-	// Rows per query on a table with a primary key; each chunk ends at a
-	// resume point. Default 100000.
+	// Rows per query on a table with a read order (table.order); each chunk
+	// ends at a resume point. Default 100000.
 	ChunkRows int `json:"chunkRows"`
 	// Approximate bytes of values per Arrow batch. Default 4 MiB.
 	BatchBytes int `json:"batchBytes"`
@@ -47,15 +48,17 @@ type SourceConfig struct {
 	// lanes up to this; a cdc read's replication connection is one more.
 	// Default 4.
 	MaxConnections int `json:"maxConnections"`
+	TLS
 }
 
-// Source reads tables: a full refresh reads a table's rows, an incremental
-// read the rows from a cursor column's floor on, and cdc reads its changes
-// through a logical replication slot (cdc.go). A table with a primary key is
-// read in key order, or (cursor, key) order, a chunk per query, so a resumed
-// read yields exactly the rows after its last chunk, within its key range if
-// it's read in splits (source_splits.go). A table without one is read in a
-// single query.
+// Source reads tables and views: a full refresh reads a table's rows, an
+// incremental read the rows from a cursor column's floor on, and cdc reads
+// its changes through a logical replication slot (cdc.go). A table with a
+// primary key, or else a unique index on NOT NULL columns, is read in that
+// key's order, or (cursor, key) order, a chunk per query, so a resumed read
+// yields exactly the rows after its last chunk, within its key range if it's
+// read in splits (source_splits.go). A table with neither is read in a single
+// query.
 type Source struct {
 	cfg  SourceConfig
 	conn *pgx.ConnConfig
@@ -90,6 +93,9 @@ func NewSource(config []byte) (*Source, error) {
 	if err != nil {
 		return nil, fmt.Errorf("postgres: dsn: %w", err)
 	}
+	if err := cfg.TLS.apply(&cc.Config); err != nil {
+		return nil, err
+	}
 	// Text values, and the keys that resume a read, are spelled in these.
 	for k, v := range map[string]string{"DateStyle": "ISO, YMD", "TimeZone": "UTC", "IntervalStyle": "iso_8601", "extra_float_digits": "3", "bytea_output": "hex"} {
 		cc.RuntimeParams[k] = v
@@ -102,6 +108,10 @@ type table struct {
 	cols []sourceColumn
 	// Indexes into cols, in key order.
 	key []int
+	// The columns a read orders by, as indexes into cols: the key, or without
+	// one, the columns of a unique index that are all NOT NULL; none if the
+	// table has neither.
+	order []int
 	// pg_class.relreplident: what the log says of an update's or delete's
 	// old row.
 	replident byte
@@ -112,6 +122,9 @@ type sourceColumn struct {
 	oid     uint32
 	typmod  int32
 	notNull bool
+	// The dimensions an array column was declared with, which Postgres
+	// doesn't hold its values to; 0 if it didn't say, as a view's don't.
+	dims int32
 }
 
 func (s *Source) Discover(ctx context.Context) (source.Catalog, error) {
@@ -131,6 +144,9 @@ func (s *Source) Discover(ctx context.Context) (source.Catalog, error) {
 			return source.Catalog{}, fmt.Errorf("postgres: %s: %w", t.name, err)
 		}
 		b.release()
+		// No CursorField: nothing in the catalog shows that a column orders
+		// new and changed rows. A sequence's or a clock's values are taken
+		// before commit, so a lower one can commit after a read's highest.
 		cs := source.CatalogStream{Name: t.name, SplitsByKey: len(t.key) > 0, Replay: source.Exact, SyncModes: []source.SyncMode{source.FullRefresh}}
 		if slices.ContainsFunc(t.cols, func(c sourceColumn) bool { return cursorTypes[c.oid] }) {
 			cs.SyncModes = append(cs.SyncModes, source.Incremental)
@@ -163,13 +179,13 @@ func nullability(decl *arrow.Schema, t table, cdc bool) *arrow.Schema {
 
 // tables lists the configured tables, in name order.
 func (s *Source) tables(ctx context.Context, conn *pgx.Conn) ([]table, error) {
-	rows, err := conn.Query(ctx, `SELECT c.relname, c.relreplident::text, a.attname, a.atttypid, a.atttypmod, a.attnotnull,
+	rows, err := conn.Query(ctx, `SELECT c.relname, c.relreplident::text, a.attname, a.atttypid, a.atttypmod, a.attnotnull, a.attndims,
 			coalesce((SELECT k.ord FROM unnest(i.indkey::int2[]) WITH ORDINALITY AS k(attnum, ord) WHERE k.attnum = a.attnum), 0)
 		FROM pg_class c
 		JOIN pg_namespace n ON n.oid = c.relnamespace
 		JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
 		LEFT JOIN pg_index i ON i.indrelid = c.oid AND i.indisprimary
-		WHERE n.nspname = $1 AND c.relkind IN ('r', 'p') AND NOT c.relispartition
+		WHERE n.nspname = $1 AND c.relkind IN ('r', 'p', 'v', 'm') AND NOT c.relispartition
 			AND (coalesce(cardinality($2::text[]), 0) = 0 OR c.relname = ANY($2))
 		ORDER BY c.relname, a.attnum`, s.cfg.Schema, s.cfg.Tables)
 	if err != nil {
@@ -194,7 +210,7 @@ func (s *Source) tables(ctx context.Context, conn *pgx.Conn) ([]table, error) {
 		var name, replident string
 		var c sourceColumn
 		var pos int64
-		if err := rows.Scan(&name, &replident, &c.name, &c.oid, &c.typmod, &c.notNull, &pos); err != nil {
+		if err := rows.Scan(&name, &replident, &c.name, &c.oid, &c.typmod, &c.notNull, &c.dims, &pos); err != nil {
 			return nil, fmt.Errorf("postgres: list tables: %w", err)
 		}
 		if len(out) == 0 || out[len(out)-1].name != name {
@@ -215,7 +231,83 @@ func (s *Source) tables(ctx context.Context, conn *pgx.Conn) ([]table, error) {
 			return nil, fmt.Errorf("postgres: no table %q in schema %q", want, s.cfg.Schema)
 		}
 	}
+	if err := s.orders(ctx, conn, out); err != nil {
+		return nil, err
+	}
 	return out, nil
+}
+
+// orders sets each table's read order: its primary key, or else the unique
+// index with the fewest columns, then the first by name, among those with
+// neither a predicate nor expressions whose columns are all NOT NULL, which
+// no two rows share. An index being built or that failed to build may hold
+// duplicates, so it isn't one.
+func (s *Source) orders(ctx context.Context, conn *pgx.Conn, tables []table) error {
+	rows, err := conn.Query(ctx, `SELECT DISTINCT ON (c.relname) c.relname,
+			(SELECT array_agg(a.attname ORDER BY k.ord) FROM unnest(i.indkey::int2[]) WITH ORDINALITY AS k(attnum, ord)
+				JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = k.attnum WHERE k.ord <= i.indnkeyatts)
+		FROM pg_index i
+		JOIN pg_class c ON c.oid = i.indrelid
+		JOIN pg_namespace n ON n.oid = c.relnamespace
+		JOIN pg_class ic ON ic.oid = i.indexrelid
+		WHERE n.nspname = $1 AND i.indisunique AND i.indisvalid AND i.indpred IS NULL AND i.indexprs IS NULL
+			AND NOT EXISTS (SELECT FROM unnest(i.indkey::int2[]) WITH ORDINALITY AS k(attnum, ord)
+				JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = k.attnum WHERE k.ord <= i.indnkeyatts AND NOT a.attnotnull)
+		ORDER BY c.relname, i.indisprimary DESC, i.indnkeyatts, ic.relname`, s.cfg.Schema)
+	if err != nil {
+		return classify(fmt.Errorf("postgres: list indexes: %w", err))
+	}
+	index := map[string][]string{}
+	for rows.Next() {
+		var name string
+		var cols []string
+		if err := rows.Scan(&name, &cols); err != nil {
+			return fmt.Errorf("postgres: list indexes: %w", err)
+		}
+		index[name] = cols
+	}
+	if err := rows.Err(); err != nil {
+		return classify(fmt.Errorf("postgres: list indexes: %w", err))
+	}
+	for i := range tables {
+		t := &tables[i]
+		if len(t.key) > 0 {
+			t.order = t.key
+			continue
+		}
+		for _, name := range index[t.name] {
+			j := slices.IndexFunc(t.cols, func(c sourceColumn) bool { return c.name == name })
+			if j < 0 {
+				t.order = nil
+				break
+			}
+			t.order = append(t.order, j)
+		}
+	}
+	return nil
+}
+
+// orderKey is what a state names the read order by: nothing for the
+// primary key, and a unique index's columns otherwise, since another index
+// can take its place.
+func (t table) orderKey() []string {
+	if len(t.key) > 0 {
+		return nil
+	}
+	names := make([]string, len(t.order))
+	for i, j := range t.order {
+		names[i] = t.cols[j].name
+	}
+	return names
+}
+
+// sameOrder fails a read resumed in another order than the one its state
+// was read in, which only a read from the start carries on from.
+func sameOrder(t table, st sourceState) error {
+	if st.After != nil && !slices.Equal(st.Key, t.orderKey()) {
+		return positionLost("postgres: %s was read in the order of columns %v, and is now read in another; it's read again from the start", t.name, st.Key)
+	}
+	return nil
 }
 
 func indexOf(xs []int, x int) int {
@@ -237,10 +329,13 @@ func hasTable(ts []table, name string) bool {
 }
 
 type sourceState struct {
-	// The primary key of the last row read, spelled as text; in an
+	// The read order's columns of the last row read, spelled as text; in an
 	// incremental read, its cursor value first.
 	After []string `json:"after,omitempty"`
-	// Set once a table without a primary key has been read.
+	// The unique index's columns that a table without a primary key is read
+	// in the order of: see orderKey.
+	Key []string `json:"key,omitempty"`
+	// Set once a table without a read order has been read.
 	Done bool `json:"done,omitempty"`
 	// An incremental read's cursor floor, inclusive, and the highest value
 	// it reads, set when it starts, as text. A completed read's Until is the
@@ -320,19 +415,61 @@ func (s *Source) readSplit(ctx context.Context, conns *connPool, tables []table,
 			return fmt.Errorf("postgres: %s state: %w", cs.Name, err)
 		}
 	}
+	// The SDK passes a whole stream's until on the stream.
+	if sp.Until == nil && len(cs.Splits) == 0 {
+		sp.Until = cs.Until
+	}
+	var u *until
+	if sp.Until != nil {
+		u = &until{state: sp.Until}
+		if err := json.Unmarshal(sp.Until, &u.sourceState); err != nil {
+			return fmt.Errorf("postgres: %s until: %w", cs.Name, err)
+		}
+	}
 	conn, err := conns.get(ctx)
 	if err != nil {
 		return err
 	}
 	defer conns.put(ctx, conn)
 	t := tables[slices.IndexFunc(tables, func(t table) bool { return t.name == cs.Name })]
-	if cs.SyncMode == source.Incremental {
-		return s.readIncremental(ctx, conn, t, sp.ID, cs.Cursor, st, out)
+	if err := sameOrder(t, st); err != nil {
+		return err
 	}
-	return s.readTable(ctx, conn, t, sp.ID, st, out)
+	if u != nil {
+		if err := sameOrder(t, u.sourceState); err != nil {
+			return err
+		}
+	}
+	if cs.SyncMode == source.Incremental {
+		return s.readIncremental(ctx, conn, t, sp.ID, cs.Cursor, st, u, out)
+	}
+	return s.readTable(ctx, conn, t, sp.ID, st, u, out)
 }
 
-func (s *Source) readTable(ctx context.Context, conn *pgx.Conn, t table, id string, st sourceState, out source.SplitEmitter) error {
+// until is where a read ends: the state of a resume point an earlier read
+// sent, which a redo of its part of an epoch gives. The read sends nothing
+// past it, then a resume point with exactly that state, and completes with
+// it.
+type until struct {
+	state []byte
+	sourceState
+}
+
+// end sends the resume point at u, and completes there.
+func (u *until) end(out source.SplitEmitter) error {
+	if err := out.ResumePoint(u.state); err != nil {
+		return err
+	}
+	return out.Complete(u.state)
+}
+
+// reached says whether a chunk that read n rows of at most limit, the last
+// last, ended the read at u.
+func (u *until) reached(n, limit int, last []string) bool {
+	return n < limit || slices.Equal(last, u.After)
+}
+
+func (s *Source) readTable(ctx context.Context, conn *pgx.Conn, t table, id string, st sourceState, u *until, out source.SplitEmitter) error {
 	b, err := newBatcher(memory.DefaultAllocator, t.cols)
 	if err != nil {
 		return fmt.Errorf("postgres: %s: %w", t.name, err)
@@ -345,31 +482,45 @@ func (s *Source) readTable(ctx context.Context, conn *pgx.Conn, t table, id stri
 	}
 	list := strings.Join(cols, ", ")
 
-	if len(t.key) == 0 {
-		if !st.Done {
+	if len(t.order) == 0 {
+		if !st.Done && (u == nil || u.Done) {
 			if _, _, err := s.query(ctx, conn, b, t.name, "SELECT "+list+" FROM "+ident, nil, 0, out); err != nil {
 				return err
 			}
-			if err := resume(out, sourceState{Done: true}); err != nil {
-				return err
+			if u == nil {
+				if err := resume(out, sourceState{Done: true}); err != nil {
+					return err
+				}
 			}
+		}
+		if u != nil {
+			return u.end(out)
 		}
 		return out.Complete(nil)
 	}
 
-	key := make([]string, len(t.key))
-	keyText := make([]string, len(t.key))
-	for i, k := range t.key {
+	key := make([]string, len(t.order))
+	keyText := make([]string, len(t.order))
+	for i, k := range t.order {
 		key[i] = cols[k]
 		keyText[i] = cols[k] + "::text AS _openetl_key_" + strconv.Itoa(i)
 	}
 	head := "SELECT " + list + ", " + strings.Join(keyText, ", ") + " FROM " + ident
 	tail := " ORDER BY " + strings.Join(key, ", ") + " LIMIT " + strconv.Itoa(s.cfg.ChunkRows)
-	if st.After != nil && len(st.After) != len(t.key) {
-		return fmt.Errorf("postgres: %s state has %d key columns, the table has %d", t.name, len(st.After), len(t.key))
+	for _, after := range [][]string{st.After, u.after()} {
+		if after != nil && len(after) != len(t.order) {
+			return fmt.Errorf("postgres: %s state has %d key columns, the read has %d", t.name, len(after), len(t.order))
+		}
 	}
-	st = sourceState{After: st.After, keyRange: st.keyRange}
-	reading := s.startSplit(t.name, id)
+	if st.Done {
+		// A read from before the table had a read order, which ended.
+		return out.Complete(nil)
+	}
+	st = sourceState{After: st.After, Key: t.orderKey(), keyRange: st.keyRange}
+	if u != nil && u.After == nil {
+		return u.end(out)
+	}
+	reading := s.startSplit(t.name, id, u == nil)
 	defer s.endSplit(t.name, id)
 	for {
 		var args []string
@@ -381,16 +532,22 @@ func (s *Source) readTable(ctx context.Context, conn *pgx.Conn, t table, id stri
 		if st.After != nil {
 			where = append(where, afterKey(key, st.After, arg))
 		}
+		if u != nil {
+			where = append(where, uptoKey(key, u.After, arg))
+		}
 		sql := head
 		if len(where) > 0 {
 			sql += " WHERE " + strings.Join(where, " AND ")
 		}
-		n, last, err := s.query(ctx, conn, b, t.name, sql+tail, args, len(t.key), out)
+		n, last, err := s.query(ctx, conn, b, t.name, sql+tail, args, len(t.order), out)
 		if err != nil {
 			return err
 		}
 		if n > 0 {
 			st.After = last
+		}
+		if u != nil && u.reached(n, s.cfg.ChunkRows, last) {
+			return u.end(out)
 		}
 		ended := n < s.cfg.ChunkRows
 		added, err := s.resplit(ctx, conn, t, reading, &st, ended, st.position(), false)
@@ -408,18 +565,35 @@ func (s *Source) readTable(ctx context.Context, conn *pgx.Conn, t table, id stri
 
 // afterKey says a row is after a position in the order of key.
 func afterKey(key, after []string, arg func(string) string) string {
-	params := make([]string, len(after))
-	for i, v := range after {
+	return compareKey(key, ">", after, arg)
+}
+
+// uptoKey says a row is at or before a position in the order of key.
+func uptoKey(key, upto []string, arg func(string) string) string {
+	return compareKey(key, "<=", upto, arg)
+}
+
+func compareKey(key []string, op string, at []string, arg func(string) string) string {
+	params := make([]string, len(at))
+	for i, v := range at {
 		params[i] = arg(v)
 	}
-	return "(" + strings.Join(key, ", ") + ") > (" + strings.Join(params, ", ") + ")"
+	return "(" + strings.Join(key, ", ") + ") " + op + " (" + strings.Join(params, ", ") + ")"
+}
+
+// after is u's position, nil for none or no u.
+func (u *until) after() []string {
+	if u == nil {
+		return nil
+	}
+	return u.After
 }
 
 // readIncremental reads the rows whose cursor is from the state's floor up
 // to the cursor's highest value when the read started, in (cursor, key)
 // order. It completes with that value as the next read's floor, so the rows
 // that hold it are read again then. Rows with a NULL cursor aren't read.
-func (s *Source) readIncremental(ctx context.Context, conn *pgx.Conn, t table, id, cursor string, st sourceState, out source.SplitEmitter) error {
+func (s *Source) readIncremental(ctx context.Context, conn *pgx.Conn, t table, id, cursor string, st sourceState, u *until, out source.SplitEmitter) error {
 	ci, err := cursorColumn(t, cursor)
 	if err != nil {
 		return err
@@ -433,6 +607,13 @@ func (s *Source) readIncremental(ctx context.Context, conn *pgx.Conn, t table, i
 	cols := make([]string, len(t.cols))
 	for i, c := range t.cols {
 		cols[i] = pgx.Identifier{c.name}.Sanitize()
+	}
+	if u != nil {
+		// The floor and the highest value of the read being redone.
+		if u.Until == nil {
+			return fmt.Errorf("postgres: %s until has no highest cursor value", t.name)
+		}
+		st.Since, st.Until = u.Since, u.Until
 	}
 	if st.Until == nil {
 		var until *string
@@ -459,21 +640,26 @@ func (s *Source) readIncremental(ctx context.Context, conn *pgx.Conn, t table, i
 	}
 	list := strings.Join(cols, ", ")
 
-	if len(t.key) == 0 {
-		if !st.Done {
+	if len(t.order) == 0 {
+		if !st.Done && (u == nil || u.Done) {
 			if _, _, err := s.query(ctx, conn, b, t.name, "SELECT "+list+" FROM "+ident+" WHERE "+bounds(), args, 0, out); err != nil {
 				return err
 			}
 			st.Done = true
-			if err := resume(out, st); err != nil {
-				return err
+			if u == nil {
+				if err := resume(out, st); err != nil {
+					return err
+				}
 			}
+		}
+		if u != nil {
+			return u.end(out)
 		}
 		return complete(out, sourceState{Since: st.Until})
 	}
 
 	order := []string{cols[ci]}
-	for _, k := range t.key {
+	for _, k := range t.order {
 		if k != ci {
 			order = append(order, cols[k])
 		}
@@ -484,17 +670,29 @@ func (s *Source) readIncremental(ctx context.Context, conn *pgx.Conn, t table, i
 	}
 	head := "SELECT " + list + ", " + strings.Join(text, ", ") + " FROM " + ident + " WHERE "
 	tail := " ORDER BY " + strings.Join(order, ", ") + " LIMIT " + strconv.Itoa(s.cfg.ChunkRows)
-	if st.After != nil && len(st.After) != len(order) {
-		return fmt.Errorf("postgres: %s state has %d cursor and key columns, the read has %d", t.name, len(st.After), len(order))
+	for _, after := range [][]string{st.After, u.after()} {
+		if after != nil && len(after) != len(order) {
+			return fmt.Errorf("postgres: %s state has %d cursor and key columns, the read has %d", t.name, len(after), len(order))
+		}
 	}
-	first := pgx.Identifier{t.cols[t.key[0]].name}.Sanitize()
-	reading := s.startSplit(t.name, id)
+	if st.Done {
+		return complete(out, sourceState{Since: st.Until})
+	}
+	st.Key = t.orderKey()
+	if u != nil && u.After == nil {
+		return u.end(out)
+	}
+	first := pgx.Identifier{t.cols[t.order[0]].name}.Sanitize()
+	reading := s.startSplit(t.name, id, u == nil)
 	defer s.endSplit(t.name, id)
 	for {
 		where := []string{bounds()}
 		where = append(where, st.where(first, arg)...)
 		if st.After != nil {
 			where = append(where, afterKey(order, st.After, arg))
+		}
+		if u != nil {
+			where = append(where, uptoKey(order, u.After, arg))
 		}
 		n, last, err := s.query(ctx, conn, b, t.name, head+strings.Join(where, " AND ")+tail, args, len(order), out)
 		if err != nil {
@@ -503,11 +701,14 @@ func (s *Source) readIncremental(ctx context.Context, conn *pgx.Conn, t table, i
 		if n > 0 {
 			st.After = last
 		}
+		if u != nil && u.reached(n, s.cfg.ChunkRows, last) {
+			return u.end(out)
+		}
 		ended := n < s.cfg.ChunkRows
 		// The position follows the key only where the cursor is its first
 		// column.
 		var pos *string
-		if t.key[0] == ci {
+		if t.order[0] == ci {
 			pos = st.position()
 		}
 		added, err := s.resplit(ctx, conn, t, reading, &st, ended, pos, true)

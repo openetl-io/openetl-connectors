@@ -90,6 +90,11 @@ type snapshotCursor struct {
 type snapshotRange struct {
 	keyRange
 	After []string `json:"after,omitempty"`
+	// In a read that ends at an until: the range is read up to and including
+	// upto, then held there.
+	bounded bool
+	upto    []string
+	held    bool
 }
 
 // lsn is spelled as Postgres spells it.
@@ -138,6 +143,16 @@ type cdcStream struct {
 	// Its last resume point's position, and when.
 	resumed   pglogrepl.LSN
 	resumedAt time.Time
+	// Where its read ends, if it's given one.
+	until *cdcUntil
+}
+
+// cdcUntil is where a stream's read ends: the state of a resume point an
+// earlier read sent, which a redo of its part of an epoch gives.
+type cdcUntil struct {
+	state []byte
+	// Transactions that committed at or after it aren't read.
+	lsn pglogrepl.LSN
 }
 
 // relation is a table as the log describes it.
@@ -168,7 +183,10 @@ type chunk struct {
 	stream *cdcStream
 	rng    *snapshotRange
 	snap   pgSnapshot
-	// Transactions that committed at or after it weren't seen.
+	// Transactions that committed at or after it weren't seen. It's held
+	// until the log reaches it, and its rows' sequence is its. In a read that
+	// ends at an until, it's the until's position if that's sooner: the next
+	// read reads the transactions from there again, after it.
 	lsn  pglogrepl.LSN
 	rows map[string][][]byte
 	// Keys in key order.
@@ -176,6 +194,8 @@ type chunk struct {
 	last []string
 	// It had chunkRows rows, so more may follow.
 	full bool
+	// It read its range up to its until.
+	reached bool
 }
 
 type cdcReader struct {
@@ -257,6 +277,17 @@ func (s *Source) readCDC(ctx context.Context, conns *connPool, req source.ReadRe
 		if st.ranges, err = r.snapshotRanges(ctx, t, state); err != nil {
 			return err
 		}
+		if cs.Until != nil && !req.Continuous {
+			var u cdcState
+			if err := json.Unmarshal(cs.Until, &u); err != nil {
+				return fmt.Errorf("postgres: %s until: %w", cs.Name, err)
+			}
+			if u.Slot != r.slot {
+				return positionLost("postgres: %s was read through replication slot %q, and the source now reads %q", t.name, u.Slot, r.slot)
+			}
+			st.until = &cdcUntil{state: cs.Until, lsn: pglogrepl.LSN(u.LSN)}
+			st.ranges = boundRanges(st.ranges, fresh(state), u.Snapshot)
+		}
 		for _, rng := range st.ranges {
 			if rng.After != nil && len(rng.After) != len(t.key) {
 				return fmt.Errorf("postgres: %s state has %d key columns, the table has %d", t.name, len(rng.After), len(t.key))
@@ -281,6 +312,14 @@ func (s *Source) readCDC(ctx context.Context, conns *connPool, req source.ReadRe
 		return err
 	}
 	r.confirmed = confirmed
+	// The slot can't stream the log before its confirmed position, so a read
+	// from before it would skip changes: a stream acknowledged past while it
+	// wasn't read, or a redo from a position acknowledged since.
+	for _, st := range r.streams {
+		if st.from != 0 && st.from < confirmed {
+			return positionLost("postgres: %s resumes from %s, and replication slot %q was acknowledged up to %s and streams nothing before it, so the changes between can't be read again; its table needs a snapshot again", st.t.name, st.from, r.slot, confirmed)
+		}
+	}
 	if !r.continuous {
 		var at string
 		if err := conn.QueryRow(ctx, "SELECT pg_current_wal_lsn()::text").Scan(&at); err != nil {
@@ -289,6 +328,16 @@ func (s *Source) readCDC(ctx context.Context, conns *connPool, req source.ReadRe
 		if r.target, err = pglogrepl.ParseLSN(at); err != nil {
 			return err
 		}
+		// Streams that end at an until need the log no further.
+		ends := pglogrepl.LSN(0)
+		for _, st := range r.streams {
+			if st.until == nil {
+				ends = r.target
+				break
+			}
+			ends = max(ends, st.until.lsn)
+		}
+		r.target = ends
 	}
 	// From the earliest stream's position, or the slot's if a stream has
 	// none.
@@ -322,12 +371,65 @@ func (s *Source) readCDC(ctx context.Context, conns *connPool, req source.ReadRe
 	return r.run(ctx)
 }
 
+// fresh says a state's snapshot hasn't started.
+func fresh(state cdcState) bool {
+	c := state.Snapshot
+	return state.Slot == "" || c != nil && c.After == nil && len(c.Ranges) == 0
+}
+
+// boundRanges bounds what's left of a snapshot by where an until's snapshot
+// had got, nil if it had ended: a range until has left is read up to its
+// position there, and the others whole, as they were before until. A
+// snapshot not started yet is read in until's ranges, with the table's rest
+// between them, since statistics may cut it differently now.
+func boundRanges(ranges []*snapshotRange, fresh bool, u *snapshotCursor) []*snapshotRange {
+	if u == nil {
+		return ranges
+	}
+	left := u.Ranges
+	if len(left) == 0 {
+		left = []*snapshotRange{{After: u.After}}
+	}
+	if fresh {
+		ranges = nil
+		var lo *string
+		for _, l := range left {
+			if !sameBound(lo, l.Lo) {
+				ranges = append(ranges, &snapshotRange{keyRange: keyRange{Lo: lo, Hi: l.Lo}})
+			}
+			ranges = append(ranges, &snapshotRange{keyRange: l.keyRange})
+			lo = l.Hi
+		}
+		if lo != nil {
+			ranges = append(ranges, &snapshotRange{keyRange: keyRange{Lo: lo}})
+		}
+	}
+	for _, rng := range ranges {
+		i := slices.IndexFunc(left, func(l *snapshotRange) bool {
+			return sameBound(l.Lo, rng.Lo) && sameBound(l.Hi, rng.Hi)
+		})
+		if i < 0 {
+			continue
+		}
+		rng.bounded, rng.upto = true, left[i].After
+		rng.held = rng.upto == nil || slices.Equal(rng.After, rng.upto)
+		if rng.held {
+			rng.After = rng.upto
+		}
+	}
+	return ranges
+}
+
+func sameBound(a, b *string) bool {
+	return a == nil && b == nil || a != nil && b != nil && *a == *b
+}
+
 // snapshotRanges is what's left of a table's snapshot, from its state. One
 // not started is read in key ranges if several connections can read it.
 func (r *cdcReader) snapshotRanges(ctx context.Context, t table, state cdcState) ([]*snapshotRange, error) {
 	cursor := state.Snapshot
 	switch {
-	case state.Slot == "" || cursor != nil && cursor.After == nil && len(cursor.Ranges) == 0:
+	case fresh(state):
 		if r.conns.limit == 1 {
 			return []*snapshotRange{{}}, nil
 		}
@@ -766,7 +868,7 @@ func (r *cdcReader) change(id uint32, op string, oldType uint8, old, new *pglogr
 		return fmt.Errorf("postgres: replication: a change to relation %d, which the log hasn't described", id)
 	}
 	st := rel.stream
-	if st == nil || r.txn == nil || r.txn.commit < st.from {
+	if st == nil || r.txn == nil || r.txn.commit < st.from || st.until != nil && r.txn.commit >= st.until.lsn {
 		return nil
 	}
 	var oldKey string
@@ -878,7 +980,9 @@ func (r *cdcReader) emit(st *cdcStream, key, op string, vals [][]byte, unchanged
 }
 
 func (r *cdcReader) add(st *cdcStream, op string, seq decimal128.Num, vals [][]byte, unchanged []string) error {
-	st.b.add(op, seq, vals, unchanged)
+	if err := st.b.add(op, seq, vals, unchanged); err != nil {
+		return fmt.Errorf("postgres: %s: %w", st.t.name, err)
+	}
 	st.dirty = true
 	if st.b.bytes >= r.s.cfg.BatchBytes {
 		return st.b.flush(st.t.name, r.out)
@@ -905,9 +1009,12 @@ func (r *cdcReader) passed() error {
 				}
 			}
 		}
-		if c.full {
+		switch {
+		case c.full && !c.reached:
 			c.rng.After = c.last
-		} else {
+		case c.rng.bounded:
+			c.rng.After, c.rng.held = c.rng.upto, true
+		default:
 			st.ranges = slices.DeleteFunc(st.ranges, func(rng *snapshotRange) bool { return rng == c.rng })
 			if len(st.ranges) == 0 {
 				slog.Info("read a table's snapshot", "table", st.t.name)
@@ -926,10 +1033,14 @@ func (r *cdcReader) passed() error {
 	return nil
 }
 
+// snapshotsRead says no stream has a range of its snapshot left to read:
+// none but those held at an until.
 func (r *cdcReader) snapshotsRead() bool {
 	for _, st := range r.streams {
-		if len(st.ranges) > 0 {
-			return false
+		for _, rng := range st.ranges {
+			if !rng.held {
+				return false
+			}
 		}
 	}
 	return true
@@ -947,7 +1058,9 @@ func (r *cdcReader) readChunks(ctx context.Context) error {
 	var todo []read
 	for _, st := range r.streams {
 		for _, rng := range st.ranges {
-			todo = append(todo, read{st, rng})
+			if !rng.held {
+				todo = append(todo, read{st, rng})
+			}
 		}
 	}
 	if len(todo) == 0 {
@@ -1042,6 +1155,9 @@ func (r *cdcReader) readChunk(ctx context.Context, conn *pgx.Conn, st *cdcStream
 	if rng.After != nil {
 		where = append(where, afterKey(key, rng.After, arg))
 	}
+	if rng.bounded {
+		where = append(where, uptoKey(key, rng.upto, arg))
+	}
 	if len(where) > 0 {
 		q += " WHERE " + strings.Join(where, " AND ")
 	}
@@ -1071,6 +1187,9 @@ func (r *cdcReader) readChunk(ctx context.Context, conn *pgx.Conn, st *cdcStream
 	if c.lsn, err = pglogrepl.ParseLSN(at); err != nil {
 		return nil, err
 	}
+	if st.until != nil {
+		c.lsn = min(c.lsn, st.until.lsn)
+	}
 	n := len(t.cols)
 	rr := tx.Conn().PgConn().ExecParams(ctx, q, args, nil, nil, nil)
 	for rr.NextRow() {
@@ -1099,6 +1218,7 @@ func (r *cdcReader) readChunk(ctx context.Context, conn *pgx.Conn, st *cdcStream
 	}
 	c.last = append([]string(nil), c.last...)
 	c.full = len(c.keys) == r.s.cfg.SnapshotChunkRows
+	c.reached = rng.bounded && (!c.full || slices.Equal(c.last, rng.upto))
 	if err := tx.Commit(ctx); err != nil {
 		return nil, classify(err)
 	}
@@ -1121,7 +1241,11 @@ func (r *cdcReader) resume() error {
 }
 
 func (r *cdcReader) state(st *cdcStream) ([]byte, error) {
-	return json.Marshal(cdcState{Slot: r.slot, LSN: lsn(max(st.from, r.pos)), Snapshot: st.cursor()})
+	at := max(st.from, r.pos)
+	if st.until != nil {
+		at = min(at, max(st.from, st.until.lsn))
+	}
+	return json.Marshal(cdcState{Slot: r.slot, LSN: lsn(at), Snapshot: st.cursor()})
 }
 
 // cursor is the snapshot's position, as a state spells it.
@@ -1151,11 +1275,20 @@ func (r *cdcReader) resumeStream(st *cdcStream) error {
 }
 
 // complete ends a bounded read: each stream's next sync starts where this
-// one ended.
+// one ended, or for one given an until, there, after a resume point there.
 func (r *cdcReader) complete() error {
 	for _, st := range r.streams {
 		if err := st.b.flush(st.t.name, r.out); err != nil {
 			return err
+		}
+		if st.until != nil {
+			if err := r.out.ResumePoint(st.t.name, st.until.state); err != nil {
+				return err
+			}
+			if err := r.out.Complete(st.t.name, st.until.state); err != nil {
+				return err
+			}
+			continue
 		}
 		b, err := r.state(st)
 		if err != nil {
@@ -1353,14 +1486,16 @@ func declaredOnly(t table, columns []string) (table, error) {
 		}
 		key[i] = j
 	}
-	t.cols, t.key = cols, key
+	t.cols, t.key, t.order = cols, key, key
 	return t, nil
 }
 
 // changeBatcher builds a CDC stream's batches: each column as text, which
-// the engine parses as the declared type, then the control columns.
+// the engine parses as the declared type, or built from its text where the
+// engine can't (typedText), then the control columns.
 type changeBatcher struct {
 	b     *array.RecordBuilder
+	typed []*textTyped
 	n     int
 	rows  int
 	bytes int
@@ -1368,22 +1503,33 @@ type changeBatcher struct {
 
 func newChangeBatcher(mem memory.Allocator, cols []sourceColumn) *changeBatcher {
 	fields := make([]arrow.Field, 0, len(cols)+3)
-	for _, c := range cols {
-		fields = append(fields, arrow.Field{Name: c.name, Type: arrow.BinaryTypes.String, Nullable: true})
+	typed := make([]*textTyped, len(cols))
+	for i, c := range cols {
+		f := arrow.Field{Name: c.name, Type: arrow.BinaryTypes.String, Nullable: true}
+		if typed[i] = typedText(c); typed[i] != nil {
+			f.Type = typed[i].dt
+		}
+		fields = append(fields, f)
 	}
 	fields = append(fields, source.OpField(), source.SeqField(seqType), source.UnchangedField())
-	return &changeBatcher{b: array.NewRecordBuilder(mem, arrow.NewSchema(fields, nil)), n: len(cols)}
+	return &changeBatcher{b: array.NewRecordBuilder(mem, arrow.NewSchema(fields, nil)), typed: typed, n: len(cols)}
 }
 
 // add appends a row; a nil value is null.
-func (c *changeBatcher) add(op string, seq decimal128.Num, vals [][]byte, unchanged []string) {
+func (c *changeBatcher) add(op string, seq decimal128.Num, vals [][]byte, unchanged []string) error {
 	for i := range c.n {
-		sb := c.b.Field(i).(*array.StringBuilder)
+		fb := c.b.Field(i)
 		if vals[i] == nil {
-			sb.AppendNull()
+			fb.AppendNull()
 			continue
 		}
-		sb.BinaryBuilder.Append(vals[i])
+		if t := c.typed[i]; t != nil {
+			if err := t.add(fb, vals[i]); err != nil {
+				return fmt.Errorf("column %q: %w", c.b.Schema().Field(i).Name, err)
+			}
+		} else {
+			fb.(*array.StringBuilder).BinaryBuilder.Append(vals[i])
+		}
 		c.bytes += len(vals[i])
 	}
 	c.b.Field(c.n).(*array.StringBuilder).Append(op)
@@ -1398,6 +1544,7 @@ func (c *changeBatcher) add(op string, seq decimal128.Num, vals [][]byte, unchan
 		}
 	}
 	c.rows++
+	return nil
 }
 
 func (c *changeBatcher) flush(stream string, out source.Emitter) error {

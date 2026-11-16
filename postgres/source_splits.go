@@ -51,10 +51,11 @@ func (k keyRange) where(col string, arg func(string) string) []string {
 	return w
 }
 
-// Splits divides a keyed table read in full or incrementally into key ranges,
-// from its statistics. Small tables, and those without statistics, are read
-// whole. An incremental read's ranges share the highest cursor value it reads
-// and its floor, where the last read's splits all ended.
+// Splits divides a table with a read order, read in full or incrementally,
+// into ranges of the order's first column, from its statistics. Small
+// tables, and those without statistics, are read whole. An incremental
+// read's ranges share the highest cursor value it reads and its floor, where
+// the last read's splits all ended.
 func (s *Source) Splits(ctx context.Context, cs source.ConfiguredStream, ended []source.Split) ([]source.Split, error) {
 	if cs.SyncMode == source.CDC {
 		// A state from a read in splits starts the table again, as one from a
@@ -147,7 +148,7 @@ func floorOf(stream string, ended []source.Split) (*string, error) {
 // first has no lower bound and the last no upper, so together they cover
 // every key.
 func (s *Source) keyRanges(ctx context.Context, conn *pgx.Conn, t table, rows int) ([]keyRange, error) {
-	if len(t.key) == 0 {
+	if len(t.order) == 0 {
 		return nil, nil
 	}
 	stats, err := s.keyStats(ctx, conn, t)
@@ -197,7 +198,7 @@ func (s *Source) keyStats(ctx context.Context, conn *pgx.Conn, t table) (keyStat
 		LEFT JOIN pg_collation co ON co.oid = a.attcollation
 		LEFT JOIN pg_namespace cn ON cn.oid = co.collnamespace
 		WHERE n.nspname = $1 AND c.relname = $2
-		ORDER BY st.inherited DESC LIMIT 1`, s.cfg.Schema, t.name, t.cols[t.key[0]].name).Scan(&st.rows, &st.bounds, &st.typ, &st.collation)
+		ORDER BY st.inherited DESC LIMIT 1`, s.cfg.Schema, t.name, t.cols[t.order[0]].name).Scan(&st.rows, &st.bounds, &st.typ, &st.collation)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return st, nil
 	}
@@ -253,8 +254,10 @@ type readingSplit struct {
 	over atomic.Bool
 }
 
-func (s *Source) startSplit(stream, id string) *readingSplit {
+// startSplit registers a split being read; resplits: Resplit may divide it.
+func (s *Source) startSplit(stream, id string, resplits bool) *readingSplit {
 	r := &readingSplit{}
+	r.over.Store(!resplits)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.reading == nil {
@@ -305,8 +308,8 @@ func (s *Source) resplit(ctx context.Context, conn *pgx.Conn, t table, r *readin
 		return nil, nil
 	}
 	if !r.asked.Swap(false) {
-		if intKey[t.cols[t.key[0]].oid] {
-			low, high, err := intRemainder(st.keyRange, pos, len(t.key) == 1)
+		if intKey[t.cols[t.order[0]].oid] {
+			low, high, err := intRemainder(st.keyRange, pos, len(t.order) == 1)
 			if err != nil {
 				return nil, err
 			}
@@ -344,7 +347,7 @@ var intKey = map[uint32]bool{pgtype.Int2OID: true, pgtype.Int4OID: true, pgtype.
 // midpoint is where to divide a range's remainder, nil if nowhere: the upper
 // part starts above it, and each part has keys to hold.
 func (s *Source) midpoint(ctx context.Context, conn *pgx.Conn, t table, r keyRange, pos *string) (*string, error) {
-	first := t.cols[t.key[0]]
+	first := t.cols[t.order[0]]
 	if !intKey[first.oid] {
 		if pos != nil {
 			r.Lo = pos
@@ -355,7 +358,7 @@ func (s *Source) midpoint(ctx context.Context, conn *pgx.Conn, t table, r keyRan
 		}
 		return &bounds[len(bounds)/2], nil
 	}
-	low, high, err := intRemainder(r, pos, len(t.key) == 1)
+	low, high, err := intRemainder(r, pos, len(t.order) == 1)
 	if err != nil {
 		return nil, err
 	}
