@@ -98,10 +98,14 @@ func (r *Retry) validate() error {
 // backoff is the wait before retry n, from 1: drawn at random up to
 // InitialBackoff doubled n-1 times, capped at MaxBackoff.
 func (r *Retry) backoff(n int) time.Duration {
-	ceil := time.Duration(r.MaxBackoff)
-	n = max(n, 1)
-	if n < 40 {
-		ceil = min(ceil, time.Duration(r.InitialBackoff)<<(n-1))
+	limit := max(time.Duration(r.MaxBackoff), 1)
+	ceil := min(max(time.Duration(r.InitialBackoff), 1), limit)
+	for i := 1; i < n && ceil < limit; i++ {
+		if ceil > limit/2 {
+			ceil = limit
+			break
+		}
+		ceil *= 2
 	}
 	return time.Duration(rand.Int64N(int64(ceil))) + 1
 }
@@ -317,21 +321,24 @@ type throttle struct {
 	n     int
 }
 
-// wait waits before the next try of a throttled call, and fails with
-// RATE_LIMITED once calls have been throttled for MaxElapsed.
+// wait waits before the next try of a throttled call, no longer than what's
+// left of MaxElapsed, and fails with RATE_LIMITED once calls have been
+// throttled for MaxElapsed.
 func (t *throttle) wait(ctx context.Context, err error) error {
 	now := time.Now()
 	if t.n == 0 {
 		t.since = now
 	}
 	t.n++
-	if d := now.Sub(t.since); d >= time.Duration(t.retry.MaxElapsed) {
+	d := now.Sub(t.since)
+	left := time.Duration(t.retry.MaxElapsed) - d
+	if left <= 0 {
 		return sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_RATE_LIMITED, fmt.Errorf("throttled for %s: %w", d.Round(time.Second), err))
 	}
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
-	case <-time.After(t.retry.backoff(t.n)):
+	case <-time.After(min(t.retry.backoff(t.n), left)):
 		return nil
 	}
 }

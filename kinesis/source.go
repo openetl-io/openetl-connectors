@@ -1,8 +1,9 @@
 package kinesis
 
 import (
-	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -175,7 +176,7 @@ func (c *SourceConfig) validate() error {
 		p.Interval = Duration(minPollInterval)
 	}
 	if p.IdleInterval == 0 {
-		p.IdleInterval = Duration(time.Second)
+		p.IdleInterval = max(Duration(time.Second), p.Interval)
 	}
 	switch {
 	case p.MaxRecords < 1 || p.MaxRecords > maxGetRecords:
@@ -190,7 +191,10 @@ func (c *SourceConfig) validate() error {
 
 func (c *SourceConfig) deaggregate() bool { return c.Deaggregate == nil || *c.Deaggregate }
 
-// consumerName is the efo consumer a pipeline reads with.
+// consumerName is the efo consumer a pipeline reads with: consumer.name, or
+// openetl- and the pipeline's name. Where the pipeline's name has characters
+// a consumer's can't, or is too long, they're replaced or cut, and a hash of
+// the whole name follows, so two pipelines' names don't make one consumer's.
 func (c *SourceConfig) consumerName(pipeline string) (string, error) {
 	if c.Consumer.Name != "" {
 		return c.Consumer.Name, nil
@@ -198,7 +202,8 @@ func (c *SourceConfig) consumerName(pipeline string) (string, error) {
 	if pipeline == "" {
 		return "", invalid(errors.New("kinesis: consumer.type efo needs consumer.name, or a pipeline to name the consumer after"))
 	}
-	b := []byte("openetl-")
+	const prefix, most = "openetl-", 128
+	b := []byte(prefix)
 	for _, r := range pipeline {
 		if r < 0x80 && consumerNameChar(byte(r)) {
 			b = append(b, byte(r))
@@ -206,7 +211,12 @@ func (c *SourceConfig) consumerName(pipeline string) (string, error) {
 			b = append(b, '-')
 		}
 	}
-	return string(b[:min(len(b), 128)]), nil
+	if string(b[len(prefix):]) == pipeline && len(b) <= most {
+		return string(b), nil
+	}
+	sum := sha256.Sum256([]byte(pipeline))
+	tag := "-" + hex.EncodeToString(sum[:4])
+	return string(b[:min(len(b), most-len(tag))]) + tag, nil
 }
 
 func validConsumerName(n string) bool {
@@ -1015,6 +1025,16 @@ func (rd *reading) poll(ctx context.Context, r *streamRead, shard string) error 
 	return nil
 }
 
+// startRefused is err, or if Kinesis refused to start the shard's read at
+// startTimestamp, a config error that says so: Kinesis refuses a time later
+// than its clock.
+func (sr *shardRead) startRefused(err error, at types.ShardIteratorType) error {
+	if at != types.ShardIteratorTypeAtTimestamp || apiCode(err) != "InvalidArgumentException" {
+		return err
+	}
+	return invalid(fmt.Errorf("startTimestamp %s is later than Kinesis's clock, and a read starts only at a time that has passed: set startTimestamp to a past time, or startPosition to latest: %w", sr.st.From.UTC().Format(time.RFC3339), err))
+}
+
 func (sr *shardRead) failed(err error) error {
 	if codeOf(err) != protocolv1.ErrorCode_ERROR_CODE_UNSPECIFIED {
 		return fmt.Errorf("kinesis: %s's shard %s: %w", sr.r.name, sr.shard, err)
@@ -1083,7 +1103,7 @@ func (sr *shardRead) iterator(ctx context.Context) (*string, error) {
 			continue
 		}
 		if err != nil {
-			return nil, sr.failed(err)
+			return nil, sr.failed(sr.startRefused(err, in.ShardIteratorType))
 		}
 		sr.th.ok()
 		return res.ShardIterator, nil
@@ -1161,7 +1181,10 @@ func (s *Source) rows(ctx context.Context, shard string, recs []types.Record) ([
 	out := make([]json.RawMessage, 0, len(recs))
 	for i := range recs {
 		rec := &recs[i]
-		if s.cfg.deaggregate() && aggregated(rec.Data) {
+		if aggregated(rec.Data) {
+			if !s.cfg.deaggregate() {
+				return nil, sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_DATA_INVALID, fmt.Errorf("kinesis: shard %s sequence %s: a record the Kinesis Producer Library aggregated, and deaggregate is off", shard, aws.ToString(rec.SequenceNumber)))
+			}
 			users, err := deaggregate(rec.Data)
 			if err != nil {
 				return nil, sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_DATA_INVALID, fmt.Errorf("kinesis: shard %s sequence %s: an aggregated record: %w", shard, aws.ToString(rec.SequenceNumber), err))
@@ -1193,9 +1216,6 @@ func (s *Source) row(ctx context.Context, shard string, rec *types.Record, sub i
 	if len(data) > 0 {
 		v, err := s.values.Decode(ctx, data)
 		if err != nil {
-			if bytes.HasPrefix(data, kplMagic) {
-				err = errors.New("a record the Kinesis Producer Library aggregated, and deaggregate is off")
-			}
 			return nil, sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_DATA_INVALID, fmt.Errorf("kinesis: shard %s sequence %s: %w", shard, seq, err))
 		}
 		b = records.AppendFields(b, v)

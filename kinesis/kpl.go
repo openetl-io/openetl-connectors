@@ -10,7 +10,10 @@ import (
 )
 
 // kplMagic starts a record the Kinesis Producer Library aggregated: the
-// magic, an AggregatedRecord message, and the message's MD5.
+// magic, an AggregatedRecord message, and the message's MD5. The MD5 is the
+// format's checksum of the message, which the library writes; it guards
+// against corruption, not tampering, and nothing here relies on it for
+// security.
 var kplMagic = []byte{0xf3, 0x89, 0x9a, 0xc2}
 
 // userRecord is one record of an aggregated record.
@@ -80,9 +83,11 @@ type parsedRecord struct {
 	data []byte
 }
 
+// parseUserRecord parses a Record, whose partition_key_index and data are
+// required.
 func parseUserRecord(b []byte) (parsedRecord, error) {
 	var r parsedRecord
-	haveKey := false
+	haveKey, haveData := false, false
 	for len(b) > 0 {
 		num, typ, n := protowire.ConsumeTag(b)
 		if n < 0 {
@@ -101,7 +106,7 @@ func parseUserRecord(b []byte) (parsedRecord, error) {
 			if n < 0 {
 				return r, protowire.ParseError(n)
 			}
-			r.data, b = v, b[n:]
+			r.data, haveData, b = v, true, b[n:]
 		default:
 			if n = protowire.ConsumeFieldValue(num, typ, b); n < 0 {
 				return r, protowire.ParseError(n)
@@ -109,8 +114,11 @@ func parseUserRecord(b []byte) (parsedRecord, error) {
 			b = b[n:]
 		}
 	}
-	if !haveKey {
+	switch {
+	case !haveKey:
 		return r, errors.New("a user record without a partition key index")
+	case !haveData:
+		return r, errors.New("a user record without data")
 	}
 	return r, nil
 }

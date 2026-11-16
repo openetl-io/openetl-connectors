@@ -602,6 +602,12 @@ func (d *Destination) targetCheck(k *conn, base, stream, name string) check.Chec
 			}
 			if diff := differs(cfg, sum); diff != "" {
 				p.Param("differences", diff)
+				if cfg.setup() {
+					if pending, err := pendingSetup(ctx, cl, name); err == nil && pending {
+						p.Found("{target} differs from the config: {differences}. The destination created it and hasn't finished setting it up, which its next write does.")
+						return nil
+					}
+				}
 				return check.Warn(targetDiffers.Fail())
 			}
 			p.Found("{target} is {status}, with {shards} open shards, {retention} of retention and {encryption}.")
@@ -630,6 +636,9 @@ func creates(cfg *DestinationConfig) string {
 // createActions are the IAM actions creating a stream takes.
 func createActions(cfg *DestinationConfig) []string {
 	out := []string{"kinesis:CreateStream", "kinesis:DescribeStream", "kinesis:DescribeStreamSummary"}
+	if cfg.setup() {
+		out = append(out, "kinesis:AddTagsToStream", "kinesis:ListTagsForStream", "kinesis:RemoveTagsFromStream")
+	}
 	if cfg.RetentionHours > minRetentionHours {
 		out = append(out, "kinesis:IncreaseStreamRetentionPeriod")
 	}

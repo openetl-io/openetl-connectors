@@ -31,6 +31,9 @@ func (s *Source) register(ctx context.Context, cl *awskinesis.Client, streamARN,
 	}
 	th := throttle{retry: &s.cfg.Retry}
 	deadline := time.Now().Add(consumerActiveWithin)
+	// Kinesis refusing to register the consumer for want of room, the last
+	// time it was asked.
+	var refused error
 	for {
 		d, err := cl.DescribeStreamConsumer(ctx, &awskinesis.DescribeStreamConsumerInput{StreamARN: aws.String(streamARN), ConsumerName: aws.String(name)})
 		switch {
@@ -41,7 +44,11 @@ func (s *Source) register(ctx context.Context, cl *awskinesis.Client, streamARN,
 			continue
 		case apiCode(err) == "ResourceNotFoundException":
 			_, err = cl.RegisterStreamConsumer(ctx, &awskinesis.RegisterStreamConsumerInput{StreamARN: aws.String(streamARN), ConsumerName: aws.String(name)})
-			if err != nil && apiCode(err) != "ResourceInUseException" && !throttled(err) {
+			refused = nil
+			switch {
+			case apiCode(err) == "LimitExceededException":
+				refused = err
+			case err != nil && apiCode(err) != "ResourceInUseException" && !throttled(err):
 				return "", failed(err)
 			}
 		case err != nil:
@@ -51,6 +58,11 @@ func (s *Source) register(ctx context.Context, cl *awskinesis.Client, streamARN,
 		}
 		th.ok()
 		if time.Now().After(deadline) {
+			if refused != nil {
+				// The limit of consumers a stream takes, or of those being
+				// registered at once, held for the whole wait.
+				return "", sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_RESOURCE_EXHAUSTED, fmt.Errorf("kinesis: consumer %s of %s: Kinesis refused to register it for %s; the stream may have as many consumers as it takes: %w", name, streamARN, consumerActiveWithin, refused))
+			}
 			return "", sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_TRANSIENT, fmt.Errorf("kinesis: consumer %s of %s isn't active after %s", name, streamARN, consumerActiveWithin))
 		}
 		select {
@@ -101,8 +113,11 @@ func (s *Source) deregister(ctx context.Context, cl *awskinesis.Client, streamAR
 	deadline := time.Now().Add(consumerActiveWithin)
 	for {
 		_, err := cl.DeregisterStreamConsumer(ctx, &awskinesis.DeregisterStreamConsumerInput{StreamARN: aws.String(streamARN), ConsumerName: aws.String(name)})
+		if err == nil {
+			return nil
+		}
 		switch apiCode(err) {
-		case "", "ResourceNotFoundException":
+		case "ResourceNotFoundException":
 			return nil
 		case "ResourceInUseException":
 			d, err := cl.DescribeStreamConsumer(ctx, &awskinesis.DescribeStreamConsumerInput{StreamARN: aws.String(streamARN), ConsumerName: aws.String(name)})
@@ -179,8 +194,9 @@ func (sr *shardRead) subscribe(ctx context.Context) (bool, error) {
 		case <-time.After(time.Until(last.Add(subscribeEvery))):
 		}
 		last = time.Now()
+		at := sr.startingPosition(cont)
 		es, err := sr.rd.subscribe(ctx, &awskinesis.SubscribeToShardInput{
-			ConsumerARN: aws.String(sr.r.consumer), ShardId: aws.String(sr.shard), StartingPosition: sr.startingPosition(cont),
+			ConsumerARN: aws.String(sr.r.consumer), ShardId: aws.String(sr.shard), StartingPosition: at,
 		})
 		if err == nil {
 			var over bool
@@ -193,7 +209,7 @@ func (sr *shardRead) subscribe(ctx context.Context) (bool, error) {
 			return false, nil
 		}
 		if !resubscribable(err) {
-			return false, sr.failed(err)
+			return false, sr.failed(sr.startRefused(err, at.Type))
 		}
 		if errors.Is(err, errSubscriptionEnded) {
 			continue
@@ -212,7 +228,7 @@ func resubscribable(err error) bool {
 		return true
 	}
 	switch apiCode(err) {
-	case "ResourceInUseException", "InternalFailure", "ServiceUnavailable":
+	case "ResourceInUseException", "InternalFailure", "InternalFailureException", "ServiceUnavailable":
 		return true
 	}
 	_, isNet := errors.AsType[net.Error](err)

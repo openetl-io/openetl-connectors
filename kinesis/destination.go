@@ -163,6 +163,12 @@ func (c *DestinationConfig) validate() error {
 
 func (c *DestinationConfig) createsStreams() bool { return c.CreateStreams == nil || *c.CreateStreams }
 
+// setup says the streams the destination creates need more than
+// CreateStream gives them: retention or encryption.
+func (c *DestinationConfig) setup() bool {
+	return c.RetentionHours > minRetentionHours || c.KMSKeyID != ""
+}
+
 func (d *Destination) Capabilities() destination.Capabilities { return DestinationCapabilities }
 
 // putter is the part of the Kinesis client a writer sends with.
@@ -324,9 +330,19 @@ func keyColumns(mode string, sc *arrow.Schema, primary, fields []string, hasID b
 	return nil, nil
 }
 
+// setupTag marks a stream the destination created and hasn't finished
+// setting up: CreateStream sets it, and it's removed once the stream has
+// the config's retention and encryption.
+const (
+	setupTag     = "openetl.io/setup"
+	setupPending = "pending"
+)
+
 // ensureStream waits for a Kinesis stream to be active, creating it unless
 // it exists or createStreams is off. Only a stream it creates gets the
-// config's mode, retention and encryption; an existing one is left as it is.
+// config's mode, retention and encryption; an existing one is left as it
+// is, unless the destination created it and its setup didn't finish, which
+// ensureStream then finishes.
 func (w *writer) ensureStream(ctx context.Context, name string) error {
 	if w.ready[name] {
 		return nil
@@ -335,6 +351,7 @@ func (w *writer) ensureStream(ctx context.Context, name string) error {
 	sum, err := w.cl.DescribeStreamSummary(ctx, &awskinesis.DescribeStreamSummaryInput{StreamName: aws.String(name)})
 	created := false
 	if apiCode(err) == "ResourceNotFoundException" {
+		sum = nil
 		if !cfg.createsStreams() {
 			return invalid(fmt.Errorf("kinesis: stream %s doesn't exist, and createStreams is off", name))
 		}
@@ -342,10 +359,13 @@ func (w *writer) ensureStream(ctx context.Context, name string) error {
 		if cfg.StreamMode == streamProvisioned {
 			in.ShardCount, in.StreamModeDetails = aws.Int32(cfg.Shards), &types.StreamModeDetails{StreamMode: types.StreamModeProvisioned}
 		}
+		if cfg.setup() {
+			in.Tags = map[string]string{setupTag: setupPending}
+		}
 		_, err = w.cl.CreateStream(ctx, in)
 		switch apiCode(err) {
 		case "":
-			created = true
+			created = err == nil
 		case "ResourceInUseException":
 			err = nil
 		}
@@ -356,17 +376,59 @@ func (w *writer) ensureStream(ctx context.Context, name string) error {
 	if err := w.active(ctx, name); err != nil {
 		return err
 	}
-	if created {
-		if err := w.configure(ctx, name); err != nil {
-			return err
+	if cfg.setup() {
+		pending := created
+		if !created {
+			var err error
+			pending, err = pendingSetup(ctx, w.cl, name)
+			switch {
+			case accessDenied(apiCode(err)) && sum != nil:
+				// Without its tags, the stream counts as one the
+				// destination didn't create.
+			case err != nil:
+				return classify(fmt.Errorf("kinesis: stream %s: list its tags: %w", name, err))
+			}
 		}
-	} else if sum != nil {
+		if pending {
+			if err := w.configure(ctx, name); err != nil {
+				return err
+			}
+			sum = nil
+		}
+	}
+	if sum != nil {
 		if diff := differs(cfg, sum.StreamDescriptionSummary); diff != "" {
 			slog.WarnContext(ctx, "kinesis: an existing stream differs from the config, which applies only to streams the destination creates", "stream", name, "differs", diff)
 		}
 	}
 	w.ready[name] = true
 	return nil
+}
+
+// tagLister is the part of the Kinesis client that lists a stream's tags.
+type tagLister interface {
+	ListTagsForStream(ctx context.Context, in *awskinesis.ListTagsForStreamInput, opts ...func(*awskinesis.Options)) (*awskinesis.ListTagsForStreamOutput, error)
+}
+
+// pendingSetup says the destination created the stream and hasn't finished
+// setting it up.
+func pendingSetup(ctx context.Context, cl tagLister, name string) (bool, error) {
+	in := &awskinesis.ListTagsForStreamInput{StreamName: aws.String(name), Limit: aws.Int32(50)}
+	for {
+		res, err := cl.ListTagsForStream(ctx, in)
+		if err != nil {
+			return false, err
+		}
+		for _, t := range res.Tags {
+			if aws.ToString(t.Key) == setupTag {
+				return aws.ToString(t.Value) == setupPending, nil
+			}
+		}
+		if !aws.ToBool(res.HasMoreTags) || len(res.Tags) == 0 {
+			return false, nil
+		}
+		in.ExclusiveStartTagKey = res.Tags[len(res.Tags)-1].Key
+	}
 }
 
 func (w *writer) active(ctx context.Context, name string) error {
@@ -377,11 +439,17 @@ func (w *writer) active(ctx context.Context, name string) error {
 	return nil
 }
 
-// configure gives a stream the destination created its retention and
-// encryption.
+// configure gives a stream the destination created the config's retention
+// and encryption, what it doesn't have of them yet, then takes away its
+// setup tag.
 func (w *writer) configure(ctx context.Context, name string) error {
 	cfg := &w.d.cfg
-	if h := cfg.RetentionHours; h > minRetentionHours {
+	res, err := w.cl.DescribeStreamSummary(ctx, &awskinesis.DescribeStreamSummaryInput{StreamName: aws.String(name)})
+	if err != nil {
+		return classify(fmt.Errorf("kinesis: stream %s: %w", name, err))
+	}
+	sum := res.StreamDescriptionSummary
+	if h := cfg.RetentionHours; h > aws.ToInt32(sum.RetentionPeriodHours) {
 		if _, err := w.cl.IncreaseStreamRetentionPeriod(ctx, &awskinesis.IncreaseStreamRetentionPeriodInput{StreamName: aws.String(name), RetentionPeriodHours: aws.Int32(h)}); err != nil {
 			return classify(fmt.Errorf("kinesis: stream %s: set retention: %w", name, err))
 		}
@@ -389,13 +457,16 @@ func (w *writer) configure(ctx context.Context, name string) error {
 			return err
 		}
 	}
-	if cfg.KMSKeyID != "" {
-		if _, err := w.cl.StartStreamEncryption(ctx, &awskinesis.StartStreamEncryptionInput{StreamName: aws.String(name), EncryptionType: types.EncryptionTypeKms, KeyId: aws.String(cfg.KMSKeyID)}); err != nil {
+	if k := cfg.KMSKeyID; k != "" && (sum.EncryptionType != types.EncryptionTypeKms || aws.ToString(sum.KeyId) != k) {
+		if _, err := w.cl.StartStreamEncryption(ctx, &awskinesis.StartStreamEncryptionInput{StreamName: aws.String(name), EncryptionType: types.EncryptionTypeKms, KeyId: aws.String(k)}); err != nil {
 			return classify(fmt.Errorf("kinesis: stream %s: start encryption: %w", name, err))
 		}
 		if err := w.active(ctx, name); err != nil {
 			return err
 		}
+	}
+	if _, err := w.cl.RemoveTagsFromStream(ctx, &awskinesis.RemoveTagsFromStreamInput{StreamName: aws.String(name), TagKeys: []string{setupTag}}); err != nil {
+		return classify(fmt.Errorf("kinesis: stream %s: remove its setup tag: %w", name, err))
 	}
 	return nil
 }
@@ -575,6 +646,9 @@ func (w *writer) putAll(ctx context.Context, target string, entries []entry) err
 			default:
 				return failed(&smithy.GenericAPIError{Code: code, Message: aws.ToString(r.ErrorMessage)})
 			}
+		}
+		if len(again) == 0 {
+			return nil
 		}
 		if len(again) < len(entries) {
 			th.ok()

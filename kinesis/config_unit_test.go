@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"reflect"
+	"regexp"
 	"slices"
 	"strings"
 	"sync"
@@ -149,6 +150,8 @@ func TestSourceConfig(t *testing.T) {
 		{`{"polling": {"interval": "100ms"}}`, false},
 		{`{"polling": {"maxRecords": 10001}}`, false},
 		{`{"polling": {"interval": "2s", "idleInterval": "1s"}}`, false},
+		{`{"polling": {"interval": "2s"}}`, true},
+		{`{"startPosition": "timestamp", "startTimestamp": "2999-01-01T00:00:00Z"}`, true},
 		{`{"polling": {"interval": "soon"}}`, false},
 		{`{"retry": {"initialBackoff": "50ms", "maxBackoff": "2s", "maxAttempts": 3, "maxElapsed": "1m"}}`, true},
 		{`{"retry": {"initialBackoff": "5s", "maxBackoff": "1s"}}`, false},
@@ -179,24 +182,49 @@ func TestSourceConfig(t *testing.T) {
 	if p.MaxRecords != 10000 || p.Interval != Duration(200*time.Millisecond) || p.IdleInterval != Duration(time.Second) || s.cfg.Consumer.Type != consumerPolling || !s.cfg.deaggregate() {
 		t.Errorf("defaults: %+v, %+v", p, s.cfg.Consumer)
 	}
+	s, err = NewSource([]byte(`{"polling": {"interval": "2s"}}`))
+	if err != nil || s.cfg.Polling.IdleInterval != Duration(2*time.Second) {
+		t.Errorf("idleInterval without one, after interval 2s: %v, %v", s.cfg.Polling.IdleInterval, err)
+	}
 	if r := s.cfg.Retry; r.InitialBackoff != defaultInitialBackoff || r.MaxBackoff != defaultMaxBackoff || r.MaxAttempts != defaultMaxAttempts || r.MaxElapsed != defaultMaxElapsed {
 		t.Errorf("retry's defaults: %+v", r)
 	}
 }
 
+// A pipeline's name is its consumer's as it is where it can be; where it
+// can't, a hash of it keeps pipelines' consumers apart.
 func TestConsumerName(t *testing.T) {
 	cfg := SourceConfig{}
+	hashed := regexp.MustCompile(`-[0-9a-f]{8}$`)
 	for pipeline, want := range map[string]string{
 		"orders":                         "openetl-orders",
-		"workspaces/w/pipelines/orders":  "openetl-workspaces-w-pipelines-orders",
-		"émoji ok":                       "openetl--moji-ok",
-		strings.Repeat("a", 200):         "openetl-" + strings.Repeat("a", 120),
 		"0b0c5a6e-1c4e-4f42-9a54-5e7f1d": "openetl-0b0c5a6e-1c4e-4f42-9a54-5e7f1d",
+		strings.Repeat("a", 120):         "openetl-" + strings.Repeat("a", 120),
+		"workspaces/w/pipelines/orders":  "openetl-workspaces-w-pipelines-orders-",
+		"émoji ok":                       "openetl--moji-ok-",
+		strings.Repeat("a", 121):         "openetl-" + strings.Repeat("a", 111) + "-",
+		strings.Repeat("a", 200):         "openetl-" + strings.Repeat("a", 111) + "-",
 	} {
 		got, err := cfg.consumerName(pipeline)
-		if err != nil || got != want || !validConsumerName(got) {
-			t.Errorf("%q: %q, %v; want %q", pipeline, got, err, want)
+		if err != nil || !validConsumerName(got) || len(got) > 128 {
+			t.Errorf("%q: %q, %v", pipeline, got, err)
+			continue
 		}
+		if strings.HasSuffix(want, "-") {
+			if !strings.HasPrefix(got, want) || !hashed.MatchString(got) || len(got) != len(want)+8 {
+				t.Errorf("%q: %q, want %s and a hash", pipeline, got, want)
+			}
+		} else if got != want {
+			t.Errorf("%q: %q, want %q", pipeline, got, want)
+		}
+	}
+	seen := map[string]string{}
+	for _, p := range []string{"a/b", "a-b", "a b", "a.b", strings.Repeat("x", 200) + "1", strings.Repeat("x", 200) + "2"} {
+		n, _ := cfg.consumerName(p)
+		if other, ok := seen[n]; ok {
+			t.Errorf("%q and %q both read with %q", p, other, n)
+		}
+		seen[n] = p
 	}
 	if _, err := cfg.consumerName(""); err == nil {
 		t.Error("no pipeline and no name: no error")

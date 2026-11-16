@@ -335,6 +335,15 @@ func TestDestinationCreatesStreams(t *testing.T) {
 		if n := len(everything(t, ns+"."+name)); n != 10 {
 			t.Errorf("%s: %d records", name, n)
 		}
+		tags, err := cl.ListTagsForStream(t.Context(), &awskinesis.ListTagsForStreamInput{StreamName: aws.String(ns + "." + name)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, tag := range tags.Tags {
+			if aws.ToString(tag.Key) == setupTag {
+				t.Errorf("%s keeps its setup tag", name)
+			}
+		}
 	}
 }
 
