@@ -1,16 +1,140 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "Parquet on S3 destination",
+  "title": "Files on S3, Google Cloud Storage, Azure Blob Storage or a local disk: destination",
   "type": "object",
   "additionalProperties": false,
-  "required": ["url"],
+  "required": [
+    "url"
+  ],
   "properties": {
-    "url": {"type": "string", "description": "Where the tables go: s3://bucket/prefix, or file:// and an absolute path. Each stream's table is a directory of Parquet files under it."},
-    "region": {"type": "string", "description": "The bucket's AWS region."},
-    "endpoint": {"type": "string", "description": "An S3-compatible endpoint, for stores other than AWS. Uses path-style addressing."},
-    "accessKeyId": {"type": "string", "x-secret": true, "description": "An AWS access key. Without one, the AWS default credentials."},
-    "secretAccessKey": {"type": "string", "x-secret": true, "description": "The access key's secret."},
-    "compression": {"type": "string", "enum": ["zstd", "snappy", "gzip", "none"], "default": "zstd", "description": "The Parquet files' compression."},
-    "fileSize": {"type": "integer", "minimum": 1048576, "default": 268435456, "description": "Bytes a file reaches before the next one starts."}
-  }
+    "url": {
+      "type": "string",
+      "title": "URL",
+      "description": "Where the tables go: s3://bucket/prefix, gs://bucket/prefix and azblob://container/prefix (from 0.2.0), or file:// and an absolute path. Each stream's table is a directory of files under it.",
+      "x-group": "location"
+    },
+    "endpoint": {
+      "type": "string",
+      "title": "Endpoint",
+      "description": "The store's endpoint, for one other than its cloud's own: an S3-compatible store's (with path-style addressing), the Google Cloud Storage JSON API's, such as an emulator's, or the Azure blob service's URL, such as Azurite's http://127.0.0.1:10000/devstoreaccount1. Not for file:// URLs.",
+      "x-group": "location",
+      "x-format": "uri",
+      "x-advanced": true
+    },
+    "region": {
+      "type": "string",
+      "title": "Region",
+      "description": "S3: the bucket's AWS region.",
+      "x-group": "s3"
+    },
+    "accessKeyId": {
+      "type": "string",
+      "x-secret": true,
+      "title": "Access key ID",
+      "description": "S3: an AWS access key. Without one, the AWS default credentials.",
+      "x-group": "s3"
+    },
+    "secretAccessKey": {
+      "type": "string",
+      "x-secret": true,
+      "title": "Secret access key",
+      "description": "S3: the access key's secret.",
+      "x-group": "s3"
+    },
+    "serviceAccountKey": {
+      "type": "string",
+      "x-secret": true,
+      "title": "Service account key",
+      "description": "Google Cloud Storage: a service account's JSON key, as its text. Without one, Google's default credentials, or none at all with an endpoint, as an emulator takes. From 0.2.0.",
+      "x-group": "gcs",
+      "x-format": "multiline"
+    },
+    "accountName": {
+      "type": "string",
+      "title": "Account name",
+      "description": "Azure Blob Storage: the storage account. Needed with accountKey, sasToken or Azure's default credentials, unless the endpoint names it. From 0.2.0.",
+      "x-group": "azure"
+    },
+    "accountKey": {
+      "type": "string",
+      "x-secret": true,
+      "title": "Account key",
+      "description": "Azure Blob Storage: the account's shared key. Set at most one of accountKey, sasToken and connectionString; without any, Azure's default credentials. From 0.2.0.",
+      "x-group": "azure"
+    },
+    "sasToken": {
+      "type": "string",
+      "x-secret": true,
+      "title": "SAS token",
+      "description": "Azure Blob Storage: a shared access signature for the container, the query string it is. From 0.2.0.",
+      "x-group": "azure"
+    },
+    "connectionString": {
+      "type": "string",
+      "x-secret": true,
+      "title": "Connection string",
+      "description": "Azure Blob Storage: the account's connection string, which names the account and its key or a SAS. From 0.2.0.",
+      "x-group": "azure"
+    },
+    "format": {
+      "type": "string",
+      "enum": [
+        "parquet",
+        "csv",
+        "jsonl"
+      ],
+      "default": "parquet",
+      "title": "Format",
+      "description": "The files' format: Parquet, CSV with a header line, or JSON Lines. From 0.2.0.",
+      "x-group": "files"
+    },
+    "compression": {
+      "type": "string",
+      "enum": [
+        "zstd",
+        "snappy",
+        "gzip",
+        "none"
+      ],
+      "title": "Compression",
+      "description": "Parquet: zstd (the default), snappy, gzip or none, inside the file. CSV and JSON Lines, from 0.2.0: gzip, zstd or none (the default), the whole file, which gets the extension .gz or .zst.",
+      "x-group": "files"
+    },
+    "fileSize": {
+      "type": "integer",
+      "minimum": 1048576,
+      "default": 268435456,
+      "title": "File size",
+      "description": "Bytes a file reaches, compressed, before the next one starts.",
+      "x-group": "files",
+      "x-advanced": true
+    }
+  },
+  "x-groups": [
+    {
+      "id": "location",
+      "title": "Location",
+      "description": "Where the files are, and the address of the store's API."
+    },
+    {
+      "id": "s3",
+      "title": "Amazon S3",
+      "description": "For s3:// URLs: the region and keys."
+    },
+    {
+      "id": "gcs",
+      "title": "Google Cloud Storage",
+      "description": "For gs:// URLs: the service account."
+    },
+    {
+      "id": "azure",
+      "title": "Azure Blob Storage",
+      "description": "For azblob:// URLs: the account and its credentials."
+    },
+    {
+      "id": "files",
+      "title": "Files",
+      "description": "How each table's files are written."
+    }
+  ]
 }

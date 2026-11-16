@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"path"
 	"slices"
 
 	"github.com/apache/arrow-go/v18/arrow"
@@ -40,7 +39,7 @@ func (w *writer) ApplySchema(ctx context.Context, streams []destination.StreamSc
 	defer func() { err = classify(err) }()
 	for _, s := range streams {
 		allow := slices.ContainsFunc(w.cfg.Streams, func(c destination.Stream) bool { return c.Name == s.Name && c.AllowTypeChanges })
-		table := w.table(s.Schema, s.Name)
+		table := w.tableOf(s.Schema, s.Name)
 		key := schemaKey(table)
 		var rec schemaRecord
 		b, err := w.b.ReadAll(ctx, key)
@@ -73,7 +72,7 @@ func (w *writer) ApplySchema(ctx context.Context, streams []destination.StreamSc
 				out.Refused = append(out.Refused, destination.RefusedColumn{
 					Stream: s.Name, Column: f.Name, FromType: was, ToType: typ,
 					Reason: "it doesn't change a column's type, which its files' readers take one of, unless the pipeline's typeChanges allows it",
-					Fix:    "remove " + w.d.location(key) + ", which records " + table + "'s columns",
+					Fix:    "remove " + w.d.store.location(key) + ", which records " + table + "'s columns",
 				})
 			}
 		}
@@ -108,11 +107,4 @@ func typeName(t arrow.DataType) string {
 		return "list<" + typeName(t.Elem()) + ">"
 	}
 	return t.String()
-}
-
-// location is key as the destination's URL names it.
-func (d *Destination) location(key string) string {
-	u := *d.u
-	u.Path = path.Join(u.Path, key)
-	return u.String()
 }

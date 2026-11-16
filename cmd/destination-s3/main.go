@@ -1,5 +1,5 @@
-// Command destination-s3 serves the Parquet on S3 destination as an external
-// connector.
+// Command destination-s3 serves the files destination, for S3, Google Cloud
+// Storage, Azure Blob Storage and local files, as an external connector.
 package main
 
 import (
