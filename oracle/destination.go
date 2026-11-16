@@ -16,12 +16,12 @@ import (
 	"slices"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	go_ora "github.com/sijms/go-ora/v2"
 
+	"github.com/openetl-io/openetl-connectors/sqlstage"
 	sdk "github.com/openetl-io/openetl/sdk/go"
 	"github.com/openetl-io/openetl/sdk/go/destination"
 )
@@ -118,11 +118,8 @@ func (d *Destination) Open(ctx context.Context, cfg destination.OpenConfig) (des
 		user:    user,
 		schema:  cmp.Or(cfg.Namespace, user),
 		boolean: major(compatible) >= 23,
-		staging: map[uint64]map[string]*stagingTable{},
-		patches: map[uint64]map[string]*stagingTable{},
-		ended:   map[uint64][]string{},
+		Epochs:  sqlstage.NewEpochs[*stagingTable](),
 		streams: map[string]destination.Stream{},
-		tables:  map[string]string{},
 		indexed: map[string]bool{},
 	}
 	for _, s := range cfg.Streams {
@@ -159,14 +156,7 @@ type writer struct {
 	// The server takes BOOLEAN columns.
 	boolean bool
 	streams map[string]destination.Stream
-	// Only Write, Patch, StartReads, EndRead and PreCommit use these.
-	staging map[uint64]map[string]*stagingTable
-	patches map[uint64]map[string]*stagingTable
-	starts  map[string]time.Time
-	ended   map[uint64][]string // streams whose read ends in each epoch
-	// Each stream's target, from its batches and schemas.
-	mu     sync.Mutex
-	tables map[string]string
+	sqlstage.Epochs[*stagingTable]
 	// Only Commit, Recover and ApplySchema use these: indexes known to
 	// exist, by name, and whether the target schema is.
 	indexed map[string]bool
@@ -174,77 +164,21 @@ type writer struct {
 }
 
 type stagingTable struct {
-	name   string
-	target string
-	cols   []dcol
-	rows   uint64
+	sqlstage.Table
+	cols []dcol
 	// The next row's _openetl_ord.
 	ord int64
-	// Merge: the key's columns.
-	key []string
-	// Columns whose held cells keep the target's value.
-	last []string
-	// Patches: columns that fill another held column, by that column.
-	fills map[string]string
-	// Tables of the epoch before name, each narrower than the next: a batch
-	// wider than a table starts the next one, as no table's column is ever
-	// changed to a wider type.
-	earlier []string
 }
 
-// all are the staging's tables, in order.
-func (st *stagingTable) all() []string { return append(slices.Clone(st.earlier), st.name) }
-
-// staged is the descriptor PreCommit returns.
-type staged struct {
-	Generation uint64         `json:"generation"`
-	Epoch      uint64         `json:"epoch"`
-	Streams    []stagedStream `json:"streams"`
-}
-
-const (
-	modeOverwrite = "overwrite"
-	modeMerge     = "merge"
+type (
+	staged       = sqlstage.Staged
+	stagedStream = sqlstage.Stream
 )
 
-type stagedStream struct {
-	Name  string `json:"name"`
-	Table string `json:"table"`
-	// Empty when an overwrite read ended in the epoch without rows in it.
-	Staging string `json:"staging"`
-	// The lane's later staging tables of the epoch, each taking batches
-	// wider than the one before.
-	Wider []string `json:"wider,omitempty"`
-	// One row per _openetl_id in the epoch, and only IDs the target doesn't
-	// have yet.
-	Dedupe bool `json:"dedupe,omitempty"`
-	// One row per _openetl_id in the epoch.
-	DedupeEpoch bool `json:"dedupe_epoch,omitempty"`
-	// Staged rows, to count those the apply skips.
-	Rows uint64 `json:"rows,omitempty"`
-	// Empty for append.
-	Mode string `json:"mode,omitempty"`
-	// Merge: the key's columns, and whether a delete removes the row.
-	Key         []string `json:"key,omitempty"`
-	HardDeletes bool     `json:"hard_deletes,omitempty"`
-	// Overwrite: the read's table, which takes the epoch's rows and, once
-	// the read has ended in it, replaces the target's.
-	Read  string `json:"read,omitempty"`
-	Ended bool   `json:"ended,omitempty"`
-	// Merge: columns whose held cells keep the target's value.
-	Last []string `json:"last,omitempty"`
-	// The epoch's patches' staging, and the columns in it that fill
-	// another held column.
-	Patch string            `json:"patch,omitempty"`
-	Fills map[string]string `json:"fills,omitempty"`
-	// As Wider, for Patch.
-	WiderPatches []string `json:"wider_patches,omitempty"`
-	// Staging and Patch, of every lane that has them, once mergeLanes has
-	// merged the lanes' descriptors.
-	stagings, patches []string
-}
-
-func (s stagedStream) deduped() bool { return s.Dedupe || s.DedupeEpoch }
+const (
+	modeOverwrite = sqlstage.ModeOverwrite
+	modeMerge     = sqlstage.ModeMerge
+)
 
 // target is a table of the target schema; own one of the user's.
 func (w *writer) target(name string) string { return quoteIdent(w.schema) + "." + quoteIdent(name) }
@@ -293,28 +227,6 @@ func readName(pipeline, stream string, start time.Time) string {
 func indexName(schema, table string) string    { return "_openetl_id_" + digest(24, schema, table) }
 func keyIndexName(schema, table string) string { return "_openetl_key_" + digest(24, schema, table) }
 
-func (w *writer) StartReads(_ context.Context, starts map[string]time.Time) error {
-	w.starts = starts
-	return nil
-}
-
-func (w *writer) EndRead(_ context.Context, e destination.Epoch, stream string) error {
-	w.ended[e.N] = append(w.ended[e.N], stream)
-	return nil
-}
-
-func (w *writer) setTable(stream, table string) {
-	w.mu.Lock()
-	w.tables[stream] = table
-	w.mu.Unlock()
-}
-
-func (w *writer) table(stream string) string {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	return w.tables[stream]
-}
-
 func (w *writer) Write(ctx context.Context, e destination.Epoch, stream string, batch arrow.RecordBatch) error {
 	cfg, ok := w.streams[stream]
 	if !ok {
@@ -326,7 +238,7 @@ func (w *writer) Write(ctx context.Context, e destination.Epoch, stream string, 
 	if cfg.Dedupe != destination.DedupeNone && len(batch.Schema().FieldIndices(colID)) == 0 {
 		return fmt.Errorf("oracle: stream %q is deduped at apply, but its batches have no %s", stream, colID)
 	}
-	if _, ok := w.starts[stream]; cfg.Mode == destination.Overwrite && !ok {
+	if _, ok := w.Starts[stream]; cfg.Mode == destination.Overwrite && !ok {
 		return fmt.Errorf("oracle: stream %q overwrites, but its read has no start", stream)
 	}
 	var key []string
@@ -336,14 +248,14 @@ func (w *writer) Write(ctx context.Context, e destination.Epoch, stream string, 
 			return fmt.Errorf("oracle: stream %q: %w", stream, err)
 		}
 	}
-	st, err := w.stage(ctx, w.staging, stagingName(w.cfg.Pipeline, stream, e, w.cfg.Lane), e, stream, targetTable(batch.Schema(), stream), key, batch)
+	st, err := w.stage(ctx, w.Staging, stagingName(w.cfg.Pipeline, stream, e, w.cfg.Lane), e, stream, targetTable(batch.Schema(), stream), key, batch)
 	if err != nil {
 		return err
 	}
-	w.setTable(stream, st.target)
+	w.SetTable(stream, st.Target)
 	for _, f := range batch.Schema().Fields() {
-		if v, _ := f.Metadata.GetValue(destination.HeldKey); v == "last" && !slices.Contains(st.last, f.Name) {
-			st.last = append(st.last, f.Name)
+		if v, _ := f.Metadata.GetValue(destination.HeldKey); v == "last" && !slices.Contains(st.Last, f.Name) {
+			st.Last = append(st.Last, f.Name)
 		}
 	}
 	return nil
@@ -370,20 +282,20 @@ func (w *writer) Patch(ctx context.Context, e destination.Epoch, stream string, 
 			return fmt.Errorf("oracle: patches for %q: %w", stream, err)
 		}
 	}
-	target := w.table(stream)
+	target := w.Table(stream)
 	if target == "" {
 		target = targetTable(batch.Schema(), stream)
 	}
-	st, err := w.stage(ctx, w.patches, patchName(w.cfg.Pipeline, stream, e, w.cfg.Lane), e, stream, target, key, batch)
+	st, err := w.stage(ctx, w.Patches, patchName(w.cfg.Pipeline, stream, e, w.cfg.Lane), e, stream, target, key, batch)
 	if err != nil {
 		return err
 	}
 	for _, f := range batch.Schema().Fields() {
 		if held, ok := f.Metadata.GetValue(destination.FillsKey); ok {
-			if st.fills == nil {
-				st.fills = map[string]string{}
+			if st.Fills == nil {
+				st.Fills = map[string]string{}
 			}
-			st.fills[f.Name] = held
+			st.Fills[f.Name] = held
 		}
 	}
 	return nil
@@ -406,8 +318,8 @@ func (w *writer) stage(ctx context.Context, tables map[uint64]map[string]*stagin
 	}
 	st := byStream[stream]
 	if st == nil {
-		st = &stagingTable{name: name, target: target, key: key}
-		if err := w.createStaging(ctx, st.name, cols); err != nil {
+		st = &stagingTable{Table: sqlstage.Table{Name: name, Target: target, Key: key}}
+		if err := w.createStaging(ctx, st.Name, cols); err != nil {
 			return nil, fmt.Errorf("oracle: create staging for %s: %w", stream, err)
 		}
 		st.cols = cols
@@ -415,9 +327,9 @@ func (w *writer) stage(ctx context.Context, tables map[uint64]map[string]*stagin
 	} else if wider, err := w.addColumns(ctx, st, cols); err != nil {
 		return nil, err
 	} else if wider != nil {
-		st.earlier = append(st.earlier, st.name)
-		st.name = name + "_" + strconv.Itoa(len(st.earlier)+1)
-		if err := w.createStaging(ctx, st.name, wider); err != nil {
+		st.Earlier = append(st.Earlier, st.Name)
+		st.Name = name + "_" + strconv.Itoa(len(st.Earlier)+1)
+		if err := w.createStaging(ctx, st.Name, wider); err != nil {
 			return nil, fmt.Errorf("oracle: create staging for %s: %w", stream, err)
 		}
 		st.cols = wider
@@ -425,7 +337,7 @@ func (w *writer) stage(ctx context.Context, tables map[uint64]map[string]*stagin
 	if err := w.insertRows(ctx, st, cols, batch); err != nil {
 		return nil, classify(fmt.Errorf("oracle: stage %s: %w", stream, err))
 	}
-	st.rows += uint64(batch.NumRows())
+	st.Rows += uint64(batch.NumRows())
 	return st, nil
 }
 
@@ -489,7 +401,7 @@ func (w *writer) insertRows(ctx context.Context, st *stagingTable, cols []dcol, 
 			exprs = append(exprs, convert(bind, c.typ, into[c.name]))
 			args = append(args, vals[j])
 		}
-		q := "INSERT INTO " + w.own(st.name) + " (" + strings.Join(names, ", ") + ") VALUES (" + strings.Join(exprs, ", ") + ")"
+		q := "INSERT INTO " + w.own(st.Name) + " (" + strings.Join(names, ", ") + ") VALUES (" + strings.Join(exprs, ", ") + ")"
 		if _, err := tx.ExecContext(ctx, q, args...); err != nil {
 			return err
 		}
@@ -561,7 +473,7 @@ func (w *writer) addColumns(ctx context.Context, st *stagingTable, cols []dcol) 
 		i := slices.IndexFunc(st.cols, func(x dcol) bool { return x.name == c.name })
 		switch {
 		case i < 0:
-			if err := w.ddl(ctx, "ALTER TABLE "+w.own(st.name)+" ADD ("+columnDef(c)+")"); err != nil {
+			if err := w.ddl(ctx, "ALTER TABLE "+w.own(st.Name)+" ADD ("+columnDef(c)+")"); err != nil {
 				return nil, fmt.Errorf("oracle: add column %q to staging: %w", c.name, err)
 			}
 			st.cols = append(st.cols, c)
@@ -618,41 +530,7 @@ func typesOf(cols []dcol) map[string]string {
 
 // PreCommit has nothing to flush: every Write committed its rows to staging.
 func (w *writer) PreCommit(_ context.Context, e destination.Epoch) (destination.Staged, error) {
-	desc := staged{Generation: e.Generation, Epoch: e.N}
-	byStream, patches := w.staging[e.N], w.patches[e.N]
-	for _, s := range w.cfg.Streams {
-		st, pt := byStream[s.Name], patches[s.Name]
-		ended := s.Mode == destination.Overwrite && slices.Contains(w.ended[e.N], s.Name)
-		if st == nil && pt == nil && !ended {
-			continue
-		}
-		ss := stagedStream{
-			Name: s.Name, Table: w.table(s.Name),
-			Dedupe: s.Dedupe == destination.DedupeTarget, DedupeEpoch: s.Dedupe == destination.DedupeEpoch,
-		}
-		key := []string(nil)
-		if pt != nil {
-			tables := pt.all()
-			ss.Table, ss.Patch, ss.WiderPatches, ss.Fills, key = pt.target, tables[0], tables[1:], pt.fills, pt.key
-		}
-		if st != nil {
-			tables := st.all()
-			ss.Table, ss.Staging, ss.Wider, ss.Rows, ss.Last, key = st.target, tables[0], tables[1:], st.rows, st.last, st.key
-		}
-		switch s.Mode {
-		case destination.Overwrite:
-			// A read that ends without rows in the epoch still replaces the
-			// target's.
-			ss.Mode, ss.Read, ss.Ended = modeOverwrite, readName(w.cfg.Pipeline, s.Name, w.starts[s.Name]), ended
-		case destination.Merge:
-			ss.Mode, ss.Key, ss.HardDeletes = modeMerge, key, s.Deletes == destination.HardDelete
-		}
-		desc.Streams = append(desc.Streams, ss)
-	}
-	delete(w.staging, e.N)
-	delete(w.patches, e.N)
-	delete(w.ended, e.N)
-	return json.Marshal(desc)
+	return w.Describe(w.cfg, e, readName)
 }
 
 func (w *writer) Commit(ctx context.Context, _ destination.Epoch, committables []destination.Staged) (destination.Committed, error) {
@@ -664,65 +542,8 @@ func (w *writer) Commit(ctx context.Context, _ destination.Epoch, committables [
 	return c, w.apply(ctx, desc, desc.Streams, c.Collapsed)
 }
 
-// mergeLanes merges the epoch's descriptors, one per lane of the attempt
-// that staged it, by stream. A lane that didn't know a read ended, or had no
-// rows of a stream, says less: its table can come from the schemas.
 func (w *writer) mergeLanes(committables []destination.Staged) (staged, error) {
-	var out staged
-	at := map[string]int{}
-	if len(committables) == 0 {
-		return out, errors.New("oracle: no staged descriptor")
-	}
-	for i, c := range committables {
-		var desc staged
-		if err := json.Unmarshal(c, &desc); err != nil {
-			return out, fmt.Errorf("oracle: staged descriptor: %w", err)
-		}
-		if i == 0 {
-			out.Generation, out.Epoch = desc.Generation, desc.Epoch
-		} else if desc.Generation != out.Generation || desc.Epoch != out.Epoch {
-			return out, fmt.Errorf("oracle: staged descriptors of epochs %d-g%d and %d-g%d", out.Epoch, out.Generation, desc.Epoch, desc.Generation)
-		}
-		for _, s := range desc.Streams {
-			j, ok := at[s.Name]
-			if !ok {
-				j = len(out.Streams)
-				at[s.Name] = j
-				out.Streams = append(out.Streams, stagedStream{
-					Name: s.Name, Dedupe: s.Dedupe, DedupeEpoch: s.DedupeEpoch, Mode: s.Mode, HardDeletes: s.HardDeletes, Read: s.Read,
-				})
-			}
-			m := &out.Streams[j]
-			if m.Read != s.Read {
-				return out, fmt.Errorf("oracle: two reads of %s in epoch %d-g%d", s.Name, out.Epoch, out.Generation)
-			}
-			m.Table, m.Rows, m.Ended = cmp.Or(m.Table, s.Table), m.Rows+s.Rows, m.Ended || s.Ended
-			if len(m.Key) == 0 {
-				m.Key = s.Key
-			}
-			for _, c := range s.Last {
-				if !slices.Contains(m.Last, c) {
-					m.Last = append(m.Last, c)
-				}
-			}
-			if len(s.Fills) > 0 && m.Fills == nil {
-				m.Fills = map[string]string{}
-			}
-			maps.Copy(m.Fills, s.Fills)
-			if s.Staging != "" {
-				m.stagings = append(append(m.stagings, s.Staging), s.Wider...)
-			}
-			if s.Patch != "" {
-				m.patches = append(append(m.patches, s.Patch), s.WiderPatches...)
-			}
-		}
-	}
-	for i := range out.Streams {
-		if s := &out.Streams[i]; s.Table == "" {
-			s.Table = w.table(s.Name)
-		}
-	}
-	return out, nil
+	return w.MergeLanes("oracle", committables)
 }
 
 // apply applies each stream that has no marker yet, then drops its staging.
@@ -849,7 +670,7 @@ func (w *writer) applyTx(ctx context.Context, desc staged, streams []stagedStrea
 		if err != nil {
 			return classify(fmt.Errorf("oracle: apply %s: %w", s.Name, err))
 		}
-		if s.deduped() && s.Rows > n {
+		if s.Deduped() && s.Rows > n {
 			skipped[s.Name] = s.Rows - n
 		}
 		if _, err := tx.ExecContext(ctx, "INSERT INTO "+w.own(loadsTable)+" (pipeline, stream, generation, epoch) VALUES (:1, :2, :3, :4)",
@@ -883,7 +704,7 @@ func (w *writer) applyStream(ctx context.Context, tx *sql.Tx, s stagedStream, p 
 
 func (w *writer) applyRows(ctx context.Context, tx *sql.Tx, s stagedStream, p prepared) (uint64, error) {
 	if s.Mode == modeMerge {
-		if len(s.stagings) == 0 {
+		if len(s.Stagings) == 0 {
 			return 0, nil
 		}
 		for _, q := range w.merge(s, p) {
@@ -894,7 +715,7 @@ func (w *writer) applyRows(ctx context.Context, tx *sql.Tx, s stagedStream, p pr
 		return 0, nil
 	}
 	var n uint64
-	if len(s.stagings) > 0 {
+	if len(s.Stagings) > 0 {
 		res, err := tx.ExecContext(ctx, w.insert(s, p))
 		if err != nil {
 			return 0, err
@@ -978,9 +799,9 @@ type prepared struct {
 func (w *writer) prepare(ctx context.Context, desc staged, s stagedStream) (prepared, error) {
 	var p prepared
 	var cols []dcol
-	if len(s.stagings) > 0 {
+	if len(s.Stagings) > 0 {
 		var err error
-		if cols, p.rows, err = w.acrossLanes(ctx, desc, s.stagings, s.Name, &p.made); err != nil {
+		if cols, p.rows, err = w.acrossLanes(ctx, desc, s.Stagings, s.Name, &p.made); err != nil {
 			return p, err
 		}
 		if len(cols) == 0 {
@@ -1027,7 +848,7 @@ func (w *writer) prepare(ctx context.Context, desc staged, s stagedStream) (prep
 			return p, err
 		}
 	}
-	if len(s.patches) > 0 {
+	if len(s.Patches) > 0 {
 		var err error
 		if p.patch, p.patches, p.patchTypes, err = w.preparePatch(ctx, desc, s, p.into, &p.made); err != nil {
 			return p, err
@@ -1157,7 +978,7 @@ func (w *writer) acrossLanes(ctx context.Context, desc staged, tables []string, 
 // target doesn't exist, _openetl_synced_at only if the target has it, and
 // gives an append target the _openetl_id index patches match on.
 func (w *writer) preparePatch(ctx context.Context, desc staged, s stagedStream, target map[string]string, made *[]string) ([]string, string, map[string]string, error) {
-	cols, rows, err := w.acrossLanes(ctx, desc, s.patches, s.Name+"\x00patch", made)
+	cols, rows, err := w.acrossLanes(ctx, desc, s.Patches, s.Name+"\x00patch", made)
 	if err != nil {
 		return nil, rows, nil, err
 	}
@@ -1323,7 +1144,7 @@ func (w *writer) ApplySchema(ctx context.Context, streams []destination.StreamSc
 			}
 		}
 		out.Limits[s.Name] = t.limits()
-		w.setTable(s.Name, tables[i])
+		w.SetTable(s.Name, tables[i])
 	}
 	return out, nil
 }
@@ -1619,7 +1440,7 @@ func (w *writer) unapplied(ctx context.Context, desc staged, streams []stagedStr
 
 func (w *writer) dropStaging(ctx context.Context, streams []stagedStream) {
 	for _, s := range streams {
-		for _, t := range slices.Concat(s.stagings, s.patches) {
+		for _, t := range slices.Concat(s.Stagings, s.Patches) {
 			w.dropOwn(ctx, t)
 		}
 	}
@@ -1696,7 +1517,7 @@ func (w *writer) Recover(ctx context.Context, gen uint64, e destination.Epoch, c
 	// staging.
 	needs, present := 0, 0
 	for _, m := range missing {
-		for _, t := range slices.Concat(m.stagings, m.patches) {
+		for _, t := range slices.Concat(m.Stagings, m.Patches) {
 			needs++
 			var n int
 			if err := w.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM all_tables WHERE owner = :1 AND table_name = :2", w.user, t).Scan(&n); err != nil {

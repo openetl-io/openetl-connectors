@@ -98,7 +98,7 @@ func (w *writer) insert(s stagedStream, p prepared) string {
 	into := "INSERT INTO " + w.into(s) + " (" + quoteAll(p.cols) + ") "
 	sel := selectList(p.cols, "s", p.held, p.types, p.into)
 	id := quoteIdent(colID)
-	if !s.deduped() {
+	if !s.Deduped() {
 		return into + "SELECT " + sel + " FROM " + p.rows + " s"
 	}
 	q := into + "SELECT " + sel + " FROM (SELECT x.*, ROW_NUMBER() OVER (PARTITION BY x." + id + " ORDER BY x." + quoteIdent(colOrd) + `) AS "_openetl_rn" FROM ` +

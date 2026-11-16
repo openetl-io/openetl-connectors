@@ -95,7 +95,8 @@ jobs:
           # sqlserver, oracle, clickhouse, mongodb, dynamodb, s3, gcs,
           # azurite, iceberg (which needs s3), glue, kafka, kafka-sasl and
           # registry (which need kafka) and kinesis. A package that isn't
-          # listed gets them all. records is shared.
+          # listed gets them all; one listed with none gets none. records and
+          # sqlstage are shared.
           SERVICES: |
             postgres: postgres
             mysql: mysql mariadb
@@ -109,6 +110,7 @@ jobs:
             iceberg: s3 iceberg glue
             s3: s3 gcs azurite
             records: kafka registry
+            sqlstage:
           ALL_SERVICES: >-
             postgres mysql mariadb sqlserver oracle clickhouse mongodb dynamodb
             s3 gcs azurite iceberg glue kafka kafka-sasl registry kinesis
@@ -149,8 +151,9 @@ jobs:
           # entry KIND NAME DIR is a job of the matrix.
           entry() {
             local needs
-            needs=$(awk -v p="$2" -F': *' '$1 == p { print $2 }' <<<"$SERVICES")
-            jq -nc --arg kind "$1" --arg name "$2" --arg dir "$3" --arg services "${needs:-$ALL_SERVICES}" \
+            needs=$(awk -v p="$2" -F': *' '$1 == p { print "=" $2 }' <<<"$SERVICES")
+            needs=${needs:-=$ALL_SERVICES}
+            jq -nc --arg kind "$1" --arg name "$2" --arg dir "$3" --arg services "${needs#=}" \
               '{job: "\($kind) \($name)", kind: $kind, name: $name, dir: $dir, services: $services}'
           }
           {

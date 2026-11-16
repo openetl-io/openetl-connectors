@@ -118,4 +118,5 @@ Each package directory holds its `openetl-connector.yaml`, its config schemas an
 - `kafka/`: the Kafka source and destination.
 - `kinesis/`: the Kinesis source and destination.
 - `records/`: the record layout and formats Kafka and Kinesis share: JSON, and Avro and Protobuf with a schema registry.
+- `sqlstage/`: what the SQL destinations share of an epoch's staging: its staging tables, the descriptor `PreCommit` returns, and how `Commit` merges the lanes' descriptors.
 - `cmd/<executable>/`: one `main` per connector, which hands the connector to `sdk.Serve`.
