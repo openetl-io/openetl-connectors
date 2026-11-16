@@ -45,8 +45,6 @@ type Destination struct {
 	cfg DestinationConfig
 }
 
-var _ destination.Checker = (*Destination)(nil)
-
 func NewDestination(config []byte) (*Destination, error) {
 	var cfg DestinationConfig
 	if err := decodeConfig(config, &cfg); err != nil {
@@ -62,9 +60,6 @@ func NewDestination(config []byte) (*Destination, error) {
 }
 
 func (d *Destination) Capabilities() destination.Capabilities { return DestinationCapabilities }
-
-// Check lists streams and, if there is one, the schema registry's subjects.
-func (d *Destination) Check(ctx context.Context) error { return check(ctx, &d.cfg.Connection) }
 
 func (d *Destination) Open(ctx context.Context, cfg destination.OpenConfig) (destination.Writer, error) {
 	for _, s := range cfg.Streams {

@@ -60,7 +60,7 @@ func decodeConfig(config []byte, v any) error {
 	return nil
 }
 
-func (c *Connection) client(ctx context.Context) (*awskinesis.Client, error) {
+func (c *Connection) loadOptions() []func(*awsconfig.LoadOptions) error {
 	opts := []func(*awsconfig.LoadOptions) error{
 		// Throttling is retried here, with backoff, rather than failing the
 		// attempt; the standard retryer's quota would give up under load.
@@ -78,7 +78,11 @@ func (c *Connection) client(ctx context.Context) (*awskinesis.Client, error) {
 	if !c.AccessKeyID.IsZero() {
 		opts = append(opts, awsconfig.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(c.AccessKeyID.Reveal(), c.SecretAccessKey.Reveal(), "")))
 	}
-	ac, err := awsconfig.LoadDefaultConfig(ctx, opts...)
+	return opts
+}
+
+func (c *Connection) client(ctx context.Context) (*awskinesis.Client, error) {
+	ac, err := c.awsConfig(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("kinesis: AWS config: %w", err)
 	}
@@ -87,25 +91,6 @@ func (c *Connection) client(ctx context.Context) (*awskinesis.Client, error) {
 			o.BaseEndpoint = aws.String(c.Endpoint)
 		}
 	}), nil
-}
-
-// check lists streams and, if there is one, the schema registry's subjects.
-func check(ctx context.Context, c *Connection) error {
-	cl, err := c.client(ctx)
-	if err != nil {
-		return err
-	}
-	if _, err := cl.ListStreams(ctx, &awskinesis.ListStreamsInput{Limit: aws.Int32(1)}); err != nil {
-		return classify(fmt.Errorf("kinesis: list streams: %w", err))
-	}
-	reg, err := c.Registry()
-	if err != nil || reg == nil {
-		return err
-	}
-	if _, err := reg.Subjects(ctx); err != nil {
-		return fmt.Errorf("kinesis: schema registry: %w", err)
-	}
-	return nil
 }
 
 // classify gives Kinesis's errors their taxonomy codes.

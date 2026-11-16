@@ -3,17 +3,26 @@
   "title": "Kinesis destination",
   "type": "object",
   "additionalProperties": false,
+  "x-groups": [
+    {"id": "aws", "title": "AWS", "description": "Without access keys, the AWS SDK's default credentials, such as a role the runner assumes for the connector."},
+    {"id": "registry", "title": "Schema registry", "description": "For Avro and Protobuf."},
+    {"id": "streams", "title": "Streams"}
+  ],
   "properties": {
-    "region": {"type": "string", "description": "The streams' AWS region. Default: the AWS default config's."},
-    "endpoint": {"type": "string", "description": "A Kinesis-compatible endpoint: an emulator's, or a VPC endpoint."},
-    "accessKeyId": {"type": "string", "x-secret": true, "description": "An AWS access key. Without one, the AWS default credentials."},
-    "secretAccessKey": {"type": "string", "x-secret": true, "description": "The access key's secret."},
-    "schemaRegistryUrl": {"type": "string", "description": "A Confluent-compatible schema registry. Avro and Protobuf need one."},
-    "schemaRegistryUsername": {"type": "string", "description": "A user for the schema registry's basic authentication. Unset: none."},
-    "schemaRegistryPassword": {"type": "string", "x-secret": true, "description": "The schema registry user's password."},
-    "format": {"type": "string", "enum": ["json", "avro", "protobuf"], "default": "json", "description": "How records' data is encoded. Avro and Protobuf register each stream's schema under <stream>-value."},
-    "namespace": {"type": "string", "description": "Used when the pipeline names no namespace: streams are named namespace.table."},
-    "createStreams": {"type": "boolean", "default": true, "description": "Create missing streams."},
-    "shards": {"type": "integer", "minimum": 1, "description": "Created streams are provisioned with this many shards. Unset: on-demand."}
+    "region": {"type": "string", "title": "Region", "x-group": "aws", "examples": ["eu-west-1"], "description": "The streams' AWS region. Default: the AWS default config's."},
+    "accessKeyId": {"type": "string", "x-secret": true, "title": "Access key ID", "x-group": "aws", "description": "An AWS access key. Without one, the AWS default credentials."},
+    "secretAccessKey": {"type": "string", "x-secret": true, "title": "Secret access key", "x-group": "aws", "description": "The access key's secret."},
+    "endpoint": {"type": "string", "x-format": "uri", "title": "Endpoint", "x-group": "aws", "x-advanced": true, "description": "A Kinesis-compatible endpoint: an emulator's, or a VPC endpoint."},
+    "schemaRegistryUrl": {"type": "string", "x-format": "uri", "title": "Registry URL", "x-group": "registry", "description": "A Confluent-compatible schema registry. Avro and Protobuf need one."},
+    "schemaRegistryUsername": {"type": "string", "title": "Registry username", "x-group": "registry", "description": "A user for the schema registry's basic authentication. Unset: none."},
+    "schemaRegistryPassword": {"type": "string", "x-secret": true, "title": "Registry password", "x-group": "registry", "description": "The schema registry user's password."},
+    "format": {"type": "string", "default": "json", "title": "Format", "description": "How records' data is encoded. Avro and Protobuf register each stream's schema under <stream>-value.", "oneOf": [
+      {"const": "json", "title": "JSON", "description": "JSON data."},
+      {"const": "avro", "title": "Avro", "description": "The schema registry's Avro wire format."},
+      {"const": "protobuf", "title": "Protobuf", "description": "The schema registry's Protobuf wire format."}
+    ]},
+    "namespace": {"type": "string", "title": "Namespace", "description": "Used when the pipeline names no namespace: streams are named namespace.table."},
+    "createStreams": {"type": "boolean", "default": true, "title": "Create streams", "x-group": "streams", "description": "Create missing streams."},
+    "shards": {"type": "integer", "minimum": 1, "title": "Shards", "x-group": "streams", "x-when": {"createStreams": true}, "description": "Created streams are provisioned with this many shards. Unset: on-demand."}
   }
 }

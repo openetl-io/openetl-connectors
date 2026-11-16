@@ -52,6 +52,7 @@ func TestSourceConformance(t *testing.T) {
 			}
 			return 7, err
 		},
+		StopsAtUntil: true,
 	}.Test(t)
 }
 
