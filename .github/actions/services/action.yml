@@ -6,12 +6,23 @@ inputs:
   services:
     description: >-
       The services to start, separated by spaces: postgres, Postgres with
-      logical replication; s3, an S3 store; iceberg, an Iceberg REST catalog
-      keeping its tables in the store's iceberg bucket, so it needs s3; glue,
-      moto's Glue; kafka, one KRaft node, in the container kafka; registry,
-      Karapace as the schema registry, which keeps its schemas in Kafka, so it
-      needs kafka; and kinesis, kinesis-mock on plain HTTP.
-    default: postgres s3 iceberg glue kafka registry kinesis
+      logical replication; mysql, MySQL 8.4 with GTIDs and full row metadata in
+      its binlog; mariadb, MariaDB 11.8 likewise, on port 3307; sqlserver, SQL
+      Server 2022 with SQL Server Agent, with the database openetl, its change
+      tracking and change data capture on, and the login openetl; oracle,
+      Oracle Database Free with its PDB FREEPDB1, archiving its redo log for
+      LogMiner; clickhouse, a single ClickHouse server; mongodb, a MongoDB
+      replica set of one node; dynamodb, DynamoDB Local in memory; s3, an S3
+      store; gcs, fake-gcs-server for Google Cloud Storage; azurite, Azurite's
+      blob service; iceberg, an Iceberg REST catalog keeping its tables in the
+      store's iceberg bucket, so it needs s3; glue, moto's Glue; kafka, one
+      KRaft node, in the container kafka; kafka-sasl, a second one taking
+      SASL_SSL on port 9094, which needs kafka's network; registry, Karapace
+      as the schema registry, which keeps its schemas in Kafka, so it needs
+      kafka; and kinesis, kinesis-mock on plain HTTP.
+    default: >-
+      postgres mysql mariadb sqlserver oracle clickhouse mongodb dynamodb
+      s3 gcs azurite iceberg glue kafka kafka-sasl registry kinesis
 runs:
   using: composite
   steps:
@@ -22,6 +33,55 @@ runs:
         docker run -d --name postgres -p 5432:5432 \
           -e POSTGRES_USER=openetl -e POSTGRES_PASSWORD=openetl -e POSTGRES_DB=openetl \
           postgres:18 -c wal_level=logical
+    - name: MySQL
+      if: contains(format(' {0} ', inputs.services), ' mysql ')
+      shell: bash
+      run: |
+        docker run -d --name mysql -p 3306:3306 -m 1g \
+          -e MYSQL_ROOT_PASSWORD=openetl -e MYSQL_USER=openetl -e MYSQL_PASSWORD=openetl -e MYSQL_DATABASE=openetl \
+          mysql:8.4 --gtid-mode=ON --enforce-gtid-consistency=ON --binlog-format=ROW --binlog-row-image=FULL \
+          --binlog-row-metadata=FULL --server-id=1 \
+          --innodb-buffer-pool-size=256M --performance-schema=OFF --max-connections=300
+    - name: MariaDB
+      if: contains(format(' {0} ', inputs.services), ' mariadb ')
+      shell: bash
+      run: |
+        docker run -d --name mariadb -p 3307:3306 -m 1g \
+          -e MARIADB_ROOT_PASSWORD=openetl -e MARIADB_USER=openetl -e MARIADB_PASSWORD=openetl -e MARIADB_DATABASE=openetl \
+          mariadb:11.8 --log-bin=mariadb-bin --binlog-format=ROW --binlog-row-image=FULL --binlog-row-metadata=FULL --server-id=2 \
+          --innodb-buffer-pool-size=256M --performance-schema=OFF --max-connections=300
+    - name: SQL Server
+      if: contains(format(' {0} ', inputs.services), ' sqlserver ')
+      shell: bash
+      run: |
+        docker run -d --name sqlserver -p 1433:1433 -m 2600m \
+          -e ACCEPT_EULA=Y -e MSSQL_SA_PASSWORD=OpenETL-test-1 -e MSSQL_AGENT_ENABLED=true -e MSSQL_MEMORY_LIMIT_MB=2048 \
+          mcr.microsoft.com/mssql/server:2022-CU22-ubuntu-22.04
+    - name: Oracle
+      if: contains(format(' {0} ', inputs.services), ' oracle ')
+      shell: bash
+      run: |
+        docker run -d --name oracle -p 1521:1521 -e ORACLE_PASSWORD=openetl \
+          -e APP_USER=openetl -e APP_USER_PASSWORD=openetl gvenzl/oracle-free:23-full
+    - name: ClickHouse
+      if: contains(format(' {0} ', inputs.services), ' clickhouse ')
+      shell: bash
+      run: |
+        docker run -d --name clickhouse -p 9000:9000 -p 8123:8123 \
+          -e CLICKHOUSE_USER=openetl -e CLICKHOUSE_PASSWORD=openetl -e CLICKHOUSE_DB=openetl \
+          -e CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1 --ulimit nofile=262144:262144 \
+          clickhouse/clickhouse-server:26.8
+    - name: MongoDB
+      if: contains(format(' {0} ', inputs.services), ' mongodb ')
+      shell: bash
+      run: |
+        docker run -d --name mongodb -p 27017:27017 \
+          -e MONGO_INITDB_ROOT_USERNAME=openetl -e MONGO_INITDB_ROOT_PASSWORD=openetl \
+          --entrypoint bash mongo:8.0 -c 'head -c 756 /dev/urandom | base64 > /etc/mongo-keyfile && chmod 400 /etc/mongo-keyfile && chown mongodb:mongodb /etc/mongo-keyfile && exec docker-entrypoint.sh mongod --replSet rs0 --bind_ip_all --keyFile /etc/mongo-keyfile --wiredTigerCacheSizeGB 0.5'
+    - name: DynamoDB
+      if: contains(format(' {0} ', inputs.services), ' dynamodb ')
+      shell: bash
+      run: docker run -d --name dynamodb -p 8000:8000 amazon/dynamodb-local:3.3.2 -jar DynamoDBLocal.jar -sharedDb -inMemory
     - name: An S3 store
       if: contains(format(' {0} ', inputs.services), ' s3 ')
       shell: bash
@@ -29,6 +89,18 @@ runs:
         docker network create iceberg
         docker run -d --name s3 --network iceberg -p 8333:8333 -e WEED_MASTER_VOLUME_GROWTH_COPY_1=1 \
           chrislusf/seaweedfs:4.51 server -dir=/data -s3 -s3.port=8333 -master.volumeSizeLimitMB=64
+    - name: Google Cloud Storage
+      if: contains(format(' {0} ', inputs.services), ' gcs ')
+      shell: bash
+      run: |
+        docker run -d --name gcs -p 4443:4443 fsouza/fake-gcs-server:1.56.1 \
+          -scheme http -port 4443 -public-host 127.0.0.1:4443
+    - name: Azure Blob Storage
+      if: contains(format(' {0} ', inputs.services), ' azurite ')
+      shell: bash
+      run: |
+        docker run -d --name azurite -p 10000:10000 mcr.microsoft.com/azure-storage/azurite:3.37.0 \
+          azurite-blob --blobHost 0.0.0.0 --skipApiVersionCheck
     - name: An Iceberg REST catalog
       if: contains(format(' {0} ', inputs.services), ' iceberg ')
       shell: bash
@@ -56,6 +128,45 @@ runs:
           -e KAFKA_CONTROLLER_QUORUM_VOTERS=1@localhost:9093 -e KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR=1 \
           -e KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR=1 -e KAFKA_TRANSACTION_STATE_LOG_MIN_ISR=1 \
           -e KAFKA_NUM_PARTITIONS=3 apache/kafka:4.3.2
+    - name: Kafka over SASL_SSL
+      if: contains(format(' {0} ', inputs.services), ' kafka-sasl ')
+      shell: bash
+      run: |
+        # A second broker, on 127.0.0.1:9094, whose listener takes TLS with a
+        # throwaway CA's certificate, then PLAIN (admin, limited),
+        # SCRAM-SHA-256 and -512 (scram) and OAUTHBEARER's unsecured tokens.
+        # It sends the CA in its chain: the tests trust what it sends.
+        certs=$RUNNER_TEMP/kafka-sasl
+        mkdir -p "$certs"
+        openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 30 \
+          -subj /CN=openetl-test-ca -keyout "$certs/ca.key" -out "$certs/ca.pem" 2>/dev/null
+        openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -subj /CN=kafka-sasl \
+          -keyout "$certs/broker.key" -out "$certs/broker.csr" 2>/dev/null
+        printf 'subjectAltName=DNS:localhost,DNS:kafka-sasl,IP:127.0.0.1\n' >"$certs/san.ext"
+        openssl x509 -req -in "$certs/broker.csr" -CA "$certs/ca.pem" -CAkey "$certs/ca.key" -CAcreateserial \
+          -days 30 -extfile "$certs/san.ext" -out "$certs/broker.crt" 2>/dev/null
+        cat "$certs/broker.key" "$certs/broker.crt" "$certs/ca.pem" >"$certs/broker.pem"
+        chmod 644 "$certs"/*
+        docker run -d --name kafka-sasl --network kafka -p 9094:9094 -v "$certs:/certs:ro" -e KAFKA_HEAP_OPTS=-Xmx384m \
+          -e KAFKA_NODE_ID=1 -e KAFKA_PROCESS_ROLES=broker,controller \
+          -e KAFKA_LISTENERS=EXTERNAL://:9094,INTERNAL://:29094,CONTROLLER://:9093 \
+          -e KAFKA_ADVERTISED_LISTENERS=EXTERNAL://127.0.0.1:9094,INTERNAL://kafka-sasl:29094 \
+          -e KAFKA_LISTENER_SECURITY_PROTOCOL_MAP=EXTERNAL:SASL_SSL,INTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT \
+          -e KAFKA_INTER_BROKER_LISTENER_NAME=INTERNAL -e KAFKA_CONTROLLER_LISTENER_NAMES=CONTROLLER \
+          -e KAFKA_CONTROLLER_QUORUM_VOTERS=1@localhost:9093 -e KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR=1 \
+          -e KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR=1 -e KAFKA_TRANSACTION_STATE_LOG_MIN_ISR=1 \
+          -e KAFKA_NUM_PARTITIONS=3 \
+          -e KAFKA_SSL_KEYSTORE_TYPE=PEM -e KAFKA_SSL_KEYSTORE_LOCATION=/certs/broker.pem \
+          -e KAFKA_SSL_TRUSTSTORE_TYPE=PEM -e KAFKA_SSL_TRUSTSTORE_LOCATION=/certs/ca.pem \
+          -e KAFKA_LISTENER_NAME_EXTERNAL_SSL_CLIENT_AUTH=requested \
+          -e KAFKA_SASL_ENABLED_MECHANISMS=PLAIN,SCRAM-SHA-256,SCRAM-SHA-512,OAUTHBEARER \
+          -e 'KAFKA_LISTENER_NAME_EXTERNAL_PLAIN_SASL_JAAS_CONFIG=org.apache.kafka.common.security.plain.PlainLoginModule required user_admin="admin-secret" user_limited="limited-secret";' \
+          -e 'KAFKA_LISTENER_NAME_EXTERNAL_SCRAM___SHA___256_SASL_JAAS_CONFIG=org.apache.kafka.common.security.scram.ScramLoginModule required;' \
+          -e 'KAFKA_LISTENER_NAME_EXTERNAL_SCRAM___SHA___512_SASL_JAAS_CONFIG=org.apache.kafka.common.security.scram.ScramLoginModule required;' \
+          -e 'KAFKA_LISTENER_NAME_EXTERNAL_OAUTHBEARER_SASL_JAAS_CONFIG=org.apache.kafka.common.security.oauthbearer.OAuthBearerLoginModule required;' \
+          -e KAFKA_AUTHORIZER_CLASS_NAME=org.apache.kafka.metadata.authorizer.StandardAuthorizer \
+          -e 'KAFKA_SUPER_USERS=User:admin;User:scram;User:ANONYMOUS' \
+          apache/kafka:4.3.2
     - name: A schema registry
       if: contains(format(' {0} ', inputs.services), ' registry ')
       shell: bash
@@ -84,7 +195,8 @@ runs:
       run: |
         has() { [[ " $SERVICES " == *" $1 "* ]]; }
         # answers NAME COMMAND... runs COMMAND until it succeeds, and fails
-        # with the container NAME's logs after five minutes in all.
+        # with the container NAME's logs once the deadline has passed: five
+        # minutes in all for every service but Oracle, which has its own.
         deadline=$((SECONDS + 300))
         answers() {
           local name=$1
@@ -101,10 +213,56 @@ runs:
         # Over TCP: while the image initializes, its server takes the socket
         # alone, and then restarts.
         if has postgres; then answers postgres docker exec postgres pg_isready -h 127.0.0.1 -U openetl; fi
+        # The tests make databases, users with the least CDC needs, and
+        # change and purge the binlog, so openetl may do anything.
+        if has mysql; then
+          answers mysql docker exec -e MYSQL_PWD=openetl mysql mysql -h127.0.0.1 -uopenetl -e 'SELECT 1'
+          docker exec -e MYSQL_PWD=openetl mysql mysql -h127.0.0.1 -uroot -e "GRANT ALL ON *.* TO 'openetl'@'%' WITH GRANT OPTION"
+        fi
+        if has mariadb; then
+          answers mariadb docker exec -e MYSQL_PWD=openetl mariadb mariadb -h127.0.0.1 -uopenetl -e 'SELECT 1'
+          docker exec -e MYSQL_PWD=openetl mariadb mariadb -h127.0.0.1 -uroot -e "GRANT ALL ON *.* TO 'openetl'@'%' WITH GRANT OPTION"
+        fi
+        # SQL Server: once it answers, the database the tests use, with change
+        # tracking and change data capture on, and the login they sign in as.
+        if has sqlserver; then
+          answers sqlserver docker exec sqlserver /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P OpenETL-test-1 -C -Q "SELECT 1"
+          docker exec -i sqlserver /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P OpenETL-test-1 -C -b <<'SQL' || exit 1
+        IF DB_ID('openetl') IS NULL CREATE DATABASE openetl;
+        GO
+        IF NOT EXISTS (SELECT 1 FROM sys.change_tracking_databases WHERE database_id = DB_ID('openetl'))
+          ALTER DATABASE openetl SET CHANGE_TRACKING = ON (CHANGE_RETENTION = 2 DAYS, AUTO_CLEANUP = ON);
+        GO
+        USE openetl;
+        IF (SELECT is_cdc_enabled FROM sys.databases WHERE name = 'openetl') = 0 EXEC sys.sp_cdc_enable_db;
+        IF SUSER_ID('openetl') IS NULL CREATE LOGIN openetl WITH PASSWORD = 'OpenETL-test-1', CHECK_POLICY = OFF;
+        IF USER_ID('openetl') IS NULL CREATE USER openetl FOR LOGIN openetl;
+        GRANT CREATE TABLE, CREATE SCHEMA TO openetl;
+        GRANT ALTER, SELECT, INSERT, UPDATE, DELETE, VIEW CHANGE TRACKING ON SCHEMA::dbo TO openetl;
+        GRANT SELECT ON SCHEMA::cdc TO openetl;
+        GO
+        SQL
+        fi
+        if has clickhouse; then answers clickhouse curl -sf -m 5 -o /dev/null -u openetl:openetl 'http://127.0.0.1:8123/?database=openetl' --data-binary 'SELECT 1'; fi
+        # A replica set, for change streams: initiated once it takes the user, ready once it's primary.
+        if has mongodb; then answers mongodb docker exec mongodb mongosh --quiet -u openetl -p openetl --authenticationDatabase admin --eval 'try { rs.status() } catch (e) { rs.initiate({_id: "rs0", members: [{_id: 0, host: "127.0.0.1:27017"}]}) } if (!db.hello().isWritablePrimary) quit(1)'; fi
+        # DynamoDB Local answers an unsigned request with a 400.
+        if has dynamodb; then answers dynamodb curl -s -m 5 -o /dev/null http://127.0.0.1:8000; fi
         if has s3; then answers s3 curl -sf -m 5 -o /dev/null -X PUT http://127.0.0.1:8333/iceberg; fi
+        if has gcs; then answers gcs curl -sf -m 5 -o /dev/null 'http://127.0.0.1:4443/storage/v1/b?project=openetl'; fi
+        # Azurite refuses an unsigned request, which still shows it answers.
+        if has azurite; then answers azurite curl -s -m 5 -o /dev/null 'http://127.0.0.1:10000/devstoreaccount1?comp=list'; fi
         if has iceberg; then answers iceberg curl -sf -m 5 -o /dev/null http://127.0.0.1:8181/v1/config; fi
         if has glue; then answers glue curl -sf -m 5 -o /dev/null http://127.0.0.1:5000/moto-api/; fi
         if has kafka; then answers kafka docker exec kafka /opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092; fi
+        # The SCRAM user exists once the broker has stored it.
+        if has kafka-sasl; then
+          answers kafka-sasl docker exec kafka-sasl /opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:29094
+          for m in SCRAM-SHA-256 SCRAM-SHA-512; do
+            docker exec kafka-sasl /opt/kafka/bin/kafka-configs.sh --bootstrap-server localhost:29094 --alter \
+              --add-config "$m=[password=scram-secret]" --entity-type users --entity-name scram >/dev/null || exit 1
+          done
+        fi
         # Karapace answers reads before it's the primary that takes writes:
         # it's ready once it registers a schema.
         if has registry; then
@@ -112,3 +270,33 @@ runs:
             --data '{"schema": "\"string\""}' http://127.0.0.1:8081/subjects/openetl-ready/versions
         fi
         if has kinesis; then answers kinesis curl -sf -m 5 -o /dev/null http://127.0.0.1:4568/healthcheck; fi
+        # LogMiner reads the redo log once it's archived, with supplemental
+        # logging; archiving takes the database's restart. The user openetl
+        # mines its PDB's redo with the README's grants. A fresh container's
+        # first start and that restart get ten minutes of their own.
+        if has oracle; then
+          deadline=$((SECONDS + 600))
+          answers oracle docker exec oracle healthcheck.sh
+          docker exec oracle mkdir -p /opt/oracle/oradata/FREE/fra
+          docker exec -i oracle sqlplus -s "/ as sysdba" > /dev/null <<'SQL' || exit 1
+        WHENEVER SQLERROR EXIT FAILURE
+        ALTER SYSTEM SET DB_RECOVERY_FILE_DEST_SIZE = 10G SCOPE = BOTH;
+        ALTER SYSTEM SET DB_RECOVERY_FILE_DEST = '/opt/oracle/oradata/FREE/fra' SCOPE = BOTH;
+        SHUTDOWN IMMEDIATE
+        STARTUP MOUNT
+        ALTER DATABASE ARCHIVELOG;
+        ALTER DATABASE OPEN;
+        ALTER PLUGGABLE DATABASE ALL OPEN;
+        ALTER DATABASE ADD SUPPLEMENTAL LOG DATA;
+        ALTER SESSION SET CONTAINER = FREEPDB1;
+        GRANT LOGMINING TO openetl;
+        GRANT EXECUTE ON SYS.DBMS_LOGMNR TO openetl;
+        GRANT SELECT ON SYS.V_$DATABASE TO openetl;
+        GRANT SELECT ON SYS.V_$LOG TO openetl;
+        GRANT SELECT ON SYS.V_$LOGFILE TO openetl;
+        GRANT SELECT ON SYS.V_$ARCHIVED_LOG TO openetl;
+        GRANT SELECT ON SYS.V_$LOGMNR_CONTENTS TO openetl;
+        GRANT SELECT ON SYS.V_$TRANSACTION TO openetl;
+        SQL
+          answers oracle docker exec oracle healthcheck.sh
+        fi

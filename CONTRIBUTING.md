@@ -30,11 +30,20 @@ The CDC tests need the server to run with `wal_level = logical`, and a user that
 
 The Iceberg tests need an Iceberg REST catalog at `OPENETL_TEST_ICEBERG_URI` (default `http://127.0.0.1:8181`) whose warehouse is the `iceberg` bucket of an S3 store at `OPENETL_TEST_S3_ENDPOINT` (default `http://127.0.0.1:8333`). openetl's compose file runs both (`make deps-up`); the tests create the bucket. With `OPENETL_TEST_GLUE_ENDPOINT` set to a Glue endpoint, such as moto's (`docker run -p 5000:5000 motoserver/moto:5.2.5`), they run against Glue too (on macOS, port 5000 is AirPlay's: map moto to another, such as `-p 5055:5000`).
 
-The S3 destination's tests run against `file://` by default, and with `-tags integration` against the S3 store too, in a bucket they create.
+The S3 tests run against `file://` by default, and with `-tags integration` against the S3 store too, in a bucket they create, and against fake-gcs-server at `OPENETL_TEST_GCS_ENDPOINT` (default `http://127.0.0.1:4443`) and Azurite at `OPENETL_TEST_AZURE_ENDPOINT` (default `http://127.0.0.1:10000/devstoreaccount1`).
 
-The Kafka tests need a broker at `OPENETL_TEST_KAFKA_BROKERS` (default `127.0.0.1:9092`) and a Confluent-compatible schema registry at `OPENETL_TEST_SCHEMA_REGISTRY` (default `http://127.0.0.1:8081`). openetl's compose file runs Kafka and Karapace.
+The Kafka tests need a broker at `OPENETL_TEST_KAFKA_BROKERS` (default `127.0.0.1:9092`), a second one that takes SASL_SSL at `OPENETL_TEST_KAFKA_SASL_BROKERS` (default `127.0.0.1:9094`), and a Confluent-compatible schema registry at `OPENETL_TEST_SCHEMA_REGISTRY` (default `http://127.0.0.1:8081`). openetl's compose file runs Kafka and Karapace; the SASL_SSL broker, with its users and certificate, is the service `kafka-sasl` of `.github/actions/services`.
 
 The Kinesis tests need a Kinesis endpoint at `OPENETL_TEST_KINESIS_ENDPOINT` (default `http://127.0.0.1:4568`), such as kinesis-mock's, which openetl's compose file runs, and the schema registry.
+
+The other databases' tests each need their server, set up as `.github/actions/services` sets it up, which `.github/test-packages.sh` needs too:
+
+- MySQL at `OPENETL_TEST_MYSQL_DSN` (default `openetl:openetl@tcp(127.0.0.1:3306)/openetl`), in the container `OPENETL_TEST_MYSQL_CONTAINER` (default `mysql`), and MariaDB at `OPENETL_TEST_MARIADB_DSN` (default `openetl:openetl@tcp(127.0.0.1:3307)/openetl`), each with a row-based binlog and full row metadata;
+- SQL Server at `OPENETL_TEST_SQLSERVER_DSN` (default `sqlserver://openetl:OpenETL-test-1@localhost:1433?database=openetl`), with SQL Server Agent, change tracking and change data capture on, and `sa` at `OPENETL_TEST_SQLSERVER_ADMIN_DSN`;
+- Oracle Database at `OPENETL_TEST_ORACLE_DSN` (default `oracle://openetl:openetl@127.0.0.1:1521/FREEPDB1`), archiving its redo log with supplemental logging, and `SYS` at `OPENETL_TEST_ORACLE_ADMIN_DSN`;
+- ClickHouse at `OPENETL_TEST_CLICKHOUSE_ADDR` (default `127.0.0.1:9000`), and for `.github/test-packages.sh` its HTTP interface at `OPENETL_TEST_CLICKHOUSE_HTTP` (default `http://127.0.0.1:8123`);
+- MongoDB at `OPENETL_TEST_MONGODB_URI` (default `mongodb://openetl:openetl@127.0.0.1:27017/?directConnection=true`), a replica set;
+- DynamoDB Local at `OPENETL_TEST_DYNAMODB_ENDPOINT` (default `http://127.0.0.1:8000`).
 
 ## CI
 
@@ -65,7 +74,7 @@ The `openetl` CLI is openetl's `main`, copied out of the image `ghcr.io/openetl-
 Each package directory has an `openetl-connector.yaml`: its name, metadata, and how each role is built. The `openetl` CLI does the rest, so nothing here is specific to this repository:
 
 ```sh
-openetl connector validate --require author,logo,description,license postgres kafka kinesis iceberg s3
+openetl connector validate --require author,logo,description,license postgres mysql sqlserver oracle clickhouse mongodb dynamodb kafka kinesis iceberg s3
 openetl connector package --tag postgres/v0.2.0
 ```
 
@@ -89,7 +98,7 @@ A fix to a release that `main` has moved past goes on a branch `release-PACKAGE-
 
 The [docs site](https://github.com/openetl-io/docs-web) shows each package from `main`: its page (`README.md` and any `docs/`), its schemas and its logo, with the package's releases and their notes. A fix to a page is on the site within minutes of reaching `main`; there's nothing to backport.
 
-So a page can describe what no release has yet. Mark a setting or behaviour that isn't released with the version it arrives in, the package's next, such as "From 0.3.0", on the page and in the setting's `description` in the schema.
+So a page can describe what no release has yet. Mark a setting or behaviour that isn't released with the version it arrives in, the package's next, such as "From 0.3.0", on the page and in the setting's `description` in the schema. A package with no release yet needs no marks, as none of it is released.
 
 The `docs` workflow calls the site's deploy hook, the secret `CLOUDFLARE_DEPLOY_HOOK`, on a push to `main` that changes a package's page, `docs/`, `openetl-connector.yaml`, schemas or logo, and `release` calls it once a release is published, for the site's list of releases. Without the secret, it skips. `gh workflow run docs.yml` deploys now.
 
@@ -98,8 +107,14 @@ The `docs` workflow calls the site's deploy hook, the secret `CLOUDFLARE_DEPLOY_
 Each package directory holds its `openetl-connector.yaml`, its config schemas and its page, `README.md`.
 
 - `postgres/`: the Postgres source and destination.
+- `mysql/`: the MySQL source and destination, which work against MariaDB too.
+- `sqlserver/`: the SQL Server source and destination.
+- `oracle/`: the Oracle Database source and destination.
+- `clickhouse/`: the ClickHouse source and destination.
+- `mongodb/`: the MongoDB source and destination.
+- `dynamodb/`: the DynamoDB source and destination.
 - `iceberg/`: the Iceberg destination.
-- `s3/`: the Parquet on S3 destination.
+- `s3/`: files on S3, S3-compatible stores, Google Cloud Storage, Azure Blob Storage or a local disk: a source of Parquet, Avro, CSV and JSON Lines, and a destination that writes Parquet, CSV and JSON Lines.
 - `kafka/`: the Kafka source and destination.
 - `kinesis/`: the Kinesis source and destination.
 - `records/`: the record layout and formats Kafka and Kinesis share: JSON, and Avro and Protobuf with a schema registry.
