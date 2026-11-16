@@ -1,281 +1,617 @@
 package kinesis
 
 import (
+	"cmp"
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
+	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awskinesis "github.com/aws/aws-sdk-go-v2/service/kinesis"
 	"github.com/aws/aws-sdk-go-v2/service/kinesis/types"
 
 	"github.com/openetl-io/openetl/sdk/go/check"
 	"github.com/openetl-io/openetl/sdk/go/destination"
+	protocolv1 "github.com/openetl-io/openetl/sdk/go/protocol/v1"
 	"github.com/openetl-io/openetl/sdk/go/source"
 )
 
-var syncModes = map[source.SyncMode]string{source.FullRefresh: "full_refresh", source.Incremental: "incremental", source.CDC: "cdc"}
+var (
+	_ source.CheckLister      = (*Source)(nil)
+	_ source.Preflighter      = (*Source)(nil)
+	_ destination.CheckLister = (*Destination)(nil)
+	_ destination.Preflighter = (*Destination)(nil)
+)
 
-// efoConsumersPerStream is how many consumers Kinesis registers on a stream.
-const efoConsumersPerStream = 20
+var (
+	syncModes  = map[source.SyncMode]string{source.FullRefresh: "full_refresh", source.Incremental: "incremental", source.CDC: "cdc", source.Stream: "stream"}
+	writeModes = map[destination.WriteMode]string{destination.Append: "append", destination.Overwrite: "overwrite", destination.Merge: "merge"}
+)
 
-// streamARN is the IAM resource of a stream, for fixes.
-func streamARN(name string) string { return "arn:aws:kinesis:REGION:ACCOUNT:stream/" + name }
+const (
+	// How many enhanced fan-out consumers a stream takes at the least: 20,
+	// or 50 for an On-demand Advantage stream, which the API doesn't tell
+	// apart.
+	consumerLimit = 20
+	// How far startTimestamp may be ahead of the runner's clock before the
+	// preflight counts it as in the future, rather than as clocks that
+	// differ.
+	clockSkew = time.Minute
+)
 
-// CheckReport checks the credentials reach Kinesis, the schema registry if
-// there is one, and that streams and streamPattern match a stream.
-func (s *Source) CheckReport(ctx context.Context, r *check.Report) {
-	cl, err := s.cfg.client(ctx)
-	if err != nil {
-		r.Fail("connect", "Reach Kinesis and list streams", err, check.Field("region"))
-		return
+var (
+	noStreams = check.Reason{
+		Name:    "no_streams",
+		Code:    protocolv1.ErrorCode_ERROR_CODE_CONFIG_INVALID,
+		Message: "No stream the credentials list in {region} matches streams and streamPattern, so the source offers none.",
+		Fix:     "Check streams and streamPattern, and that the streams are in {region}.",
 	}
-	if !connect(ctx, &s.cfg.Connection, cl, r) {
-		return
+	streamsMissing = check.Reason{
+		Name:    "streams_missing",
+		Code:    protocolv1.ErrorCode_ERROR_CODE_CONFIG_INVALID,
+		Message: "The source offers none of {missing}, which streams names.",
+		Fix:     "Check that each stream in streams exists in {region}, that the credentials can list it, and that it matches streamPattern if that's set.",
 	}
+	startInFuture = check.Reason{
+		Name:    "start_in_future",
+		Code:    protocolv1.ErrorCode_ERROR_CODE_CONFIG_INVALID,
+		Message: "startTimestamp {start} is in the future. Kinesis starts a read only at a time that has passed, so every first read would fail until then.",
+		Fix:     "Set startTimestamp to a time that has passed, or set startPosition to latest.",
+	}
+	syncModeUnsupported = check.Reason{
+		Name:    "sync_mode_unsupported",
+		Code:    protocolv1.ErrorCode_ERROR_CODE_CONFIG_INVALID,
+		Message: "The source reads Kinesis streams with the stream sync mode only, not {mode}.",
+		Fix:     "Read {stream} with the stream sync mode in the pipeline.",
+	}
+	streamMissing = check.Reason{
+		Name:    check.NotFound.Name,
+		Code:    check.NotFound.Code,
+		Message: "{stream} doesn't exist in {region}.",
+		Fix:     "Create {stream} in {region}, or take it out of the pipeline.",
+	}
+	streamCreating = check.Reason{
+		Name:    "stream_not_active",
+		Code:    protocolv1.ErrorCode_ERROR_CODE_TRANSIENT,
+		Message: "{stream} is {status}: a read waits until it's active.",
+	}
+	streamDeleting = check.Reason{
+		Name:    "stream_deleting",
+		Code:    protocolv1.ErrorCode_ERROR_CODE_CONFIG_INVALID,
+		Message: "{stream} is being deleted.",
+		Fix:     "Take {stream} out of the pipeline, or create it again once it's gone.",
+	}
+	startBeforeRetention = check.Reason{
+		Name:    "start_before_retention",
+		Code:    protocolv1.ErrorCode_ERROR_CODE_CONFIG_INVALID,
+		Message: "startTimestamp {start} is older than {stream}'s retention of {retention}. A first read starts at the oldest record the stream holds, and what arrived before that is gone.",
+		Fix:     "Set startTimestamp within the last {retention}, or accept that the first read starts at the oldest record.",
+	}
+	scheduleOutrunsRetention = check.Reason{
+		Name:    "schedule_outruns_retention",
+		Code:    protocolv1.ErrorCode_ERROR_CODE_CONFIG_INVALID,
+		Message: "The pipeline can go {interval} between syncs, longer than {stream}'s retention of {retention}. Records that arrive just after a sync can be gone by the next, and the read then stops with its position lost.",
+		Fix:     "Sync at least every {retention}, read continuously, or raise {stream}'s retention.",
+	}
+	consumerUnknown = check.Reason{
+		Name:    "consumer_unknown",
+		Code:    protocolv1.ErrorCode_ERROR_CODE_CONFIG_INVALID,
+		Message: "The preflight doesn't name the pipeline, so it can't tell which consumer of {stream} the pipeline reads with.",
+		Fix:     "Set consumer.name, or preflight the pipeline itself.",
+	}
+	consumerDeleting = check.Reason{
+		Name:    "consumer_deleting",
+		Code:    protocolv1.ErrorCode_ERROR_CODE_TRANSIENT,
+		Message: "{consumer} is being deregistered from {stream}. The first read waits until it's gone, then registers it again.",
+	}
+	consumersFull = check.Reason{
+		Name:    "consumer_limit",
+		Code:    protocolv1.ErrorCode_ERROR_CODE_RESOURCE_EXHAUSTED,
+		Message: "{stream} has {count} enhanced fan-out consumers. Kinesis allows 20 a stream, or 50 for an On-demand Advantage stream, so registering the pipeline's may fail.",
+		Fix:     "Deregister a consumer that {stream} no longer needs, or read with consumer.type polling.",
+	}
+)
+
+// Checks sign in to Kinesis, reach the schema registry if the format needs
+// one, and find the streams the source offers.
+func (s *Source) Checks() []check.Check {
+	k := newConn(&s.cfg.Connection)
+	return append(connectionChecks(k, false), s.offeredCheck(k))
+}
+
+func (s *Source) offeredCheck(k *conn) check.Check {
 	field := "streams"
-	if len(s.cfg.Streams) == 0 {
+	if len(s.cfg.Streams) == 0 && s.cfg.StreamPattern != "" {
 		field = "streamPattern"
 	}
-	names, err := s.streams(ctx, cl, 0)
-	switch {
-	case err != nil:
-		r.Fail("streams", "Find the streams to offer", err, check.Field(field))
-	case len(names) == 0:
-		r.Warn("streams", "Find the streams to offer", "No stream the credentials can list matches streams and streamPattern, so the source offers none.",
-			check.Field(field), check.WithFix("Check streams and streamPattern, and that the streams are in the region."))
-	default:
-		r.Pass("streams", "Find the streams to offer", fmt.Sprintf("%d streams match.", len(names)), check.Field(field))
+	return check.Check{
+		Name: "streams.offered", Kind: check.Resource, Title: "Find the streams to offer",
+		Description: "Lists the streams the credentials can list, and keeps those that streams and streamPattern name.",
+		Field:       field, Needs: []string{"kinesis.sign-in"}, Timeout: callTimeout,
+		Run: func(ctx context.Context, p *check.Probe) error {
+			cl, err := k.client(ctx)
+			if err != nil {
+				return err
+			}
+			p.Param("region", k.ac.Region)
+			names, err := s.streams(ctx, cl, 0)
+			if err != nil {
+				return call{action: "kinesis:ListStreams", resource: "*"}.failure(err)
+			}
+			if len(names) == 0 {
+				return check.Warn(noStreams.Fail())
+			}
+			p.Param("count", len(names))
+			p.Param("streams", list(names))
+			var missing []string
+			for _, n := range s.cfg.Streams {
+				if !slices.Contains(names, n) {
+					missing = append(missing, n)
+				}
+			}
+			if len(missing) > 0 {
+				p.Param("missing", list(missing))
+				return check.Warn(streamsMissing.Fail())
+			}
+			p.Found("The source offers {count} streams: {streams}.")
+			return nil
+		},
 	}
 }
 
-// Preflight checks, for each stream a pipeline would read, that it's there
-// and active, that the reads the source makes are allowed, that its
-// retention keeps what the schedule and startTimestamp need, and with
-// enhanced fan-out, the pipeline's consumer. It reads no records and
+// Preflight checks, for each stream the pipeline reads, its sync mode; that
+// the Kinesis stream is there and active, and its shards listed and read;
+// that its retention keeps what startTimestamp and the schedule need; and
+// with enhanced fan-out, the pipeline's consumer. It reads no records and
 // registers nothing.
-func (s *Source) Preflight(ctx context.Context, req source.PreflightRequest, r *check.Report) {
-	cl, err := s.cfg.client(ctx)
-	if err != nil {
-		r.Fail("connect", "Reach Kinesis", err, check.Field("region"))
-		return
+func (s *Source) Preflight(req source.PreflightRequest) []check.Check {
+	k := newConn(&s.cfg.Connection)
+	var checks []check.Check
+	if s.cfg.StartPosition == startTimestamp {
+		checks = append(checks, s.startCheck())
 	}
+	names := make([]string, len(req.Streams))
+	for i, cs := range req.Streams {
+		names[i] = cs.Name
+	}
+	parts := streamParts(names)
+	seen := map[string]bool{}
 	for _, cs := range req.Streams {
-		if cs.SyncMode != 0 && cs.SyncMode != source.Stream {
-			r.Fail("stream."+cs.Name+".mode", "Read stream "+cs.Name+" with its sync mode",
-				invalid(fmt.Errorf("kinesis: stream %s: the source reads Kinesis streams with the stream sync mode only, not %s", cs.Name, syncModes[cs.SyncMode])),
-				check.WithFix("Read the stream with the stream sync mode."))
+		if seen[cs.Name] {
 			continue
 		}
-		s.preflightStream(ctx, cl, r, cs.Name, req)
+		seen[cs.Name] = true
+		checks = append(checks, s.streamChecks(k, "stream."+parts[cs.Name], cs, req)...)
 	}
+	return checks
 }
 
-func (s *Source) preflightStream(ctx context.Context, cl *awskinesis.Client, r *check.Report, name string, req source.PreflightRequest) {
-	item := func(what string) string { return "stream." + name + "." + what }
-	arn := streamARN(name)
-	var sum *types.StreamDescriptionSummary
-	if !r.Run(item("describe"), "Describe stream "+name, func() error {
-		res, err := cl.DescribeStreamSummary(ctx, &awskinesis.DescribeStreamSummaryInput{StreamName: aws.String(name)})
-		if apiCode(err) == "ResourceNotFoundException" {
-			return check.Fix(invalid(fmt.Errorf("kinesis: stream %s doesn't exist", name)), "Create the stream in the region, or take it out of the pipeline.")
-		}
-		if err != nil {
-			return allow(classify(wrap("describe stream "+name, err)), "kinesis:DescribeStreamSummary", arn)
-		}
-		sum = res.StreamDescriptionSummary
-		return nil
-	}, check.Field("streams")) {
-		return
-	}
-	arn = aws.ToString(sum.StreamARN)
-	retention := time.Duration(aws.ToInt32(sum.RetentionPeriodHours)) * time.Hour
-	described := fmt.Sprintf("%s, %d open shards, %s retention, %s", strings.ToLower(string(sum.StreamStatus)), aws.ToInt32(sum.OpenShardCount), retention, encryption(sum))
-	if sum.StreamStatus == types.StreamStatusActive || sum.StreamStatus == types.StreamStatusUpdating {
-		r.Pass(item("status"), "Stream "+name+" is active", described+".")
-	} else {
-		r.Warn(item("status"), "Stream "+name+" is active", "The stream is "+described+"; a read waits until it's active.")
-	}
-	if s.cfg.StartPosition == startTimestamp && time.Since(*s.cfg.StartTimestamp) > retention {
-		r.Warn(item("start"), "Stream "+name+" still holds records from startTimestamp",
-			fmt.Sprintf("startTimestamp is older than the stream's %s retention: the first read starts at the oldest record the stream holds, and what arrived before that is gone.", retention),
-			check.Field("startTimestamp"))
-	}
-	if req.Interval > retention {
-		r.Warn(item("schedule"), "Stream "+name+" keeps records from one sync to the next",
-			fmt.Sprintf("The pipeline can go %s between syncs, longer than the stream's %s retention: records that arrive just after a sync can be gone by the next, and the read stops with its position lost.", req.Interval, retention),
-			check.WithFix(fmt.Sprintf("Sync at least every %s, read continuously, or raise the stream's retention.", retention)))
-	}
-	var shard string
-	if !r.Run(item("shards"), "List stream "+name+"'s shards", func() error {
-		res, err := cl.ListShards(ctx, &awskinesis.ListShardsInput{StreamName: aws.String(name), ShardFilter: &types.ShardFilter{Type: types.ShardFilterTypeAtLatest}})
-		if err != nil {
-			return allow(classify(wrap("list "+name+"'s shards", err)), "kinesis:ListShards", arn)
-		}
-		if len(res.Shards) > 0 {
-			shard = aws.ToString(res.Shards[0].ShardId)
-		}
-		return nil
-	}) {
-		return
-	}
-	if shard == "" {
-		r.Skip(item("read"), "Read stream "+name, "The stream has no open shard to read.")
-	} else {
-		r.Run(item("read"), "Read stream "+name, func() error {
-			it, err := cl.GetShardIterator(ctx, &awskinesis.GetShardIteratorInput{StreamName: aws.String(name), ShardId: aws.String(shard), ShardIteratorType: types.ShardIteratorTypeLatest})
-			if err != nil {
-				return allow(classify(wrap("get a shard iterator of "+name, err)), "kinesis:GetShardIterator", arn)
-			}
-			_, err = cl.GetRecords(ctx, &awskinesis.GetRecordsInput{ShardIterator: it.ShardIterator, Limit: aws.Int32(1)})
-			if apiCode(err) == "KMSAccessDeniedException" {
-				return allow(classify(wrap("read "+name, err)), "kms:Decrypt", "the stream's KMS key")
-			}
-			return allow(classify(wrap("read "+name, err)), "kinesis:GetRecords", arn)
-		})
-	}
-	if s.cfg.Consumer.Type == consumerEFO {
-		s.preflightConsumer(ctx, cl, r, name, arn, req.Pipeline)
-	}
-}
-
-// preflightConsumer checks the pipeline's enhanced fan-out consumer of a
-// stream, without registering it: there already, or with room for it.
-func (s *Source) preflightConsumer(ctx context.Context, cl *awskinesis.Client, r *check.Report, stream, arn, pipeline string) {
-	item := "stream." + stream + ".consumer"
-	name, err := s.cfg.consumerName(pipeline)
-	if err != nil {
-		r.Fail(item, "Find the pipeline's consumer of stream "+stream, err, check.Field("consumer.name"))
-		return
-	}
-	title := "Find consumer " + name + " of stream " + stream
-	consumerARN := arn + "/consumer/" + name + ":*"
-	d, err := cl.DescribeStreamConsumer(ctx, &awskinesis.DescribeStreamConsumerInput{StreamARN: aws.String(arn), ConsumerName: aws.String(name)})
-	switch {
-	case err == nil && d.ConsumerDescription.ConsumerStatus == types.ConsumerStatusDeleting:
-		r.Warn(item, title, "The consumer is being deregistered; the first read waits until it's gone, and registers it again.", check.Field("consumer.name"))
-	case err == nil:
-		r.Pass(item, title, "Registered, "+strings.ToLower(string(d.ConsumerDescription.ConsumerStatus))+".", check.Field("consumer.name"))
-	case apiCode(err) != "ResourceNotFoundException":
-		r.Fail(item, title, allow(classify(wrap("describe consumer "+name, err)), "kinesis:DescribeStreamConsumer", consumerARN), check.Field("consumer.name"))
-		return
-	default:
-		if !r.Run(item, title, func() error {
-			n := 0
-			p := awskinesis.NewListStreamConsumersPaginator(cl, &awskinesis.ListStreamConsumersInput{StreamARN: aws.String(arn)})
-			for p.HasMorePages() {
-				page, err := p.NextPage(ctx)
-				if err != nil {
-					return allow(classify(wrap("list "+stream+"'s consumers", err)), "kinesis:ListStreamConsumers", arn)
-				}
-				n += len(page.Consumers)
-			}
-			if n >= efoConsumersPerStream {
-				return check.Fix(invalid(fmt.Errorf("kinesis: stream %s has %d consumers, Kinesis's limit, so the pipeline's can't be registered", stream, n)), "Deregister a consumer the stream no longer needs.")
+func (s *Source) startCheck() check.Check {
+	start := *s.cfg.StartTimestamp
+	return check.Check{
+		Name: "start-timestamp", Kind: check.Configuration, Title: "Start new reads at {start}",
+		Field:  "startTimestamp",
+		Params: check.Params{"start": start.UTC().Format(time.RFC3339)},
+		Run: func(context.Context, *check.Probe) error {
+			if start.After(time.Now().Add(clockSkew)) {
+				return startInFuture.Fail()
 			}
 			return nil
-		}, check.Field("consumer.name")) {
-			return
+		},
+	}
+}
+
+// streamFacts is what a stream's checks found, for the checks after them.
+type streamFacts struct {
+	sum found[*types.StreamDescriptionSummary]
+	// An open shard; empty for none.
+	shard found[string]
+	// The pipeline's consumer is registered or being registered.
+	registered found[bool]
+}
+
+func (s *Source) streamChecks(k *conn, base string, cs source.ConfiguredStream, req source.PreflightRequest) []check.Check {
+	name := cs.Name
+	f := &streamFacts{}
+	params := func(kv ...string) check.Params {
+		p := check.Params{"stream": name}
+		for i := 0; i+1 < len(kv); i += 2 {
+			p[kv[i]] = kv[i+1]
 		}
+		return p
 	}
-	r.Skip("stream."+stream+".subscribe", "Register consumer "+name+" of stream "+stream+" and subscribe to its shards",
-		"Registering a consumer would change the stream, so the first read does it if it isn't registered yet.", check.Field("consumer.type"),
-		check.WithFix(fmt.Sprintf("Allow kinesis:DescribeStreamConsumer, kinesis:ListStreamConsumers, kinesis:RegisterStreamConsumer and kinesis:DeregisterStreamConsumer on %s, and kinesis:SubscribeToShard on %s.", arn, consumerARN)))
+	mode := cmp.Or(syncModes[cs.SyncMode], "stream")
+	checks := []check.Check{{
+		Name: base + ".mode", Kind: check.Configuration, Title: "Read {stream} with the stream sync mode",
+		Params: params("mode", mode),
+		Run: func(context.Context, *check.Probe) error {
+			if mode != "stream" {
+				return syncModeUnsupported.Fail()
+			}
+			return nil
+		},
+	}, {
+		Name: base + ".describe", Kind: check.Resource, Title: "Describe {stream}",
+		Description: "Describes the Kinesis stream: its status, open shards, retention and encryption.",
+		Field:       "streams", Params: params(), Needs: []string{base + ".mode"}, Timeout: callTimeout,
+		Run: func(ctx context.Context, p *check.Probe) error {
+			cl, err := k.client(ctx)
+			if err != nil {
+				return err
+			}
+			p.Param("region", k.ac.Region)
+			res, err := cl.DescribeStreamSummary(ctx, &awskinesis.DescribeStreamSummaryInput{StreamName: aws.String(name)})
+			if apiCode(err) == "ResourceNotFoundException" {
+				return streamMissing.Fail()
+			}
+			if err != nil {
+				return call{action: "kinesis:DescribeStreamSummary", resource: k.streamARN(name)}.failure(err)
+			}
+			sum := res.StreamDescriptionSummary
+			k.learn(sum.StreamARN)
+			f.sum.set(sum)
+			describe(p, sum)
+			switch {
+			case sum.StreamStatus == types.StreamStatusDeleting:
+				return streamDeleting.Fail()
+			case !isActive(sum):
+				return check.Warn(streamCreating.Fail())
+			}
+			p.Found("{stream} is {status}, with {shards} open shards, {retention} of retention and {encryption}.")
+			return nil
+		},
+	}}
+	retention := func() time.Duration {
+		return time.Duration(aws.ToInt32(f.sum.get().RetentionPeriodHours)) * time.Hour
+	}
+	if s.cfg.StartPosition == startTimestamp {
+		start := *s.cfg.StartTimestamp
+		checks = append(checks, check.Check{
+			Name: base + ".start", Kind: check.Configuration, Title: "Hold {stream}'s records from {start}",
+			Field:  "startTimestamp",
+			Params: params("start", start.UTC().Format(time.RFC3339)),
+			Needs:  []string{"start-timestamp", base + ".describe"},
+			Run: func(_ context.Context, p *check.Probe) error {
+				r := retention()
+				p.Param("retention", human(r))
+				if time.Since(start) > r {
+					return check.Warn(startBeforeRetention.Fail())
+				}
+				p.Found("{start} is within {stream}'s retention of {retention}.")
+				return nil
+			},
+		})
+	}
+	if req.Interval > 0 {
+		checks = append(checks, check.Check{
+			Name: base + ".schedule", Kind: check.Configuration, Title: "Keep {stream}'s records from one sync to the next",
+			Params: params("interval", human(req.Interval)),
+			Needs:  []string{base + ".describe"},
+			Run: func(_ context.Context, p *check.Probe) error {
+				r := retention()
+				p.Param("retention", human(r))
+				if req.Interval > r {
+					return check.Warn(scheduleOutrunsRetention.Fail())
+				}
+				p.Found("{stream} keeps records for {retention}, longer than the {interval} between syncs.")
+				return nil
+			},
+		})
+	}
+	checks = append(checks, check.Check{
+		Name: base + ".shards", Kind: check.Permission, Title: "List {stream}'s shards",
+		Params: params(), Needs: []string{base + ".describe"}, Timeout: callTimeout,
+		Run: func(ctx context.Context, p *check.Probe) error {
+			cl, err := k.client(ctx)
+			if err != nil {
+				return err
+			}
+			res, err := cl.ListShards(ctx, &awskinesis.ListShardsInput{StreamName: aws.String(name), ShardFilter: &types.ShardFilter{Type: types.ShardFilterTypeAtLatest}})
+			if err != nil {
+				return call{action: "kinesis:ListShards", resource: k.streamARN(name)}.failure(err)
+			}
+			if len(res.Shards) > 0 {
+				f.shard.set(aws.ToString(res.Shards[0].ShardId))
+			}
+			return nil
+		},
+	}, check.Check{
+		Name: base + ".read", Kind: check.Permission, Title: "Read {stream}",
+		Description: "Reads one open shard from its newest record, which returns nothing: the preflight reads no records.",
+		Params:      params(), Needs: []string{base + ".shards"}, Timeout: callTimeout,
+		Run: func(ctx context.Context, p *check.Probe) error {
+			shard := f.shard.get()
+			if shard == "" {
+				return check.Skip("{stream} has no open shard to read.")
+			}
+			p.Param("shard", shard)
+			cl, err := k.client(ctx)
+			if err != nil {
+				return err
+			}
+			arn := k.streamARN(name)
+			it, err := cl.GetShardIterator(ctx, &awskinesis.GetShardIteratorInput{StreamName: aws.String(name), ShardId: aws.String(shard), ShardIteratorType: types.ShardIteratorTypeLatest})
+			if err != nil {
+				return call{action: "kinesis:GetShardIterator", resource: arn}.failure(err)
+			}
+			if _, err := cl.GetRecords(ctx, &awskinesis.GetRecordsInput{ShardIterator: it.ShardIterator, Limit: aws.Int32(1)}); err != nil {
+				return call{action: "kinesis:GetRecords", resource: arn, kmsAction: "kms:Decrypt"}.failure(err)
+			}
+			p.Found("Read {stream}'s shard {shard} from its newest record.")
+			return nil
+		},
+	})
+	if s.cfg.Consumer.Type == consumerEFO {
+		checks = append(checks, s.consumerChecks(k, base, name, req.Pipeline, f)...)
+	}
+	return checks
 }
 
-func encryption(sum *types.StreamDescriptionSummary) string {
-	if sum.EncryptionType == types.EncryptionTypeKms {
-		return "KMS encryption"
+// consumerChecks check the pipeline's enhanced fan-out consumer of a stream
+// without registering it: whether it's registered, and if it isn't, whether
+// the stream has room for it.
+func (s *Source) consumerChecks(k *conn, base, stream, pipeline string, f *streamFacts) []check.Check {
+	consumer, err := s.cfg.consumerName(pipeline)
+	known := err == nil
+	params := check.Params{"stream": stream}
+	title := "Find the pipeline's consumer of {stream}"
+	subscribe := "Register the pipeline's consumer of {stream}, and subscribe to its shards"
+	if known {
+		params["consumer"] = consumer
+		title = "Find the consumer {consumer} of {stream}"
+		subscribe = "Register {consumer} on {stream}, and subscribe to its shards"
 	}
-	return "no encryption"
+	return []check.Check{{
+		Name: base + ".consumer", Kind: check.Resource, Title: title,
+		Field: "consumer.name", Params: params, Needs: []string{base + ".describe"}, Timeout: callTimeout,
+		Run: func(ctx context.Context, p *check.Probe) error {
+			if !known {
+				return check.Warn(consumerUnknown.Fail())
+			}
+			cl, err := k.client(ctx)
+			if err != nil {
+				return err
+			}
+			arn := aws.ToString(f.sum.get().StreamARN)
+			d, err := cl.DescribeStreamConsumer(ctx, &awskinesis.DescribeStreamConsumerInput{StreamARN: aws.String(arn), ConsumerName: aws.String(consumer)})
+			switch {
+			case apiCode(err) == "ResourceNotFoundException":
+				p.Found("{consumer} isn't registered yet: the first read registers it.")
+				return nil
+			case err != nil:
+				return call{action: "kinesis:DescribeStreamConsumer", resource: consumerARN(arn, consumer)}.failure(err)
+			}
+			switch d.ConsumerDescription.ConsumerStatus {
+			case types.ConsumerStatusDeleting:
+				return check.Warn(consumerDeleting.Fail())
+			case types.ConsumerStatusCreating:
+				p.Found("{consumer} is being registered.")
+			default:
+				p.Found("{consumer} is registered and active.")
+			}
+			f.registered.set(true)
+			return nil
+		},
+	}, {
+		Name: base + ".consumer-limit", Kind: check.Quota, Title: "Find room for another consumer of {stream}",
+		Description: "Counts the stream's enhanced fan-out consumers, when the pipeline's isn't registered yet.",
+		Field:       "consumer.type", Params: params, Needs: []string{base + ".consumer"}, Timeout: callTimeout,
+		Run: func(ctx context.Context, p *check.Probe) error {
+			if f.registered.get() {
+				return check.Skip("{consumer} is registered already, so it takes no new place.")
+			}
+			sum := f.sum.get()
+			n := int(aws.ToInt32(sum.ConsumerCount))
+			if sum.ConsumerCount == nil {
+				cl, err := k.client(ctx)
+				if err != nil {
+					return err
+				}
+				pages := awskinesis.NewListStreamConsumersPaginator(cl, &awskinesis.ListStreamConsumersInput{StreamARN: sum.StreamARN})
+				for pages.HasMorePages() {
+					page, err := pages.NextPage(ctx)
+					if err != nil {
+						return call{action: "kinesis:ListStreamConsumers", resource: aws.ToString(sum.StreamARN)}.failure(err)
+					}
+					n += len(page.Consumers)
+				}
+			}
+			p.Param("count", n)
+			if n >= consumerLimit {
+				return check.Warn(consumersFull.Fail())
+			}
+			p.Found("{stream} has {count} enhanced fan-out consumers, fewer than the 20 Kinesis allows a stream.")
+			return nil
+		},
+	}, {
+		Name: base + ".subscribe", Kind: check.Permission, Title: subscribe,
+		Field: "consumer.type", Params: params, Needs: []string{base + ".describe"},
+		Run: func(_ context.Context, p *check.Probe) error {
+			arn := aws.ToString(f.sum.get().StreamARN)
+			p.Param("arn", arn)
+			p.Param("consumer_arn", consumerARN(arn, cmp.Or(consumer, "*")))
+			return check.Skip("Registering a consumer changes the stream, so the preflight doesn't. The first read registers the consumer with kinesis:RegisterStreamConsumer on {arn}, and subscribes with kinesis:SubscribeToShard on {consumer_arn}. Deregistering it at teardown takes kinesis:DeregisterStreamConsumer on {consumer_arn}.")
+		},
+	}}
 }
 
-// CheckReport checks the credentials reach Kinesis, and the schema registry
-// if there is one.
-func (d *Destination) CheckReport(ctx context.Context, r *check.Report) {
-	cl, err := d.cfg.client(ctx)
-	if err != nil {
-		r.Fail("connect", "Reach Kinesis and list streams", err, check.Field("region"))
-		return
+var (
+	appendOnly = check.Reason{
+		Name:    "write_mode_unsupported",
+		Code:    protocolv1.ErrorCode_ERROR_CODE_CONFIG_INVALID,
+		Message: "Kinesis streams only take appends, and the pipeline writes {stream} with {mode}.",
+		Fix:     "Write {stream} with the append mode in the pipeline.",
 	}
-	connect(ctx, &d.cfg.Connection, cl, r)
+	keysUnusable = check.Reason{
+		Name:    "partition_key_unusable",
+		Code:    protocolv1.ErrorCode_ERROR_CODE_CONFIG_INVALID,
+		Message: "The destination can't make partition keys for {stream}.",
+	}
+	targetMissing = check.Reason{
+		Name:    check.NotFound.Name,
+		Code:    check.NotFound.Code,
+		Message: "{target} doesn't exist in {region}, and createStreams is off.",
+		Fix:     "Create {target} in {region}, or set createStreams to true.",
+	}
+	targetNotActive = check.Reason{
+		Name:    "stream_not_active",
+		Code:    protocolv1.ErrorCode_ERROR_CODE_TRANSIENT,
+		Message: "{target} is {status}: a write waits until it's active.",
+	}
+	targetDiffers = check.Reason{
+		Name:    "stream_differs",
+		Code:    protocolv1.ErrorCode_ERROR_CODE_CONFIG_INVALID,
+		Message: "{target} differs from the config: {differences}. The destination writes to it as it is: streamMode, shards, retentionHours and kmsKeyId apply only to streams it creates.",
+		Fix:     "Change {target} in Kinesis if it should match the config, or change the config to match it.",
+	}
+)
+
+// Checks sign in to Kinesis, and reach the schema registry if the format
+// needs one.
+func (d *Destination) Checks() []check.Check {
+	return connectionChecks(newConn(&d.cfg.Connection), true)
 }
 
 // Preflight checks, for each stream a pipeline would write, its write mode,
-// its partition keys, and its Kinesis stream: there and as the config would
-// create it, or missing and to be created. It writes nothing.
-func (d *Destination) Preflight(ctx context.Context, req destination.PreflightRequest, r *check.Report) {
-	cl, err := d.cfg.client(ctx)
-	if err != nil {
-		r.Fail("connect", "Reach Kinesis", err, check.Field("region"))
-		return
+// its partition keys, and the Kinesis stream it goes to, named as the writer
+// names it: there and as the config would create it, or missing and to be
+// created. It writes nothing.
+func (d *Destination) Preflight(req destination.PreflightRequest) []check.Check {
+	k := newConn(&d.cfg.Connection)
+	names := make([]string, len(req.Streams))
+	for i, s := range req.Streams {
+		names[i] = s.Name
 	}
+	parts := streamParts(names)
+	var checks []check.Check
 	var targets []string
+	seen := map[string]bool{}
 	for _, s := range req.Streams {
+		if seen[s.Name] {
+			continue
+		}
+		seen[s.Name] = true
 		sc := req.Schemas[s.Name]
-		name := target(req.Namespace, d.cfg.Namespace, tableOf(s.Name, sc))
-		targets = append(targets, streamARN(name))
-		item := func(what string) string { return "stream." + s.Name + "." + what }
-		if !DestinationCapabilities.SupportsMode(s.Mode) {
-			r.Fail(item("mode"), "Write stream "+s.Name+" with its write mode", invalid(fmt.Errorf("kinesis: stream %s: Kinesis only appends", s.Name)),
-				check.WithFix("Write the stream with the append mode."))
+		t := target(req.Namespace, d.cfg.Namespace, tableOf(s.Name, sc))
+		targets = append(targets, t)
+		base := "stream." + parts[s.Name]
+		checks = append(checks, check.Check{
+			Name: base + ".mode", Kind: check.Configuration, Title: "Write {stream} by appending",
+			Params: check.Params{"stream": s.Name, "mode": cmp.Or(writeModes[s.Mode], fmt.Sprint(int(s.Mode)))},
+			Run: func(context.Context, *check.Probe) error {
+				if !DestinationCapabilities.SupportsMode(s.Mode) {
+					return appendOnly.Fail()
+				}
+				return nil
+			},
+		})
+		if sc != nil && d.cfg.PartitionKey.Mode != partitionRandom {
+			checks = append(checks, d.keysCheck(base, s, sc))
 		}
-		if sc != nil {
-			// The engine adds _openetl_id to every batch, so a stream
-			// without a primary key still has a partition key.
-			r.Run(item("keys"), "Make partition keys for stream "+s.Name, func() error {
-				_, err := keyColumns(d.cfg.PartitionKey.Mode, sc, s.PrimaryKey, d.cfg.PartitionKey.Fields, true)
+		checks = append(checks, d.targetCheck(k, base, s.Name, t))
+	}
+	if len(targets) == 0 {
+		return checks
+	}
+	ns := cmp.Or(req.Namespace, d.cfg.Namespace)
+	return append(checks, check.Check{
+		Name: "put", Kind: check.Permission, Title: "Put records into the pipeline's Kinesis streams",
+		Run: func(ctx context.Context, p *check.Probe) error {
+			if _, err := k.client(ctx); err != nil {
 				return err
-			}, check.Field("partitionKey"))
-		}
-		d.preflightTarget(ctx, cl, r, s.Name, name)
+			}
+			arns := k.streamARN(ns + ".*")
+			if ns == "" {
+				all := make([]string, len(targets))
+				for i, t := range targets {
+					all[i] = k.streamARN(t)
+				}
+				arns = list(all)
+			}
+			p.Param("arns", arns)
+			return check.Skip("Putting a record writes to a stream, so the preflight doesn't. Writing takes kinesis:DescribeStreamSummary and kinesis:PutRecords on {arns}, and kms:GenerateDataKey on the key of a stream encrypted with a customer-managed KMS key.")
+		},
+	})
+}
+
+// keysCheck checks that the columns partition keys are made of are the
+// stream's. The engine adds _openetl_id to every batch, so a stream without
+// a primary key still has partition keys.
+func (d *Destination) keysCheck(base string, s destination.Stream, sc *arrow.Schema) check.Check {
+	field, fix := "partitionKey.mode", "Give {stream} the primary key columns it names, or set partitionKey.mode to fields or random."
+	if d.cfg.PartitionKey.Mode == partitionByFields {
+		field, fix = "partitionKey.fields", "Name columns of {stream} in partitionKey.fields, or set partitionKey.mode to key or random."
 	}
-	put := "kinesis:DescribeStreamSummary and kinesis:PutRecords"
-	if d.cfg.KMSKeyID != "" {
-		put += ", and kms:GenerateDataKey on the streams' key"
-	}
-	if len(targets) > 0 {
-		r.Skip("put", "Put records", "Putting a record would write to a stream, so it's not checked.",
-			check.WithFix(fmt.Sprintf("Allow %s on %s.", put, strings.Join(targets, ", "))))
+	return check.Check{
+		Name: base + ".keys", Kind: check.Configuration, Title: "Make partition keys for {stream}",
+		Field: field, Params: check.Params{"stream": s.Name},
+		Run: func(_ context.Context, p *check.Probe) error {
+			cols, err := keyColumns(d.cfg.PartitionKey.Mode, sc, s.PrimaryKey, d.cfg.PartitionKey.Fields, true)
+			if err != nil {
+				f := keysUnusable.Wrap(err)
+				f.Fix = fix
+				return f
+			}
+			if len(cols) == 0 {
+				p.Found("Partition keys are each row's " + idColumn + ".")
+				return nil
+			}
+			p.Param("columns", strings.Join(cols, ", "))
+			p.Found("Partition keys are made of {columns}.")
+			return nil
+		},
 	}
 }
 
-// preflightTarget checks the Kinesis stream a pipeline's stream goes to.
-func (d *Destination) preflightTarget(ctx context.Context, cl *awskinesis.Client, r *check.Report, stream, name string) {
-	item := "stream." + stream + ".target"
-	title := "Kinesis stream " + name
+// targetCheck checks the Kinesis stream a pipeline's stream goes to.
+func (d *Destination) targetCheck(k *conn, base, stream, name string) check.Check {
 	cfg := &d.cfg
-	res, err := cl.DescribeStreamSummary(ctx, &awskinesis.DescribeStreamSummaryInput{StreamName: aws.String(name)})
-	switch {
-	case apiCode(err) == "ResourceNotFoundException" && cfg.CreateStreams != nil && !*cfg.CreateStreams:
-		r.Fail(item, title, check.Fix(invalid(fmt.Errorf("kinesis: stream %s doesn't exist, and createStreams is off", name)), "Create the stream, or turn createStreams on."), check.Field("createStreams"))
-	case apiCode(err) == "ResourceNotFoundException":
-		actions := "kinesis:CreateStream and kinesis:DescribeStream"
-		if cfg.RetentionHours > minRetentionHours {
-			actions += ", kinesis:IncreaseStreamRetentionPeriod"
-		}
-		if cfg.KMSKeyID != "" {
-			actions += ", kinesis:StartStreamEncryption, and kms:GenerateDataKey on the key"
-		}
-		r.Skip(item, title, fmt.Sprintf("The stream doesn't exist yet. The first write creates it %s.", creates(cfg)),
-			check.Field("createStreams"), check.WithFix(fmt.Sprintf("Allow %s on %s.", actions, streamARN(name))))
-	case err != nil:
-		r.Fail(item, title, allow(classify(wrap("describe stream "+name, err)), "kinesis:DescribeStreamSummary", streamARN(name)))
-	default:
-		sum := res.StreamDescriptionSummary
-		described := fmt.Sprintf("%s, %d open shards, %d hours' retention, %s", strings.ToLower(string(sum.StreamStatus)), aws.ToInt32(sum.OpenShardCount), aws.ToInt32(sum.RetentionPeriodHours), encryption(sum))
-		diff := differs(cfg, sum)
-		switch {
-		case sum.StreamStatus != types.StreamStatusActive && sum.StreamStatus != types.StreamStatusUpdating:
-			r.Warn(item, title, "The stream is "+described+"; a write waits until it's active.")
-		case diff != "":
-			r.Warn(item, title, "The stream is "+diff+". The destination writes to it as it is: streamMode, shards, retentionHours and kmsKeyId apply only to streams it creates.",
-				check.WithFix("Change the stream in Kinesis if it should match."))
-		default:
-			r.Pass(item, title, "The stream is "+described+".")
-		}
+	c := check.Check{
+		Name: base + ".target", Kind: check.Resource, Title: "Find the Kinesis stream {target}",
+		Description: "Describes the Kinesis stream the destination writes {stream} to.",
+		Params:      check.Params{"stream": stream, "target": name}, Timeout: callTimeout,
+		Run: func(ctx context.Context, p *check.Probe) error {
+			cl, err := k.client(ctx)
+			if err != nil {
+				return err
+			}
+			p.Param("region", k.ac.Region)
+			res, err := cl.DescribeStreamSummary(ctx, &awskinesis.DescribeStreamSummaryInput{StreamName: aws.String(name)})
+			switch {
+			case apiCode(err) == "ResourceNotFoundException" && !cfg.createsStreams():
+				return targetMissing.Fail()
+			case apiCode(err) == "ResourceNotFoundException":
+				p.Param("arn", k.streamARN(name))
+				p.Param("creates", creates(cfg))
+				p.Param("actions", and(createActions(cfg)))
+				if cfg.KMSKeyID != "" {
+					return check.Skip("{target} doesn't exist yet: the first write creates it {creates}. Creating a stream changes the account, so the preflight doesn't. It takes {actions} on {arn}, and kms:GenerateDataKey on kmsKeyId's key.")
+				}
+				return check.Skip("{target} doesn't exist yet: the first write creates it {creates}. Creating a stream changes the account, so the preflight doesn't. It takes {actions} on {arn}.")
+			case err != nil:
+				return call{action: "kinesis:DescribeStreamSummary", resource: k.streamARN(name)}.failure(err)
+			}
+			sum := res.StreamDescriptionSummary
+			k.learn(sum.StreamARN)
+			describe(p, sum)
+			if !isActive(sum) {
+				return check.Warn(targetNotActive.Fail())
+			}
+			if diff := differs(cfg, sum); diff != "" {
+				p.Param("differences", diff)
+				return check.Warn(targetDiffers.Fail())
+			}
+			p.Found("{target} is {status}, with {shards} open shards, {retention} of retention and {encryption}.")
+			return nil
+		},
 	}
+	if !cfg.createsStreams() {
+		c.Field = "createStreams"
+	}
+	return c
 }
 
 // creates says how the destination creates a stream.
@@ -284,9 +620,21 @@ func creates(cfg *DestinationConfig) string {
 	if cfg.StreamMode == streamProvisioned {
 		out = fmt.Sprintf("provisioned with %d shards", cfg.Shards)
 	}
-	out += fmt.Sprintf(", with %d hours' retention", max(cfg.RetentionHours, minRetentionHours))
+	out += ", with " + hours(max(cfg.RetentionHours, minRetentionHours)) + " of retention"
 	if cfg.KMSKeyID != "" {
 		return out + ", encrypted with kmsKeyId"
 	}
 	return out + ", unencrypted"
+}
+
+// createActions are the IAM actions creating a stream takes.
+func createActions(cfg *DestinationConfig) []string {
+	out := []string{"kinesis:CreateStream", "kinesis:DescribeStream", "kinesis:DescribeStreamSummary"}
+	if cfg.RetentionHours > minRetentionHours {
+		out = append(out, "kinesis:IncreaseStreamRetentionPeriod")
+	}
+	if cfg.KMSKeyID != "" {
+		out = append(out, "kinesis:StartStreamEncryption")
+	}
+	return out
 }

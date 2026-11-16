@@ -94,11 +94,6 @@ type Destination struct {
 	records, bytes *rate.Limiter
 }
 
-var (
-	_ destination.CheckReporter = (*Destination)(nil)
-	_ destination.Preflighter   = (*Destination)(nil)
-)
-
 func NewDestination(config []byte) (*Destination, error) {
 	var cfg DestinationConfig
 	if err := decodeConfig(config, &cfg); err != nil {
@@ -165,6 +160,8 @@ func (c *DestinationConfig) validate() error {
 	}
 	return nil
 }
+
+func (c *DestinationConfig) createsStreams() bool { return c.CreateStreams == nil || *c.CreateStreams }
 
 func (d *Destination) Capabilities() destination.Capabilities { return DestinationCapabilities }
 
@@ -338,7 +335,7 @@ func (w *writer) ensureStream(ctx context.Context, name string) error {
 	sum, err := w.cl.DescribeStreamSummary(ctx, &awskinesis.DescribeStreamSummaryInput{StreamName: aws.String(name)})
 	created := false
 	if apiCode(err) == "ResourceNotFoundException" {
-		if c := cfg.CreateStreams; c != nil && !*c {
+		if !cfg.createsStreams() {
 			return invalid(fmt.Errorf("kinesis: stream %s doesn't exist, and createStreams is off", name))
 		}
 		in := &awskinesis.CreateStreamInput{StreamName: aws.String(name), StreamModeDetails: &types.StreamModeDetails{StreamMode: types.StreamModeOnDemand}}
@@ -418,7 +415,7 @@ func differs(cfg *DestinationConfig, sum *types.StreamDescriptionSummary) string
 		}
 	}
 	if h := cfg.RetentionHours; h != 0 && aws.ToInt32(sum.RetentionPeriodHours) != h {
-		out = append(out, fmt.Sprintf("%dh retention, not %dh", aws.ToInt32(sum.RetentionPeriodHours), h))
+		out = append(out, fmt.Sprintf("%dh of retention, not %dh", aws.ToInt32(sum.RetentionPeriodHours), h))
 	}
 	if cfg.KMSKeyID != "" && (sum.EncryptionType != types.EncryptionTypeKms || aws.ToString(sum.KeyId) != cfg.KMSKeyID) {
 		out = append(out, "not encrypted with kmsKeyId")

@@ -167,14 +167,15 @@ func TestSourceConsumerLifecycle(t *testing.T) {
 			t.Errorf("consumer %s", consumer)
 		}
 	}
-	var r check.Report
-	s.Preflight(t.Context(), source.PreflightRequest{Pipeline: "orders", Streams: []source.ConfiguredStream{{Name: stream, SyncMode: source.Stream}}}, &r)
+	r := check.Run(t.Context(), s.Preflight(source.PreflightRequest{Pipeline: "orders", Streams: []source.ConfiguredStream{{Name: stream, SyncMode: source.Stream}}}))
 	if err := r.Err(); err != nil {
 		t.Fatalf("preflight: %v", err)
 	}
-	if it := items(&r)["stream."+stream+".consumer"]; it.Status != check.Passed || !strings.HasPrefix(it.Message, "Registered") {
+	got := itemsOf(r)
+	if it := wantItem(t, got, "stream."+check.Name(stream)+".consumer", check.Passed); it.Message != name+" is registered and active." {
 		t.Errorf("the registered consumer: %+v", it)
 	}
+	wantItem(t, got, "stream."+check.Name(stream)+".consumer-limit", check.Skipped)
 	for range 2 {
 		if err := s.Teardown(t.Context(), "orders"); err != nil {
 			t.Fatal(err)
@@ -186,52 +187,42 @@ func TestSourceConsumerLifecycle(t *testing.T) {
 	}
 }
 
-func items(r *check.Report) map[string]check.Item {
-	out := map[string]check.Item{}
-	for _, it := range r.Items() {
-		out[it.Name] = it
-	}
-	return out
-}
-
-func wantItem(t *testing.T, got map[string]check.Item, name string, status check.Status) check.Item {
-	t.Helper()
-	it, ok := got[name]
-	if !ok {
-		t.Errorf("no item %s", name)
-		return it
-	}
-	if it.Status != status {
-		t.Errorf("%s: %s (%s), want %s", name, it.Status, it.Message, status)
-	}
-	return it
-}
-
-// The source's check reaches Kinesis and finds streams to offer, and warns
-// when streams and streamPattern match none.
+// The source's check reaches Kinesis and finds streams to offer, warns when
+// streams and streamPattern match none, and fails fast when the endpoint
+// doesn't answer.
 func TestSourceCheck(t *testing.T) {
 	stream := uniq("chk")
 	createStream(t, stream, 1)
-	var r check.Report
-	newSource(t, map[string]any{"streams": []string{stream}}).CheckReport(t.Context(), &r)
-	got := items(&r)
-	wantItem(t, got, "connect", check.Passed)
-	wantItem(t, got, "streams", check.Passed)
+	r := check.Run(t.Context(), newSource(t, map[string]any{"streams": []string{stream}}).Checks())
+	got := itemsOf(r)
+	for _, n := range []string{"net.dns", "net.connect", "kinesis.sign-in", "streams.offered"} {
+		wantItem(t, got, n, check.Passed)
+	}
 	if r.Err() != nil {
 		t.Errorf("check: %v", r.Err())
 	}
-	r = check.Report{}
-	newSource(t, map[string]any{"streamPattern": "^nothing-matches-" + stream + "$"}).CheckReport(t.Context(), &r)
-	if it := wantItem(t, items(&r), "streams", check.Warning); it.Field != "streamPattern" {
+	r = check.Run(t.Context(), newSource(t, map[string]any{"streams": []string{stream, "missing-" + stream}}).Checks())
+	if it := wantItem(t, itemsOf(r), "streams.offered", check.Warning); it.Field != "streams" || !strings.Contains(it.Message, "missing-"+stream) {
+		t.Errorf("a stream that's missing: %+v", it)
+	}
+	r = check.Run(t.Context(), newSource(t, map[string]any{"streamPattern": "^nothing-matches-" + stream + "$"}).Checks())
+	if it := wantItem(t, itemsOf(r), "streams.offered", check.Warning); it.Field != "streamPattern" {
 		t.Errorf("field %q", it.Field)
 	}
 	if r.Err() != nil {
 		t.Errorf("a pattern that matches nothing fails: %v", r.Err())
 	}
-	r = check.Report{}
-	newSource(t, map[string]any{"endpoint": "http://127.0.0.1:1", "retry": map[string]any{"maxAttempts": 1}}).CheckReport(t.Context(), &r)
-	wantItem(t, items(&r), "connect", check.Failed)
+	start := time.Now()
+	r = check.Run(t.Context(), newSource(t, map[string]any{"endpoint": "http://127.0.0.1:1"}).Checks())
+	got = itemsOf(r)
+	if it := wantItem(t, got, "net.connect", check.Failed); it.Field != "endpoint" || it.Failure.Reason != "connection_refused" {
+		t.Errorf("unreachable: %+v", it)
+	}
+	wantItem(t, got, "kinesis.sign-in", check.Skipped)
 	wantCode(t, r.Err(), protocolv1.ErrorCode_ERROR_CODE_TRANSIENT)
+	if d := time.Since(start); d > 5*time.Second {
+		t.Errorf("an endpoint that refuses took %s", d)
+	}
 }
 
 // The source's preflight passes each stream that's there and readable,
@@ -244,51 +235,78 @@ func TestSourcePreflight(t *testing.T) {
 	missing, other := uniq("missing"), uniq("other")
 	createStream(t, other, 1)
 	s := newSource(t, map[string]any{"streams": []string{stream, missing, other}})
-	var r check.Report
-	s.Preflight(t.Context(), source.PreflightRequest{Pipeline: "p", Interval: 48 * time.Hour, Streams: []source.ConfiguredStream{
+	r := check.Run(t.Context(), s.Preflight(source.PreflightRequest{Pipeline: "p", Interval: 48 * time.Hour, Streams: []source.ConfiguredStream{
 		{Name: stream, SyncMode: source.Stream}, {Name: missing, SyncMode: source.Stream}, {Name: other, SyncMode: source.Incremental},
-	}}, &r)
-	got := items(&r)
-	for _, what := range []string{"describe", "status", "shards", "read"} {
-		wantItem(t, got, "stream."+stream+"."+what, check.Passed)
+	}}))
+	got := itemsOf(r)
+	base := func(n string) string { return "stream." + check.Name(n) }
+	for _, what := range []string{"mode", "describe", "shards", "read"} {
+		wantItem(t, got, base(stream)+"."+what, check.Passed)
 	}
-	wantItem(t, got, "stream."+stream+".schedule", check.Warning)
-	if it := wantItem(t, got, "stream."+missing+".describe", check.Failed); it.Field != "streams" || it.Fix == "" {
-		t.Errorf("missing stream: field %q, fix %q", it.Field, it.Fix)
+	wantItem(t, got, base(stream)+".schedule", check.Warning)
+	if it := wantItem(t, got, base(missing)+".describe", check.Failed); it.Field != "streams" || it.Failure == nil || it.Failure.Fix == "" {
+		t.Errorf("missing stream: %+v", it)
 	}
-	wantItem(t, got, "stream."+other+".mode", check.Failed)
+	wantItem(t, got, base(other)+".mode", check.Failed)
+	wantItem(t, got, base(other)+".describe", check.Skipped)
 	wantCode(t, r.Err(), protocolv1.ErrorCode_ERROR_CODE_CONFIG_INVALID)
 
-	r = check.Report{}
 	old := time.Now().Add(-30 * 24 * time.Hour).UTC().Format(time.RFC3339)
 	efo := newSource(t, map[string]any{"streams": []string{stream}, "startPosition": "timestamp", "startTimestamp": old, "consumer": map[string]any{"type": "efo"}})
-	efo.Preflight(t.Context(), source.PreflightRequest{Pipeline: "p", Continuous: true, Streams: []source.ConfiguredStream{{Name: stream, SyncMode: source.Stream}}}, &r)
-	got = items(&r)
-	wantItem(t, got, "stream."+stream+".start", check.Warning)
-	if _, ok := got["stream."+stream+".schedule"]; ok {
+	r = check.Run(t.Context(), efo.Preflight(source.PreflightRequest{Pipeline: "p", Continuous: true, Streams: []source.ConfiguredStream{{Name: stream, SyncMode: source.Stream}}}))
+	got = itemsOf(r)
+	wantItem(t, got, "start-timestamp", check.Passed)
+	wantItem(t, got, base(stream)+".start", check.Warning)
+	if _, ok := got[base(stream)+".schedule"]; ok {
 		t.Error("a continuous pipeline's schedule outruns retention")
 	}
-	wantItem(t, got, "stream."+stream+".consumer", check.Passed)
-	wantItem(t, got, "stream."+stream+".subscribe", check.Skipped)
+	wantItem(t, got, base(stream)+".consumer", check.Passed)
+	wantItem(t, got, base(stream)+".consumer-limit", check.Passed)
+	wantItem(t, got, base(stream)+".subscribe", check.Skipped)
 	if r.Err() != nil {
 		t.Errorf("preflight: %v", r.Err())
 	}
 
-	// A stream with Kinesis's 20 consumers has no room for the pipeline's.
+	// Once the pipeline's consumer is one of a stream's 20, it takes no new
+	// place. A stream with 20 others may have no room for it: a warning.
 	cl := client(t)
 	sum, err := cl.DescribeStreamSummary(t.Context(), &awskinesis.DescribeStreamSummaryInput{StreamName: aws.String(other)})
 	if err != nil {
 		t.Fatal(err)
 	}
-	for i := range efoConsumersPerStream {
-		if _, err := cl.RegisterStreamConsumer(t.Context(), &awskinesis.RegisterStreamConsumerInput{StreamARN: sum.StreamDescriptionSummary.StreamARN, ConsumerName: aws.String("c" + strconv.Itoa(i))}); err != nil {
+	arn := aws.ToString(sum.StreamDescriptionSummary.StreamARN)
+	for i := range consumerLimit - 1 {
+		if _, err := cl.RegisterStreamConsumer(t.Context(), &awskinesis.RegisterStreamConsumerInput{StreamARN: aws.String(arn), ConsumerName: aws.String("c" + strconv.Itoa(i))}); err != nil {
 			t.Fatal(err)
 		}
 	}
-	r = check.Report{}
-	efo.Preflight(t.Context(), source.PreflightRequest{Pipeline: "p", Streams: []source.ConfiguredStream{{Name: other, SyncMode: source.Stream}}}, &r)
-	wantItem(t, items(&r), "stream."+other+".consumer", check.Failed)
-	wantCode(t, r.Err(), protocolv1.ErrorCode_ERROR_CODE_CONFIG_INVALID)
+	preflightOther := func() map[string]check.Item {
+		return itemsOf(check.Run(t.Context(), efo.Preflight(source.PreflightRequest{Pipeline: "p", Streams: []source.ConfiguredStream{{Name: other, SyncMode: source.Stream}}})))
+	}
+	wantItem(t, preflightOther(), base(other)+".consumer-limit", check.Passed)
+	name, err := efo.cfg.consumerName("p")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := efo.register(t.Context(), cl, arn, name); err != nil {
+		t.Fatal(err)
+	}
+	got = preflightOther()
+	wantItem(t, got, base(other)+".consumer", check.Passed)
+	wantItem(t, got, base(other)+".consumer-limit", check.Skipped)
+	if err := efo.deregister(t.Context(), cl, arn, name); err != nil {
+		t.Fatal(err)
+	}
+	await(t, name+" to be gone", func() bool {
+		_, err := cl.DescribeStreamConsumer(t.Context(), &awskinesis.DescribeStreamConsumerInput{StreamARN: aws.String(arn), ConsumerName: aws.String(name)})
+		return apiCode(err) == "ResourceNotFoundException"
+	})
+	if _, err := cl.RegisterStreamConsumer(t.Context(), &awskinesis.RegisterStreamConsumerInput{StreamARN: aws.String(arn), ConsumerName: aws.String("c-last")}); err != nil {
+		t.Fatal(err)
+	}
+	if it := wantItem(t, preflightOther(), base(other)+".consumer-limit", check.Warning); it.Failure == nil || it.Failure.Reason != "consumer_limit" {
+		t.Errorf("full: %+v", it)
+	}
 }
 
 // A stream the destination creates gets the config's capacity mode, shards
@@ -338,17 +356,16 @@ func TestDestinationPreflight(t *testing.T) {
 		Streams: []destination.Stream{{Name: "public.old", Mode: destination.Append, PrimaryKey: []string{"id"}}, {Name: "public.new", Mode: destination.Append}},
 		Schemas: map[string]*arrow.Schema{"public.old": schemaOf("old"), "public.new": schemaOf("new")},
 	}
-	var r check.Report
-	d.Preflight(t.Context(), req, &r)
-	got := items(&r)
-	if it := wantItem(t, got, "stream.public.old.target", check.Warning); !strings.Contains(it.Message, "1 open shards, not 3") {
+	r := check.Run(t.Context(), d.Preflight(req))
+	got := itemsOf(r)
+	if it := wantItem(t, got, "stream.public-old.target", check.Warning); !strings.Contains(it.Message, "1 open shards, not 3") {
 		t.Errorf("old: %s", it.Message)
 	}
-	if it := wantItem(t, got, "stream.public.new.target", check.Skipped); !strings.Contains(it.Message, "provisioned with 3 shards, with 48 hours' retention") || !strings.Contains(it.Fix, "kinesis:CreateStream") || !strings.Contains(it.Fix, "stream/"+ns+".new") {
+	if it := wantItem(t, got, "stream.public-new.target", check.Skipped); !strings.Contains(it.Message, "provisioned with 3 shards, with 48 hours of retention") || !strings.Contains(it.Message, "kinesis:CreateStream") || !strings.Contains(it.Message, "stream/"+ns+".new") {
 		t.Errorf("new: %+v", it)
 	}
-	wantItem(t, got, "stream.public.old.keys", check.Passed)
-	wantItem(t, got, "stream.public.new.keys", check.Passed)
+	wantItem(t, got, "stream.public-old.keys", check.Passed)
+	wantItem(t, got, "stream.public-new.keys", check.Passed)
 	wantItem(t, got, "put", check.Skipped)
 	if r.Err() != nil {
 		t.Errorf("preflight: %v", r.Err())
@@ -356,13 +373,12 @@ func TestDestinationPreflight(t *testing.T) {
 
 	off := newDest(t, map[string]any{"createStreams": false, "partitionKey": map[string]any{"mode": "fields", "fields": []string{"nope"}}})
 	req.Streams[0].Mode = destination.Merge
-	r = check.Report{}
-	off.Preflight(t.Context(), req, &r)
-	got = items(&r)
-	wantItem(t, got, "stream.public.old.mode", check.Failed)
-	wantItem(t, got, "stream.public.old.keys", check.Failed)
-	wantItem(t, got, "stream.public.old.target", check.Warning)
-	wantItem(t, got, "stream.public.new.target", check.Failed)
+	r = check.Run(t.Context(), off.Preflight(req))
+	got = itemsOf(r)
+	wantItem(t, got, "stream.public-old.mode", check.Failed)
+	wantItem(t, got, "stream.public-old.keys", check.Failed)
+	wantItem(t, got, "stream.public-old.target", check.Warning)
+	wantItem(t, got, "stream.public-new.target", check.Failed)
 	wantCode(t, r.Err(), protocolv1.ErrorCode_ERROR_CODE_CONFIG_INVALID)
 }
 

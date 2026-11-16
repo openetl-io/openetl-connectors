@@ -107,11 +107,9 @@ type Source struct {
 }
 
 var (
-	_ source.Source        = (*Source)(nil)
-	_ source.CheckReporter = (*Source)(nil)
-	_ source.Preflighter   = (*Source)(nil)
-	_ source.Splitter      = (*Source)(nil)
-	_ source.Teardowner    = (*Source)(nil)
+	_ source.Source     = (*Source)(nil)
+	_ source.Splitter   = (*Source)(nil)
+	_ source.Teardowner = (*Source)(nil)
 )
 
 func NewSource(config []byte) (*Source, error) {

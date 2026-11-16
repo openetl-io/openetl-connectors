@@ -160,8 +160,18 @@ func decodeConfig(config []byte, v any) error {
 }
 
 func (c *Connection) client(ctx context.Context) (*awskinesis.Client, error) {
+	cl, _, err := c.clientWith(ctx, 0)
+	return cl, err
+}
+
+// clientWith is a client and its AWS config, whose calls try at most
+// attempts times; 0: retry.maxAttempts.
+func (c *Connection) clientWith(ctx context.Context, attempts int) (*awskinesis.Client, aws.Config, error) {
 	rc := c.Retry
 	rc.defaults()
+	if attempts > 0 {
+		rc.MaxAttempts = min(rc.MaxAttempts, attempts)
+	}
 	opts := []func(*awsconfig.LoadOptions) error{
 		awsconfig.WithRetryer(func() aws.Retryer {
 			return retry.NewStandard(func(o *retry.StandardOptions) {
@@ -182,60 +192,13 @@ func (c *Connection) client(ctx context.Context) (*awskinesis.Client, error) {
 	}
 	ac, err := awsconfig.LoadDefaultConfig(ctx, opts...)
 	if err != nil {
-		return nil, fmt.Errorf("kinesis: AWS config: %w", err)
+		return nil, aws.Config{}, fmt.Errorf("kinesis: AWS config: %w", err)
 	}
 	return awskinesis.NewFromConfig(ac, func(o *awskinesis.Options) {
 		if c.Endpoint != "" {
 			o.BaseEndpoint = aws.String(c.Endpoint)
 		}
-	}), nil
-}
-
-// connect checks the credentials reach Kinesis, and the schema registry if
-// there is one. It reports whether Kinesis was reached.
-func connect(ctx context.Context, c *Connection, cl *awskinesis.Client, r *check.Report) bool {
-	ok := r.Run("connect", "Reach Kinesis and list streams", func() error {
-		_, err := cl.ListStreams(ctx, &awskinesis.ListStreamsInput{Limit: aws.Int32(1)})
-		return allow(classify(wrap("list streams", err)), "kinesis:ListStreams", "*")
-	}, check.Field("region"))
-	reg, err := c.Registry()
-	switch {
-	case err != nil:
-		r.Fail("schema-registry", "Reach the schema registry", invalid(err), check.Field("schemaRegistryUrl"))
-	case reg != nil:
-		r.Run("schema-registry", "Reach the schema registry and list its subjects", func() error {
-			if _, err := reg.Subjects(ctx); err != nil {
-				return check.Fix(fmt.Errorf("kinesis: schema registry: %w", err), "Check schemaRegistryUrl, and the user and password if the registry needs them.")
-			}
-			return nil
-		}, check.Field("schemaRegistryUrl"))
-	}
-	return ok
-}
-
-// wrap names what failed, or is nil.
-func wrap(what string, err error) error {
-	if err == nil {
-		return nil
-	}
-	return fmt.Errorf("kinesis: %s: %w", what, err)
-}
-
-// allow says what to do about a classified error: the action to allow on
-// resource for a permission failure, or what else to check.
-func allow(err error, action, resource string) error {
-	if err == nil {
-		return nil
-	}
-	switch codeOf(err) {
-	case protocolv1.ErrorCode_ERROR_CODE_PERMISSION_DENIED:
-		return check.Fix(err, fmt.Sprintf("Allow %s on %s in the IAM policy of the credentials, or of the role in aws.role.", action, resource))
-	case protocolv1.ErrorCode_ERROR_CODE_AUTH_INVALID, protocolv1.ErrorCode_ERROR_CODE_AUTH_EXPIRED:
-		return check.Fix(err, "Check accessKeyId and secretAccessKey, or the role in aws.role, and the region.")
-	case protocolv1.ErrorCode_ERROR_CODE_TRANSIENT:
-		return check.Fix(err, "Check that the runner reaches Kinesis in the region, or endpoint if it's set.")
-	}
-	return err
+	}), ac, nil
 }
 
 func codeOf(err error) protocolv1.ErrorCode {
@@ -248,29 +211,76 @@ func codeOf(err error) protocolv1.ErrorCode {
 	return protocolv1.ErrorCode_ERROR_CODE_UNSPECIFIED
 }
 
+// AWS error codes that mean a call was refused for want of an IAM
+// permission.
+func accessDenied(code string) bool {
+	return code == "AccessDeniedException" || code == "AccessDenied"
+}
+
+// awsReasons are the reasons of Kinesis's error codes that mean the same
+// whatever the call: a failed check's, and in their Code, a read's or a
+// write's. Access denied, which names an action, isn't here.
+var awsReasons = map[string]check.Reason{
+	"UnrecognizedClientException": credentialsRejected,
+	"InvalidSignatureException":   credentialsRejected,
+	"IncompleteSignature":         credentialsRejected,
+	"MissingAuthenticationToken":  credentialsRejected,
+	"InvalidClientTokenId":        credentialsRejected,
+	"ExpiredTokenException":       check.CredentialsExpired,
+	"ExpiredToken":                check.CredentialsExpired,
+
+	"ProvisionedThroughputExceededException": check.RateLimited,
+	"LimitExceededException":                 check.RateLimited,
+	"ThrottlingException":                    check.RateLimited,
+	"KMSThrottlingException":                 check.RateLimited,
+
+	"KMSAccessDeniedException":  kmsDenied,
+	"KMSDisabledException":      kmsUnusable,
+	"KMSInvalidStateException":  kmsUnusable,
+	"KMSNotFoundException":      kmsUnusable,
+	"KMSOptInRequired":          kmsUnusable,
+	"ResourceNotFoundException": check.NotFound,
+
+	"InternalFailure":          check.Unavailable,
+	"InternalFailureException": check.Unavailable,
+	"ServiceUnavailable":       check.Unavailable,
+}
+
+var (
+	credentialsRejected = check.Reason{
+		Name:    check.CredentialsRejected.Name,
+		Code:    check.CredentialsRejected.Code,
+		Message: "AWS rejected the credentials.",
+		Fix:     "Check accessKeyId and secretAccessKey, or the IAM role in the source's or destination's aws.role. In a Region that's opt-in, also check that the account has it enabled.",
+	}
+	kmsDenied = check.Reason{
+		Name:    check.PrivilegeMissing.Name,
+		Code:    check.PrivilegeMissing.Code,
+		Message: "Kinesis can't use the stream's KMS key for the connector's AWS identity.",
+		Fix:     "Allow {kms_action} on the stream's KMS key, in the key's policy or in an IAM policy of the connector's identity.",
+	}
+	kmsUnusable = check.Reason{
+		Name:    "kms_key_unusable",
+		Code:    protocolv1.ErrorCode_ERROR_CODE_CONFIG_INVALID,
+		Message: "The KMS key that encrypts the stream can't be used: it's disabled, pending deletion, or gone.",
+		Fix:     "Enable the stream's KMS key in AWS KMS, or encrypt the stream with a key that's enabled.",
+	}
+)
+
 // classify gives Kinesis's errors their taxonomy codes.
 func classify(err error) error {
+	if err == nil {
+		return nil
+	}
 	if _, ok := errors.AsType[net.Error](err); ok && !errors.Is(err, context.Canceled) {
 		return sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_TRANSIENT, err)
 	}
-	var ae smithy.APIError
-	if err == nil || !errors.As(err, &ae) {
-		return err
+	code := apiCode(err)
+	if accessDenied(code) {
+		return sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_PERMISSION_DENIED, err)
 	}
-	code := func(c protocolv1.ErrorCode) error { return sdk.WithCode(c, err) }
-	switch ae.ErrorCode() {
-	case "AccessDeniedException", "KMSAccessDeniedException":
-		return code(protocolv1.ErrorCode_ERROR_CODE_PERMISSION_DENIED)
-	case "UnrecognizedClientException", "InvalidSignatureException", "IncompleteSignature", "MissingAuthenticationToken", "InvalidClientTokenId":
-		return code(protocolv1.ErrorCode_ERROR_CODE_AUTH_INVALID)
-	case "ExpiredTokenException", "ExpiredToken":
-		return code(protocolv1.ErrorCode_ERROR_CODE_AUTH_EXPIRED)
-	case "ProvisionedThroughputExceededException", "LimitExceededException", "ThrottlingException", "KMSThrottlingException":
-		return code(protocolv1.ErrorCode_ERROR_CODE_RATE_LIMITED)
-	case "ResourceNotFoundException":
-		return code(protocolv1.ErrorCode_ERROR_CODE_CONFIG_INVALID)
-	case "InternalFailure", "ServiceUnavailable":
-		return code(protocolv1.ErrorCode_ERROR_CODE_TRANSIENT)
+	if r, ok := awsReasons[code]; ok {
+		return sdk.WithCode(r.Code, err)
 	}
 	return err
 }
@@ -288,6 +298,14 @@ func apiCode(err error) string {
 	var ae smithy.APIError
 	if errors.As(err, &ae) {
 		return ae.ErrorCode()
+	}
+	return ""
+}
+
+func apiMessage(err error) string {
+	var ae smithy.APIError
+	if errors.As(err, &ae) {
+		return ae.ErrorMessage()
 	}
 	return ""
 }
