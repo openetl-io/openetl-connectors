@@ -10,7 +10,6 @@ import (
 	"slices"
 	"strconv"
 	"strings"
-	"sync"
 
 	"github.com/ClickHouse/clickhouse-go/v2/lib/driver"
 	"github.com/apache/arrow-go/v18/arrow"
@@ -18,6 +17,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/extensions"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 
+	"github.com/openetl-io/openetl-connectors/keysplit"
 	sdk "github.com/openetl-io/openetl/sdk/go"
 	protocolv1 "github.com/openetl-io/openetl/sdk/go/protocol/v1"
 	"github.com/openetl-io/openetl/sdk/go/source"
@@ -49,9 +49,7 @@ type SourceConfig struct {
 type Source struct {
 	cfg SourceConfig
 
-	mu sync.Mutex
-	// The keyed splits being read, which Resplit splits.
-	reading map[readingKey]*readingSplit
+	keysplit.Reads
 }
 
 var _ source.Source = (*Source)(nil)
@@ -471,8 +469,8 @@ func (r *tableRead) chunks(ctx context.Context, st sourceState, order []int, con
 	keyed := len(r.t.key) > 0
 	// The position follows the key only where it's the order's first column.
 	positioned := keyed && order[0] == r.t.key[0]
-	reading := r.s.startSplit(r.t.name, r.id)
-	defer r.s.endSplit(r.t.name, r.id)
+	reading := r.s.Start(r.t.name, r.id, true)
+	defer r.s.End(r.t.name, r.id)
 	for {
 		where := slices.Clone(conds)
 		if keyed {

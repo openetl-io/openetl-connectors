@@ -9,7 +9,6 @@ import (
 	"maps"
 	"slices"
 	"strings"
-	"sync"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
@@ -20,6 +19,7 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 	"golang.org/x/sync/errgroup"
 
+	"github.com/openetl-io/openetl-connectors/keysplit"
 	sdk "github.com/openetl-io/openetl/sdk/go"
 	protocolv1 "github.com/openetl-io/openetl/sdk/go/protocol/v1"
 	"github.com/openetl-io/openetl/sdk/go/source"
@@ -56,8 +56,7 @@ type Source struct {
 	// From uri, as parsed when the source was made.
 	opts *options.ClientOptions
 
-	mu      sync.Mutex
-	reading map[readingKey]*readingSplit
+	keysplit.Reads
 }
 
 var (
@@ -358,10 +357,10 @@ func (s *Source) readSplit(ctx context.Context, db *mongo.Database, cs source.Co
 	}
 	b := s.newBatcher(cs, cols, false)
 	defer b.release()
-	var r *readingSplit
+	var r *keysplit.Reading
 	if until == nil {
-		r = s.startSplit(cs.Name, sp.ID)
-		defer s.endSplit(cs.Name, sp.ID)
+		r = s.Start(cs.Name, sp.ID, true)
+		defer s.End(cs.Name, sp.ID)
 	}
 	for {
 		hi := st.Hi
@@ -398,7 +397,7 @@ func (s *Source) readSplit(ctx context.Context, db *mongo.Database, cs source.Co
 		}
 	}
 	if r != nil {
-		r.over.Store(true)
+		r.Over.Store(true)
 	}
 	if until != nil {
 		return s.endAt(ctx, coll, filter, until.After, sp.Until, b, "", seq{}, out)

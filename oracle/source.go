@@ -19,6 +19,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	go_ora "github.com/sijms/go-ora/v2"
 
+	"github.com/openetl-io/openetl-connectors/keysplit"
 	sdk "github.com/openetl-io/openetl/sdk/go"
 	"github.com/openetl-io/openetl/sdk/go/source"
 )
@@ -55,9 +56,7 @@ type Source struct {
 	// The dsn's host:port, empty if it names none; its user and service.
 	addr, user, service string
 
-	mu sync.Mutex
-	// The keyed splits being read, which Resplit splits.
-	reading map[readingKey]*readingSplit
+	keysplit.Reads
 }
 
 var _ source.Source = (*Source)(nil)
@@ -708,8 +707,8 @@ func (r *tableReader) readTable(ctx context.Context, id string, st sourceState) 
 		return fmt.Errorf("oracle: %s state has %d key columns, the table has %d", r.t.name, len(st.After), len(r.t.key))
 	}
 	st = sourceState{After: st.After, keyRange: st.keyRange}
-	reading := r.s.startSplit(r.t.name, id)
-	defer r.s.endSplit(r.t.name, id)
+	reading := r.s.Start(r.t.name, id, true)
+	defer r.s.End(r.t.name, id)
 	for {
 		n, last, err := r.query(ctx, r.t.key, func(w *where) error { return st.where(r.t.cols[r.t.key[0]], w) }, st.After)
 		if err != nil {
@@ -768,8 +767,8 @@ func (r *tableReader) readIncremental(ctx context.Context, id, cursor string, st
 	if st.After != nil && len(st.After) != len(order) {
 		return fmt.Errorf("oracle: %s state has %d cursor and key columns, the read has %d", r.t.name, len(st.After), len(order))
 	}
-	reading := r.s.startSplit(r.t.name, id)
-	defer r.s.endSplit(r.t.name, id)
+	reading := r.s.Start(r.t.name, id, true)
+	defer r.s.End(r.t.name, id)
 	for {
 		conds := func(w *where) error {
 			if err := bounds(w); err != nil {

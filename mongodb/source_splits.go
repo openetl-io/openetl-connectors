@@ -8,11 +8,11 @@ import (
 	"fmt"
 	"slices"
 	"strconv"
-	"sync/atomic"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 
+	"github.com/openetl-io/openetl-connectors/keysplit"
 	"github.com/openetl-io/openetl/sdk/go/source"
 )
 
@@ -151,51 +151,11 @@ func aggregateIDs(ctx context.Context, coll *mongo.Collection, pipeline mongo.Pi
 // at MinKey or MaxKey.
 func bound(v *value) bool { return v.Type != bson.TypeMinKey && v.Type != bson.TypeMaxKey }
 
-type readingKey struct{ stream, split string }
-
-// readingSplit is a split being read.
-type readingSplit struct {
-	// Resplit asked, and the split's next resume point answers.
-	asked atomic.Bool
-	// It can't be split: Resplit refuses.
-	over atomic.Bool
-}
-
-func (s *Source) startSplit(stream, id string) *readingSplit {
-	r := &readingSplit{}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.reading == nil {
-		s.reading = map[readingKey]*readingSplit{}
-	}
-	s.reading[readingKey{stream, id}] = r
-	return r
-}
-
-func (s *Source) endSplit(stream, id string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	delete(s.reading, readingKey{stream, id})
-}
-
-// Resplit asks a split being read to split its remainder at its next resume
-// point, which works out where. It refuses a split it knows it can't split,
-// or that's already been asked.
-func (s *Source) Resplit(_ context.Context, stream, split string) (bool, error) {
-	s.mu.Lock()
-	r := s.reading[readingKey{stream, split}]
-	s.mu.Unlock()
-	if r == nil || r.over.Load() {
-		return false, nil
-	}
-	return r.asked.CompareAndSwap(false, true), nil
-}
-
 // resplit runs at each resume point of a split. If it was asked, it divides
 // what's left of the range at the median of a sample of the _ids in it:
 // st keeps the lower part, and the split to add takes the upper.
-func (s *Source) resplit(ctx context.Context, coll *mongo.Collection, r *readingSplit, st *readState) ([]source.Split, error) {
-	if !r.asked.Swap(false) {
+func (s *Source) resplit(ctx context.Context, coll *mongo.Collection, r *keysplit.Reading, st *readState) ([]source.Split, error) {
+	if !r.Asked.Swap(false) {
 		return nil, nil
 	}
 	ids, err := sampleIDs(ctx, coll, 1000, st.After, st.Hi)
@@ -204,7 +164,7 @@ func (s *Source) resplit(ctx context.Context, coll *mongo.Collection, r *reading
 	}
 	ids = slices.DeleteFunc(ids, func(v *value) bool { return !bound(v) })
 	if len(ids) == 0 {
-		r.over.Store(true)
+		r.Over.Store(true)
 		return nil, nil
 	}
 	mid := ids[len(ids)/2]

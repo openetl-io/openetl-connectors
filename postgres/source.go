@@ -17,6 +17,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/openetl-io/openetl-connectors/keysplit"
 	sdk "github.com/openetl-io/openetl/sdk/go"
 	"github.com/openetl-io/openetl/sdk/go/source"
 )
@@ -66,8 +67,7 @@ type Source struct {
 	mu sync.Mutex
 	// The cdc read running, which Committed acknowledges on.
 	reader *cdcReader
-	// The keyed splits being read, which Resplit splits.
-	reading map[readingKey]*readingSplit
+	keysplit.Reads
 }
 
 var _ source.Source = (*Source)(nil)
@@ -520,8 +520,8 @@ func (s *Source) readTable(ctx context.Context, conn *pgx.Conn, t table, id stri
 	if u != nil && u.After == nil {
 		return u.end(out)
 	}
-	reading := s.startSplit(t.name, id, u == nil)
-	defer s.endSplit(t.name, id)
+	reading := s.Start(t.name, id, u == nil)
+	defer s.End(t.name, id)
 	for {
 		var args []string
 		arg := func(v string) string {
@@ -683,8 +683,8 @@ func (s *Source) readIncremental(ctx context.Context, conn *pgx.Conn, t table, i
 		return u.end(out)
 	}
 	first := pgx.Identifier{t.cols[t.order[0]].name}.Sanitize()
-	reading := s.startSplit(t.name, id, u == nil)
-	defer s.endSplit(t.name, id)
+	reading := s.Start(t.name, id, u == nil)
+	defer s.End(t.name, id)
 	for {
 		where := []string{bounds()}
 		where = append(where, st.where(first, arg)...)

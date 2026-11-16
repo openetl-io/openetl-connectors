@@ -11,8 +11,8 @@ import (
 	"math/big"
 	"strconv"
 	"strings"
-	"sync/atomic"
 
+	"github.com/openetl-io/openetl-connectors/keysplit"
 	"github.com/openetl-io/openetl/sdk/go/source"
 )
 
@@ -90,7 +90,7 @@ func (s *Source) Splits(ctx context.Context, cs source.ConfiguredStream, ended [
 		if ci, err = cursorColumn(t, cs.Cursor); err != nil {
 			return nil, err
 		}
-		if st.Since, err = floorOf(cs.Name, ended); err != nil {
+		if st.Since, err = keysplit.Floor("oracle", cs.Name, ended); err != nil {
 			return nil, err
 		}
 	}
@@ -126,24 +126,6 @@ func (s *Source) Splits(ctx context.Context, cs source.ConfiguredStream, ended [
 		splits[i] = source.Split{ID: strconv.Itoa(i), State: state}
 	}
 	return splits, nil
-}
-
-// floorOf is the floor an incremental read starts from, where its last read's
-// splits ended: one floor, which each of them carries.
-func floorOf(stream string, ended []source.Split) (*string, error) {
-	for _, sp := range ended {
-		if sp.State == nil {
-			continue
-		}
-		var st sourceState
-		if err := json.Unmarshal(sp.State, &st); err != nil {
-			return nil, fmt.Errorf("oracle: %s state: %w", stream, err)
-		}
-		if st.Since != nil {
-			return st.Since, nil
-		}
-	}
-	return nil, nil
 }
 
 // keyRanges divides a table into contiguous ranges of its key's first
@@ -220,46 +202,6 @@ func extent(ctx context.Context, conn *sql.Conn, schema string, t table) (low, h
 	return low, high, err
 }
 
-type readingKey struct{ stream, split string }
-
-// readingSplit is a keyed split being read.
-type readingSplit struct {
-	// Resplit asked, and the split's next resume point answers.
-	asked atomic.Bool
-	// It can't be split: Resplit refuses.
-	over atomic.Bool
-}
-
-func (s *Source) startSplit(stream, id string) *readingSplit {
-	r := &readingSplit{}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.reading == nil {
-		s.reading = map[readingKey]*readingSplit{}
-	}
-	s.reading[readingKey{stream, id}] = r
-	return r
-}
-
-func (s *Source) endSplit(stream, id string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	delete(s.reading, readingKey{stream, id})
-}
-
-// Resplit asks a keyed split being read to split its remainder at its next
-// resume point, which works out where. It refuses a split it knows it can't
-// split, or that's already been asked.
-func (s *Source) Resplit(_ context.Context, stream, split string) (bool, error) {
-	s.mu.Lock()
-	r := s.reading[readingKey{stream, split}]
-	s.mu.Unlock()
-	if r == nil || r.over.Load() {
-		return false, nil
-	}
-	return r.asked.CompareAndSwap(false, true), nil
-}
-
 // position is where a key-ordered read has reached in the key's first column,
 // nil before its first row.
 func (st sourceState) position() *string {
@@ -275,31 +217,31 @@ func (st sourceState) position() *string {
 // split to add takes the upper. pos is st's position, if it says how far the
 // key has been read; keep has the new split keep st's position, where rows of
 // any key can follow it. ended: the chunk was its last.
-func (s *Source) resplit(ctx context.Context, conn *sql.Conn, schema string, t table, r *readingSplit, st *sourceState, ended bool, pos *string, keep bool) ([]source.Split, error) {
+func (s *Source) resplit(ctx context.Context, conn *sql.Conn, schema string, t table, r *keysplit.Reading, st *sourceState, ended bool, pos *string, keep bool) ([]source.Split, error) {
 	if ended || !splittable(t) {
-		r.over.Store(true)
+		r.Over.Store(true)
 		return nil, nil
 	}
 	low, high, err := remainder(st.keyRange, pos, len(t.key) == 1)
 	if err != nil {
 		return nil, err
 	}
-	if !r.asked.Swap(false) {
+	if !r.Asked.Swap(false) {
 		if low != nil && high != nil && low.Cmp(high) >= 0 {
-			r.over.Store(true)
+			r.Over.Store(true)
 		}
 		return nil, nil
 	}
 	if low == nil || high == nil {
 		least, most, err := extent(ctx, conn, schema, t)
 		if err != nil || least == nil {
-			r.over.Store(least == nil)
+			r.Over.Store(least == nil)
 			return nil, err
 		}
 		low, high = cmp.Or(low, least), cmp.Or(high, most)
 	}
 	if low.Cmp(high) >= 0 {
-		r.over.Store(true)
+		r.Over.Store(true)
 		return nil, nil
 	}
 	m := new(big.Int).Sub(high, low)

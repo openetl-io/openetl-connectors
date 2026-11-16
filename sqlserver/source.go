@@ -17,6 +17,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/decimal128"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 
+	"github.com/openetl-io/openetl-connectors/keysplit"
 	sdk "github.com/openetl-io/openetl/sdk/go"
 	"github.com/openetl-io/openetl/sdk/go/source"
 )
@@ -59,9 +60,7 @@ type Source struct {
 	cfg SourceConfig
 	db  *sql.DB
 
-	mu sync.Mutex
-	// The keyed splits being read, which Resplit splits.
-	reading map[readingKey]*readingSplit
+	keysplit.Reads
 }
 
 var _ source.Source = (*Source)(nil)
@@ -438,8 +437,8 @@ func (r *tableRead) full(ctx context.Context, st sourceState) error {
 		return fmt.Errorf("sqlserver: %s state has %d key columns, the table has %d", r.t.name, len(st.After), len(keys))
 	}
 	st = sourceState{After: st.After, keyRange: st.keyRange}
-	reading := r.s.startSplit(r.t.name, r.id)
-	defer r.s.endSplit(r.t.name, r.id)
+	reading := r.s.Start(r.t.name, r.id, true)
+	defer r.s.End(r.t.name, r.id)
 	for {
 		var a args
 		where := st.where(keys[0], keyRefs[0], &a)
@@ -585,8 +584,8 @@ func (r *tableRead) incremental(ctx context.Context, cursor string, st sourceSta
 		return fmt.Errorf("sqlserver: %s state has %d cursor and key columns, the read has %d", r.t.name, len(st.After), len(order))
 	}
 	first := r.t.cols[r.t.key[0]]
-	reading := r.s.startSplit(r.t.name, r.id)
-	defer r.s.endSplit(r.t.name, r.id)
+	reading := r.s.Start(r.t.name, r.id, true)
+	defer r.s.End(r.t.name, r.id)
 	for {
 		var a args
 		where := []string{bounds(&a)}

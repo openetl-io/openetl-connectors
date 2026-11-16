@@ -20,6 +20,7 @@ import (
 	"github.com/go-sql-driver/mysql"
 	"golang.org/x/text/encoding"
 
+	"github.com/openetl-io/openetl-connectors/keysplit"
 	sdk "github.com/openetl-io/openetl/sdk/go"
 	"github.com/openetl-io/openetl/sdk/go/source"
 )
@@ -59,9 +60,7 @@ type Source struct {
 	cfg  SourceConfig
 	conn *mysql.Config
 
-	mu sync.Mutex
-	// The keyed splits being read, which Resplit splits.
-	reading map[readingKey]*readingSplit
+	keysplit.Reads
 }
 
 var _ source.Source = (*Source)(nil)
@@ -597,8 +596,8 @@ func (r *tableReader) readTable(ctx context.Context, id string, st sourceState) 
 		return fmt.Errorf("mysql: %s state has %d key columns, the table has %d", r.t.name, len(st.After), len(key))
 	}
 	st = sourceState{After: st.After, keyRange: st.keyRange}
-	reading := r.s.startSplit(r.t.name, id)
-	defer r.s.endSplit(r.t.name, id)
+	reading := r.s.Start(r.t.name, id, true)
+	defer r.s.End(r.t.name, id)
 	for {
 		var w where
 		if err := st.where(keyCols[0], &w); err != nil {
@@ -702,8 +701,8 @@ func (r *tableReader) readIncremental(ctx context.Context, id, cursor string, st
 		return fmt.Errorf("mysql: %s state has %d cursor and key columns, the read has %d", r.t.name, len(st.After), len(order))
 	}
 	orderCols := r.cols(order)
-	reading := r.s.startSplit(r.t.name, id)
-	defer r.s.endSplit(r.t.name, id)
+	reading := r.s.Start(r.t.name, id, true)
+	defer r.s.End(r.t.name, id)
 	for {
 		var w where
 		if err := bounds(&w); err != nil {
