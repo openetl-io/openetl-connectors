@@ -7,6 +7,10 @@ import (
 	"encoding/json"
 	"errors"
 	"maps"
+	"net/http"
+	"net/http/httptest"
+	"net/http/httputil"
+	"net/url"
 	"testing"
 
 	ice "github.com/apache/iceberg-go"
@@ -16,21 +20,49 @@ import (
 	"github.com/openetl-io/openetl/sdk/go/conformance"
 )
 
+// tokenProxy is a REST catalog in front of the one at target that answers
+// 401 to a request without the bearer token.
+func tokenProxy(t *testing.T, target, token string) string {
+	u, err := url.Parse(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxy := httputil.NewSingleHostReverseProxy(u)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer "+token {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(`{"error": {"message": "Not authorized", "type": "NotAuthorizedException", "code": 401}}`))
+			return
+		}
+		proxy.ServeHTTP(w, r)
+	}))
+	t.Cleanup(srv.Close)
+	return srv.URL
+}
+
 func TestDestinationConformance(t *testing.T) {
 	env := newEnv(t)
 	cat, err := env.d.catalog(t.Context())
 	if err != nil {
 		t.Fatal(err)
 	}
-	cfg := map[string]string{"uri": uri(), "s3Endpoint": s3(), "region": "us-east-1", "accessKeyId": "openetl", "secretAccessKey": "openetl"}
+	// The REST fixture takes any token, and SeaweedFS any key: the suite's
+	// catalog is a proxy that takes one token.
+	auth := tokenProxy(t, uri(), "openetl")
+	cfg := map[string]string{"uri": auth, "token": "openetl", "s3Endpoint": s3(), "region": "us-east-1", "accessKeyId": "openetl", "secretAccessKey": "openetl"}
 	unreachable := maps.Clone(cfg)
 	unreachable["uri"] = "http://127.0.0.1:1"
+	wrong := maps.Clone(cfg)
+	wrong["token"] = "wrong"
 	config, _ := json.Marshal(cfg)
 	closed, _ := json.Marshal(unreachable)
+	bad, _ := json.Marshal(wrong)
 	conformance.DestinationSuite{
-		Launch:      conformance.Exec(conformance.Build(t, "../cmd/destination-iceberg")),
-		Config:      config,
-		Unreachable: closed,
+		Launch:         conformance.Exec(conformance.Build(t, "../cmd/destination-iceberg")),
+		Config:         config,
+		BadCredentials: bad,
+		Unreachable:    closed,
 		Read: func(ctx context.Context, namespace, stream string) ([]map[string]any, error) {
 			tbl, err := cat.LoadTable(ctx, table.Identifier{namespace, stream})
 			if errors.Is(err, catalog.ErrNoSuchTable) || errors.Is(err, catalog.ErrNoSuchNamespace) {
