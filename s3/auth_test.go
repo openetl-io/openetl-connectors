@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/openetl-io/openetl/sdk/go/check"
 	protocolv1 "github.com/openetl-io/openetl/sdk/go/protocol/v1"
 )
 
@@ -43,7 +44,7 @@ func TestAuthErrors(t *testing.T) {
 		says     string
 	}{
 		{"no credentials", answer(http.StatusOK, ""), false, protocolv1.ErrorCode_ERROR_CODE_AUTH_INVALID,
-			"no AWS credentials: set accessKeyId and secretAccessKey, or name a role in the destination's aws.role"},
+			"no AWS credentials: set accessKeyId and secretAccessKey, or name a role in the connector's aws.role"},
 		{"unknown keys", answer(http.StatusForbidden, "InvalidAccessKeyId"), true, protocolv1.ErrorCode_ERROR_CODE_AUTH_INVALID, "InvalidAccessKeyId"},
 		{"no access to the bucket", answer(http.StatusForbidden, "AccessDenied"), true, protocolv1.ErrorCode_ERROR_CODE_PERMISSION_DENIED, "AccessDenied"},
 		{"an expired session", answer(http.StatusBadRequest, "ExpiredToken"), true, protocolv1.ErrorCode_ERROR_CODE_AUTH_EXPIRED, "ExpiredToken"},
@@ -58,7 +59,7 @@ func TestAuthErrors(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			err = d.Check(t.Context())
+			err = check.Run(t.Context(), d.Checks()).Err()
 			if got := codeOf(err); got != tc.want {
 				t.Errorf("Check: %s (%v), want %s", got, err, tc.want)
 			}

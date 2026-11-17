@@ -1,14 +1,19 @@
-package s3
+package objstore
 
 import (
 	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
+	"maps"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
@@ -18,6 +23,7 @@ import (
 	"github.com/apache/arrow-go/v18/parquet/pqarrow"
 	"gocloud.dev/blob"
 
+	"github.com/openetl-io/openetl/sdk/go/check"
 	"github.com/openetl-io/openetl/sdk/go/destination"
 )
 
@@ -33,11 +39,11 @@ func newDest(t *testing.T, cfg, extra map[string]any) *Destination {
 		cfg[k] = v
 	}
 	b, _ := json.Marshal(cfg)
-	d, err := NewDestination(b)
+	d, err := testDestination(b)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := d.Check(t.Context()); err != nil {
+	if err := check.Run(t.Context(), d.Checks()).Err(); err != nil {
 		t.Fatal(err)
 	}
 	return d
@@ -60,6 +66,9 @@ func suite(t *testing.T, newDest func(*testing.T, map[string]any) *Destination) 
 		"CloseDropsUncommitted":      testCloseDropsUncommitted,
 		"LanesNameTheirFiles":        testLanesNameTheirFiles,
 		"TypesDontChange":            testTypesDontChange,
+		"OverwritePublishes":         testOverwritePublishes,
+		"SwapRefusesStale":           testSwapRefusesStale,
+		"Preflight":                  testDestinationPreflight,
 	} {
 		t.Run(name, func(t *testing.T) {
 			d := newDest(t, nil)
@@ -80,6 +89,19 @@ func suite(t *testing.T, newDest func(*testing.T, map[string]any) *Destination) 
 		t.Cleanup(func() { _ = b.Close() })
 		testFilesRollOver(&env{t: t, d: d, b: b})
 	})
+	for _, c := range []struct{ format, compression, ext string }{
+		{formatCSV, "zstd", ".csv.zst"}, {formatJSONL, "gzip", ".jsonl.gz"}, {formatCSV, "none", ".csv"},
+	} {
+		t.Run("Text/"+c.format+"/"+c.compression, func(t *testing.T) {
+			d := newDest(t, map[string]any{"format": c.format, "compression": c.compression})
+			b, err := d.bucket(t.Context())
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = b.Close() })
+			testText(&env{t: t, d: d, b: b}, c.ext)
+		})
+	}
 	t.Run("Types", func(t *testing.T) {
 		d := newDest(t, nil)
 		b, err := d.bucket(t.Context())
@@ -480,5 +502,213 @@ func testTypesDontChange(e *env) {
 	}
 	if a := apply(idField, n64, nameField); len(a.Refused) != 0 {
 		e.t.Errorf("once a person removed the record: %+v", a.Refused)
+	}
+}
+
+// testText writes a text format, compressed as its extension says.
+func testText(e *env, ext string) {
+	w := e.open(1, "users")
+	e.recover(w, 1, destination.Epoch{}, nil)
+	ep := destination.Epoch{Generation: 1, N: 1}
+	e.write(w, ep, "users", 1, 2)
+	e.commit(w, ep, e.precommit(w, ep))
+	keys := e.keys("users/")
+	if len(keys) != 1 || !strings.HasSuffix(keys[0], ext) {
+		e.t.Fatalf("files %v, want one ending %s", keys, ext)
+	}
+	data, err := e.b.ReadAll(e.t.Context(), keys[0])
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	compression, _ := compressionOf(keys[0])
+	r, err := decompress(compression, bytes.NewReader(data))
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	text, err := io.ReadAll(r)
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	want := "id,name\n1,n1\n2,n2\n"
+	if strings.Contains(ext, "jsonl") {
+		want = `{"id":1,"name":"n1"}` + "\n" + `{"id":2,"name":"n2"}` + "\n"
+	}
+	if string(text) != want {
+		e.t.Errorf("%s: %q, want %q", keys[0], text, want)
+	}
+}
+
+// manifestIDs are the ids of the files the table's manifest lists.
+func (e *env) manifestIDs(table string) []int64 {
+	e.t.Helper()
+	listed, err := e.b.ReadAll(e.t.Context(), table+"/"+manifestPath)
+	if err != nil {
+		return nil
+	}
+	var ids []int64
+	for _, loc := range strings.Fields(string(listed)) {
+		k, ok := e.d.store.key(loc)
+		if !ok {
+			e.t.Fatalf("the manifest lists %s, outside the URL", loc)
+		}
+		data, err := e.b.ReadAll(e.t.Context(), k)
+		if err != nil {
+			e.t.Fatalf("the manifest lists %s: %v", loc, err)
+		}
+		pf, err := file.NewParquetReader(bytes.NewReader(data))
+		if err != nil {
+			e.t.Fatal(err)
+		}
+		fr, _ := pqarrow.NewFileReader(pf, pqarrow.ArrowReadProperties{BatchSize: 1 << 16}, memory.DefaultAllocator)
+		tbl, err := fr.ReadTable(e.t.Context())
+		if err != nil {
+			e.t.Fatal(err)
+		}
+		for _, c := range tbl.Column(int(tbl.Schema().FieldIndices("id")[0])).Data().Chunks() {
+			ids = append(ids, c.(*array.Int64).Int64Values()...)
+		}
+		tbl.Release()
+		_ = pf.Close()
+	}
+	slices.Sort(ids)
+	return ids
+}
+
+// An overwrite's files appear at once, when its read ends, and a stale
+// attempt can't move the manifest back to an older read.
+func testOverwritePublishes(e *env) {
+	open := func(gen uint64) destination.Writer {
+		w, err := e.d.Open(e.t.Context(), destination.OpenConfig{Pipeline: "p1", Generation: gen, Scope: destination.ScopeStream,
+			Streams: []destination.Stream{{Name: "users", Mode: destination.Overwrite}}})
+		if err != nil {
+			e.t.Fatal(err)
+		}
+		e.t.Cleanup(func() { _ = w.Close(context.Background()) })
+		e.recover(w, gen, destination.Epoch{}, nil)
+		return w
+	}
+	rt := func(w destination.Writer) destination.ReadTracker { return w.(destination.ReadTracker) }
+	w := open(1)
+	first := time.UnixMicro(1_000_000)
+	if err := rt(w).StartReads(e.t.Context(), map[string]time.Time{"users": first}); err != nil {
+		e.t.Fatal(err)
+	}
+	e1, e2 := destination.Epoch{Generation: 1, N: 1}, destination.Epoch{Generation: 1, N: 2}
+	e.write(w, e1, "users", 1, 2)
+	e.commit(w, e1, e.precommit(w, e1))
+	if ids := e.manifestIDs("users"); ids != nil {
+		e.t.Fatalf("a read that hasn't ended shows %v", ids)
+	}
+	e.write(w, e2, "users", 3)
+	_ = rt(w).EndRead(e.t.Context(), e2, "users")
+	st2 := e.precommit(w, e2)
+	e.commit(w, e2, st2)
+	if ids := e.manifestIDs("users"); !slices.Equal(ids, []int64{1, 2, 3}) {
+		e.t.Fatalf("after the first read: %v", ids)
+	}
+
+	// The next read, by the next generation, ends without rows.
+	w2 := open(2)
+	if err := rt(w2).StartReads(e.t.Context(), map[string]time.Time{"users": first.Add(time.Second)}); err != nil {
+		e.t.Fatal(err)
+	}
+	e3 := destination.Epoch{Generation: 2, N: 3}
+	_ = rt(w2).EndRead(e.t.Context(), e3, "users")
+	e.commit(w2, e3, e.precommit(w2, e3))
+	if listed, err := e.b.ReadAll(e.t.Context(), "users/"+manifestPath); err != nil || len(listed) != 0 {
+		e.t.Fatalf("an empty read's manifest: %q, %v", listed, err)
+	}
+	if got := e.keys("users/" + readsDir + "/"); len(got) != 0 {
+		e.t.Errorf("the first read's files stay: %v", got)
+	}
+	// The first generation publishing its read again, as a zombie would.
+	stale := stagedStream{Name: "users", Table: "users", Read: strconv.FormatInt(first.UnixMicro(), 10), Ended: true}
+	if err := w.(*writer).publish(e.t.Context(), staged{Generation: 1, Epoch: 2}, stale); err != nil {
+		e.t.Fatal(err)
+	}
+	if listed, _ := e.b.ReadAll(e.t.Context(), "users/"+manifestPath); len(listed) != 0 {
+		e.t.Fatalf("a stale attempt moved the manifest back: %q", listed)
+	}
+}
+
+// swap writes only over the version it was given, on every store.
+func testSwapRefusesStale(e *env) {
+	ctx, st := e.t.Context(), e.d.store
+	check := func(key string) func() (*version, error) {
+		return func() (*version, error) {
+			a, err := e.b.Attributes(ctx, key)
+			if err != nil {
+				return nil, nil
+			}
+			return st.version(a), nil
+		}
+	}
+	key := "swap/obj"
+	if err := st.swap(ctx, e.b, key, []byte("1"), nil, nil, check(key)); err != nil {
+		e.t.Fatal(err)
+	}
+	if err := st.swap(ctx, e.b, key, []byte("x"), nil, nil, check(key)); !errors.Is(err, errConflict) {
+		e.t.Fatalf("creating what exists: %v", err)
+	}
+	a, err := e.b.Attributes(ctx, key)
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	v1 := st.version(a)
+	if err := st.swap(ctx, e.b, key, []byte("2"), nil, v1, check(key)); err != nil {
+		e.t.Fatal(err)
+	}
+	if err := st.swap(ctx, e.b, key, []byte("x"), nil, v1, check(key)); !errors.Is(err, errConflict) {
+		e.t.Fatalf("over a stale version: %v", err)
+	}
+	if got, _ := e.b.ReadAll(ctx, key); string(got) != "2" {
+		e.t.Fatalf("%q, want 2", got)
+	}
+}
+
+// Preflight checks each stream's mode and column types, and, for a
+// pipeline that overwrites, conditional writes, leaving nothing behind.
+func testDestinationPreflight(e *env) {
+	t := e.t
+	sc := arrow.NewSchema([]arrow.Field{{Name: "x", Type: arrow.BinaryTypes.String, Nullable: true}}, nil)
+	req := destination.PreflightRequest{Pipeline: "p", Streams: []destination.Stream{{Name: "a", Mode: destination.Append}}, Schemas: map[string]*arrow.Schema{"a": sc, "b": sc}}
+	statuses := func(req destination.PreflightRequest) map[string]string {
+		t.Helper()
+		checks := e.d.Preflight(req)
+		if err := check.Validate(append(e.d.Checks(), checks...)); err != nil {
+			t.Fatal(err)
+		}
+		out := map[string]string{}
+		for _, it := range check.Run(t.Context(), checks).Items {
+			out[it.Name] = it.Status.String()
+			if it.Failure != nil {
+				out[it.Name] += " " + it.Failure.Reason
+			}
+		}
+		return out
+	}
+	if got := statuses(req); !maps.Equal(got, map[string]string{"stream.a.mode": "passed", "stream.a.types": "passed"}) {
+		t.Errorf("append: %v", got)
+	}
+	if err := e.b.WriteAll(t.Context(), schemaKey("b"), []byte(`{"columns":[{"name":"x","type":"int64"}]}`), nil); err != nil {
+		t.Fatal(err)
+	}
+	req.Streams = append(req.Streams, destination.Stream{Name: "b", Mode: destination.Overwrite}, destination.Stream{Name: "c", Mode: destination.Merge})
+	want := map[string]string{
+		"stream.a.mode": "passed", "stream.a.types": "passed",
+		"stream.b.mode": "passed", "stream.b.types": "failed type_change_refused",
+		"stream.c.mode": "failed setting_mismatch", "stream.c.types": "skipped",
+		"store.conditional-write": "passed",
+	}
+	if got := statuses(req); !maps.Equal(got, want) {
+		t.Errorf("overwrite and merge: %v", got)
+	}
+	req.Streams[1].AllowTypeChanges = true
+	if got := statuses(req)["stream.b.types"]; got != "passed" {
+		t.Errorf("a stream that may change types: %s", got)
+	}
+	it := e.b.List(&blob.ListOptions{Prefix: reserved + "/check-"})
+	if obj, err := it.Next(t.Context()); err == nil {
+		t.Errorf("the preflight left %s", obj.Key)
 	}
 }
