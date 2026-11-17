@@ -327,11 +327,7 @@ func (s *Source) readSplit(ctx context.Context, conns *connPool, tables []table,
 	defer conns.put(ctx, conn)
 	t := tables[slices.IndexFunc(tables, func(t table) bool { return t.name == cs.Name })]
 	if cs.SyncMode == source.Incremental {
-		completeAt := sp.CompleteAt
-		if len(cs.Splits) == 0 {
-			completeAt = cs.CompleteAt
-		}
-		return s.readIncremental(ctx, conn, t, sp.ID, cs.Cursor, st, completeAt, out)
+		return s.readIncremental(ctx, conn, t, sp.ID, cs.Cursor, st, sp.CompleteAt, out)
 	}
 	return s.readTable(ctx, conn, t, sp.ID, st, out)
 }
