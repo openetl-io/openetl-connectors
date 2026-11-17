@@ -141,3 +141,44 @@ func TestSourceRefusesBadCursors(t *testing.T) {
 		}
 	}
 }
+
+// A read given where an incremental read completed reads up to that floor,
+// not to the cursor's highest value now, and completes there; one given the
+// completion of a read that found no rows reads none.
+func TestSourceIncrementalCompletesWhereItIsAsked(t *testing.T) {
+	e := newSourceEnv(t)
+	e.exec("CREATE TABLE $schema.t (id int PRIMARY KEY, seq bigint)")
+	e.exec("INSERT INTO $schema.t VALUES (1, 10), (2, 20), (3, 30)")
+	s := e.source(`, "chunkRows": 2`)
+	if c := mustReadIncremental(t, s, "t", "seq", `{"since":"20"}`); c.log[len(c.log)-1] != `t complete{"since":"30"}` {
+		t.Fatalf("the first read ended with %q", c.log)
+	}
+	e.exec("INSERT INTO $schema.t VALUES (4, 40)")
+	read := func(state, completeAt string) *capture {
+		t.Helper()
+		cs := source.ConfiguredStream{Name: "t", SyncMode: source.Incremental, Cursor: "seq", CompleteAt: []byte(completeAt)}
+		if state != "" {
+			cs.State = []byte(state)
+		}
+		c := &capture{}
+		t.Cleanup(c.release)
+		if err := s.Read(t.Context(), source.ReadRequest{Streams: []source.ConfiguredStream{cs}}, c); err != nil {
+			t.Fatal(err)
+		}
+		return c
+	}
+	c := read(`{"since":"20"}`, `{"since":"30"}`)
+	if got := c.column("t", "id"); !slices.Equal(got, []string{"2", "3"}) {
+		t.Errorf("a read to 30 read %v", got)
+	}
+	if last := c.log[len(c.log)-1]; last != `t complete{"since":"30"}` {
+		t.Errorf("a read to 30 ended with %s", last)
+	}
+	c = read(`{"after":["20","2"],"until":"30"}`, `{"since":"30"}`)
+	if got := c.column("t", "id"); !slices.Equal(got, []string{"3"}) || c.log[len(c.log)-1] != `t complete{"since":"30"}` {
+		t.Errorf("a read to 30 from a resume point read %v, and ended with %q", got, c.log)
+	}
+	if c := read("", "{}"); !slices.Equal(c.log, []string{"t complete{}"}) {
+		t.Errorf("a read to where an empty table's read completed: %q", c.log)
+	}
+}

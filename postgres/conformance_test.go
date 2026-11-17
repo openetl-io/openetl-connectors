@@ -63,8 +63,13 @@ func TestSourceConformance(t *testing.T) {
 		AddRecords: func(ctx context.Context, stream string) (int, error) {
 			switch stream {
 			case "events":
+				// Each call adds new events, later than any before.
+				var from int64
+				if err := e.conn.QueryRow(ctx, "SELECT max(id) + 1 FROM "+pgx.Identifier{e.schema, "events"}.Sanitize()).Scan(&from); err != nil {
+					return 0, err
+				}
 				_, err := e.conn.Exec(ctx, "INSERT INTO "+pgx.Identifier{e.schema, "events"}.Sanitize()+
-					" SELECT i, timestamptz '2026-02-01 00:00Z' + i * interval '1 minute', '{}' FROM generate_series(1001, 1010) i")
+					" SELECT i, timestamptz '2026-02-01 00:00Z' + i * interval '1 minute', '{}' FROM generate_series($1::bigint, $1::bigint + 9) i", from)
 				return 10, err
 			case "orders":
 				// Each call adds new orders, as a continuous read is restarted.
@@ -84,6 +89,7 @@ func TestSourceConformance(t *testing.T) {
 			{Name: "kinds", Mode: source.FullRefresh},
 			{Name: "orders", Mode: source.CDC},
 		},
+		StopsAtCompletion: true,
 	}.Test(t)
 }
 

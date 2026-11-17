@@ -27,12 +27,17 @@ import (
 // address.
 func fake(t *testing.T) []string {
 	t.Helper()
+	return fakeCluster(t).ListenAddrs()
+}
+
+func fakeCluster(t *testing.T) *kfake.Cluster {
+	t.Helper()
 	c, err := kfake.NewCluster(kfake.NumBrokers(1), kfake.DefaultNumPartitions(1))
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(c.Close)
-	return c.ListenAddrs()
+	return c
 }
 
 func fakeConfig(t *testing.T, addrs []string, extra map[string]any) []byte {

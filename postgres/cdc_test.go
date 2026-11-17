@@ -694,3 +694,77 @@ func codeOf(err error) protocolv1.ErrorCode {
 	}
 	return protocolv1.ErrorCode_ERROR_CODE_UNSPECIFIED
 }
+
+// readCDCStopping reads users from state, stopping at until or completeAt
+// as a redo asks.
+func readCDCStopping(t *testing.T, s *Source, pipeline, state string, until, completeAt []byte) *capture {
+	t.Helper()
+	cs := source.ConfiguredStream{Name: "users", SyncMode: source.CDC, Until: until, CompleteAt: completeAt}
+	if state != "" {
+		cs.State = []byte(state)
+	}
+	c := &capture{}
+	t.Cleanup(c.release)
+	if err := s.Read(t.Context(), source.ReadRequest{Pipeline: pipeline, Streams: []source.ConfiguredStream{cs}}, c); err != nil {
+		t.Fatal(err)
+	}
+	return c
+}
+
+// A bounded read asked to complete where an earlier read of the log did
+// reads the transactions that one read and completes with its state, though
+// the log has moved on; one asked to stop at a resume point's position
+// stops there. A read with the table's snapshot left to read can't read its
+// chunks again as they were read, so it ignores both.
+func TestCDCStopsWhereARedoAsks(t *testing.T) {
+	e := newSourceEnv(t)
+	e.exec("CREATE TABLE $schema.users (id int PRIMARY KEY, name text)")
+	e.exec("INSERT INTO $schema.users VALUES (1, 'a')")
+	s, pipeline := e.cdcSource("")
+	from := readCDC(t, s, pipeline, map[string]string{"users": ""}).last("users")
+	e.exec("INSERT INTO $schema.users VALUES (2, 'b')")
+	var at string
+	if err := e.conn.QueryRow(t.Context(), "SELECT pg_current_wal_lsn()::text").Scan(&at); err != nil {
+		t.Fatal(err)
+	}
+	mid, err := pglogrepl.ParseLSN(at)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.exec("BEGIN; INSERT INTO $schema.users VALUES (3, 'c'); UPDATE $schema.users SET name = 'b2' WHERE id = 2; COMMIT")
+	first := readCDC(t, s, pipeline, map[string]string{"users": from})
+	if got := first.column("users", "id"); !slices.Equal(got, []string{"2", "3", "2"}) {
+		t.Fatalf("the first read read %v", got)
+	}
+	end := first.last("users")
+	e.exec("INSERT INTO $schema.users VALUES (4, 'd')")
+	e.exec("UPDATE $schema.users SET name = 'a2' WHERE id = 1")
+
+	again := readCDCStopping(t, s, pipeline, from, nil, []byte(end))
+	if got := again.column("users", "id"); !slices.Equal(got, []string{"2", "3", "2"}) {
+		t.Errorf("a read to the first's completion read %v", got)
+	}
+	if last := again.lastLog(); last != "users complete"+end {
+		t.Errorf("a read to the first's completion ended with %s, not at %s", last, end)
+	}
+
+	until, err := json.Marshal(cdcState{Slot: s.slotName(pipeline), LSN: lsn(mid)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	again = readCDCStopping(t, s, pipeline, from, until, nil)
+	if got := again.column("users", "id"); !slices.Equal(got, []string{"2"}) {
+		t.Errorf("a read until %s read %v", mid, got)
+	}
+	if n := len(again.log); n < 2 || again.log[n-2] != "users@"+string(until) || again.log[n-1] != "users complete"+string(until) {
+		t.Errorf("a read until %s ended with %q", mid, again.log)
+	}
+
+	fresh := readCDCStopping(t, s, pipeline, "", nil, []byte(end))
+	if got := fresh.column("users", "id"); !slices.Contains(got, "1") || !slices.Contains(got, "4") {
+		t.Errorf("a read from the snapshot read %v", got)
+	}
+	if last := fresh.lastLog(); last == "users complete"+end {
+		t.Errorf("a read from the snapshot completed at %s, where it can't have read its chunks as before", end)
+	}
+}
