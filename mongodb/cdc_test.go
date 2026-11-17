@@ -16,6 +16,7 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 
+	"github.com/openetl-io/openetl-connectors/sourcetest"
 	protocolv1 "github.com/openetl-io/openetl/sdk/go/protocol/v1"
 	"github.com/openetl-io/openetl/sdk/go/source"
 )
@@ -32,10 +33,10 @@ func waitFor(t *testing.T, d time.Duration, what string, cond func() bool) {
 
 // follow starts a continuous cdc read of stream, from state, stopped when t
 // ends; done has its error.
-func follow(t *testing.T, s *Source, stream string, state []byte, columns []string) (*recorder, <-chan error) {
+func follow(t *testing.T, s *Source, stream string, state []byte, columns []string) (*sourcetest.Recorder, <-chan error) {
 	t.Helper()
 	ctx := t.Context()
-	rec := &recorder{}
+	rec := &sourcetest.Recorder{}
 	done := make(chan error, 1)
 	go func() {
 		done <- s.Read(ctx, source.ReadRequest{Continuous: true, Streams: []source.ConfiguredStream{
@@ -67,15 +68,15 @@ func TestCDCContinuous(t *testing.T) {
 			t.Fatalf("the read ended: %v", err)
 		default:
 		}
-		return len(rec.rows("orders")) >= 70
+		return len(rec.RowsOf("orders")) >= 70
 	})
 	insert(t, coll, bson.D{{Key: "_id", Value: 71}, {Key: "total", Value: 2}})
-	waitFor(t, 20*time.Second, "the insert", func() bool { return len(rec.rows("orders")) >= 71 })
-	rows := rec.rows("orders")
+	waitFor(t, 20*time.Second, "the insert", func() bool { return len(rec.RowsOf("orders")) >= 71 })
+	rows := rec.RowsOf("orders")
 	if got := rows[70]; got["_id"] != intID(71) || got["openetl.op"] != "insert" {
 		t.Errorf("the insert's row: %v", got)
 	}
-	state, _ := rec.last("orders")
+	state, _ := rec.Last("orders")
 	var st cdcState
 	if err := json.Unmarshal(state, &st); err != nil || st.Snapshot != nil {
 		t.Errorf("the state after the snapshot: %s: %v", state, err)
@@ -83,7 +84,7 @@ func TestCDCContinuous(t *testing.T) {
 }
 
 // changes waits for n rows past the first skip, and returns them.
-func changes(t *testing.T, rec *recorder, done <-chan error, stream string, skip, n int) []map[string]string {
+func changes(t *testing.T, rec *sourcetest.Recorder, done <-chan error, stream string, skip, n int) []map[string]string {
 	t.Helper()
 	waitFor(t, 20*time.Second, fmt.Sprintf("%d rows of %s", skip+n, stream), func() bool {
 		select {
@@ -91,9 +92,9 @@ func changes(t *testing.T, rec *recorder, done <-chan error, stream string, skip
 			t.Fatalf("the read ended: %v", err)
 		default:
 		}
-		return len(rec.rows(stream)) >= skip+n
+		return len(rec.RowsOf(stream)) >= skip+n
 	})
-	return rec.rows(stream)[skip:]
+	return rec.RowsOf(stream)[skip:]
 }
 
 func checkRows(t *testing.T, got []map[string]string, want ...map[string]string) {
@@ -144,7 +145,7 @@ func TestCDCChanges(t *testing.T) {
 		map[string]string{"_id": intID(2), "b": "r", "openetl.op": "update"},
 		map[string]string{"_id": intID(3), "openetl.op": "delete"},
 	)
-	all := rec.rows("c")
+	all := rec.RowsOf("c")
 	for i := 1; i < len(all); i++ {
 		if seqOf(t, all[i-1]).Cmp(seqOf(t, all[i])) > 0 {
 			t.Errorf("row %d's seq is below the one before it", i)
@@ -187,7 +188,7 @@ func TestCDCUpdateOfDeleted(t *testing.T) {
 	insert(t, coll, bson.D{{Key: "_id", Value: 1}, {Key: "a", Value: 1}})
 	s := newTestSource(t, db, "")
 	rec := readAll(t, s, source.ConfiguredStream{Name: "c", SyncMode: source.CDC})
-	state, _ := rec.last("c")
+	state, _ := rec.Last("c")
 	if _, err := coll.UpdateOne(ctx, bson.D{{Key: "_id", Value: 1}}, bson.D{{Key: "$set", Value: bson.D{{Key: "a", Value: 2}}}}); err != nil {
 		t.Fatal(err)
 	}
@@ -207,11 +208,11 @@ func TestCDCNewField(t *testing.T) {
 	insert(t, coll, bson.D{{Key: "_id", Value: 1}, {Key: "a", Value: 1}})
 	s := newTestSource(t, db, "")
 	columns := []string{"_id", "a", "openetl.op", "openetl.seq"}
-	rec := &recorder{}
+	rec := &sourcetest.Recorder{}
 	if err := s.Read(ctx, source.ReadRequest{Streams: []source.ConfiguredStream{{Name: "c", SyncMode: source.CDC, Columns: columns}}}, rec); err != nil {
 		t.Fatal(err)
 	}
-	state, _ := rec.last("c")
+	state, _ := rec.Last("c")
 
 	// A field that a document had and no document has now is left out.
 	insert(t, coll, bson.D{{Key: "_id", Value: 2}, {Key: "gone", Value: 1}})
@@ -229,8 +230,8 @@ func TestCDCNewField(t *testing.T) {
 	insert(t, coll, bson.D{{Key: "_id", Value: 3}, {Key: "gone", Value: 1}})
 	select {
 	case err := <-done:
-		if codeOf(err) != protocolv1.ErrorCode_ERROR_CODE_TRANSIENT || !strings.Contains(err.Error(), `new field "gone"`) {
-			t.Errorf("a new field: %s: %v", codeOf(err), err)
+		if sourcetest.CodeOf(err) != protocolv1.ErrorCode_ERROR_CODE_TRANSIENT || !strings.Contains(err.Error(), `new field "gone"`) {
+			t.Errorf("a new field: %s: %v", sourcetest.CodeOf(err), err)
 		}
 	case <-time.After(20 * time.Second):
 		t.Fatal("a new field didn't end the read")
@@ -258,8 +259,8 @@ func TestCDCEnds(t *testing.T) {
 			}
 			select {
 			case err := <-done:
-				if codeOf(err) != protocolv1.ErrorCode_ERROR_CODE_POSITION_LOST || !strings.Contains(err.Error(), c.want) {
-					t.Errorf("%s: %s: %v", c.name, codeOf(err), err)
+				if sourcetest.CodeOf(err) != protocolv1.ErrorCode_ERROR_CODE_POSITION_LOST || !strings.Contains(err.Error(), c.want) {
+					t.Errorf("%s: %s: %v", c.name, sourcetest.CodeOf(err), err)
 				}
 			case <-time.After(20 * time.Second):
 				t.Fatalf("%s didn't end the read", c.name)
@@ -278,7 +279,7 @@ func TestRetention(t *testing.T) {
 	// Before the oplog's oldest entry.
 	old, _ := json.Marshal(cdcState{Time: bson.Timestamp{T: 1, I: 1}})
 	rec := readAll(t, s, source.ConfiguredStream{Name: "c", SyncMode: source.CDC})
-	now, _ := rec.last("c")
+	now, _ := rec.Last("c")
 	ps, err := s.Retention(t.Context(), "p", map[string][]byte{"c": now, "old": old, "bad": []byte("{")}, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -297,7 +298,7 @@ func TestCDCTransactionSeq(t *testing.T) {
 	insert(t, coll, bson.D{{Key: "_id", Value: 0}})
 	s := newTestSource(t, db, `, "chunkDocuments": 1`)
 	rec := readAll(t, s, source.ConfiguredStream{Name: "c", SyncMode: source.CDC})
-	state, _ := rec.last("c")
+	state, _ := rec.Last("c")
 	sess, err := db.Client().StartSession()
 	if err != nil {
 		t.Fatal(err)
@@ -318,10 +319,10 @@ func TestCDCTransactionSeq(t *testing.T) {
 	// The resume point after the first change.
 	var after []byte
 	n := 0
-	for _, e := range first.snapshot() {
-		n += len(e.rows)
-		if e.resume && n == 1 {
-			after = e.state
+	for _, e := range first.Snapshot() {
+		n += len(e.Rows)
+		if e.Resume && n == 1 {
+			after = e.State
 		}
 	}
 	if after == nil {

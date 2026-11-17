@@ -14,6 +14,7 @@ import (
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 
+	"github.com/openetl-io/openetl-connectors/sourcetest"
 	protocolv1 "github.com/openetl-io/openetl/sdk/go/protocol/v1"
 	"github.com/openetl-io/openetl/sdk/go/source"
 )
@@ -273,7 +274,7 @@ func TestBatcher(t *testing.T) {
 		}
 		return b
 	}
-	rec := &recorder{}
+	rec := &sourcetest.Recorder{}
 	out := rec.Split("s", source.WholeStream)
 	cols := []string{"_id", "a", "openetl.op", "openetl.seq"}
 	b := (&Source{}).newBatcher(source.ConfiguredStream{Name: "s", Columns: cols}, cols, true)
@@ -294,7 +295,7 @@ func TestBatcher(t *testing.T) {
 	sampled := (&Source{cfg: SourceConfig{SampleSize: 100}}).newBatcher(source.ConfiguredStream{Name: "s", Columns: cols}, cols, true)
 	defer sampled.release()
 	err = sampled.add(doc(bson.D{{Key: "_id", Value: 3}, {Key: "z", Value: 1}}), source.OpUpdate, q)
-	if codeOf(err) != protocolv1.ErrorCode_ERROR_CODE_TRANSIENT || !strings.Contains(err.Error(), "sample of 100") || !strings.Contains(err.Error(), "packed") {
+	if sourcetest.CodeOf(err) != protocolv1.ErrorCode_ERROR_CODE_TRANSIENT || !strings.Contains(err.Error(), "sample of 100") || !strings.Contains(err.Error(), "packed") {
 		t.Errorf("an undeclared field, sampled: %v", err)
 	}
 	b.gone = func(string) (bool, error) { return true, nil }
@@ -304,7 +305,7 @@ func TestBatcher(t *testing.T) {
 	if err := b.flush(out); err != nil {
 		t.Fatal(err)
 	}
-	rows := rec.rows("s")
+	rows := rec.RowsOf("s")
 	want := []map[string]string{
 		{"_id": intID(1), "a": "x", "openetl.op": "insert"},
 		{"_id": intID(2), "openetl.op": "delete"},
@@ -328,11 +329,11 @@ func TestBatcher(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	rec2 := &recorder{}
+	rec2 := &sourcetest.Recorder{}
 	if err := b2.flush(rec2.Split("s", "")); err != nil {
 		t.Fatal(err)
 	}
-	if rows := rec2.rows("s"); len(rows) != 2 || rows[0]["n"] != "" || rows[1]["n"] != "1" {
+	if rows := rec2.RowsOf("s"); len(rows) != 2 || rows[0]["n"] != "" || rows[1]["n"] != "1" {
 		t.Errorf("rows = %v", rows)
 	}
 
@@ -348,11 +349,11 @@ func TestBatcher(t *testing.T) {
 	if err := b3.addKey(raw(t, "k"), q); err != nil {
 		t.Fatal(err)
 	}
-	rec3 := &recorder{}
+	rec3 := &sourcetest.Recorder{}
 	if err := b3.flush(rec3.Split("s", "")); err != nil {
 		t.Fatal(err)
 	}
-	rows = rec3.rows("s")
+	rows = rec3.RowsOf("s")
 	if len(rows) != 2 || rows[0]["_id"] != intID(1) || rows[0]["data"] != `{"_id":{"$numberInt":"1"},"new":{"$numberLong":"2"}}` ||
 		rows[1]["_id"] != `"k"` || rows[1]["data"] != "" || rows[1]["openetl.op"] != "delete" {
 		t.Errorf("packed rows = %v", rows)

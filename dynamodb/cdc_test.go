@@ -11,6 +11,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 
+	"github.com/openetl-io/openetl-connectors/sourcetest"
 	protocolv1 "github.com/openetl-io/openetl/sdk/go/protocol/v1"
 	"github.com/openetl-io/openetl/sdk/go/source"
 )
@@ -41,12 +42,12 @@ func readChanges(t *testing.T, s *Source, cs *source.ConfiguredStream) ([]map[st
 	if err != nil {
 		return nil, err
 	}
-	st, complete := rec.last(cs.Name)
+	st, complete := rec.Last(cs.Name)
 	if !complete {
 		t.Fatal("a bounded cdc read didn't complete")
 	}
 	cs.State = st
-	return rec.rows(cs.Name), nil
+	return rec.RowsOf(cs.Name), nil
 }
 
 // A cdc read snapshots the table and then reads its stream: inserts,
@@ -110,8 +111,8 @@ func TestCDCNewAttribute(t *testing.T) {
 	}
 	put(t, cl, name, map[string]types.AttributeValue{"id": avI(1), "v": avS("a"), "w": avS("new")})
 	state := cs.State
-	if _, err := readChanges(t, s, cs); codeOf(err) != protocolv1.ErrorCode_ERROR_CODE_TRANSIENT {
-		t.Fatalf("a new attribute: %v (%v), want TRANSIENT", err, codeOf(err))
+	if _, err := readChanges(t, s, cs); sourcetest.CodeOf(err) != protocolv1.ErrorCode_ERROR_CODE_TRANSIENT {
+		t.Fatalf("a new attribute: %v (%v), want TRANSIENT", err, sourcetest.CodeOf(err))
 	}
 	if cs := discovered(t, s, name); index(cs.Schema, "w") < 0 {
 		t.Errorf("discovery doesn't declare w: %v", cs.Schema)
@@ -182,7 +183,7 @@ func TestCDCStreamReplaced(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if _, err := readChanges(t, s, cs); codeOf(err) != protocolv1.ErrorCode_ERROR_CODE_POSITION_LOST {
-		t.Errorf("a read of a replaced stream: %v (%v), want POSITION_LOST", err, codeOf(err))
+	if _, err := readChanges(t, s, cs); sourcetest.CodeOf(err) != protocolv1.ErrorCode_ERROR_CODE_POSITION_LOST {
+		t.Errorf("a read of a replaced stream: %v (%v), want POSITION_LOST", err, sourcetest.CodeOf(err))
 	}
 }

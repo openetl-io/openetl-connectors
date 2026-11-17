@@ -8,6 +8,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow"
 	"go.mongodb.org/mongo-driver/v2/bson"
 
+	"github.com/openetl-io/openetl-connectors/sourcetest"
 	"github.com/openetl-io/openetl/sdk/go/check"
 	"github.com/openetl-io/openetl/sdk/go/destination"
 	protocolv1 "github.com/openetl-io/openetl/sdk/go/protocol/v1"
@@ -212,7 +213,7 @@ func TestUniqueConflict(t *testing.T) {
 // doesn't resolve is TRANSIENT, as DNS may answer later, not a bad config.
 func TestSRVLookupFails(t *testing.T) {
 	_, err := NewSource([]byte(`{"uri": "mongodb+srv://u:p@cluster0.example.invalid/", "database": "app"}`))
-	if code := codeOf(err); code != protocolv1.ErrorCode_ERROR_CODE_TRANSIENT {
+	if code := sourcetest.CodeOf(err); code != protocolv1.ErrorCode_ERROR_CODE_TRANSIENT {
 		t.Errorf("%s: %v", code, err)
 	}
 	if f := check.Classify(err); f.Reason != check.DNSFailed.Name {

@@ -20,6 +20,7 @@ import (
 	streamtypes "github.com/aws/aws-sdk-go-v2/service/dynamodbstreams/types"
 	"github.com/aws/smithy-go"
 
+	"github.com/openetl-io/openetl-connectors/sourcetest"
 	"github.com/openetl-io/openetl/sdk/go/check"
 	"github.com/openetl-io/openetl/sdk/go/destination"
 	protocolv1 "github.com/openetl-io/openetl/sdk/go/protocol/v1"
@@ -184,7 +185,7 @@ func insert(seq, id int, at time.Time) streamtypes.Record {
 	}}
 }
 
-func lineageRead(f *fakeStream, rec *recorder, st cdcState) *cdcRead {
+func lineageRead(f *fakeStream, rec *sourcetest.Recorder, st cdcState) *cdcRead {
 	return &cdcRead{
 		s: &Source{}, streams: f, cs: source.ConfiguredStream{Name: "t", SyncMode: source.CDC},
 		t: &table{name: "t", keys: []string{"id"}}, out: rec.Split("t", source.WholeStream), start: now(), st: st,
@@ -204,7 +205,7 @@ func TestShardLineage(t *testing.T) {
 			"d": {insert(5, 4, at)},
 		},
 	}
-	rec := &recorder{}
+	rec := &sourcetest.Recorder{}
 	r := lineageRead(f, rec, cdcState{Stream: "arn", G: 1, Skip: at.Add(-time.Hour), Shards: map[string]shardState{"a": {Since: at.Add(-time.Hour)}}})
 	if err := r.follow(t.Context()); err != nil {
 		t.Fatal(err)
@@ -217,13 +218,13 @@ func TestShardLineage(t *testing.T) {
 		t.Errorf("closed shards read to their ends: %v", f.ended)
 	}
 	var ids []string
-	for _, row := range rec.rows("t") {
+	for _, row := range rec.RowsOf("t") {
 		ids = append(ids, row["id"])
 	}
 	if len(ids) != 5 || ids[0] != "1" || ids[1] != "1" || ids[4] != "4" {
 		t.Errorf("rows by id %v, want a's two, b's and c's, then d's", ids)
 	}
-	state, complete := rec.last("t")
+	state, complete := rec.Last("t")
 	if !complete {
 		t.Fatal("the read didn't complete")
 	}
@@ -235,11 +236,11 @@ func TestShardLineage(t *testing.T) {
 		t.Errorf("state's shards %+v", st.Shards)
 	}
 	// The next read starts after d's last record, and reads nothing.
-	rec2 := &recorder{}
+	rec2 := &sourcetest.Recorder{}
 	if err := lineageRead(f, rec2, st).follow(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	if rows := rec2.rows("t"); len(rows) != 0 {
+	if rows := rec2.RowsOf("t"); len(rows) != 0 {
 		t.Errorf("a read from the state read %v again", rows)
 	}
 }
@@ -251,27 +252,27 @@ func TestTrimmedPositionIsLost(t *testing.T) {
 		records: map[string][]streamtypes.Record{"a": {insert(1, 1, at)}},
 		fail:    map[string]error{"a": &smithy.GenericAPIError{Code: "TrimmedDataAccessException", Message: "trimmed"}},
 	}
-	err := lineageRead(f, &recorder{}, cdcState{Stream: "arn", G: 1, Skip: at, Shards: map[string]shardState{"a": {After: "x"}}}).follow(t.Context())
-	if codeOf(err) != protocolv1.ErrorCode_ERROR_CODE_POSITION_LOST {
-		t.Errorf("a trimmed position: %v (%v), want POSITION_LOST", err, codeOf(err))
+	err := lineageRead(f, &sourcetest.Recorder{}, cdcState{Stream: "arn", G: 1, Skip: at, Shards: map[string]shardState{"a": {After: "x"}}}).follow(t.Context())
+	if sourcetest.CodeOf(err) != protocolv1.ErrorCode_ERROR_CODE_POSITION_LOST {
+		t.Errorf("a trimmed position: %v (%v), want POSITION_LOST", err, sourcetest.CodeOf(err))
 	}
 	// A shard the state hadn't read to its end that the stream no longer
 	// lists.
-	err = lineageRead(f, &recorder{}, cdcState{Stream: "arn", G: 1, Skip: at, Shards: map[string]shardState{"gone": {After: "1"}}}).follow(t.Context())
-	if codeOf(err) != protocolv1.ErrorCode_ERROR_CODE_POSITION_LOST {
-		t.Errorf("a shard gone: %v (%v), want POSITION_LOST", err, codeOf(err))
+	err = lineageRead(f, &sourcetest.Recorder{}, cdcState{Stream: "arn", G: 1, Skip: at, Shards: map[string]shardState{"gone": {After: "1"}}}).follow(t.Context())
+	if sourcetest.CodeOf(err) != protocolv1.ErrorCode_ERROR_CODE_POSITION_LOST {
+		t.Errorf("a shard gone: %v (%v), want POSITION_LOST", err, sourcetest.CodeOf(err))
 	}
 	// A shard gone whose position is within 24 hours had nothing after it:
 	// the read goes on without it.
-	if err := lineageRead(f, &recorder{}, cdcState{Stream: "arn", G: 1, Skip: at, Shards: map[string]shardState{
+	if err := lineageRead(f, &sourcetest.Recorder{}, cdcState{Stream: "arn", G: 1, Skip: at, Shards: map[string]shardState{
 		"gone": {After: "1", Since: time.Now().Add(-23 * time.Hour)}, "a": {Since: at},
-	}}).follow(t.Context()); codeOf(err) != protocolv1.ErrorCode_ERROR_CODE_POSITION_LOST || !strings.Contains(err.Error(), "shard a ") {
+	}}).follow(t.Context()); sourcetest.CodeOf(err) != protocolv1.ErrorCode_ERROR_CODE_POSITION_LOST || !strings.Contains(err.Error(), "shard a ") {
 		t.Errorf("a shard gone within 24 hours: %v, want the read to go on to a's trimmed position", err)
 	}
 	// A shard read from its start that has records older than 24 hours.
-	err = lineageRead(f, &recorder{}, cdcState{Stream: "arn", G: 1, Skip: at, Shards: map[string]shardState{"a": {Since: time.Now().Add(-25 * time.Hour)}}}).follow(t.Context())
-	if codeOf(err) != protocolv1.ErrorCode_ERROR_CODE_POSITION_LOST {
-		t.Errorf("a position past 24 hours: %v (%v), want POSITION_LOST", err, codeOf(err))
+	err = lineageRead(f, &sourcetest.Recorder{}, cdcState{Stream: "arn", G: 1, Skip: at, Shards: map[string]shardState{"a": {Since: time.Now().Add(-25 * time.Hour)}}}).follow(t.Context())
+	if sourcetest.CodeOf(err) != protocolv1.ErrorCode_ERROR_CODE_POSITION_LOST {
+		t.Errorf("a position past 24 hours: %v (%v), want POSITION_LOST", err, sourcetest.CodeOf(err))
 	}
 }
 
@@ -293,7 +294,7 @@ func TestSeq(t *testing.T) {
 	if b.Cmp(a) <= 0 {
 		t.Error("a later snapshot's seq isn't above the stream before it")
 	}
-	if _, err := r.seq("1" + fmt.Sprintf("%029d", 0)); codeOf(err) != protocolv1.ErrorCode_ERROR_CODE_CONTRACT_CHANGED {
+	if _, err := r.seq("1" + fmt.Sprintf("%029d", 0)); sourcetest.CodeOf(err) != protocolv1.ErrorCode_ERROR_CODE_CONTRACT_CHANGED {
 		t.Errorf("a 30-digit sequence number: %v", err)
 	}
 }
@@ -395,17 +396,17 @@ func TestShardUntil(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	rec := &recorder{}
+	rec := &sourcetest.Recorder{}
 	if err := lineageRead(f, rec, first).follow(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 	from, rows := start, map[string]int{}
 	points := 0
-	for _, e := range rec.snapshot() {
-		for _, row := range e.rows {
+	for _, e := range rec.Snapshot() {
+		for _, row := range e.Rows {
 			rows[row["id"]]++
 		}
-		if !e.resume {
+		if !e.Resume {
 			continue
 		}
 		points++
@@ -413,27 +414,27 @@ func TestShardUntil(t *testing.T) {
 		if err := json.Unmarshal(from, &st); err != nil {
 			t.Fatal(err)
 		}
-		if err := json.Unmarshal(e.state, &until); err != nil {
+		if err := json.Unmarshal(e.State, &until); err != nil {
 			t.Fatal(err)
 		}
-		again := &recorder{}
+		again := &sourcetest.Recorder{}
 		r := lineageRead(f, again, st)
-		r.until, r.untilRaw = &until, e.state
+		r.until, r.untilRaw = &until, e.State
 		if err := r.follow(t.Context()); err != nil {
 			t.Fatal(err)
 		}
 		got := map[string]int{}
-		for _, row := range again.rows("t") {
+		for _, row := range again.RowsOf("t") {
 			got[row["id"]]++
 		}
 		if !maps.Equal(got, rows) {
 			t.Errorf("until resume point %d: read %v, want %v", points, got, rows)
 		}
-		events := again.snapshot()
-		if n := len(events); n < 2 || !events[n-2].resume || string(events[n-2].state) != string(e.state) || !events[n-1].complete || string(events[n-1].state) != string(e.state) {
+		events := again.Snapshot()
+		if n := len(events); n < 2 || !events[n-2].Resume || string(events[n-2].State) != string(e.State) || !events[n-1].Complete || string(events[n-1].State) != string(e.State) {
 			t.Errorf("until resume point %d: didn't end with a resume point and a completion at it", points)
 		}
-		from, rows = e.state, map[string]int{}
+		from, rows = e.State, map[string]int{}
 	}
 	if points < 5 {
 		t.Errorf("%d resume points, want one a record", points)
@@ -455,11 +456,11 @@ func TestIdleShardsAcrossSyncs(t *testing.T) {
 	}
 	read := func(st cdcState) (cdcState, error) {
 		f.trimBefore(clock.Add(-retention))
-		rec := &recorder{}
+		rec := &sourcetest.Recorder{}
 		if err := lineageRead(f, rec, st).follow(t.Context()); err != nil {
 			return st, err
 		}
-		state, complete := rec.last("t")
+		state, complete := rec.Last("t")
 		if !complete {
 			t.Fatal("the read didn't complete")
 		}
@@ -487,7 +488,7 @@ func TestIdleShardsAcrossSyncs(t *testing.T) {
 	f.records["a"] = append(f.records["a"], insert(2, 2, clock.Add(time.Hour)))
 	f.mu.Unlock()
 	clock = clock.Add(25*time.Hour + 30*time.Minute)
-	if _, err := read(st); codeOf(err) != protocolv1.ErrorCode_ERROR_CODE_POSITION_LOST {
-		t.Errorf("a read 25.5 hours after the last, of a record written between that the stream trimmed: %v (%v), want POSITION_LOST", err, codeOf(err))
+	if _, err := read(st); sourcetest.CodeOf(err) != protocolv1.ErrorCode_ERROR_CODE_POSITION_LOST {
+		t.Errorf("a read 25.5 hours after the last, of a record written between that the stream trimmed: %v (%v), want POSITION_LOST", err, sourcetest.CodeOf(err))
 	}
 }

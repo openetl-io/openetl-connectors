@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/jackc/pglogrepl"
+	"github.com/openetl-io/openetl-connectors/keysplit"
 )
 
 func TestCutRanges(t *testing.T) {
@@ -54,8 +55,8 @@ func TestCutRanges(t *testing.T) {
 			t.Errorf("%s: cuts %q, want %q", c.name, got, c.want)
 		}
 	}
-	if got := cutRanges(bounds, 1e12, 100); len(got) != maxKeyRanges {
-		t.Errorf("%d ranges at most, want %d", len(got), maxKeyRanges)
+	if got := cutRanges(bounds, 1e12, 100); len(got) != keysplit.MaxRanges {
+		t.Errorf("%d ranges at most, want %d", len(got), keysplit.MaxRanges)
 	}
 }
 

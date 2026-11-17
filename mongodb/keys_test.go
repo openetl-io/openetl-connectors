@@ -16,6 +16,7 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 
+	"github.com/openetl-io/openetl-connectors/sourcetest"
 	"github.com/openetl-io/openetl/sdk/go/destination"
 	protocolv1 "github.com/openetl-io/openetl/sdk/go/protocol/v1"
 	"github.com/openetl-io/openetl/sdk/go/source"
@@ -131,8 +132,8 @@ func TestMixedIDKeys(t *testing.T) {
 
 	// A full refresh and an incremental read key each document alike.
 	left := collectionKeys(t, coll)
-	full := readAll(t, s, source.ConfiguredStream{Name: "c", SyncMode: source.FullRefresh, Columns: columns[:3]}).rows("c")
-	incr := readAll(t, s, source.ConfiguredStream{Name: "c", SyncMode: source.Incremental, Cursor: "at", Columns: columns[:3]}).rows("c")
+	full := readAll(t, s, source.ConfiguredStream{Name: "c", SyncMode: source.FullRefresh, Columns: columns[:3]}).RowsOf("c")
+	incr := readAll(t, s, source.ConfiguredStream{Name: "c", SyncMode: source.Incremental, Cursor: "at", Columns: columns[:3]}).RowsOf("c")
 	for name, rows := range map[string][]map[string]string{"full refresh": full, "incremental": incr} {
 		got := rowKeys(rows)
 		slices.Sort(got)
@@ -145,7 +146,7 @@ func TestMixedIDKeys(t *testing.T) {
 	// document, which keeps its _id's BSON type.
 	w := openWriterWith(t, db, `, "extendedJSONKeys": true`, 1,
 		destination.Stream{Name: "out", Mode: destination.Merge, PrimaryKey: []string{"_id"}, Deletes: destination.HardDelete, Dedupe: destination.DedupeTarget})
-	commit(t, w, 1, "out", cdcBatch(t, rec.rows("c")))
+	commit(t, w, 1, "out", cdcBatch(t, rec.RowsOf("c")))
 	if got := collectionKeys(t, db.Collection("out")); !slices.Equal(got, left) {
 		t.Errorf("destination-mongodb has _ids %q, want %q", got, left)
 	}
@@ -156,13 +157,13 @@ func TestMixedIDKeys(t *testing.T) {
 	// A key the source wouldn't spell, a bare 5, is refused.
 	bad := cdcBatch(t, []map[string]string{{"_id": "5", "openetl.op": source.OpInsert, "openetl.seq": "1"}})
 	defer bad.Release()
-	if err := w.Write(ctx, destination.Epoch{Generation: 1, N: 2}, "out", bad); codeOf(err) != protocolv1.ErrorCode_ERROR_CODE_DATA_INVALID {
-		t.Errorf("a key that isn't Extended JSON: %s: %v", codeOf(err), err)
+	if err := w.Write(ctx, destination.Epoch{Generation: 1, N: 2}, "out", bad); sourcetest.CodeOf(err) != protocolv1.ErrorCode_ERROR_CODE_DATA_INVALID {
+		t.Errorf("a key that isn't Extended JSON: %s: %v", sourcetest.CodeOf(err), err)
 	}
 
 	// Without extendedJSONKeys, the keys are strings, one for each _id.
 	w = openWriterWith(t, db, "", 2, destination.Stream{Name: "text", Mode: destination.Merge, PrimaryKey: []string{"_id"}, Deletes: destination.HardDelete})
-	commit(t, w, 1, "text", cdcBatch(t, rec.rows("c")))
+	commit(t, w, 1, "text", cdcBatch(t, rec.RowsOf("c")))
 	if n, err := db.Collection("text").CountDocuments(ctx, bson.D{}); err != nil || n != int64(len(left)) {
 		t.Errorf("with string keys, %d documents: %v", n, err)
 	}
@@ -196,7 +197,7 @@ func TestPacked(t *testing.T) {
 		b, _ := bson.Marshal(want)
 		return slices.Equal(got, b) && r["_id"] == keyText(got.Lookup("_id"))
 	}
-	full := readAll(t, s, source.ConfiguredStream{Name: "c", SyncMode: source.FullRefresh, Columns: columns}).rows("c")
+	full := readAll(t, s, source.ConfiguredStream{Name: "c", SyncMode: source.FullRefresh, Columns: columns}).RowsOf("c")
 	if len(full) != 2 || !same(full[0], bson.D{{Key: "_id", Value: int32(1)}, {Key: "at", Value: bson.NewDateTimeFromTime(at)}, {Key: "a", Value: int64(7)}}) ||
 		!same(full[1], bson.D{{Key: "_id", Value: "x"}, {Key: "at", Value: bson.NewDateTimeFromTime(at.Add(time.Hour))}, {Key: "b", Value: bson.D{{Key: "c", Value: bson.A{int32(1), 2.5}}}}}) {
 		t.Errorf("full refresh: %v", full)
@@ -206,12 +207,12 @@ func TestPacked(t *testing.T) {
 	// on it.
 	incr := source.ConfiguredStream{Name: "c", SyncMode: source.Incremental, Cursor: "at", Columns: columns}
 	rec := readAll(t, s, incr)
-	if n := len(rec.rows("c")); n != 2 {
+	if n := len(rec.RowsOf("c")); n != 2 {
 		t.Errorf("the first incremental read read %d", n)
 	}
-	incr.State, _ = rec.last("c")
+	incr.State, _ = rec.Last("c")
 	insert(t, coll, bson.D{{Key: "_id", Value: 2}, {Key: "at", Value: at.Add(2 * time.Hour)}, {Key: "unseen", Value: true}})
-	rows := readAll(t, s, incr).rows("c")
+	rows := readAll(t, s, incr).RowsOf("c")
 	// From the last read's highest at, in _id order.
 	if len(rows) != 2 || rows[0]["_id"] != intID(2) || rows[1]["_id"] != `"x"` || !same(rows[0], bson.D{{Key: "_id", Value: int32(2)}, {Key: "at", Value: bson.NewDateTimeFromTime(at.Add(2 * time.Hour))}, {Key: "unseen", Value: true}}) {
 		t.Errorf("the next incremental read: %v", rows)

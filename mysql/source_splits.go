@@ -2,10 +2,7 @@ package mysql
 
 import (
 	"context"
-	"crypto/sha256"
 	"database/sql"
-	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"math/big"
 	"strconv"
@@ -19,9 +16,6 @@ var (
 	_ source.Splitter   = (*Source)(nil)
 	_ source.Resplitter = (*Source)(nil)
 )
-
-// The most key ranges a table's read in.
-const maxKeyRanges = 32
 
 // keyRange is a range of an integer key's first column, spelled as decimal
 // text: above Lo, up to and including Hi. Nil is no bound.
@@ -60,10 +54,7 @@ func (s *Source) Splits(ctx context.Context, cs source.ConfiguredStream, ended [
 	if cs.SyncMode == source.CDC {
 		// A state from a read in splits starts the table again, as one from a
 		// full refresh does.
-		if whole, err := source.Whole(ended); err == nil {
-			return whole, nil
-		}
-		return []source.Split{{ID: source.WholeStream}}, nil
+		return keysplit.Whole(ended, nil), nil
 	}
 	db, srv, err := open(ctx, s.conn, 1)
 	if err != nil {
@@ -105,26 +96,12 @@ func (s *Source) Splits(ctx context.Context, cs source.ConfiguredStream, ended [
 			ranges = nil
 		}
 	}
-	if len(ranges) == 0 {
-		if whole, err := source.Whole(ended); err == nil {
-			return whole, nil
+	return keysplit.Of(ended, len(ranges), func(i int) any {
+		if i >= 0 {
+			st.keyRange = ranges[i]
 		}
-		state, err := json.Marshal(st)
-		if err != nil {
-			return nil, err
-		}
-		return []source.Split{{ID: source.WholeStream, State: state}}, nil
-	}
-	splits := make([]source.Split, len(ranges))
-	for i, r := range ranges {
-		st.keyRange = r
-		state, err := json.Marshal(st)
-		if err != nil {
-			return nil, err
-		}
-		splits[i] = source.Split{ID: strconv.Itoa(i), State: state}
-	}
-	return splits, nil
+		return st
+	})
 }
 
 // keyRanges divides a table into contiguous ranges of its key's first
@@ -139,7 +116,7 @@ func (s *Source) keyRanges(ctx context.Context, conn *sql.Conn, t table, rows in
 	if err != nil {
 		return nil, err
 	}
-	n := min((est+int64(rows)-1)/int64(rows), maxKeyRanges)
+	n := min((est+int64(rows)-1)/int64(rows), keysplit.MaxRanges)
 	if n < 2 {
 		return nil, nil
 	}
@@ -153,21 +130,7 @@ func (s *Source) keyRanges(ctx context.Context, conn *sql.Conn, t table, rows in
 // cutRanges cuts [low, high] into n ranges of about as many values, fewer if
 // it holds fewer.
 func cutRanges(low, high *big.Int, n int) []keyRange {
-	span := new(big.Int).Sub(high, low)
-	if span.Cmp(big.NewInt(int64(n))) < 0 {
-		n = int(span.Int64())
-	}
-	if n < 2 {
-		return nil
-	}
-	out := make([]keyRange, n)
-	for i := 1; i < n; i++ {
-		b := new(big.Int).Mul(span, big.NewInt(int64(i)))
-		b.Quo(b, big.NewInt(int64(n))).Add(b, low)
-		text := b.String()
-		out[i-1].Hi, out[i].Lo = &text, &text
-	}
-	return out
+	return keysplit.Between(keysplit.CutInts(low, high, n), func(lo, hi *string) keyRange { return keyRange{lo, hi} })
 }
 
 // estimate is the optimizer's estimate of a table's rows.
@@ -240,46 +203,20 @@ func (s *Source) resplit(ctx context.Context, conn *sql.Conn, t table, r *keyspl
 	if err != nil {
 		return nil, err
 	}
-	if !r.Asked.Swap(false) {
-		if low != nil && high != nil && low.Cmp(high) >= 0 {
-			r.Over.Store(true)
-		}
-		return nil, nil
+	mid, err := r.IntMid(low, high, func() (*big.Int, *big.Int, error) { return s.extent(ctx, conn, t) })
+	if mid == nil || err != nil {
+		return nil, err
 	}
-	if low == nil || high == nil {
-		least, most, err := s.extent(ctx, conn, t)
-		if err != nil || least == nil {
-			r.Over.Store(least == nil)
-			return nil, err
-		}
-		low, high = cmpOr(low, least), cmpOr(high, most)
-	}
-	if low.Cmp(high) >= 0 {
-		r.Over.Store(true)
-		return nil, nil
-	}
-	m := new(big.Int).Sub(high, low)
-	m.Rsh(m, 1).Add(m, low)
-	mid := m.String()
 	upper := *st
-	upper.Lo = &mid
+	upper.Lo = mid
 	if !keep {
 		upper.After = nil
 	}
-	state, err := json.Marshal(upper)
-	if err != nil {
-		return nil, err
+	splits, err := keysplit.Upper(*mid, upper)
+	if err == nil {
+		st.Hi = mid
 	}
-	st.Hi = &mid
-	id := sha256.Sum256([]byte(mid))
-	return []source.Split{{ID: hex.EncodeToString(id[:6]), State: state}}, nil
-}
-
-func cmpOr(a, b *big.Int) *big.Int {
-	if a != nil {
-		return a
-	}
-	return b
+	return splits, err
 }
 
 // connPool holds at most as many of a read's connections at a time as it

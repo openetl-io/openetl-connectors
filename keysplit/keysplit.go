@@ -1,6 +1,7 @@
 // Package keysplit is what the sources share of reading a table in splits
 // of its key: the splits being read, which Resplit divides, an incremental
-// read's floor, and what's left of an integer key's range.
+// read's floor, how a key is cut into ranges and a range at its midpoint,
+// and what's left of an integer key's range.
 package keysplit
 
 import (

@@ -96,7 +96,7 @@ jobs:
           # azurite, iceberg (which needs s3), glue, kafka, kafka-sasl and
           # registry (which need kafka) and kinesis. A package that isn't
           # listed gets them all; one listed with none gets none. records,
-          # sqlstage, keysplit and objstore are shared.
+          # sqlstage, keysplit, objstore and sourcetest are shared.
           SERVICES: |
             postgres: postgres
             mysql: mysql mariadb
@@ -115,6 +115,7 @@ jobs:
             records: kafka registry
             sqlstage:
             keysplit:
+            sourcetest:
           ALL_SERVICES: >-
             postgres mysql mariadb sqlserver oracle clickhouse mongodb dynamodb
             s3 gcs azurite iceberg glue kafka kafka-sasl registry kinesis

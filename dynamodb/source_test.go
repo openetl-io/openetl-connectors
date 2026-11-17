@@ -12,6 +12,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 
+	"github.com/openetl-io/openetl-connectors/sourcetest"
 	protocolv1 "github.com/openetl-io/openetl/sdk/go/protocol/v1"
 	"github.com/openetl-io/openetl/sdk/go/source"
 )
@@ -40,9 +41,9 @@ func discovered(t *testing.T, s *Source, name string) source.CatalogStream {
 	return source.CatalogStream{}
 }
 
-func read(t *testing.T, s *Source, cs source.ConfiguredStream) (*recorder, error) {
+func read(t *testing.T, s *Source, cs source.ConfiguredStream) (*sourcetest.Recorder, error) {
 	t.Helper()
-	rec := &recorder{}
+	rec := &sourcetest.Recorder{}
 	err := s.Read(t.Context(), source.ReadRequest{Streams: []source.ConfiguredStream{cs}}, rec)
 	return rec, err
 }
@@ -79,7 +80,7 @@ func TestSourceTypes(t *testing.T) {
 		t.Fatal(err)
 	}
 	rows := map[string]map[string]string{}
-	for _, r := range rec.rows(name) {
+	for _, r := range rec.RowsOf(name) {
 		rows[r["id"]] = r
 	}
 	for id, w := range map[string]map[string]string{
@@ -123,18 +124,18 @@ func TestSourceSplits(t *testing.T) {
 	seen := map[string]int{}
 	var resumed []source.Split
 	for _, sp := range splits {
-		rec := &recorder{}
+		rec := &sourcetest.Recorder{}
 		cs.Splits = []source.Split{sp}
 		if err := s.Read(t.Context(), source.ReadRequest{Streams: []source.ConfiguredStream{cs}}, rec); err != nil {
 			t.Fatal(err)
 		}
-		for _, r := range rec.rows(name) {
+		for _, r := range rec.RowsOf(name) {
 			seen[r["sk"]]++
 		}
 		// The split's first resume point, as a crash after it leaves it.
-		for _, e := range rec.snapshot() {
-			if e.resume {
-				resumed = append(resumed, source.Split{ID: sp.ID, State: e.state})
+		for _, e := range rec.Snapshot() {
+			if e.Resume {
+				resumed = append(resumed, source.Split{ID: sp.ID, State: e.State})
 				break
 			}
 		}
@@ -153,12 +154,12 @@ func TestSourceSplits(t *testing.T) {
 	if err != nil || len(again) != len(resumed) {
 		t.Fatalf("splits from states: %v, %v", again, err)
 	}
-	rec := &recorder{}
+	rec := &sourcetest.Recorder{}
 	cs.Splits = again
 	if err := s.Read(t.Context(), source.ReadRequest{Streams: []source.ConfiguredStream{cs}}, rec); err != nil {
 		t.Fatal(err)
 	}
-	if n := len(rec.rows(name)); n >= 200 || n == 0 {
+	if n := len(rec.RowsOf(name)); n >= 200 || n == 0 {
 		t.Errorf("reading on from resume points read %d items, want fewer than 200", n)
 	}
 }
@@ -172,8 +173,8 @@ func TestNewAttributeFailsRetryably(t *testing.T) {
 	put(t, cl, name, map[string]types.AttributeValue{"id": avI(1), "v": avS("a")}, map[string]types.AttributeValue{"id": avI(2), "rare": avS("b")})
 	s := testSource(t, fmt.Sprintf(`, "tables": [%q], "sampleSize": 1`, name))
 	_, err := read(t, s, source.ConfiguredStream{Name: name, SyncMode: source.FullRefresh, Columns: []string{"id", "v"}})
-	if codeOf(err) != protocolv1.ErrorCode_ERROR_CODE_TRANSIENT {
-		t.Fatalf("a new attribute: %v (%v), want TRANSIENT", err, codeOf(err))
+	if sourcetest.CodeOf(err) != protocolv1.ErrorCode_ERROR_CODE_TRANSIENT {
+		t.Fatalf("a new attribute: %v (%v), want TRANSIENT", err, sourcetest.CodeOf(err))
 	}
 	// Discovery of every item declares it.
 	if cs := discovered(t, testSource(t, fmt.Sprintf(`, "tables": [%q]`, name)), name); index(cs.Schema, "rare") < 0 {
@@ -218,7 +219,7 @@ func TestIncrementalFloor(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		st, complete := rec.last(name)
+		st, complete := rec.Last(name)
 		if !complete {
 			t.Fatal("the read didn't complete")
 		}
@@ -233,17 +234,17 @@ func TestIncrementalFloor(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !slices.ContainsFunc(rec.rows(name), func(r map[string]string) bool { return r["id"] == "0" && r["at"] == "105" }) {
-		t.Errorf("the second read missed an item written below the first read's highest cursor: %v", rec.rows(name))
+	if !slices.ContainsFunc(rec.RowsOf(name), func(r map[string]string) bool { return r["id"] == "0" && r["at"] == "105" }) {
+		t.Errorf("the second read missed an item written below the first read's highest cursor: %v", rec.RowsOf(name))
 	}
-	cs.State, _ = rec.last(name)
+	cs.State, _ = rec.Last(name)
 	next()
 	// Then, with nothing new, a read reads the items at its floor, 109.
 	rec, err = read(t, s, cs)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if rows := rec.rows(name); len(rows) != 1 || rows[0]["at"] != "109" {
+	if rows := rec.RowsOf(name); len(rows) != 1 || rows[0]["at"] != "109" {
 		t.Errorf("reads with nothing new read %v, want the item at the floor, 109", rows)
 	}
 	var st segState
@@ -267,7 +268,7 @@ func TestCDCOffered(t *testing.T) {
 		t.Errorf("a table with a stream: %v, seq %v", cs.SyncModes, cs.Seq)
 	}
 	_, err := read(t, s, source.ConfiguredStream{Name: p + "plain", SyncMode: source.CDC})
-	if codeOf(err) != protocolv1.ErrorCode_ERROR_CODE_CONFIG_INVALID {
+	if sourcetest.CodeOf(err) != protocolv1.ErrorCode_ERROR_CODE_CONFIG_INVALID {
 		t.Errorf("cdc of a table without a stream: %v", err)
 	}
 }

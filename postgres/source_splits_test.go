@@ -22,6 +22,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 
+	"github.com/openetl-io/openetl-connectors/keysplit"
 	"github.com/openetl-io/openetl/sdk/go/arrowipc"
 	"github.com/openetl-io/openetl/sdk/go/conformance"
 	protocolv1 "github.com/openetl-io/openetl/sdk/go/protocol/v1"
@@ -1204,7 +1205,7 @@ func TestSourceServesSplits(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(splits.GetSplits()) != maxKeyRanges {
+	if len(splits.GetSplits()) != keysplit.MaxRanges {
 		t.Fatalf("%d splits", len(splits.GetSplits()))
 	}
 	cs.Splits = splits.GetSplits()
@@ -1252,7 +1253,7 @@ func TestSourceServesSplits(t *testing.T) {
 	if !asked {
 		t.Error("no ask to split was accepted")
 	}
-	if len(ended) != maxKeyRanges+len(added) {
+	if len(ended) != keysplit.MaxRanges+len(added) {
 		t.Errorf("%d splits ended, with %d added", len(ended), len(added))
 	}
 }

@@ -12,6 +12,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/extensions"
 	"go.mongodb.org/mongo-driver/v2/bson"
 
+	"github.com/openetl-io/openetl-connectors/sourcetest"
 	protocolv1 "github.com/openetl-io/openetl/sdk/go/protocol/v1"
 	"github.com/openetl-io/openetl/sdk/go/source"
 )
@@ -31,9 +32,9 @@ func discovered(t *testing.T, s *Source, stream string) source.CatalogStream {
 	return source.CatalogStream{}
 }
 
-func readAll(t *testing.T, s *Source, streams ...source.ConfiguredStream) *recorder {
+func readAll(t *testing.T, s *Source, streams ...source.ConfiguredStream) *sourcetest.Recorder {
 	t.Helper()
-	rec := &recorder{}
+	rec := &sourcetest.Recorder{}
 	if err := s.Read(t.Context(), source.ReadRequest{Streams: streams}, rec); err != nil {
 		t.Fatal(err)
 	}
@@ -67,7 +68,7 @@ func TestSourceTypes(t *testing.T) {
 		t.Errorf("stream: %+v", cs)
 	}
 
-	rows := readAll(t, s, source.ConfiguredStream{Name: "kinds", SyncMode: source.FullRefresh}).rows("kinds")
+	rows := readAll(t, s, source.ConfiguredStream{Name: "kinds", SyncMode: source.FullRefresh}).RowsOf("kinds")
 	if len(rows) != 3 {
 		t.Fatalf("rows: %v", rows)
 	}
@@ -159,9 +160,9 @@ func TestSplitsMixedIDs(t *testing.T) {
 	// Read in smaller chunks, the first split read is asked to split at its
 	// first resume point.
 	s = newTestSource(t, db, `, "chunkDocuments": 5`)
-	rec := &recorder{}
+	rec := &sourcetest.Recorder{}
 	asked := false
-	hook := &hookRecorder{recorder: rec, onResume: func(stream, split string) {
+	hook := &hookRecorder{Recorder: rec, onResume: func(stream, split string) {
 		if !asked {
 			asked = true
 			if ok, err := s.Resplit(context.Background(), stream, split); !ok || err != nil {
@@ -173,7 +174,7 @@ func TestSplitsMixedIDs(t *testing.T) {
 		t.Fatal(err)
 	}
 	seen := map[string]int{}
-	for _, r := range rec.rows("mixed") {
+	for _, r := range rec.RowsOf("mixed") {
 		seen[r["_id"]]++
 	}
 	for id := range want {
@@ -185,8 +186,8 @@ func TestSplitsMixedIDs(t *testing.T) {
 		t.Errorf("read %d _ids, want %d", len(seen), total)
 	}
 	added := 0
-	for _, e := range rec.snapshot() {
-		added += len(e.added)
+	for _, e := range rec.Snapshot() {
+		added += len(e.Added)
 	}
 	if added != 1 {
 		t.Errorf("the resplit added %d splits, want 1", added)
@@ -195,7 +196,7 @@ func TestSplitsMixedIDs(t *testing.T) {
 	// Read whole, in chunks of one and of seven.
 	for _, chunk := range []int{1, 7} {
 		s := newTestSource(t, db, fmt.Sprintf(`, "chunkDocuments": %d`, chunk))
-		rows := readAll(t, s, source.ConfiguredStream{Name: "mixed", SyncMode: source.FullRefresh}).rows("mixed")
+		rows := readAll(t, s, source.ConfiguredStream{Name: "mixed", SyncMode: source.FullRefresh}).RowsOf("mixed")
 		seen := map[string]int{}
 		for _, r := range rows {
 			seen[r["_id"]]++
@@ -208,12 +209,12 @@ func TestSplitsMixedIDs(t *testing.T) {
 
 // hookRecorder calls onResume after each split's resume point.
 type hookRecorder struct {
-	*recorder
+	*sourcetest.Recorder
 	onResume func(stream, split string)
 }
 
 func (h *hookRecorder) Split(stream, id string) source.SplitEmitter {
-	return &hookSplit{SplitEmitter: h.recorder.Split(stream, id), h: h, stream: stream, id: id}
+	return &hookSplit{SplitEmitter: h.Recorder.Split(stream, id), h: h, stream: stream, id: id}
 }
 
 type hookSplit struct {
@@ -240,24 +241,24 @@ func TestIncrementalCursorTypes(t *testing.T) {
 	s := newTestSource(t, db, `, "chunkDocuments": 7`)
 	cs := source.ConfiguredStream{Name: "ev", SyncMode: source.Incremental, Cursor: "at"}
 	rec := readAll(t, s, cs)
-	if n := len(rec.rows("ev")); n != 30 {
+	if n := len(rec.RowsOf("ev")); n != 30 {
 		t.Errorf("the first incremental read read %d, want 30", n)
 	}
-	next, complete := rec.last("ev")
+	next, complete := rec.Last("ev")
 	if !complete {
 		t.Fatalf("the read didn't complete")
 	}
 	insert(t, coll, bson.D{{Key: "_id", Value: 200}, {Key: "at", Value: day.AddDate(1, 0, 0)}}, bson.D{{Key: "_id", Value: 201}, {Key: "at", Value: day}})
 	cs.State = next
-	rows := readAll(t, s, cs).rows("ev")
+	rows := readAll(t, s, cs).RowsOf("ev")
 	// From the last read's highest value: 29's again, and 200's.
 	if len(rows) != 2 || rows[0]["_id"] != intID(29) || rows[1]["_id"] != intID(200) {
 		t.Errorf("the next read: %v", rows)
 	}
 	// Without a cursor, incremental can't read.
-	err := s.Read(t.Context(), source.ReadRequest{Streams: []source.ConfiguredStream{{Name: "ev", SyncMode: source.Incremental}}}, &recorder{})
-	if codeOf(err) != protocolv1.ErrorCode_ERROR_CODE_CONFIG_INVALID {
-		t.Errorf("incremental without a cursor: %s: %v", codeOf(err), err)
+	err := s.Read(t.Context(), source.ReadRequest{Streams: []source.ConfiguredStream{{Name: "ev", SyncMode: source.Incremental}}}, &sourcetest.Recorder{})
+	if sourcetest.CodeOf(err) != protocolv1.ErrorCode_ERROR_CODE_CONFIG_INVALID {
+		t.Errorf("incremental without a cursor: %s: %v", sourcetest.CodeOf(err), err)
 	}
 }
 
@@ -268,14 +269,14 @@ func TestSourceCheck(t *testing.T) {
 		t.Errorf("Check: %v", err)
 	}
 	err := newTestSource(t, db, `, "collections": ["missing"]`).Check(t.Context())
-	if codeOf(err) != protocolv1.ErrorCode_ERROR_CODE_CONFIG_INVALID {
-		t.Errorf("Check of a missing collection: %s: %v", codeOf(err), err)
+	if sourcetest.CodeOf(err) != protocolv1.ErrorCode_ERROR_CODE_CONFIG_INVALID {
+		t.Errorf("Check of a missing collection: %s: %v", sourcetest.CodeOf(err), err)
 	}
 	bad, err := NewSource(sourceConfig(badPassword(t), db, ""))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := bad.Check(t.Context()); codeOf(err) != protocolv1.ErrorCode_ERROR_CODE_AUTH_INVALID {
-		t.Errorf("Check with a bad password: %s: %v", codeOf(err), err)
+	if err := bad.Check(t.Context()); sourcetest.CodeOf(err) != protocolv1.ErrorCode_ERROR_CODE_AUTH_INVALID {
+		t.Errorf("Check with a bad password: %s: %v", sourcetest.CodeOf(err), err)
 	}
 }

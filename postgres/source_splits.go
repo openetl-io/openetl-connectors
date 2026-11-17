@@ -2,13 +2,9 @@ package postgres
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
-	"math"
 	"math/big"
 	"slices"
 	"strconv"
@@ -27,8 +23,6 @@ var (
 	_ source.Resplitter = (*Source)(nil)
 )
 
-// The most key ranges a table's read in.
-const maxKeyRanges = 32
 
 // keyRange is a range of a key's first column, spelled as text: above Lo, up
 // to and including Hi. Nil is no bound.
@@ -59,10 +53,7 @@ func (s *Source) Splits(ctx context.Context, cs source.ConfiguredStream, ended [
 	if cs.SyncMode == source.CDC {
 		// A state from a read in splits starts the table again, as one from a
 		// full refresh does.
-		if whole, err := source.Whole(ended); err == nil {
-			return whole, nil
-		}
-		return []source.Split{{ID: source.WholeStream}}, nil
+		return keysplit.Whole(ended, nil), nil
 	}
 	conn, err := pgx.ConnectConfig(ctx, s.conn)
 	if err != nil {
@@ -102,26 +93,12 @@ func (s *Source) Splits(ctx context.Context, cs source.ConfiguredStream, ended [
 			ranges = nil
 		}
 	}
-	if len(ranges) == 0 {
-		if whole, err := source.Whole(ended); err == nil {
-			return whole, nil
+	return keysplit.Of(ended, len(ranges), func(i int) any {
+		if i >= 0 {
+			st.keyRange = ranges[i]
 		}
-		state, err := json.Marshal(st)
-		if err != nil {
-			return nil, err
-		}
-		return []source.Split{{ID: source.WholeStream, State: state}}, nil
-	}
-	splits := make([]source.Split, len(ranges))
-	for i, r := range ranges {
-		st.keyRange = r
-		state, err := json.Marshal(st)
-		if err != nil {
-			return nil, err
-		}
-		splits[i] = source.Split{ID: strconv.Itoa(i), State: state}
-	}
-	return splits, nil
+		return st
+	})
 }
 
 // keyRanges divides a table into contiguous ranges of its key's first column
@@ -142,17 +119,7 @@ func (s *Source) keyRanges(ctx context.Context, conn *pgx.Conn, t table, rows in
 // cutRanges cuts at bounds, a histogram's in order, evenly: each of its
 // buckets holds about as many rows.
 func cutRanges(bounds []string, tuples float64, rows int) []keyRange {
-	bounds = slices.Compact(slices.Clone(bounds))
-	n := min(int(math.Min(math.Ceil(tuples/float64(rows)), maxKeyRanges)), len(bounds)-1)
-	if n < 2 {
-		return nil
-	}
-	out := make([]keyRange, n)
-	for i := 1; i < n; i++ {
-		b := &bounds[i*(len(bounds)-1)/n]
-		out[i-1].Hi, out[i].Lo = b, b
-	}
-	return out
+	return keysplit.Between(keysplit.CutBounds(bounds, tuples, rows), func(lo, hi *string) keyRange { return keyRange{lo, hi} })
 }
 
 // keyStats is what the server's statistics say of a table's key's first
@@ -271,13 +238,11 @@ func (s *Source) resplit(ctx context.Context, conn *pgx.Conn, t table, r *keyspl
 	if !keep {
 		upper.After = nil
 	}
-	state, err := json.Marshal(upper)
-	if err != nil {
-		return nil, err
+	splits, err := keysplit.Upper(*mid, upper)
+	if err == nil {
+		st.Hi = mid
 	}
-	st.Hi = mid
-	id := sha256.Sum256([]byte(*mid))
-	return []source.Split{{ID: hex.EncodeToString(id[:6]), State: state}}, nil
+	return splits, err
 }
 
 // The types of a key's first column whose ranges are divided by arithmetic.

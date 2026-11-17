@@ -20,6 +20,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
 
+	"github.com/openetl-io/openetl-connectors/keysplit"
 	"github.com/openetl-io/openetl/sdk/go/check"
 	"github.com/openetl-io/openetl/sdk/go/source"
 )
@@ -457,7 +458,7 @@ func TestSplitsReadEveryRowOnce(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if len(splits) != min((n+99)/100, maxKeyRanges) {
+		if len(splits) != min((n+99)/100, keysplit.MaxRanges) {
 			t.Fatalf("%s: %d splits", name, len(splits))
 		}
 		cs.Splits = splits

@@ -53,7 +53,7 @@ func TestLeastPrivilege(t *testing.T) {
 		t.Errorf("Splits: %v", err)
 	}
 	rec := readAll(t, s, source.ConfiguredStream{Name: "c", SyncMode: source.CDC})
-	state, _ := rec.last("c")
+	state, _ := rec.Last("c")
 	if ps, err := s.Retention(ctx, "p", map[string][]byte{"c": state}, nil); err != nil || len(ps) != 1 {
 		t.Errorf("Retention: %v, %v", ps, err)
 	}

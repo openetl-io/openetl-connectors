@@ -1,7 +1,8 @@
-// Package sqlstage is what the SQL destinations share of an epoch's
-// staging: the tables a writer stages each stream's rows and patches in, the
-// descriptor its PreCommit returns, and how its Commit merges the lanes'
-// descriptors. Applying them, in each database's SQL, is each destination's.
+// Package sqlstage is what the SQL destinations share: a writer's Write,
+// Patch, PreCommit, Commit and Recover, over each database's SQL; the tables
+// it stages each stream's rows and patches in, and their names; the
+// descriptor its PreCommit returns, and how its Commit merges the lanes'; and
+// a database/sql destination's fence and markers.
 package sqlstage
 
 import (
