@@ -203,7 +203,7 @@ func (r *cdcRead) seq(sequence string) (decimal128.Num, error) {
 func (r *cdcRead) emit(b *batcher, update func()) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if err := b.flush(r.out); err != nil {
+	if err := b.Flush(r.out); err != nil {
 		return err
 	}
 	update()
@@ -241,7 +241,7 @@ func (r *cdcRead) snapshot(ctx context.Context) error {
 		}
 		g.Go(func() error {
 			b := r.s.newBatcher(r.cs, r.t, true)
-			defer b.release()
+			defer b.Release()
 			return r.s.scanPages(gctx, &clients{db: r.db}, r.t.name, i, len(r.st.Snapshot), seg.After.attrs(), nil, true, func(items []map[string]types.AttributeValue, last map[string]types.AttributeValue) (bool, error) {
 				reached := false
 				if until.After != nil {
@@ -547,7 +547,7 @@ func (r *cdcRead) poll(ctx context.Context, id string) (ended bool, err error) {
 		}
 	}
 	b := r.s.newBatcher(r.cs, r.t, true)
-	defer b.release()
+	defer b.Release()
 	b.gone = r.gone(ctx)
 	empty := 0
 	for {
@@ -620,7 +620,7 @@ func (r *cdcRead) poll(ctx context.Context, id string) (ended bool, err error) {
 			empty = 0
 		}
 		next := shardState{After: st.After, Since: st.Since, Checked: st.Checked}
-		if len(recs) > 0 || b.rows > 0 || checked {
+		if len(recs) > 0 || b.Rows > 0 || checked {
 			if err := r.emit(b, func() { r.setShard(id, next) }); err != nil {
 				return false, err
 			}

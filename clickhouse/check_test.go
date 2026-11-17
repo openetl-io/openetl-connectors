@@ -11,53 +11,10 @@ import (
 	"time"
 
 	"github.com/apache/arrow-go/v18/arrow"
-	"github.com/openetl-io/openetl/sdk/go/check"
+	"github.com/openetl-io/openetl-connectors/connectortest"
 	"github.com/openetl-io/openetl/sdk/go/destination"
 	"github.com/openetl-io/openetl/sdk/go/source"
 )
-
-// items runs checks, and gives each item's status, and its failure's reason
-// after it; each item's text has its params filled in.
-func items(t *testing.T, checks []check.Check) map[string]string {
-	t.Helper()
-	if err := check.Validate(checks); err != nil {
-		t.Fatal(err)
-	}
-	out := map[string]string{}
-	for _, it := range check.Run(t.Context(), checks).Items {
-		s := it.Status.String()
-		r := it.Rendered()
-		text := r.Title + " " + r.Message
-		if f := r.Failure; f != nil {
-			s += " " + f.Reason
-			text += " " + f.Message + " " + f.Fix
-		}
-		if strings.ContainsAny(text, "{}") {
-			t.Errorf("%s: a placeholder unfilled: %s", it.Name, text)
-		}
-		out[it.Name] = s
-	}
-	return out
-}
-
-// expectItems compares the items want names; the rest pass.
-func expectItems(t *testing.T, got map[string]string, want map[string]string) {
-	t.Helper()
-	for name, status := range got {
-		w, ok := want[name]
-		switch {
-		case ok && status != w:
-			t.Errorf("%s: %s, want %s", name, status, w)
-		case !ok && status != "passed":
-			t.Errorf("%s: %s", name, status)
-		}
-	}
-	for name := range want {
-		if _, ok := got[name]; !ok {
-			t.Errorf("no item %s", name)
-		}
-	}
-}
 
 // testUser creates a user with settings and grants, dropped when t ends,
 // and gives its name; $db in a grant is database.
@@ -95,11 +52,11 @@ func TestSourceCheckItems(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	expectItems(t, items(t, s.Checks()), nil)
+	connectortest.ExpectStatuses(t, connectortest.Items(t, s.Checks()), nil)
 	if err := s.Check(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	expectItems(t, items(t, s.Preflight(source.PreflightRequest{Streams: []source.ConfiguredStream{
+	connectortest.ExpectStatuses(t, connectortest.Items(t, s.Preflight(source.PreflightRequest{Streams: []source.ConfiguredStream{
 		{Name: "items", SyncMode: source.FullRefresh},
 		{Name: "items", SyncMode: source.Incremental, Cursor: "at"},
 		{Name: "items", SyncMode: source.Incremental, Cursor: "j"},
@@ -123,10 +80,10 @@ func TestSourceCheckItems(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	expectItems(t, items(t, s.Checks()), map[string]string{"tables.read": "failed privilege_missing"})
-	expectItems(t, items(t, s.Preflight(source.PreflightRequest{Streams: []source.ConfiguredStream{{Name: "nokey", SyncMode: source.FullRefresh}, {Name: "items", SyncMode: source.FullRefresh}}})),
+	connectortest.ExpectStatuses(t, connectortest.Items(t, s.Checks()), map[string]string{"tables.read": "failed privilege_missing"})
+	connectortest.ExpectStatuses(t, connectortest.Items(t, s.Preflight(source.PreflightRequest{Streams: []source.ConfiguredStream{{Name: "nokey", SyncMode: source.FullRefresh}, {Name: "items", SyncMode: source.FullRefresh}}})),
 		map[string]string{"stream.items.read": "failed privilege_missing", "stream.items.order": "skipped"})
-	expectItems(t, items(t, s.Preflight(source.PreflightRequest{Streams: []source.ConfiguredStream{{Name: "v", SyncMode: source.FullRefresh}}})),
+	connectortest.ExpectStatuses(t, connectortest.Items(t, s.Preflight(source.PreflightRequest{Streams: []source.ConfiguredStream{{Name: "v", SyncMode: source.FullRefresh}}})),
 		map[string]string{"stream.v.read": "failed not_found", "stream.v.order": "skipped"})
 	// A readonly profile's user reads, as the source sets no setting.
 	e.exec("INSERT INTO $db.items (id, at) VALUES (1, now()), (2, now())")
@@ -134,7 +91,7 @@ func TestSourceCheckItems(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	expectItems(t, items(t, s.Checks()), nil)
+	connectortest.ExpectStatuses(t, connectortest.Items(t, s.Checks()), nil)
 	c := newCollector()
 	if err := s.Read(t.Context(), source.ReadRequest{Streams: []source.ConfiguredStream{{Name: "items", SyncMode: source.FullRefresh}}, Lanes: 1}, c); err != nil {
 		t.Fatal(err)
@@ -146,7 +103,7 @@ func TestSourceCheckItems(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	expectItems(t, items(t, s.Checks()), map[string]string{"database.found": "failed not_found", "tables.read": "skipped"})
+	connectortest.ExpectStatuses(t, connectortest.Items(t, s.Checks()), map[string]string{"database.found": "failed not_found", "tables.read": "skipped"})
 }
 
 func TestDestinationCheckItems(t *testing.T) {
@@ -155,7 +112,7 @@ func TestDestinationCheckItems(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	expectItems(t, items(t, d.Checks()), nil)
+	connectortest.ExpectStatuses(t, connectortest.Items(t, d.Checks()), nil)
 	if err := d.Check(t.Context()); err != nil {
 		t.Fatal(err)
 	}
@@ -166,7 +123,7 @@ func TestDestinationCheckItems(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	expectItems(t, items(t, d.Checks()), map[string]string{
+	connectortest.ExpectStatuses(t, connectortest.Items(t, d.Checks()), map[string]string{
 		"grant.tables": "failed privilege_missing", "grant.rows": "failed privilege_missing", "grant.columns": "failed privilege_missing",
 		"grant.partitions": "failed privilege_missing", "grant.update": "failed privilege_missing", "grant.system": "failed privilege_missing",
 	})
@@ -182,7 +139,7 @@ func TestDestinationCheckItems(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	expectItems(t, items(t, d.Checks()), map[string]string{
+	connectortest.ExpectStatuses(t, connectortest.Items(t, d.Checks()), map[string]string{
 		"grant.tables": "failed user_readonly", "grant.rows": "failed user_readonly", "grant.columns": "failed user_readonly",
 		"grant.partitions": "failed user_readonly", "grant.update": "failed user_readonly", "settings.write": "failed setting_locked",
 	})
@@ -191,7 +148,7 @@ func TestDestinationCheckItems(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := items(t, d.Checks()); got["database.create"] != "failed privilege_missing" {
+	if got := connectortest.Items(t, d.Checks()); got["database.create"] != "failed privilege_missing" {
 		t.Errorf("database.create of a missing database without CREATE DATABASE: %s", got["database.create"])
 	}
 
@@ -201,7 +158,7 @@ func TestDestinationCheckItems(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	expectItems(t, items(t, d.Checks()), map[string]string{"settings.write": "failed setting_locked"})
+	connectortest.ExpectStatuses(t, connectortest.Items(t, d.Checks()), map[string]string{"settings.write": "failed setting_locked"})
 
 	// Preflight: a merge without a key, an existing table whose key can't
 	// take the stream's type, a seq that can't version, and a hard delete
@@ -218,7 +175,7 @@ func TestDestinationCheckItems(t *testing.T) {
 		return arrow.NewSchema([]arrow.Field{{Name: "id", Type: arrow.PrimitiveTypes.Int64}, {Name: opColumn, Type: arrow.BinaryTypes.String}, {Name: seqColumn, Type: seq, Nullable: true}}, nil)
 	}
 	keyed := arrow.NewSchema([]arrow.Field{{Name: "id", Type: arrow.PrimitiveTypes.Int64}, {Name: "v", Type: arrow.PrimitiveTypes.Int64}}, nil)
-	expectItems(t, items(t, d.Preflight(destination.PreflightRequest{
+	connectortest.ExpectStatuses(t, connectortest.Items(t, d.Preflight(destination.PreflightRequest{
 		Namespace: db,
 		Streams: []destination.Stream{
 			{Name: "nokey", Mode: destination.Merge},
@@ -241,7 +198,7 @@ func TestDestinationCheckItems(t *testing.T) {
 	// A namespace with a dot can't take patches.
 	dotted := db + ".x"
 	t.Cleanup(func() { _ = conn.Exec(context.Background(), "DROP DATABASE IF EXISTS "+ident(dotted)) })
-	expectItems(t, items(t, d.Preflight(destination.PreflightRequest{
+	connectortest.ExpectStatuses(t, connectortest.Items(t, d.Preflight(destination.PreflightRequest{
 		Namespace: dotted, Streams: []destination.Stream{{Name: "a", Mode: destination.Append}},
 		Schemas: map[string]*arrow.Schema{"a": keyed},
 	})), map[string]string{"stream.a.write": "warning database_name_dotted"})
@@ -253,7 +210,7 @@ func TestCheckErrors(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	expectItems(t, items(t, d.Checks()), map[string]string{
+	connectortest.ExpectStatuses(t, connectortest.Items(t, d.Checks()), map[string]string{
 		"db.connect": "failed credentials_rejected", "server.version": "skipped", "database.create": "skipped",
 		"grant.tables": "skipped", "grant.rows": "skipped", "grant.columns": "skipped", "grant.partitions": "skipped",
 		"grant.update": "skipped", "grant.system": "skipped", "settings.write": "skipped",
@@ -262,7 +219,7 @@ func TestCheckErrors(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	expectItems(t, items(t, s.Checks()), map[string]string{
+	connectortest.ExpectStatuses(t, connectortest.Items(t, s.Checks()), map[string]string{
 		"net.connect": "failed connection_refused", "db.connect": "skipped", "server.version": "skipped", "database.found": "skipped", "tables.read": "skipped",
 	})
 }
@@ -285,7 +242,7 @@ func TestDestinationGranted(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			expectItems(t, items(t, d.Checks()), nil)
+			connectortest.ExpectStatuses(t, connectortest.Items(t, d.Checks()), nil)
 			f(t, kit{t: t, db: db, d: d})
 		})
 	}

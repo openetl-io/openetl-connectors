@@ -20,6 +20,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
 
+	"github.com/openetl-io/openetl-connectors/connectortest"
 	"github.com/openetl-io/openetl-connectors/keysplit"
 	"github.com/openetl-io/openetl/sdk/go/check"
 	"github.com/openetl-io/openetl/sdk/go/source"
@@ -614,24 +615,11 @@ func endsAt(t *testing.T, events []srcEvent, until string) {
 	}
 }
 
-// statuses is each item's status and reason, as "status reason".
-func statuses(r check.Report) map[string]string {
-	out := map[string]string{}
-	for _, it := range r.Items {
-		s := it.Status.String()
-		if it.Failure != nil {
-			s += " " + it.Failure.Reason
-		}
-		out[it.Name] = s
-	}
-	return out
-}
-
 // expectItems checks the items named in want, and logs every item, as it
 // renders, when one isn't as wanted or with -v.
 func expectItems(t *testing.T, what string, r check.Report, want map[string]string) {
 	t.Helper()
-	got := statuses(r)
+	got := connectortest.Statuses(r)
 	for name, w := range want {
 		if got[name] != w {
 			t.Errorf("%s: %s is %q, want %q", what, name, got[name], w)

@@ -439,53 +439,8 @@ func (w *writer) Apply(ctx context.Context, desc staged, streams []stagedStream,
 
 func (w *writer) applyTx(ctx context.Context, desc staged, streams []stagedStream, prep map[string]prepared, lock string, collapsed map[string]uint64) error {
 	return w.ApplyTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted}, lock, desc, streams, func(tx *sql.Tx, s stagedStream) (uint64, error) {
-		return w.applyStream(ctx, tx, s, prep[s.Name])
+		return sqlstage.ApplyStream(ctx, "mysql", tx, w, s, prep[s.Name])
 	}, collapsed)
-}
-
-// applyStream applies one stream's staging in tx, and returns the rows it
-// inserted.
-func (w *writer) applyStream(ctx context.Context, tx *sql.Tx, s stagedStream, p prepared) (uint64, error) {
-	n, err := w.applyRows(ctx, tx, s, p)
-	if err != nil {
-		return 0, err
-	}
-	for _, q := range w.patch(s, p) {
-		if _, err := tx.ExecContext(ctx, q); err != nil {
-			return 0, fmt.Errorf("patch: %w", err)
-		}
-	}
-	return n, nil
-}
-
-func (w *writer) applyRows(ctx context.Context, tx *sql.Tx, s stagedStream, p prepared) (uint64, error) {
-	if s.Mode == modeMerge {
-		if len(s.Stagings) == 0 {
-			return 0, nil
-		}
-		for _, q := range w.merge(s, p) {
-			if _, err := tx.ExecContext(ctx, q); err != nil {
-				return 0, err
-			}
-		}
-		return 0, nil
-	}
-	var n uint64
-	if len(s.Stagings) > 0 {
-		res, err := tx.ExecContext(ctx, w.insert(s, p))
-		if err != nil {
-			return 0, err
-		}
-		affected, err := res.RowsAffected()
-		if err != nil || affected < 0 {
-			return 0, fmt.Errorf("mysql: the insert reported %d rows: %w", affected, err)
-		}
-		n = uint64(affected)
-	}
-	if s.Ended {
-		return n, w.replace(ctx, tx, s, p.read)
-	}
-	return n, nil
 }
 
 // latestFirst orders rel's rows from the last staged, by _openetl_seq if
@@ -554,10 +509,10 @@ func selectList(cols []string, rel string, held []string) string {
 	return strings.Join(out, ", ")
 }
 
-// insert copies a stream's staging into its target, or its read's table. A
+// InsertSQL copies a stream's staging into its target, or its read's table. A
 // deduped stream inserts one row per _openetl_id, the first staged, and with
 // Dedupe only IDs the target doesn't have.
-func (w *writer) insert(s stagedStream, p prepared) string {
+func (w *writer) InsertSQL(s stagedStream, p prepared) string {
 	into := "INSERT INTO " + w.ident(s.Into()) + " (" + quoteAll(p.cols) + ") "
 	sel := selectList(p.cols, "s", p.held)
 	id := quoteIdent(idColumn)
@@ -572,10 +527,10 @@ func (w *writer) insert(s stagedStream, p prepared) string {
 	return q
 }
 
-// patch fills held cells from the epoch's patches: each column where the
+// PatchSQL fills held cells from the epoch's patches: each column where the
 // target still holds the version the patch comes from, matched by key for
 // merge and by _openetl_id for append.
-func (w *writer) patch(s stagedStream, p prepared) []string {
+func (w *writer) PatchSQL(s stagedStream, p prepared) []string {
 	cols := p.patch
 	if len(cols) == 0 {
 		return nil
@@ -608,7 +563,7 @@ func (w *writer) patch(s stagedStream, p prepared) []string {
 	return out
 }
 
-// merge upserts each key's latest staged version, by _openetl_seq and then
+// MergeSQL upserts each key's latest staged version, by _openetl_seq and then
 // staging order, unless the target's is newer. A delete keeps the row's
 // other columns as they were, with its metadata columns updated, or with
 // hard deletes removes the row. A column in unchanged that the latest
@@ -618,7 +573,7 @@ func (w *writer) patch(s stagedStream, p prepared) []string {
 // Each row's values are worked out in the SELECT, against the target's row
 // joined as cur, and ON DUPLICATE KEY UPDATE only takes them: its
 // assignments would see the values of those before them.
-func (w *writer) merge(s stagedStream, p prepared) []string {
+func (w *writer) MergeSQL(s stagedStream, p prepared) []string {
 	cols := p.cols
 	q := quoteIdent
 	hasSeq, hasOp := slices.Contains(cols, seqColumn), slices.Contains(cols, opColumn)
@@ -752,9 +707,10 @@ func (w *writer) latest(s stagedStream, p prepared, hasSeq bool) string {
 	return "(SELECT " + strings.Join(sel, ", ") + " FROM " + l + " WHERE l._openetl_rn = 1)"
 }
 
-// replace makes the read's rows the target's. Readers see the old rows
+// Replace makes the read's rows the target's. Readers see the old rows
 // until the transaction commits; apply drops the read's table after it.
-func (w *writer) replace(ctx context.Context, tx *sql.Tx, s stagedStream, read []string) error {
+func (w *writer) Replace(ctx context.Context, tx *sql.Tx, s stagedStream, p prepared) error {
+	read := p.read
 	switch {
 	case s.Table == "" && len(read) > 0:
 		return fmt.Errorf("its read has rows in %s, and no target table", s.Read)

@@ -2,7 +2,8 @@
 // Patch, PreCommit, Commit and Recover, over each database's SQL; the tables
 // it stages each stream's rows and patches in, and their names; the
 // descriptor its PreCommit returns, and how its Commit merges the lanes'; and
-// a database/sql destination's fence and markers.
+// a database/sql destination's fence and markers, and how it applies a
+// stream's staging.
 package sqlstage
 
 import (

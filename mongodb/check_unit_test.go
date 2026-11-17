@@ -8,20 +8,12 @@ import (
 	"github.com/apache/arrow-go/v18/arrow"
 	"go.mongodb.org/mongo-driver/v2/bson"
 
-	"github.com/openetl-io/openetl-connectors/sourcetest"
+	"github.com/openetl-io/openetl-connectors/connectortest"
 	"github.com/openetl-io/openetl/sdk/go/check"
 	"github.com/openetl-io/openetl/sdk/go/destination"
 	protocolv1 "github.com/openetl-io/openetl/sdk/go/protocol/v1"
 	"github.com/openetl-io/openetl/sdk/go/source"
 )
-
-func itemNames(checks []check.Check) []string {
-	out := make([]string, len(checks))
-	for i, c := range checks {
-		out[i] = c.Name
-	}
-	return out
-}
 
 // valid fails a list check.Validate refuses, or whose items name a field
 // the config doesn't have.
@@ -59,7 +51,7 @@ func TestCheckLists(t *testing.T) {
 		}
 		checks := s.Checks()
 		valid(t, tc.config, checks, srcFields...)
-		if got := itemNames(checks); !slices.Equal(got, tc.want) {
+		if got := connectortest.ItemNames(checks); !slices.Equal(got, tc.want) {
 			t.Errorf("%s: %v, want %v", tc.config, got, tc.want)
 		}
 		for _, c := range checks {
@@ -70,7 +62,7 @@ func TestCheckLists(t *testing.T) {
 			}
 		}
 		// One host: signing in needs it; several: it needs none of them.
-		if i := slices.Index(itemNames(checks), "db.connect"); len(s.opts.Hosts) == 1 && len(checks[i].Needs) != 1 || len(s.opts.Hosts) > 1 && len(checks[i].Needs) != 0 {
+		if i := slices.Index(connectortest.ItemNames(checks), "db.connect"); len(s.opts.Hosts) == 1 && len(checks[i].Needs) != 1 || len(s.opts.Hosts) > 1 && len(checks[i].Needs) != 0 {
 			t.Errorf("%s: db.connect needs %v", tc.config, checks[i].Needs)
 		}
 	}
@@ -86,7 +78,7 @@ func TestCheckLists(t *testing.T) {
 	valid(t, "source preflight", pf, srcFields...)
 	want := []string{"db.connect", "stream.orders.read", "stream.orders.read-2", "stream.orders.cursor", "stream.x.read",
 		"cdc.replica-set", "cdc.watch", "cdc.images", "cdc.oplog"}
-	if got := itemNames(pf); !slices.Equal(got, want) {
+	if got := connectortest.ItemNames(pf); !slices.Equal(got, want) {
 		t.Errorf("source preflight %v, want %v", got, want)
 	}
 	for _, c := range pf {
@@ -94,7 +86,7 @@ func TestCheckLists(t *testing.T) {
 			t.Errorf("source preflight: %s is advisory: %v", c.Name, c.Advisory)
 		}
 	}
-	if got := itemNames(s.Preflight(source.PreflightRequest{Streams: req.Streams[2:]})); !slices.Equal(got, []string{"db.connect", "stream.x.read"}) {
+	if got := connectortest.ItemNames(s.Preflight(source.PreflightRequest{Streams: req.Streams[2:]})); !slices.Equal(got, []string{"db.connect", "stream.x.read"}) {
 		t.Errorf("preflight without cdc %v", got)
 	}
 
@@ -104,7 +96,7 @@ func TestCheckLists(t *testing.T) {
 	}
 	dstFields := []string{"uri", "database", "extendedJSONKeys"}
 	valid(t, "destination checks", d.Checks(), dstFields...)
-	if got, want := itemNames(d.Checks()), []string{"net.dns", "net.connect", "net.tls", "db.connect", "db.write"}; !slices.Equal(got, want) {
+	if got, want := connectortest.ItemNames(d.Checks()), []string{"net.dns", "net.connect", "net.tls", "db.connect", "db.write"}; !slices.Equal(got, want) {
 		t.Errorf("destination checks %v, want %v", got, want)
 	}
 	str := arrow.NewSchema([]arrow.Field{{Name: "id", Type: arrow.BinaryTypes.String}}, nil)
@@ -117,7 +109,7 @@ func TestCheckLists(t *testing.T) {
 	// Only a merge by one text key has its _ids checked.
 	want = []string{"db.connect", "db.write", "stream.a-b.write", "stream.a-b.indexes", "stream.a-b.keys",
 		"stream.a-b.write-2", "stream.a-b.indexes-2", "stream.c.write", "stream.c.indexes"}
-	if got := itemNames(dpf); !slices.Equal(got, want) {
+	if got := connectortest.ItemNames(dpf); !slices.Equal(got, want) {
 		t.Errorf("destination preflight %v, want %v", got, want)
 	}
 }
@@ -213,7 +205,7 @@ func TestUniqueConflict(t *testing.T) {
 // doesn't resolve is TRANSIENT, as DNS may answer later, not a bad config.
 func TestSRVLookupFails(t *testing.T) {
 	_, err := NewSource([]byte(`{"uri": "mongodb+srv://u:p@cluster0.example.invalid/", "database": "app"}`))
-	if code := sourcetest.CodeOf(err); code != protocolv1.ErrorCode_ERROR_CODE_TRANSIENT {
+	if code := connectortest.CodeOf(err); code != protocolv1.ErrorCode_ERROR_CODE_TRANSIENT {
 		t.Errorf("%s: %v", code, err)
 	}
 	if f := check.Classify(err); f.Reason != check.DNSFailed.Name {

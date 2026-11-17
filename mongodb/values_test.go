@@ -14,7 +14,7 @@ import (
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 
-	"github.com/openetl-io/openetl-connectors/sourcetest"
+	"github.com/openetl-io/openetl-connectors/connectortest"
 	protocolv1 "github.com/openetl-io/openetl/sdk/go/protocol/v1"
 	"github.com/openetl-io/openetl/sdk/go/source"
 )
@@ -274,11 +274,11 @@ func TestBatcher(t *testing.T) {
 		}
 		return b
 	}
-	rec := &sourcetest.Recorder{}
+	rec := &connectortest.Recorder{}
 	out := rec.Split("s", source.WholeStream)
 	cols := []string{"_id", "a", "openetl.op", "openetl.seq"}
 	b := (&Source{}).newBatcher(source.ConfiguredStream{Name: "s", Columns: cols}, cols, true)
-	defer b.release()
+	defer b.Release()
 	q := seq{t: bson.Timestamp{T: 1}, place: 1}
 	if err := b.add(doc(bson.D{{Key: "_id", Value: 1}, {Key: "a", Value: "x"}}), source.OpInsert, q); err != nil {
 		t.Fatal(err)
@@ -293,16 +293,16 @@ func TestBatcher(t *testing.T) {
 	}
 	// Discovery that samples can miss the field again: the error says how not to.
 	sampled := (&Source{cfg: SourceConfig{SampleSize: 100}}).newBatcher(source.ConfiguredStream{Name: "s", Columns: cols}, cols, true)
-	defer sampled.release()
+	defer sampled.Release()
 	err = sampled.add(doc(bson.D{{Key: "_id", Value: 3}, {Key: "z", Value: 1}}), source.OpUpdate, q)
-	if sourcetest.CodeOf(err) != protocolv1.ErrorCode_ERROR_CODE_TRANSIENT || !strings.Contains(err.Error(), "sample of 100") || !strings.Contains(err.Error(), "packed") {
+	if connectortest.CodeOf(err) != protocolv1.ErrorCode_ERROR_CODE_TRANSIENT || !strings.Contains(err.Error(), "sample of 100") || !strings.Contains(err.Error(), "packed") {
 		t.Errorf("an undeclared field, sampled: %v", err)
 	}
 	b.gone = func(string) (bool, error) { return true, nil }
 	if err := b.add(doc(bson.D{{Key: "_id", Value: 4}, {Key: "z", Value: 1}}), source.OpUpdate, q); err != nil {
 		t.Errorf("a field no document has: %v", err)
 	}
-	if err := b.flush(out); err != nil {
+	if err := b.Flush(out); err != nil {
 		t.Fatal(err)
 	}
 	rows := rec.RowsOf("s")
@@ -323,14 +323,14 @@ func TestBatcher(t *testing.T) {
 
 	// Without the run's columns, a batch has the fields its documents have.
 	b2 := (&Source{}).newBatcher(source.ConfiguredStream{Name: "s"}, nil, false)
-	defer b2.release()
+	defer b2.Release()
 	for _, d := range []bson.D{{{Key: "_id", Value: 1}}, {{Key: "_id", Value: 2}, {Key: "n", Value: 1}}} {
 		if err := b2.add(doc(d), "", seq{}); err != nil {
 			t.Fatal(err)
 		}
 	}
-	rec2 := &sourcetest.Recorder{}
-	if err := b2.flush(rec2.Split("s", "")); err != nil {
+	rec2 := &connectortest.Recorder{}
+	if err := b2.Flush(rec2.Split("s", "")); err != nil {
 		t.Fatal(err)
 	}
 	if rows := rec2.RowsOf("s"); len(rows) != 2 || rows[0]["n"] != "" || rows[1]["n"] != "1" {
@@ -342,15 +342,15 @@ func TestBatcher(t *testing.T) {
 	p := &Source{cfg: SourceConfig{Packed: true}}
 	cs := source.ConfiguredStream{Name: "s", Columns: []string{"_id", "data", "openetl.op", "openetl.seq"}}
 	b3 := p.newBatcher(cs, []string{dataColumn}, true)
-	defer b3.release()
+	defer b3.Release()
 	if err := b3.add(doc(bson.D{{Key: "_id", Value: 1}, {Key: "new", Value: int64(2)}}), source.OpInsert, q); err != nil {
 		t.Fatal(err)
 	}
 	if err := b3.addKey(raw(t, "k"), q); err != nil {
 		t.Fatal(err)
 	}
-	rec3 := &sourcetest.Recorder{}
-	if err := b3.flush(rec3.Split("s", "")); err != nil {
+	rec3 := &connectortest.Recorder{}
+	if err := b3.Flush(rec3.Split("s", "")); err != nil {
 		t.Fatal(err)
 	}
 	rows = rec3.RowsOf("s")

@@ -488,58 +488,13 @@ func (w *writer) Apply(ctx context.Context, desc staged, streams []stagedStream,
 
 func (w *writer) applyTx(ctx context.Context, desc staged, streams []stagedStream, prep map[string]prepared, collapsed map[string]uint64) error {
 	return w.ApplyTx(ctx, nil, "FOR UPDATE", desc, streams, func(tx *sql.Tx, s stagedStream) (uint64, error) {
-		return w.applyStream(ctx, tx, s, prep[s.Name])
+		return sqlstage.ApplyStream(ctx, "oracle", tx, w, s, prep[s.Name])
 	}, collapsed)
 }
 
-// applyStream applies one stream's staging in tx, and returns the rows it
-// inserted.
-func (w *writer) applyStream(ctx context.Context, tx *sql.Tx, s stagedStream, p prepared) (uint64, error) {
-	n, err := w.applyRows(ctx, tx, s, p)
-	if err != nil {
-		return 0, err
-	}
-	for _, q := range w.patch(s, p) {
-		if _, err := tx.ExecContext(ctx, q); err != nil {
-			return 0, fmt.Errorf("patch: %w", err)
-		}
-	}
-	return n, nil
-}
-
-func (w *writer) applyRows(ctx context.Context, tx *sql.Tx, s stagedStream, p prepared) (uint64, error) {
-	if s.Mode == modeMerge {
-		if len(s.Stagings) == 0 {
-			return 0, nil
-		}
-		for _, q := range w.merge(s, p) {
-			if _, err := tx.ExecContext(ctx, q); err != nil {
-				return 0, err
-			}
-		}
-		return 0, nil
-	}
-	var n uint64
-	if len(s.Stagings) > 0 {
-		res, err := tx.ExecContext(ctx, w.insert(s, p))
-		if err != nil {
-			return 0, err
-		}
-		affected, err := res.RowsAffected()
-		if err != nil || affected < 0 {
-			return 0, fmt.Errorf("oracle: the insert reported %d rows: %w", affected, err)
-		}
-		n = uint64(affected)
-	}
-	if s.Ended {
-		return n, w.replace(ctx, tx, s, p)
-	}
-	return n, nil
-}
-
-// replace makes the read's rows the target's. Readers see the old rows
+// Replace makes the read's rows the target's. Readers see the old rows
 // until the transaction commits; apply drops the read's table after it.
-func (w *writer) replace(ctx context.Context, tx *sql.Tx, s stagedStream, p prepared) error {
+func (w *writer) Replace(ctx context.Context, tx *sql.Tx, s stagedStream, p prepared) error {
 	switch {
 	case s.Table == "" && len(p.read) > 0:
 		return fmt.Errorf("its read has rows in %s, and no target table", s.Read)

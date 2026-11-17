@@ -16,7 +16,7 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 
-	"github.com/openetl-io/openetl-connectors/sourcetest"
+	"github.com/openetl-io/openetl-connectors/connectortest"
 	protocolv1 "github.com/openetl-io/openetl/sdk/go/protocol/v1"
 	"github.com/openetl-io/openetl/sdk/go/source"
 )
@@ -33,10 +33,10 @@ func waitFor(t *testing.T, d time.Duration, what string, cond func() bool) {
 
 // follow starts a continuous cdc read of stream, from state, stopped when t
 // ends; done has its error.
-func follow(t *testing.T, s *Source, stream string, state []byte, columns []string) (*sourcetest.Recorder, <-chan error) {
+func follow(t *testing.T, s *Source, stream string, state []byte, columns []string) (*connectortest.Recorder, <-chan error) {
 	t.Helper()
 	ctx := t.Context()
-	rec := &sourcetest.Recorder{}
+	rec := &connectortest.Recorder{}
 	done := make(chan error, 1)
 	go func() {
 		done <- s.Read(ctx, source.ReadRequest{Continuous: true, Streams: []source.ConfiguredStream{
@@ -84,7 +84,7 @@ func TestCDCContinuous(t *testing.T) {
 }
 
 // changes waits for n rows past the first skip, and returns them.
-func changes(t *testing.T, rec *sourcetest.Recorder, done <-chan error, stream string, skip, n int) []map[string]string {
+func changes(t *testing.T, rec *connectortest.Recorder, done <-chan error, stream string, skip, n int) []map[string]string {
 	t.Helper()
 	waitFor(t, 20*time.Second, fmt.Sprintf("%d rows of %s", skip+n, stream), func() bool {
 		select {
@@ -208,7 +208,7 @@ func TestCDCNewField(t *testing.T) {
 	insert(t, coll, bson.D{{Key: "_id", Value: 1}, {Key: "a", Value: 1}})
 	s := newTestSource(t, db, "")
 	columns := []string{"_id", "a", "openetl.op", "openetl.seq"}
-	rec := &sourcetest.Recorder{}
+	rec := &connectortest.Recorder{}
 	if err := s.Read(ctx, source.ReadRequest{Streams: []source.ConfiguredStream{{Name: "c", SyncMode: source.CDC, Columns: columns}}}, rec); err != nil {
 		t.Fatal(err)
 	}
@@ -230,8 +230,8 @@ func TestCDCNewField(t *testing.T) {
 	insert(t, coll, bson.D{{Key: "_id", Value: 3}, {Key: "gone", Value: 1}})
 	select {
 	case err := <-done:
-		if sourcetest.CodeOf(err) != protocolv1.ErrorCode_ERROR_CODE_TRANSIENT || !strings.Contains(err.Error(), `new field "gone"`) {
-			t.Errorf("a new field: %s: %v", sourcetest.CodeOf(err), err)
+		if connectortest.CodeOf(err) != protocolv1.ErrorCode_ERROR_CODE_TRANSIENT || !strings.Contains(err.Error(), `new field "gone"`) {
+			t.Errorf("a new field: %s: %v", connectortest.CodeOf(err), err)
 		}
 	case <-time.After(20 * time.Second):
 		t.Fatal("a new field didn't end the read")
@@ -259,8 +259,8 @@ func TestCDCEnds(t *testing.T) {
 			}
 			select {
 			case err := <-done:
-				if sourcetest.CodeOf(err) != protocolv1.ErrorCode_ERROR_CODE_POSITION_LOST || !strings.Contains(err.Error(), c.want) {
-					t.Errorf("%s: %s: %v", c.name, sourcetest.CodeOf(err), err)
+				if connectortest.CodeOf(err) != protocolv1.ErrorCode_ERROR_CODE_POSITION_LOST || !strings.Contains(err.Error(), c.want) {
+					t.Errorf("%s: %s: %v", c.name, connectortest.CodeOf(err), err)
 				}
 			case <-time.After(20 * time.Second):
 				t.Fatalf("%s didn't end the read", c.name)

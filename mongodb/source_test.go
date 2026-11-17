@@ -12,7 +12,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/extensions"
 	"go.mongodb.org/mongo-driver/v2/bson"
 
-	"github.com/openetl-io/openetl-connectors/sourcetest"
+	"github.com/openetl-io/openetl-connectors/connectortest"
 	protocolv1 "github.com/openetl-io/openetl/sdk/go/protocol/v1"
 	"github.com/openetl-io/openetl/sdk/go/source"
 )
@@ -32,9 +32,9 @@ func discovered(t *testing.T, s *Source, stream string) source.CatalogStream {
 	return source.CatalogStream{}
 }
 
-func readAll(t *testing.T, s *Source, streams ...source.ConfiguredStream) *sourcetest.Recorder {
+func readAll(t *testing.T, s *Source, streams ...source.ConfiguredStream) *connectortest.Recorder {
 	t.Helper()
-	rec := &sourcetest.Recorder{}
+	rec := &connectortest.Recorder{}
 	if err := s.Read(t.Context(), source.ReadRequest{Streams: streams}, rec); err != nil {
 		t.Fatal(err)
 	}
@@ -160,7 +160,7 @@ func TestSplitsMixedIDs(t *testing.T) {
 	// Read in smaller chunks, the first split read is asked to split at its
 	// first resume point.
 	s = newTestSource(t, db, `, "chunkDocuments": 5`)
-	rec := &sourcetest.Recorder{}
+	rec := &connectortest.Recorder{}
 	asked := false
 	hook := &hookRecorder{Recorder: rec, onResume: func(stream, split string) {
 		if !asked {
@@ -209,7 +209,7 @@ func TestSplitsMixedIDs(t *testing.T) {
 
 // hookRecorder calls onResume after each split's resume point.
 type hookRecorder struct {
-	*sourcetest.Recorder
+	*connectortest.Recorder
 	onResume func(stream, split string)
 }
 
@@ -256,9 +256,9 @@ func TestIncrementalCursorTypes(t *testing.T) {
 		t.Errorf("the next read: %v", rows)
 	}
 	// Without a cursor, incremental can't read.
-	err := s.Read(t.Context(), source.ReadRequest{Streams: []source.ConfiguredStream{{Name: "ev", SyncMode: source.Incremental}}}, &sourcetest.Recorder{})
-	if sourcetest.CodeOf(err) != protocolv1.ErrorCode_ERROR_CODE_CONFIG_INVALID {
-		t.Errorf("incremental without a cursor: %s: %v", sourcetest.CodeOf(err), err)
+	err := s.Read(t.Context(), source.ReadRequest{Streams: []source.ConfiguredStream{{Name: "ev", SyncMode: source.Incremental}}}, &connectortest.Recorder{})
+	if connectortest.CodeOf(err) != protocolv1.ErrorCode_ERROR_CODE_CONFIG_INVALID {
+		t.Errorf("incremental without a cursor: %s: %v", connectortest.CodeOf(err), err)
 	}
 }
 
@@ -269,14 +269,14 @@ func TestSourceCheck(t *testing.T) {
 		t.Errorf("Check: %v", err)
 	}
 	err := newTestSource(t, db, `, "collections": ["missing"]`).Check(t.Context())
-	if sourcetest.CodeOf(err) != protocolv1.ErrorCode_ERROR_CODE_CONFIG_INVALID {
-		t.Errorf("Check of a missing collection: %s: %v", sourcetest.CodeOf(err), err)
+	if connectortest.CodeOf(err) != protocolv1.ErrorCode_ERROR_CODE_CONFIG_INVALID {
+		t.Errorf("Check of a missing collection: %s: %v", connectortest.CodeOf(err), err)
 	}
 	bad, err := NewSource(sourceConfig(badPassword(t), db, ""))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := bad.Check(t.Context()); sourcetest.CodeOf(err) != protocolv1.ErrorCode_ERROR_CODE_AUTH_INVALID {
-		t.Errorf("Check with a bad password: %s: %v", sourcetest.CodeOf(err), err)
+	if err := bad.Check(t.Context()); connectortest.CodeOf(err) != protocolv1.ErrorCode_ERROR_CODE_AUTH_INVALID {
+		t.Errorf("Check with a bad password: %s: %v", connectortest.CodeOf(err), err)
 	}
 }

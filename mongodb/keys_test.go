@@ -16,7 +16,7 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 
-	"github.com/openetl-io/openetl-connectors/sourcetest"
+	"github.com/openetl-io/openetl-connectors/connectortest"
 	"github.com/openetl-io/openetl/sdk/go/destination"
 	protocolv1 "github.com/openetl-io/openetl/sdk/go/protocol/v1"
 	"github.com/openetl-io/openetl/sdk/go/source"
@@ -157,8 +157,8 @@ func TestMixedIDKeys(t *testing.T) {
 	// A key the source wouldn't spell, a bare 5, is refused.
 	bad := cdcBatch(t, []map[string]string{{"_id": "5", "openetl.op": source.OpInsert, "openetl.seq": "1"}})
 	defer bad.Release()
-	if err := w.Write(ctx, destination.Epoch{Generation: 1, N: 2}, "out", bad); sourcetest.CodeOf(err) != protocolv1.ErrorCode_ERROR_CODE_DATA_INVALID {
-		t.Errorf("a key that isn't Extended JSON: %s: %v", sourcetest.CodeOf(err), err)
+	if err := w.Write(ctx, destination.Epoch{Generation: 1, N: 2}, "out", bad); connectortest.CodeOf(err) != protocolv1.ErrorCode_ERROR_CODE_DATA_INVALID {
+		t.Errorf("a key that isn't Extended JSON: %s: %v", connectortest.CodeOf(err), err)
 	}
 
 	// Without extendedJSONKeys, the keys are strings, one for each _id.

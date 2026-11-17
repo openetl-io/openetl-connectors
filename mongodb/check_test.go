@@ -13,39 +13,11 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 
+	"github.com/openetl-io/openetl-connectors/connectortest"
 	"github.com/openetl-io/openetl/sdk/go/check"
 	"github.com/openetl-io/openetl/sdk/go/destination"
 	"github.com/openetl-io/openetl/sdk/go/source"
 )
-
-// statuses is each item's status and reason, as "status reason".
-func statuses(r check.Report) map[string]string {
-	out := map[string]string{}
-	for _, it := range r.Items {
-		s := it.Status.String()
-		if it.Failure != nil {
-			s += " " + it.Failure.Reason
-		}
-		out[it.Name] = s
-	}
-	return out
-}
-
-func expectItems(t *testing.T, what string, r check.Report, want map[string]string) {
-	t.Helper()
-	got := statuses(r)
-	for name, w := range want {
-		if got[name] != w {
-			t.Errorf("%s: %s is %q, want %q", what, name, got[name], w)
-		}
-	}
-	if t.Failed() {
-		for _, it := range r.Items {
-			it = it.Rendered()
-			t.Logf("%s %s: %s: %s", it.Status, it.Name, it.Title, it.Message)
-		}
-	}
-}
 
 // Each thing a user lacks is an item of its own, with its reason, and the
 // lists say what a pipeline needs of each stream.
@@ -68,7 +40,7 @@ func TestSourceChecks(t *testing.T) {
 	}
 
 	s := newTestSource(t, db, "")
-	expectItems(t, "the owner's check", check.Run(ctx, s.Checks()), map[string]string{
+	connectortest.ExpectItems(t, "the owner's check", check.Run(ctx, s.Checks()), map[string]string{
 		"net.dns": "passed", "net.connect": "passed", "db.connect": "passed", "db.read": "passed",
 		"cdc.replica-set": "passed", "cdc.watch": "passed", "cdc.images": "warning pre_and_post_images_off", "cdc.oplog": "passed",
 	})
@@ -77,7 +49,7 @@ func TestSourceChecks(t *testing.T) {
 		{Name: "b", SyncMode: source.Incremental, Cursor: "at"}, {Name: "b", SyncMode: source.Incremental},
 		{Name: "gone"}, {Name: "v"}, {Name: "ts"},
 	}}))
-	expectItems(t, "the owner's preflight", pf, map[string]string{
+	connectortest.ExpectItems(t, "the owner's preflight", pf, map[string]string{
 		"stream.a.read": "passed", "stream.a.read-2": "passed", "stream.a.cursor": "warning cursor_not_indexed",
 		"stream.b.read": "passed", "stream.b.cursor": "passed", "stream.b.read-2": "passed", "stream.b.cursor-2": "failed config_invalid",
 		"stream.gone.read": "failed not_found", "stream.v.read": "failed collection_unsupported", "stream.ts.read": "failed collection_unsupported",
@@ -90,7 +62,7 @@ func TestSourceChecks(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	expectItems(t, "a reader's check", check.Run(ctx, s.Checks()), map[string]string{
+	connectortest.ExpectItems(t, "a reader's check", check.Run(ctx, s.Checks()), map[string]string{
 		"db.connect": "passed", "collections.found": "failed not_found", "db.read": "passed",
 		"cdc.watch": "passed", "cdc.oplog": "warning privilege_missing",
 	})
@@ -98,12 +70,12 @@ func TestSourceChecks(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	expectItems(t, "a view and a time series named", check.Run(ctx, s.Checks()), map[string]string{"collections.found": "failed config_invalid"})
+	connectortest.ExpectItems(t, "a view and a time series named", check.Run(ctx, s.Checks()), map[string]string{"collections.found": "failed config_invalid"})
 	// With a long gap between syncs, a fresh server's oplog is too short.
 	pf = check.Run(ctx, s.Preflight(source.PreflightRequest{Pipeline: "p", Interval: 1 << 62, Streams: []source.ConfiguredStream{{Name: "b", SyncMode: source.CDC}}}))
-	expectItems(t, "a reader's preflight", pf, map[string]string{"cdc.watch": "passed", "cdc.images": "passed", "cdc.oplog": "warning privilege_missing"})
+	connectortest.ExpectItems(t, "a reader's preflight", pf, map[string]string{"cdc.watch": "passed", "cdc.images": "passed", "cdc.oplog": "warning privilege_missing"})
 	pf = check.Run(ctx, newTestSource(t, db, "").Preflight(source.PreflightRequest{Pipeline: "p", Interval: 1 << 62, Streams: []source.ConfiguredStream{{Name: "b", SyncMode: source.CDC}}}))
-	expectItems(t, "a long interval", pf, map[string]string{"cdc.oplog": "warning oplog_window_short"})
+	connectortest.ExpectItems(t, "a long interval", pf, map[string]string{"cdc.oplog": "warning oplog_window_short"})
 
 	// find on a alone, which reads a but can't list or watch the rest.
 	role := "role_" + db.Name()
@@ -121,7 +93,7 @@ func TestSourceChecks(t *testing.T) {
 		t.Fatal(err)
 	}
 	r := check.Run(ctx, s.Checks())
-	expectItems(t, "a narrow role's check", r, map[string]string{"db.read": "failed privilege_missing", "cdc.watch": "warning privilege_missing"})
+	connectortest.ExpectItems(t, "a narrow role's check", r, map[string]string{"db.read": "failed privilege_missing", "cdc.watch": "warning privilege_missing"})
 	for _, it := range r.Items {
 		if it = it.Rendered(); it.Name == "db.read" && (!strings.Contains(it.Message, db.Name()+".b") || strings.Contains(it.Message, db.Name()+".a")) {
 			t.Errorf("db.read: %s", it.Message)
@@ -130,7 +102,7 @@ func TestSourceChecks(t *testing.T) {
 	pf = check.Run(ctx, s.Preflight(source.PreflightRequest{Pipeline: "p", Streams: []source.ConfiguredStream{
 		{Name: "a", SyncMode: source.CDC}, {Name: "b"},
 	}}))
-	expectItems(t, "a narrow role's preflight", pf, map[string]string{
+	connectortest.ExpectItems(t, "a narrow role's preflight", pf, map[string]string{
 		"stream.a.read": "passed", "stream.b.read": "failed privilege_missing", "cdc.watch": "failed privilege_missing",
 	})
 
@@ -142,7 +114,7 @@ func TestSourceChecks(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		expectItems(t, config, check.Run(ctx, s.Checks()), want)
+		connectortest.ExpectItems(t, config, check.Run(ctx, s.Checks()), want)
 	}
 }
 
@@ -164,8 +136,8 @@ func TestDestinationChecks(t *testing.T) {
 		}
 		return d
 	}
-	expectItems(t, "a reader's check", check.Run(ctx, dest(reader, "").Checks()), map[string]string{"db.connect": "passed", "db.write": "failed privilege_missing"})
-	expectItems(t, "a writer's check", check.Run(ctx, dest(writer, "").Checks()), map[string]string{"db.connect": "passed", "db.write": "passed"})
+	connectortest.ExpectItems(t, "a reader's check", check.Run(ctx, dest(reader, "").Checks()), map[string]string{"db.connect": "passed", "db.write": "failed privilege_missing"})
+	connectortest.ExpectItems(t, "a writer's check", check.Run(ctx, dest(writer, "").Checks()), map[string]string{"db.connect": "passed", "db.write": "passed"})
 
 	create := func(name string, opts ...bson.E) {
 		if err := db.RunCommand(ctx, append(bson.D{{Key: "create", Value: name}}, opts...)).Err(); err != nil {
@@ -214,7 +186,7 @@ func TestDestinationChecks(t *testing.T) {
 		"patterns": schema("patterns", arrow.Field{Name: "_openetl_synced_at", Type: arrow.FixedWidthTypes.Timestamp_us, Nullable: true}),
 	}}
 	pf := check.Run(ctx, dest(uri(), "").Preflight(req))
-	expectItems(t, "the preflight", pf, map[string]string{
+	connectortest.ExpectItems(t, "the preflight", pf, map[string]string{
 		"db.write":         "passed",
 		"stream.new.write": "passed", "stream.new.indexes": "passed", "stream.new.keys": "passed",
 		"stream.req.write":    "failed validator_requires_fields",
@@ -228,10 +200,10 @@ func TestDestinationChecks(t *testing.T) {
 		"stream.nokey.write":    "failed config_invalid",
 	})
 	pf = check.Run(ctx, dest(uri(), `, "extendedJSONKeys": true`).Preflight(req))
-	expectItems(t, "the preflight with extendedJSONKeys", pf, map[string]string{"stream.oids.keys": "passed", "stream.hex.keys": "warning key_mismatch"})
+	connectortest.ExpectItems(t, "the preflight with extendedJSONKeys", pf, map[string]string{"stream.oids.keys": "passed", "stream.hex.keys": "warning key_mismatch"})
 	// A writer may not widen a validator.
 	pf = check.Run(ctx, dest(writer, "").Preflight(req))
-	expectItems(t, "a writer's preflight", pf, map[string]string{"db.write": "passed", "stream.widen.write": "failed privilege_missing", "stream.new.write": "passed"})
+	connectortest.ExpectItems(t, "a writer's preflight", pf, map[string]string{"db.write": "passed", "stream.widen.write": "failed privilege_missing", "stream.new.write": "passed"})
 	pf = check.Run(ctx, dest(reader, "").Preflight(req))
-	expectItems(t, "a reader's preflight", pf, map[string]string{"db.write": "failed privilege_missing", "stream.new.write": "skipped"})
+	connectortest.ExpectItems(t, "a reader's preflight", pf, map[string]string{"db.write": "failed privilege_missing", "stream.new.write": "skipped"})
 }

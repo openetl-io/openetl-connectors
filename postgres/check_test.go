@@ -13,39 +13,11 @@ import (
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/jackc/pgx/v5"
 
+	"github.com/openetl-io/openetl-connectors/connectortest"
 	"github.com/openetl-io/openetl/sdk/go/check"
 	"github.com/openetl-io/openetl/sdk/go/destination"
 	"github.com/openetl-io/openetl/sdk/go/source"
 )
-
-// statuses is each item's status and reason, as "status reason".
-func statuses(r check.Report) map[string]string {
-	out := map[string]string{}
-	for _, it := range r.Items {
-		s := it.Status.String()
-		if it.Failure != nil {
-			s += " " + it.Failure.Reason
-		}
-		out[it.Name] = s
-	}
-	return out
-}
-
-func expectItems(t *testing.T, what string, r check.Report, want map[string]string) {
-	t.Helper()
-	got := statuses(r)
-	for name, w := range want {
-		if got[name] != w {
-			t.Errorf("%s: %s is %q, want %q", what, name, got[name], w)
-		}
-	}
-	if t.Failed() {
-		for _, it := range r.Items {
-			it = it.Rendered()
-			t.Logf("%s %s: %s: %s", it.Status, it.Name, it.Title, it.Message)
-		}
-	}
-}
 
 // A user with little access gets an item for each thing it lacks, each
 // with its reason, and the source's and destination's lists say what a
@@ -75,7 +47,7 @@ func TestChecksItemByItem(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	expectItems(t, "the source's check", check.Run(t.Context(), s.Checks()), map[string]string{
+	connectortest.ExpectItems(t, "the source's check", check.Run(t.Context(), s.Checks()), map[string]string{
 		"net.dns": "passed", "net.connect": "passed", "db.tls": "warning plaintext_connection", "db.connect": "passed",
 		"schema.usage": "passed", "tables.read": "failed privilege_missing",
 		"cdc.wal-level": "passed", "cdc.replication": "warning privilege_missing",
@@ -84,7 +56,7 @@ func TestChecksItemByItem(t *testing.T) {
 		{Name: "a", SyncMode: source.CDC}, {Name: "a", SyncMode: source.Incremental, Cursor: "v"},
 		{Name: "b"}, {Name: "gone"}, {Name: "nokey", SyncMode: source.CDC},
 	}}))
-	expectItems(t, "the source's preflight", pf, map[string]string{
+	connectortest.ExpectItems(t, "the source's preflight", pf, map[string]string{
 		"db.connect": "passed", "stream.a.read": "passed", "stream.a.cdc": "passed",
 		"stream.a.read-2": "passed", "stream.a.cursor": "failed cursor_unsupported",
 		"stream.b.read": "failed privilege_missing", "stream.gone.read": "failed not_found",
@@ -97,7 +69,7 @@ func TestChecksItemByItem(t *testing.T) {
 	// first read.
 	pf = check.Run(t.Context(), e.source(fmt.Sprintf(`, "publication": %q`, e.schema)).Preflight(source.PreflightRequest{Pipeline: "p",
 		Streams: []source.ConfiguredStream{{Name: "a", SyncMode: source.CDC}}}))
-	expectItems(t, "the owner's preflight", pf, map[string]string{"cdc.replication": "passed", "cdc.publication": "passed", "cdc.slot": "passed"})
+	connectortest.ExpectItems(t, "the owner's preflight", pf, map[string]string{"cdc.replication": "passed", "cdc.publication": "passed", "cdc.slot": "passed"})
 
 	bad := *u
 	bad.User = url.UserPassword(role, "not-pw")
@@ -105,7 +77,7 @@ func TestChecksItemByItem(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	expectItems(t, "bad credentials", check.Run(t.Context(), s.Checks()), map[string]string{
+	connectortest.ExpectItems(t, "bad credentials", check.Run(t.Context(), s.Checks()), map[string]string{
 		"db.connect": "failed credentials_rejected", "schema.usage": "skipped", "cdc.replication": "skipped",
 	})
 
@@ -113,7 +85,7 @@ func TestChecksItemByItem(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	expectItems(t, "the destination's check", check.Run(t.Context(), d.Checks()), map[string]string{
+	connectortest.ExpectItems(t, "the destination's check", check.Run(t.Context(), d.Checks()), map[string]string{
 		"db.connect": "passed", "schema.create": "failed privilege_missing",
 	})
 	e.exec("GRANT CREATE ON SCHEMA $schema TO " + role)
@@ -124,7 +96,7 @@ func TestChecksItemByItem(t *testing.T) {
 	dpf := check.Run(t.Context(), d.Preflight(destination.PreflightRequest{Streams: []destination.Stream{
 		{Name: "b", Mode: destination.Append}, {Name: "b", Mode: destination.Merge, PrimaryKey: []string{"id"}}, {Name: "new"}, {Name: "wider"},
 	}, Schemas: map[string]*arrow.Schema{"wider": wider}}))
-	expectItems(t, "the destination's preflight", dpf, map[string]string{
+	connectortest.ExpectItems(t, "the destination's preflight", dpf, map[string]string{
 		"schema.create": "passed", "stream.b.write": "warning table_not_owned",
 		"stream.b.write-2": "failed privilege_missing", "stream.new.write": "passed", "stream.wider.write": "failed table_not_owned",
 	})
@@ -136,7 +108,7 @@ func TestChecksItemByItem(t *testing.T) {
 	// database.
 	missing := "m_" + strings.ToLower(rand.Text())[:10]
 	dpf = check.Run(t.Context(), d.Preflight(destination.PreflightRequest{Namespace: missing}))
-	expectItems(t, "a schema to create", dpf, map[string]string{"schema.create": "failed privilege_missing"})
+	connectortest.ExpectItems(t, "a schema to create", dpf, map[string]string{"schema.create": "failed privilege_missing"})
 	var db string
 	if err := e.conn.QueryRow(t.Context(), "SELECT current_database()").Scan(&db); err != nil {
 		t.Fatal(err)
@@ -146,5 +118,5 @@ func TestChecksItemByItem(t *testing.T) {
 		_, _ = e.conn.Exec(context.Background(), "REVOKE CREATE ON DATABASE "+pgx.Identifier{db}.Sanitize()+" FROM "+role)
 	})
 	dpf = check.Run(t.Context(), d.Preflight(destination.PreflightRequest{Namespace: missing}))
-	expectItems(t, "a schema to create", dpf, map[string]string{"schema.create": "passed"})
+	connectortest.ExpectItems(t, "a schema to create", dpf, map[string]string{"schema.create": "passed"})
 }

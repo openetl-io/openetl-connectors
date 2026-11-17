@@ -18,7 +18,7 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 
-	"github.com/openetl-io/openetl-connectors/sourcetest"
+	"github.com/openetl-io/openetl-connectors/connectortest"
 	"github.com/openetl-io/openetl/sdk/go/destination"
 	protocolv1 "github.com/openetl-io/openetl/sdk/go/protocol/v1"
 )
@@ -336,8 +336,8 @@ func TestApplySchemaValidator(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := w.Commit(ctx, e, []destination.Staged{staged}); sourcetest.CodeOf(err) != protocolv1.ErrorCode_ERROR_CODE_DATA_INVALID {
-		t.Errorf("a document the validator rejects: %s: %v", sourcetest.CodeOf(err), err)
+	if _, err := w.Commit(ctx, e, []destination.Staged{staged}); connectortest.CodeOf(err) != protocolv1.ErrorCode_ERROR_CODE_DATA_INVALID {
+		t.Errorf("a document the validator rejects: %s: %v", connectortest.CodeOf(err), err)
 	}
 }
 
@@ -361,8 +361,8 @@ func TestUniqueIndex(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if _, err := w.Commit(t.Context(), e, []destination.Staged{staged}); sourcetest.CodeOf(err) != protocolv1.ErrorCode_ERROR_CODE_DATA_INVALID {
-				t.Errorf("a row the unique index refuses: %s: %v", sourcetest.CodeOf(err), err)
+			if _, err := w.Commit(t.Context(), e, []destination.Staged{staged}); connectortest.CodeOf(err) != protocolv1.ErrorCode_ERROR_CODE_DATA_INVALID {
+				t.Errorf("a row the unique index refuses: %s: %v", connectortest.CodeOf(err), err)
 			}
 		})
 	}

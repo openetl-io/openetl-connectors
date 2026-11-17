@@ -18,6 +18,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 	"golang.org/x/sync/errgroup"
 
+	"github.com/openetl-io/openetl-connectors/docstore"
 	sdk "github.com/openetl-io/openetl/sdk/go"
 	protocolv1 "github.com/openetl-io/openetl/sdk/go/protocol/v1"
 	"github.com/openetl-io/openetl/sdk/go/source"
@@ -133,7 +134,7 @@ func (s *Source) tables(ctx context.Context, cl *clients) ([]string, error) {
 }
 
 // The type of a cdc stream's seq (cdc.go).
-var seqType = &arrow.Decimal128Type{Precision: 38, Scale: 0}
+var seqType = docstore.SeqType
 
 // Discover offers each table with its key attributes first, typed by their
 // definitions, and the other top-level attributes its items have, each
@@ -443,7 +444,7 @@ func (s *Source) readScan(ctx context.Context, cl *clients, cs source.Configured
 		filter = &scanFilter{cursor: cs.Cursor, floor: st.Floor.AttributeValue}
 	}
 	b := s.newBatcher(cs, t, false)
-	defer b.release()
+	defer b.Release()
 	reached := false
 	err = s.scanPages(ctx, cl, t.name, seg, total, st.After.attrs(), filter, false, func(items []map[string]types.AttributeValue, last map[string]types.AttributeValue) (bool, error) {
 		if until.After != nil {
@@ -461,7 +462,7 @@ func (s *Source) readScan(ctx context.Context, cl *clients, cs source.Configured
 				}
 			}
 		}
-		if err := b.flush(out); err != nil {
+		if err := b.Flush(out); err != nil {
 			return false, err
 		}
 		if reached || last == nil {

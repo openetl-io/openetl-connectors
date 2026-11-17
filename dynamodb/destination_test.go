@@ -14,7 +14,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 
-	"github.com/openetl-io/openetl-connectors/sourcetest"
+	"github.com/openetl-io/openetl-connectors/connectortest"
 	"github.com/openetl-io/openetl/sdk/go/destination"
 	protocolv1 "github.com/openetl-io/openetl/sdk/go/protocol/v1"
 )
@@ -106,7 +106,7 @@ func TestDestinationRefusesKeyTypeChanges(t *testing.T) {
 	// A stream keyed on another column than the table.
 	w2 := openWriter(t, ns, destination.Stream{Name: "t", Mode: destination.Merge, PrimaryKey: []string{"g"}})
 	schema = arrow.NewSchema([]arrow.Field{{Name: "g", Type: arrow.BinaryTypes.String}}, nil)
-	if _, err := w2.ApplySchema(t.Context(), []destination.StreamSchema{{Name: "t", Schema: schema}}); sourcetest.CodeOf(err) != protocolv1.ErrorCode_ERROR_CODE_CONFIG_INVALID {
+	if _, err := w2.ApplySchema(t.Context(), []destination.StreamSchema{{Name: "t", Schema: schema}}); connectortest.CodeOf(err) != protocolv1.ErrorCode_ERROR_CODE_CONFIG_INVALID {
 		t.Errorf("a table keyed on another attribute: %v", err)
 	}
 }
@@ -122,8 +122,8 @@ func TestDestinationItemTooLarge(t *testing.T) {
 	b := batch(t, fields, []any{strings.Repeat("x", 401*1024), "00000000-0000-0000-0000-000000000001", "insert", 1})
 	defer b.Release()
 	err := w.Write(t.Context(), destination.Epoch{Generation: 1, N: 1}, "t", b)
-	if sourcetest.CodeOf(err) != protocolv1.ErrorCode_ERROR_CODE_DATA_INVALID {
-		t.Errorf("a 401 KB item: %v (%v), want DATA_INVALID", err, sourcetest.CodeOf(err))
+	if connectortest.CodeOf(err) != protocolv1.ErrorCode_ERROR_CODE_DATA_INVALID {
+		t.Errorf("a 401 KB item: %v (%v), want DATA_INVALID", err, connectortest.CodeOf(err))
 	}
 }
 

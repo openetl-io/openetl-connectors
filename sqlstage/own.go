@@ -148,3 +148,59 @@ func (o *Own) ApplyTx(ctx context.Context, opts *sql.TxOptions, lock string, des
 func (o *Own) TrimMarkers(ctx context.Context, applied uint64) {
 	_, _ = o.DB.ExecContext(ctx, o.Trim, o.Pipeline, applied)
 }
+
+// Applier is how a database/sql destination applies a stream's staging, in
+// its SQL; P is what it prepared of the stream for that.
+type Applier[P any] interface {
+	MergeSQL(s Stream, p P) []string
+	// Its rows affected are the rows it applied.
+	InsertSQL(s Stream, p P) string
+	PatchSQL(s Stream, p P) []string
+	// Replace makes an ended overwrite's read the target.
+	Replace(ctx context.Context, tx *sql.Tx, s Stream, p P) error
+}
+
+// ApplyStream applies one stream's staging in tx, its rows and then its
+// patches, and returns the rows it inserted.
+func ApplyStream[P any](ctx context.Context, name string, tx *sql.Tx, a Applier[P], s Stream, p P) (uint64, error) {
+	n, err := applyRows(ctx, name, tx, a, s, p)
+	if err != nil {
+		return 0, err
+	}
+	for _, q := range a.PatchSQL(s, p) {
+		if _, err := tx.ExecContext(ctx, q); err != nil {
+			return 0, fmt.Errorf("patch: %w", err)
+		}
+	}
+	return n, nil
+}
+
+func applyRows[P any](ctx context.Context, name string, tx *sql.Tx, a Applier[P], s Stream, p P) (uint64, error) {
+	if s.Mode == ModeMerge {
+		if len(s.Stagings) == 0 {
+			return 0, nil
+		}
+		for _, q := range a.MergeSQL(s, p) {
+			if _, err := tx.ExecContext(ctx, q); err != nil {
+				return 0, err
+			}
+		}
+		return 0, nil
+	}
+	var n uint64
+	if len(s.Stagings) > 0 {
+		res, err := tx.ExecContext(ctx, a.InsertSQL(s, p))
+		if err != nil {
+			return 0, err
+		}
+		affected, err := res.RowsAffected()
+		if err != nil || affected < 0 {
+			return 0, fmt.Errorf("%s: the insert reported %d rows: %w", name, affected, err)
+		}
+		n = uint64(affected)
+	}
+	if s.Ended {
+		return n, a.Replace(ctx, tx, s, p)
+	}
+	return n, nil
+}

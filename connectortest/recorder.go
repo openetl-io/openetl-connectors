@@ -1,6 +1,6 @@
-// Package sourcetest is what the sources' tests share: a recorder of what
-// a read emits.
-package sourcetest
+// Package connectortest is what the connectors' tests share: a recorder of
+// what a read emits, and a check's items' statuses.
+package connectortest
 
 import (
 	"encoding/json"

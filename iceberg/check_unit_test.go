@@ -4,17 +4,10 @@ import (
 	"slices"
 	"testing"
 
+	"github.com/openetl-io/openetl-connectors/connectortest"
 	"github.com/openetl-io/openetl/sdk/go/check"
 	"github.com/openetl-io/openetl/sdk/go/destination"
 )
-
-func itemNames(checks []check.Check) []string {
-	out := make([]string, len(checks))
-	for i, c := range checks {
-		out[i] = c.Name
-	}
-	return out
-}
 
 // The lists are valid for any config and request, streams whose names make
 // the same check name included, and hold what the config calls for.
@@ -33,7 +26,7 @@ func TestCheckLists(t *testing.T) {
 		if err := check.Validate(checks); err != nil {
 			t.Errorf("%s: %v", config, err)
 		}
-		if got := itemNames(checks); !slices.Equal(got, want) {
+		if got := connectortest.ItemNames(checks); !slices.Equal(got, want) {
 			t.Errorf("%s: %v, want %v", config, got, want)
 		}
 		// AWS's own endpoint may need a proxy: reaching it only advises.
@@ -51,7 +44,7 @@ func TestCheckLists(t *testing.T) {
 		t.Error(err)
 	}
 	want := []string{"net.dns", "net.connect", "catalog.auth", "catalog.namespace", "stream.a-b.mode", "stream.a-b.table", "stream.a-b.mode-2", "stream.a-b.table-2"}
-	if got := itemNames(pf); !slices.Equal(got, want) {
+	if got := connectortest.ItemNames(pf); !slices.Equal(got, want) {
 		t.Errorf("preflight %v, want %v", got, want)
 	}
 	if pf[0].Advisory {

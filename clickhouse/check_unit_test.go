@@ -6,19 +6,12 @@ import (
 	"testing"
 
 	ch "github.com/ClickHouse/clickhouse-go/v2"
+	"github.com/openetl-io/openetl-connectors/connectortest"
 	"github.com/openetl-io/openetl/sdk/go/check"
 	"github.com/openetl-io/openetl/sdk/go/configschema"
 	"github.com/openetl-io/openetl/sdk/go/destination"
 	"github.com/openetl-io/openetl/sdk/go/source"
 )
-
-func itemNames(checks []check.Check) []string {
-	out := make([]string, len(checks))
-	for i, c := range checks {
-		out[i] = c.Name
-	}
-	return out
-}
 
 func TestSchemasLint(t *testing.T) {
 	for name, schema := range map[string][]byte{"source": SourceConfigSchema, "destination": DestinationConfigSchema} {
@@ -43,7 +36,7 @@ func TestCheckLists(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := []string{"net.dns", "net.connect", "net.tls", "db.connect", "server.version", "database.found", "tables.found", "tables.read"}
-	if got := itemNames(s.Checks()); !slices.Equal(got, want) {
+	if got := connectortest.ItemNames(s.Checks()); !slices.Equal(got, want) {
 		t.Errorf("source checks %v, want %v", got, want)
 	}
 	if err := check.Validate(s.Checks()); err != nil {
@@ -53,7 +46,7 @@ func TestCheckLists(t *testing.T) {
 		{Name: "Orders", SyncMode: source.CDC}, {Name: "orders", SyncMode: source.Incremental, Cursor: "at"}, {Name: "x", SyncMode: source.FullRefresh},
 	}})
 	want = []string{"db.connect", "stream.orders.mode", "stream.orders.read", "stream.orders.cursor", "stream.x.read", "stream.x.order"}
-	if got := itemNames(pf); !slices.Equal(got, want) {
+	if got := connectortest.ItemNames(pf); !slices.Equal(got, want) {
 		t.Errorf("source preflight %v, want %v", got, want)
 	}
 	if err := check.Validate(pf); err != nil {
@@ -64,7 +57,7 @@ func TestCheckLists(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := itemNames(s.Checks()); !slices.Equal(got, []string{"net.dns", "net.connect", "db.connect", "server.version", "database.found", "tables.read"}) {
+	if got := connectortest.ItemNames(s.Checks()); !slices.Equal(got, []string{"net.dns", "net.connect", "db.connect", "server.version", "database.found", "tables.read"}) {
 		t.Errorf("source checks without tls or tables %v", got)
 	}
 
@@ -74,14 +67,14 @@ func TestCheckLists(t *testing.T) {
 	}
 	want = []string{"net.dns", "net.connect", "db.connect", "server.version", "database.create",
 		"grant.tables", "grant.rows", "grant.columns", "grant.partitions", "grant.update", "grant.system", "settings.write"}
-	if got := itemNames(d.Checks()); !slices.Equal(got, want) {
+	if got := connectortest.ItemNames(d.Checks()); !slices.Equal(got, want) {
 		t.Errorf("destination checks %v, want %v", got, want)
 	}
 	if err := check.Validate(d.Checks()); err != nil {
 		t.Error(err)
 	}
 	dp := d.Preflight(destination.PreflightRequest{Namespace: "ns", Streams: []destination.Stream{{Name: "A"}, {Name: "a"}}})
-	if got := itemNames(dp); !slices.Equal(got, append(append([]string{"db.connect"}, want[4:]...), "stream.a.write", "stream.a.write-2")) {
+	if got := connectortest.ItemNames(dp); !slices.Equal(got, append(append([]string{"db.connect"}, want[4:]...), "stream.a.write", "stream.a.write-2")) {
 		t.Errorf("destination preflight %v", got)
 	}
 	if err := check.Validate(dp); err != nil {

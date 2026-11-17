@@ -17,7 +17,6 @@ var (
 	_ source.Resplitter = (*Source)(nil)
 )
 
-
 // keyRange is a range of a key's first column, as its state values are:
 // above Lo, up to and including Hi. Nil is no bound.
 type keyRange struct {

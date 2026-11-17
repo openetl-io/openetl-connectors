@@ -20,7 +20,7 @@ import (
 	streamtypes "github.com/aws/aws-sdk-go-v2/service/dynamodbstreams/types"
 	"github.com/aws/smithy-go"
 
-	"github.com/openetl-io/openetl-connectors/sourcetest"
+	"github.com/openetl-io/openetl-connectors/connectortest"
 	"github.com/openetl-io/openetl/sdk/go/check"
 	"github.com/openetl-io/openetl/sdk/go/destination"
 	protocolv1 "github.com/openetl-io/openetl/sdk/go/protocol/v1"
@@ -185,7 +185,7 @@ func insert(seq, id int, at time.Time) streamtypes.Record {
 	}}
 }
 
-func lineageRead(f *fakeStream, rec *sourcetest.Recorder, st cdcState) *cdcRead {
+func lineageRead(f *fakeStream, rec *connectortest.Recorder, st cdcState) *cdcRead {
 	return &cdcRead{
 		s: &Source{}, streams: f, cs: source.ConfiguredStream{Name: "t", SyncMode: source.CDC},
 		t: &table{name: "t", keys: []string{"id"}}, out: rec.Split("t", source.WholeStream), start: now(), st: st,
@@ -205,7 +205,7 @@ func TestShardLineage(t *testing.T) {
 			"d": {insert(5, 4, at)},
 		},
 	}
-	rec := &sourcetest.Recorder{}
+	rec := &connectortest.Recorder{}
 	r := lineageRead(f, rec, cdcState{Stream: "arn", G: 1, Skip: at.Add(-time.Hour), Shards: map[string]shardState{"a": {Since: at.Add(-time.Hour)}}})
 	if err := r.follow(t.Context()); err != nil {
 		t.Fatal(err)
@@ -236,7 +236,7 @@ func TestShardLineage(t *testing.T) {
 		t.Errorf("state's shards %+v", st.Shards)
 	}
 	// The next read starts after d's last record, and reads nothing.
-	rec2 := &sourcetest.Recorder{}
+	rec2 := &connectortest.Recorder{}
 	if err := lineageRead(f, rec2, st).follow(t.Context()); err != nil {
 		t.Fatal(err)
 	}
@@ -252,27 +252,27 @@ func TestTrimmedPositionIsLost(t *testing.T) {
 		records: map[string][]streamtypes.Record{"a": {insert(1, 1, at)}},
 		fail:    map[string]error{"a": &smithy.GenericAPIError{Code: "TrimmedDataAccessException", Message: "trimmed"}},
 	}
-	err := lineageRead(f, &sourcetest.Recorder{}, cdcState{Stream: "arn", G: 1, Skip: at, Shards: map[string]shardState{"a": {After: "x"}}}).follow(t.Context())
-	if sourcetest.CodeOf(err) != protocolv1.ErrorCode_ERROR_CODE_POSITION_LOST {
-		t.Errorf("a trimmed position: %v (%v), want POSITION_LOST", err, sourcetest.CodeOf(err))
+	err := lineageRead(f, &connectortest.Recorder{}, cdcState{Stream: "arn", G: 1, Skip: at, Shards: map[string]shardState{"a": {After: "x"}}}).follow(t.Context())
+	if connectortest.CodeOf(err) != protocolv1.ErrorCode_ERROR_CODE_POSITION_LOST {
+		t.Errorf("a trimmed position: %v (%v), want POSITION_LOST", err, connectortest.CodeOf(err))
 	}
 	// A shard the state hadn't read to its end that the stream no longer
 	// lists.
-	err = lineageRead(f, &sourcetest.Recorder{}, cdcState{Stream: "arn", G: 1, Skip: at, Shards: map[string]shardState{"gone": {After: "1"}}}).follow(t.Context())
-	if sourcetest.CodeOf(err) != protocolv1.ErrorCode_ERROR_CODE_POSITION_LOST {
-		t.Errorf("a shard gone: %v (%v), want POSITION_LOST", err, sourcetest.CodeOf(err))
+	err = lineageRead(f, &connectortest.Recorder{}, cdcState{Stream: "arn", G: 1, Skip: at, Shards: map[string]shardState{"gone": {After: "1"}}}).follow(t.Context())
+	if connectortest.CodeOf(err) != protocolv1.ErrorCode_ERROR_CODE_POSITION_LOST {
+		t.Errorf("a shard gone: %v (%v), want POSITION_LOST", err, connectortest.CodeOf(err))
 	}
 	// A shard gone whose position is within 24 hours had nothing after it:
 	// the read goes on without it.
-	if err := lineageRead(f, &sourcetest.Recorder{}, cdcState{Stream: "arn", G: 1, Skip: at, Shards: map[string]shardState{
+	if err := lineageRead(f, &connectortest.Recorder{}, cdcState{Stream: "arn", G: 1, Skip: at, Shards: map[string]shardState{
 		"gone": {After: "1", Since: time.Now().Add(-23 * time.Hour)}, "a": {Since: at},
-	}}).follow(t.Context()); sourcetest.CodeOf(err) != protocolv1.ErrorCode_ERROR_CODE_POSITION_LOST || !strings.Contains(err.Error(), "shard a ") {
+	}}).follow(t.Context()); connectortest.CodeOf(err) != protocolv1.ErrorCode_ERROR_CODE_POSITION_LOST || !strings.Contains(err.Error(), "shard a ") {
 		t.Errorf("a shard gone within 24 hours: %v, want the read to go on to a's trimmed position", err)
 	}
 	// A shard read from its start that has records older than 24 hours.
-	err = lineageRead(f, &sourcetest.Recorder{}, cdcState{Stream: "arn", G: 1, Skip: at, Shards: map[string]shardState{"a": {Since: time.Now().Add(-25 * time.Hour)}}}).follow(t.Context())
-	if sourcetest.CodeOf(err) != protocolv1.ErrorCode_ERROR_CODE_POSITION_LOST {
-		t.Errorf("a position past 24 hours: %v (%v), want POSITION_LOST", err, sourcetest.CodeOf(err))
+	err = lineageRead(f, &connectortest.Recorder{}, cdcState{Stream: "arn", G: 1, Skip: at, Shards: map[string]shardState{"a": {Since: time.Now().Add(-25 * time.Hour)}}}).follow(t.Context())
+	if connectortest.CodeOf(err) != protocolv1.ErrorCode_ERROR_CODE_POSITION_LOST {
+		t.Errorf("a position past 24 hours: %v (%v), want POSITION_LOST", err, connectortest.CodeOf(err))
 	}
 }
 
@@ -294,7 +294,7 @@ func TestSeq(t *testing.T) {
 	if b.Cmp(a) <= 0 {
 		t.Error("a later snapshot's seq isn't above the stream before it")
 	}
-	if _, err := r.seq("1" + fmt.Sprintf("%029d", 0)); sourcetest.CodeOf(err) != protocolv1.ErrorCode_ERROR_CODE_CONTRACT_CHANGED {
+	if _, err := r.seq("1" + fmt.Sprintf("%029d", 0)); connectortest.CodeOf(err) != protocolv1.ErrorCode_ERROR_CODE_CONTRACT_CHANGED {
 		t.Errorf("a 30-digit sequence number: %v", err)
 	}
 }
@@ -396,7 +396,7 @@ func TestShardUntil(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	rec := &sourcetest.Recorder{}
+	rec := &connectortest.Recorder{}
 	if err := lineageRead(f, rec, first).follow(t.Context()); err != nil {
 		t.Fatal(err)
 	}
@@ -417,7 +417,7 @@ func TestShardUntil(t *testing.T) {
 		if err := json.Unmarshal(e.State, &until); err != nil {
 			t.Fatal(err)
 		}
-		again := &sourcetest.Recorder{}
+		again := &connectortest.Recorder{}
 		r := lineageRead(f, again, st)
 		r.until, r.untilRaw = &until, e.State
 		if err := r.follow(t.Context()); err != nil {
@@ -456,7 +456,7 @@ func TestIdleShardsAcrossSyncs(t *testing.T) {
 	}
 	read := func(st cdcState) (cdcState, error) {
 		f.trimBefore(clock.Add(-retention))
-		rec := &sourcetest.Recorder{}
+		rec := &connectortest.Recorder{}
 		if err := lineageRead(f, rec, st).follow(t.Context()); err != nil {
 			return st, err
 		}
@@ -488,7 +488,7 @@ func TestIdleShardsAcrossSyncs(t *testing.T) {
 	f.records["a"] = append(f.records["a"], insert(2, 2, clock.Add(time.Hour)))
 	f.mu.Unlock()
 	clock = clock.Add(25*time.Hour + 30*time.Minute)
-	if _, err := read(st); sourcetest.CodeOf(err) != protocolv1.ErrorCode_ERROR_CODE_POSITION_LOST {
-		t.Errorf("a read 25.5 hours after the last, of a record written between that the stream trimmed: %v (%v), want POSITION_LOST", err, sourcetest.CodeOf(err))
+	if _, err := read(st); connectortest.CodeOf(err) != protocolv1.ErrorCode_ERROR_CODE_POSITION_LOST {
+		t.Errorf("a read 25.5 hours after the last, of a record written between that the stream trimmed: %v (%v), want POSITION_LOST", err, connectortest.CodeOf(err))
 	}
 }

@@ -11,14 +11,13 @@ import (
 	"strings"
 
 	"github.com/apache/arrow-go/v18/arrow"
-	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/decimal128"
-	"github.com/apache/arrow-go/v18/arrow/memory"
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 	"golang.org/x/sync/errgroup"
 
+	"github.com/openetl-io/openetl-connectors/docstore"
 	"github.com/openetl-io/openetl-connectors/keysplit"
 	sdk "github.com/openetl-io/openetl/sdk/go"
 	protocolv1 "github.com/openetl-io/openetl/sdk/go/protocol/v1"
@@ -116,7 +115,7 @@ func (s *Source) listCollections(ctx context.Context, db *mongo.Database) ([]str
 
 // The type of a cdc stream's seq: a change's cluster time, its seconds and
 // increment, times 2^32, plus its place among the changes of that time.
-var seqType = &arrow.Decimal128Type{Precision: 38, Scale: 0}
+var seqType = docstore.SeqType
 
 // Discover offers each collection with _id as keyText spells it, and the
 // other top-level fields its documents have, each declared as fieldType says
@@ -356,7 +355,7 @@ func (s *Source) readSplit(ctx context.Context, db *mongo.Database, cs source.Co
 		return err
 	}
 	b := s.newBatcher(cs, cols, false)
-	defer b.release()
+	defer b.Release()
 	var r *keysplit.Reading
 	if until == nil {
 		r = s.Start(cs.Name, sp.ID, true)
@@ -371,7 +370,7 @@ func (s *Source) readSplit(ctx context.Context, db *mongo.Database, cs source.Co
 			return b.addFlushing(doc, "", seq{}, out)
 		})
 		if err == nil {
-			err = b.flush(out)
+			err = b.Flush(out)
 		}
 		if err != nil {
 			return err
@@ -425,7 +424,7 @@ func (s *Source) endAt(ctx context.Context, coll *mongo.Collection, filter bson.
 			if err := b.add(doc, op, q); err != nil {
 				return err
 			}
-			if err := b.flush(out); err != nil {
+			if err := b.Flush(out); err != nil {
 				return err
 			}
 		}
@@ -564,19 +563,13 @@ func (q seq) decimal() decimal128.Num {
 // starts with, and those documents bring since. Packed, a batch is _id and
 // data.
 type batcher struct {
+	docstore.Batch
 	stream   string
 	declared bool
 	changes  bool
 	packed   bool
 	// Discovery's sample size; 0: it reads every document.
 	sampled int
-	names   []string
-	index   map[string]int
-	cols    []*array.StringBuilder
-	op      *array.StringBuilder
-	seq     *array.Decimal128Builder
-	rows    int
-	size    int
 	// For a field the run doesn't declare: whether the collection's
 	// documents no longer have it, so that the next discovery won't declare
 	// it either, and the row leaves it out. Nil: none are.
@@ -586,30 +579,15 @@ type batcher struct {
 // newBatcher makes a batcher of columns, which are the run's where cs has
 // them.
 func (s *Source) newBatcher(cs source.ConfiguredStream, columns []string, changes bool) *batcher {
-	b := &batcher{stream: cs.Name, changes: changes, index: map[string]int{}, declared: cs.Columns != nil, packed: s.cfg.Packed, sampled: s.cfg.SampleSize}
-	b.column("_id")
+	b := &batcher{stream: cs.Name, changes: changes, declared: cs.Columns != nil, packed: s.cfg.Packed, sampled: s.cfg.SampleSize}
+	b.Batch = docstore.NewBatch(changes)
+	b.Column("_id")
 	for _, c := range columns {
 		if !strings.HasPrefix(c, "openetl.") {
-			b.column(c)
+			b.Column(c)
 		}
 	}
-	if changes {
-		b.op = array.NewStringBuilder(memory.DefaultAllocator)
-		b.seq = array.NewDecimal128Builder(memory.DefaultAllocator, seqType)
-	}
 	return b
-}
-
-func (b *batcher) column(name string) int {
-	if i, ok := b.index[name]; ok {
-		return i
-	}
-	c := array.NewStringBuilder(memory.DefaultAllocator)
-	c.AppendNulls(b.rows)
-	b.index[name] = len(b.names)
-	b.names = append(b.names, name)
-	b.cols = append(b.cols, c)
-	return len(b.names) - 1
 }
 
 // add appends a document's row; only declared fields of a delete's, whose
@@ -627,7 +605,7 @@ func (b *batcher) add(doc bson.Raw, op string, q seq) error {
 	at := make([]int, len(elems))
 	for j, e := range elems {
 		k := e.Key()
-		i, ok := b.index[k]
+		i, ok := b.Index[k]
 		switch {
 		case ok:
 		case op == source.OpDelete:
@@ -644,11 +622,11 @@ func (b *batcher) add(doc bson.Raw, op string, q seq) error {
 			}
 			i = -1
 		default:
-			i = b.column(k)
+			i = b.Column(k)
 		}
 		at[j] = i
 	}
-	set := make([]bool, len(b.cols))
+	set := make([]bool, len(b.Cols))
 	for j, e := range elems {
 		i := at[j]
 		if i < 0 || set[i] {
@@ -660,15 +638,15 @@ func (b *batcher) add(doc bson.Raw, op string, q seq) error {
 			t, ok = keyText(e.Value()), true
 		}
 		if ok {
-			b.cols[i].Append(t)
-			b.size += len(t)
+			b.Cols[i].Append(t)
+			b.Size += len(t)
 		} else {
-			b.cols[i].AppendNull()
+			b.Cols[i].AppendNull()
 		}
 	}
 	for i, done := range set {
 		if !done {
-			b.cols[i].AppendNull()
+			b.Cols[i].AppendNull()
 		}
 	}
 	b.end(op, q)
@@ -702,13 +680,13 @@ func (b *batcher) addPacked(doc bson.Raw, whole bool, op string, q seq) error {
 		}
 	}
 	k := keyText(id)
-	b.cols[0].Append(k)
+	b.Cols[0].Append(k)
 	if data == nil {
-		b.cols[1].AppendNull()
+		b.Cols[1].AppendNull()
 	} else {
-		b.cols[1].Append(string(data))
+		b.Cols[1].Append(string(data))
 	}
-	b.size += len(k) + len(data)
+	b.Size += len(k) + len(data)
 	b.end(op, q)
 	return nil
 }
@@ -727,10 +705,10 @@ func (b *batcher) addKey(key bson.RawValue, q seq) error {
 
 func (b *batcher) end(op string, q seq) {
 	if b.changes {
-		b.op.Append(op)
-		b.seq.Append(q.decimal())
+		b.Op.Append(op)
+		b.Seq.Append(q.decimal())
 	}
-	b.rows++
+	b.Rows++
 }
 
 // addFlushing adds a row, and flushes once the batch is full.
@@ -738,45 +716,8 @@ func (b *batcher) addFlushing(doc bson.Raw, op string, q seq, out source.SplitEm
 	if err := b.add(doc, op, q); err != nil {
 		return err
 	}
-	if b.size < batchBytes {
+	if b.Size < batchBytes {
 		return nil
 	}
-	return b.flush(out)
-}
-
-// flush emits the rows added since the last flush, if any.
-func (b *batcher) flush(out source.SplitEmitter) error {
-	if b.rows == 0 {
-		return nil
-	}
-	fields := make([]arrow.Field, 0, len(b.cols)+2)
-	arrs := make([]arrow.Array, 0, len(b.cols)+2)
-	for i, c := range b.cols {
-		fields = append(fields, arrow.Field{Name: b.names[i], Type: arrow.BinaryTypes.String, Nullable: true})
-		arrs = append(arrs, c.NewArray())
-	}
-	if b.changes {
-		fields = append(fields, source.OpField(), source.SeqField(seqType))
-		arrs = append(arrs, b.op.NewArray(), b.seq.NewArray())
-	}
-	rec := array.NewRecordBatch(arrow.NewSchema(fields, nil), arrs, int64(b.rows))
-	for _, a := range arrs {
-		a.Release()
-	}
-	b.rows, b.size = 0, 0
-	if err := out.Records(rec); err != nil {
-		rec.Release()
-		return err
-	}
-	return nil
-}
-
-func (b *batcher) release() {
-	for _, c := range b.cols {
-		c.Release()
-	}
-	if b.changes {
-		b.op.Release()
-		b.seq.Release()
-	}
+	return b.Flush(out)
 }

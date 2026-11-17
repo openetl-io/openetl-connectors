@@ -91,10 +91,10 @@ func selectList(cols []string, rel string, held []string, from, to map[string]st
 	return strings.Join(out, ", ")
 }
 
-// insert copies a stream's staging into its target, or its read's table. A
+// InsertSQL copies a stream's staging into its target, or its read's table. A
 // deduped stream inserts one row per _openetl_id, the first staged, and with
 // Dedupe only IDs the target doesn't have.
-func (w *writer) insert(s stagedStream, p prepared) string {
+func (w *writer) InsertSQL(s stagedStream, p prepared) string {
 	into := "INSERT INTO " + w.into(s) + " (" + quoteAll(p.cols) + ") "
 	sel := selectList(p.cols, "s", p.held, p.types, p.into)
 	id := quoteIdent(colID)
@@ -109,11 +109,11 @@ func (w *writer) insert(s stagedStream, p prepared) string {
 	return q
 }
 
-// patch fills held cells from the epoch's patches: each column where the
+// PatchSQL fills held cells from the epoch's patches: each column where the
 // target still holds the version the patch comes from, matched by key for
 // merge and by _openetl_id for append. Of patches from one version, the
 // last staged fills it.
-func (w *writer) patch(s stagedStream, p prepared) []string {
+func (w *writer) PatchSQL(s stagedStream, p prepared) []string {
 	cols := p.patch
 	if len(cols) == 0 {
 		return nil
@@ -151,14 +151,14 @@ func (w *writer) patch(s stagedStream, p prepared) []string {
 	return out
 }
 
-// merge upserts each key's latest staged version, by _openetl_seq and then
+// MergeSQL upserts each key's latest staged version, by _openetl_seq and then
 // staging order, unless the target's is newer. A delete keeps the row's
 // other columns as they were, with its metadata columns updated, or with
 // hard deletes removes the row. A column in unchanged that the latest
 // version didn't send takes its value from the key's latest staged version
 // that did, or else keeps the target's. An update's values all see the
 // target's row as it was.
-func (w *writer) merge(s stagedStream, p prepared) []string {
+func (w *writer) MergeSQL(s stagedStream, p prepared) []string {
 	cols := p.cols
 	q := quoteIdent
 	hasSeq, hasOp := slices.Contains(cols, colSeq), slices.Contains(cols, colOp)

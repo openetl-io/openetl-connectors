@@ -13,6 +13,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
+	"github.com/openetl-io/openetl-connectors/connectortest"
 	"github.com/openetl-io/openetl/sdk/go/check"
 	"github.com/openetl-io/openetl/sdk/go/destination"
 )
@@ -191,7 +192,7 @@ func TestTLSInPlace(t *testing.T) {
 			t.Fatal(err)
 		}
 		r := check.Run(t.Context(), s.Checks())
-		if st := statuses(r)["db.tls"]; st != "failed tls_failed" {
+		if st := connectortest.Statuses(r)["db.tls"]; st != "failed tls_failed" {
 			t.Errorf("%s: db.tls %s", name, st)
 		}
 		d, err := NewDestination(tlsConfig(c[0], c[1], "", "", ""))

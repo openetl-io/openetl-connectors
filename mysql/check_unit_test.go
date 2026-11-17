@@ -7,18 +7,11 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/openetl-io/openetl-connectors/connectortest"
 	"github.com/openetl-io/openetl/sdk/go/check"
 	"github.com/openetl-io/openetl/sdk/go/destination"
 	"github.com/openetl-io/openetl/sdk/go/source"
 )
-
-func itemNames(checks []check.Check) []string {
-	out := make([]string, len(checks))
-	for i, c := range checks {
-		out[i] = c.Name
-	}
-	return out
-}
 
 var cdcItems = []string{"cdc.log-bin", "cdc.binlog-format", "cdc.binlog-row-image", "cdc.binlog-row-metadata", "cdc.binlog-row-value-options",
 	"cdc.gtid-mode", "cdc.replication", "cdc.binlog-monitor"}
@@ -34,7 +27,7 @@ func TestCheckLists(t *testing.T) {
 		t.Error(err)
 	}
 	want := append([]string{"net.dns", "net.connect", "db.tls", "db.connect", "database.found", "tables.found", "tables.read"}, append(slices.Clone(cdcItems), "cdc.retention")...)
-	if got := itemNames(s.Checks()); !slices.Equal(got, want) {
+	if got := connectortest.ItemNames(s.Checks()); !slices.Equal(got, want) {
 		t.Errorf("source checks %v, want %v", got, want)
 	}
 	for _, c := range s.Checks()[7:] {
@@ -51,7 +44,7 @@ func TestCheckLists(t *testing.T) {
 	}
 	want = append([]string{"db.connect", "stream.orders.read", "stream.orders.cdc", "stream.orders.read-2", "stream.orders.cursor", "stream.x.read"},
 		append(slices.Clone(cdcItems), "cdc.retention")...)
-	if got := itemNames(pf); !slices.Equal(got, want) {
+	if got := connectortest.ItemNames(pf); !slices.Equal(got, want) {
 		t.Errorf("source preflight %v, want %v", got, want)
 	}
 	for _, c := range pf {
@@ -60,7 +53,7 @@ func TestCheckLists(t *testing.T) {
 		}
 	}
 	// Without cdc, nothing of it.
-	if got := itemNames(s.Preflight(source.PreflightRequest{Streams: req.Streams[2:]})); !slices.Equal(got, []string{"db.connect", "stream.x.read"}) {
+	if got := connectortest.ItemNames(s.Preflight(source.PreflightRequest{Streams: req.Streams[2:]})); !slices.Equal(got, []string{"db.connect", "stream.x.read"}) {
 		t.Errorf("preflight without cdc %v", got)
 	}
 
@@ -74,7 +67,7 @@ func TestCheckLists(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if got := itemNames(s.Checks()); !slices.Equal(got, append(append(want, cdcItems...), "cdc.retention")) {
+		if got := connectortest.ItemNames(s.Checks()); !slices.Equal(got, append(append(want, cdcItems...), "cdc.retention")) {
 			t.Errorf("%s: %v, want %v", config, got, want)
 		}
 	}
@@ -84,7 +77,7 @@ func TestCheckLists(t *testing.T) {
 		t.Fatal(err)
 	}
 	checks := d.Checks()
-	if got, want := itemNames(checks), []string{"net.dns", "net.connect", "db.tls", "db.connect", "database.create"}; !slices.Equal(got, want) {
+	if got, want := connectortest.ItemNames(checks), []string{"net.dns", "net.connect", "db.tls", "db.connect", "database.create"}; !slices.Equal(got, want) {
 		t.Errorf("destination checks %v, want %v", got, want)
 	}
 	if checks[2].Field != "tls.mode" || checks[4].Field != "database" {
@@ -94,7 +87,7 @@ func TestCheckLists(t *testing.T) {
 	if err := check.Validate(dpf); err != nil {
 		t.Error(err)
 	}
-	if got, want := itemNames(dpf), []string{"db.connect", "database.create", "stream.a-b.write", "stream.a-b.write-2"}; !slices.Equal(got, want) {
+	if got, want := connectortest.ItemNames(dpf), []string{"db.connect", "database.create", "stream.a-b.write", "stream.a-b.write-2"}; !slices.Equal(got, want) {
 		t.Errorf("destination preflight %v, want %v", got, want)
 	}
 	if dpf[1].Field != "" {

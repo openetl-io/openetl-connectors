@@ -7,59 +7,25 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/openetl-io/openetl/sdk/go/check"
+	"github.com/openetl-io/openetl-connectors/connectortest"
 	"github.com/openetl-io/openetl/sdk/go/destination"
 	"github.com/openetl-io/openetl/sdk/go/source"
 )
 
-// items runs checks, and gives each item's status, and its failure's reason
-// after it; each item's text has its params filled in.
-func items(t *testing.T, checks []check.Check) map[string]string {
-	t.Helper()
-	if err := check.Validate(checks); err != nil {
-		t.Fatal(err)
-	}
-	out := map[string]string{}
-	for _, it := range check.Run(t.Context(), checks).Items {
-		s := it.Status.String()
-		r := it.Rendered()
-		text := r.Title + " " + r.Message
-		if f := r.Failure; f != nil {
-			s += " " + f.Reason
-			text += " " + f.Message + " " + f.Fix
-		}
-		if strings.ContainsAny(text, "{}") {
-			t.Errorf("%s: a placeholder unfilled: %s", it.Name, text)
-		}
-		out[it.Name] = s
-	}
-	return out
-}
-
-// expectItems compares the items want names; the rest pass, but for
-// cdc.gtid-mode, which may warn.
+// expectItems is connectortest.ExpectStatuses, but cdc.gtid-mode may warn.
 func expectItems(t *testing.T, got map[string]string, want map[string]string) {
 	t.Helper()
-	for name, status := range got {
-		w, ok := want[name]
-		switch {
-		case ok && status != w:
-			t.Errorf("%s: %s, want %s", name, status, w)
-		case !ok && name == "cdc.gtid-mode" && status == "warning setting_mismatch":
-		case !ok && status != "passed":
-			t.Errorf("%s: %s", name, status)
-		}
+	if _, ok := want["cdc.gtid-mode"]; !ok && got["cdc.gtid-mode"] == "warning setting_mismatch" {
+		got = maps.Clone(got)
+		delete(got, "cdc.gtid-mode")
 	}
-	for name := range want {
-		if _, ok := got[name]; !ok {
-			t.Errorf("no item %s", name)
-		}
-	}
+	connectortest.ExpectStatuses(t, got, want)
 }
 
 // userDSN creates a user with grants, dropped when t ends, and gives the
@@ -97,7 +63,7 @@ func TestSourceCheckItems(t *testing.T) {
 		e.exec("CREATE TABLE $db.fkey (f double PRIMARY KEY)")
 		e.exec("CREATE VIEW $db.v AS SELECT id FROM $db.items")
 		s := e.source("")
-		expectItems(t, items(t, s.Checks()), nil)
+		expectItems(t, connectortest.Items(t, s.Checks()), nil)
 		if err := s.Check(t.Context()); err != nil {
 			t.Fatal(err)
 		}
@@ -121,7 +87,7 @@ func TestSourceCheckItems(t *testing.T) {
 			retention = "failed binlog_retention_short"
 		}
 		for interval, want := range map[time.Duration]string{time.Hour: "passed", time.Duration(expire+86400) * time.Second: retention} {
-			got := items(t, s.Preflight(source.PreflightRequest{Pipeline: "p", Streams: streams, Interval: interval}))
+			got := connectortest.Items(t, s.Preflight(source.PreflightRequest{Pipeline: "p", Streams: streams, Interval: interval}))
 			expectItems(t, got, map[string]string{
 				"stream.nokey.cdc":    "failed primary_key_missing",
 				"stream.fkey.cdc":     "failed primary_key_unsupported",
@@ -135,9 +101,9 @@ func TestSourceCheckItems(t *testing.T) {
 		// tables in the config: a table it names that isn't there, and a
 		// stream it leaves out.
 		s = e.source(`, "tables": ["items", "gone"]`)
-		expectItems(t, items(t, s.Checks()), map[string]string{"tables.found": "failed not_found", "tables.read": "skipped"})
+		expectItems(t, connectortest.Items(t, s.Checks()), map[string]string{"tables.found": "failed not_found", "tables.read": "skipped"})
 		s = e.source(`, "tables": ["items"]`)
-		expectItems(t, items(t, s.Preflight(source.PreflightRequest{Streams: streams[2:3]})), map[string]string{
+		expectItems(t, connectortest.Items(t, s.Preflight(source.PreflightRequest{Streams: streams[2:3]})), map[string]string{
 			"stream.nokey.read": "failed not_found", "stream.nokey.cdc": "skipped",
 		})
 
@@ -147,7 +113,7 @@ func TestSourceCheckItems(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		got := items(t, bad.Checks())
+		got := connectortest.Items(t, bad.Checks())
 		if got["db.connect"] != "failed credentials_rejected" || got["tables.read"] != "skipped" || got["cdc.log-bin"] != "skipped" {
 			t.Errorf("with a wrong password: %v", got)
 		}
@@ -186,8 +152,8 @@ func TestSourceChecksWithLeastPrivileges(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				expectItems(t, items(t, s.Checks()), c.checks)
-				expectItems(t, items(t, s.Preflight(req)), c.flight)
+				expectItems(t, connectortest.Items(t, s.Checks()), c.checks)
+				expectItems(t, connectortest.Items(t, s.Preflight(req)), c.flight)
 			})
 		}
 
@@ -212,8 +178,8 @@ func TestSourceChecksWithLeastPrivileges(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			expectItems(t, items(t, s.Checks()), nil)
-			expectItems(t, items(t, s.Preflight(req)), nil)
+			expectItems(t, connectortest.Items(t, s.Checks()), nil)
+			expectItems(t, connectortest.Items(t, s.Preflight(req)), nil)
 			first := read(t, s, cdc("role", nil, "items"))
 			e.exec("INSERT INTO $db.items VALUES (1)")
 			if n := len(read(t, s, cdc("role", map[string]string{"items": first.state("items")}, "items")).rows("items")); n != 1 {
@@ -232,10 +198,10 @@ func TestCDCSettingsAreItems(t *testing.T) {
 		e.exec("SET GLOBAL binlog_row_image = 'MINIMAL'")
 		t.Cleanup(func() { _, _ = e.db.ExecContext(context.Background(), "SET GLOBAL binlog_row_image = 'FULL'") })
 		s := e.source("")
-		expectItems(t, items(t, s.Checks()), map[string]string{"cdc.binlog-row-image": "warning setting_mismatch"})
-		expectItems(t, items(t, s.Preflight(source.PreflightRequest{Streams: []source.ConfiguredStream{{Name: "items", SyncMode: source.CDC}}})),
+		expectItems(t, connectortest.Items(t, s.Checks()), map[string]string{"cdc.binlog-row-image": "warning setting_mismatch"})
+		expectItems(t, connectortest.Items(t, s.Preflight(source.PreflightRequest{Streams: []source.ConfiguredStream{{Name: "items", SyncMode: source.CDC}}})),
 			map[string]string{"cdc.binlog-row-image": "failed setting_mismatch"})
-		expectItems(t, items(t, s.Preflight(source.PreflightRequest{Streams: []source.ConfiguredStream{{Name: "items"}}})), nil)
+		expectItems(t, connectortest.Items(t, s.Preflight(source.PreflightRequest{Streams: []source.ConfiguredStream{{Name: "items"}}})), nil)
 	})
 }
 
@@ -273,7 +239,7 @@ func TestDestinationCheckItems(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				expectItems(t, items(t, d.Checks()), c.checks)
+				expectItems(t, connectortest.Items(t, d.Checks()), c.checks)
 				if c.name == "no database" {
 					return
 				}
@@ -281,7 +247,7 @@ func TestDestinationCheckItems(t *testing.T) {
 				for k, v := range c.flight {
 					flight[k] = v
 				}
-				expectItems(t, items(t, d.Preflight(destination.PreflightRequest{Pipeline: "p", Streams: streams})), flight)
+				expectItems(t, connectortest.Items(t, d.Preflight(destination.PreflightRequest{Pipeline: "p", Streams: streams})), flight)
 			})
 		}
 
@@ -291,8 +257,8 @@ func TestDestinationCheckItems(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		expectItems(t, items(t, d.Checks()), nil)
-		expectItems(t, items(t, d.Preflight(destination.PreflightRequest{Namespace: database, Streams: streams[:3]})), nil)
+		expectItems(t, connectortest.Items(t, d.Checks()), nil)
+		expectItems(t, connectortest.Items(t, d.Preflight(destination.PreflightRequest{Namespace: database, Streams: streams[:3]})), nil)
 	})
 }
 
@@ -314,7 +280,7 @@ func expectTLSItems(t *testing.T, dsn, ca string) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		got := items(t, s.Checks())
+		got := connectortest.Items(t, s.Checks())
 		if got["db.tls"] != c.want || c.want == "passed" && got["db.connect"] != "passed" {
 			t.Errorf("tls %s: db.tls %s, db.connect %s", c.tls["mode"], got["db.tls"], got["db.connect"])
 		}

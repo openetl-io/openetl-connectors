@@ -20,6 +20,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
 
+	"github.com/openetl-io/openetl-connectors/connectortest"
 	protocolv1 "github.com/openetl-io/openetl/sdk/go/protocol/v1"
 	"github.com/openetl-io/openetl/sdk/go/source"
 )
@@ -805,8 +806,8 @@ func TestSourceWithLeastPrivileges(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		expectItems(t, items(t, s.Checks()), nil)
-		expectItems(t, items(t, s.Preflight(source.PreflightRequest{Pipeline: "grants", Streams: cdc("grants", nil, "items").Streams})), nil)
+		expectItems(t, connectortest.Items(t, s.Checks()), nil)
+		expectItems(t, connectortest.Items(t, s.Preflight(source.PreflightRequest{Pipeline: "grants", Streams: cdc("grants", nil, "items").Streams})), nil)
 		if n := len(read(t, s, full("items")).rows("items")); n != 1 {
 			t.Fatalf("%d rows", n)
 		}

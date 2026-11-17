@@ -106,7 +106,7 @@ func (r *cdcReader) read(ctx context.Context) error {
 		return err
 	}
 	r.b = r.s.newBatcher(r.cs, cols, true)
-	defer r.b.release()
+	defer r.b.Release()
 	if r.st.Snapshot != nil {
 		if stopped, err := r.snapshot(ctx); stopped || err != nil {
 			return err
@@ -176,7 +176,7 @@ func atLeast(ctx context.Context, coll *mongo.Collection, t bson.Timestamp, fn f
 
 // resume flushes, and emits a resume point at the state.
 func (r *cdcReader) resume() error {
-	if err := r.b.flush(r.out); err != nil {
+	if err := r.b.Flush(r.out); err != nil {
 		return err
 	}
 	state, err := json.Marshal(r.st)
@@ -188,7 +188,7 @@ func (r *cdcReader) resume() error {
 
 // stopAtUntil ends a read at its until, past which it emitted nothing.
 func (r *cdcReader) stopAtUntil() error {
-	if err := r.b.flush(r.out); err != nil {
+	if err := r.b.Flush(r.out); err != nil {
 		return err
 	}
 	if err := r.out.ResumePoint(r.untilB); err != nil {
@@ -199,7 +199,7 @@ func (r *cdcReader) stopAtUntil() error {
 
 // complete ends a bounded read where it is.
 func (r *cdcReader) complete() error {
-	if err := r.b.flush(r.out); err != nil {
+	if err := r.b.Flush(r.out); err != nil {
 		return err
 	}
 	state, err := json.Marshal(r.st)
@@ -274,7 +274,7 @@ func (r *cdcReader) follow(ctx context.Context) error {
 			if r.until != nil && tokenCompare(tok, r.until.Token) == 0 {
 				return r.stopAtUntil()
 			}
-			if r.b.rows >= r.s.cfg.ChunkDocuments {
+			if r.b.Rows >= r.s.cfg.ChunkDocuments {
 				if err := r.resume(); err != nil {
 					return err
 				}
@@ -291,7 +291,7 @@ func (r *cdcReader) follow(ctx context.Context) error {
 		// The batch is drained: the stream has looked as far as pbrt.
 		pbrt := clone(bson.RawValue{Type: bson.TypeEmbeddedDocument, Value: stream.ResumeToken()})
 		switch {
-		case r.b.rows > 0:
+		case r.b.Rows > 0:
 			if err := r.resume(); err != nil {
 				return err
 			}
