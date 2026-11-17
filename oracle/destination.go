@@ -654,20 +654,11 @@ func (w *writer) targetTypes(ctx context.Context, table string) (map[string]stri
 
 // jsonNames returns the distinct strings in the JSON arrays of rel's col.
 func (w *writer) jsonNames(ctx context.Context, rel, col string) ([]string, error) {
-	rows, err := w.db.QueryContext(ctx, "SELECT DISTINCT j.c FROM "+rel+" x, JSON_TABLE(x."+quoteIdent(col)+", '$[*]' COLUMNS (c VARCHAR2(512) PATH '$')) j WHERE j.c IS NOT NULL ORDER BY j.c")
+	out, err := sqlstage.Strings(ctx, w.db, "SELECT DISTINCT j.c FROM "+rel+" x, JSON_TABLE(x."+quoteIdent(col)+", '$[*]' COLUMNS (c VARCHAR2(512) PATH '$')) j WHERE j.c IS NOT NULL ORDER BY j.c")
 	if err != nil {
 		return nil, classify(fmt.Errorf("oracle: read %s of the staging: %w", col, err))
 	}
-	defer func() { _ = rows.Close() }()
-	var out []string
-	for rows.Next() {
-		var c string
-		if err := rows.Scan(&c); err != nil {
-			return nil, err
-		}
-		out = append(out, c)
-	}
-	return out, rows.Err()
+	return out, nil
 }
 
 // acrossLanes returns the columns of tables, each staging of one stream on

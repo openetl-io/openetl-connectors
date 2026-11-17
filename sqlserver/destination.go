@@ -1450,22 +1450,9 @@ type querier interface {
 // labelled returns the schema's tables whose names start with prefix, with
 // their labels.
 func (w *writer) labelled(ctx context.Context, q querier, prefix string) ([][2]string, error) {
-	rows, err := q.QueryContext(ctx, `SELECT t.name, CONVERT(nvarchar(4000), p.value) FROM sys.tables t
+	return sqlstage.Pairs(q.QueryContext(ctx, `SELECT t.name, CONVERT(nvarchar(4000), p.value) FROM sys.tables t
 		JOIN sys.extended_properties p ON p.class = 1 AND p.major_id = t.object_id AND p.minor_id = 0 AND p.name = @p2
-		WHERE t.schema_id = SCHEMA_ID(@p1) AND LEFT(t.name, LEN(@p3)) = @p3`, w.schema, labelProperty, prefix)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = rows.Close() }()
-	var out [][2]string
-	for rows.Next() {
-		var t [2]string
-		if err := rows.Scan(&t[0], &t[1]); err != nil {
-			return nil, err
-		}
-		out = append(out, t)
-	}
-	return out, rows.Err()
+		WHERE t.schema_id = SCHEMA_ID(@p1) AND LEFT(t.name, LEN(@p3)) = @p3`, w.schema, labelProperty, prefix))
 }
 
 // DropStale drops what earlier generations of the pipeline staged. None of

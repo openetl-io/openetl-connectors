@@ -511,7 +511,7 @@ func TestResplitDividesTheRemainder(t *testing.T) {
 			}
 		}
 	}
-	if err := s.readSplit(t.Context(), &connPool{db: db, held: make(chan struct{}, 1)}, schema, tables, fullRefresh("ST_RESPLIT"), source.Split{ID: "x"}, nil, srcSplit{out}); err != nil {
+	if err := s.readSplit(t.Context(), &connPool{DB: db, Held: make(chan struct{}, 1)}, schema, tables, fullRefresh("ST_RESPLIT"), source.Split{ID: "x"}, nil, srcSplit{out}); err != nil {
 		t.Fatal(err)
 	}
 	var added []source.Split

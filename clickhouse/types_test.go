@@ -2,6 +2,7 @@ package clickhouse
 
 import (
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/apache/arrow-go/v18/arrow"
@@ -46,40 +47,46 @@ func TestWidens(t *testing.T) {
 }
 
 func TestParseType(t *testing.T) {
-	for typ, want := range map[string]string{
-		"Int64":                                  "int64",
-		"Int8":                                   "int16",
-		"UInt8":                                  "int16",
-		"UInt16":                                 "int32",
-		"UInt32":                                 "int64",
-		"UInt64":                                 "decimal(20, 0)",
-		"Nullable(Int128)":                       "utf8",
-		"UInt256":                                "utf8",
-		"LowCardinality(Nullable(String))":       "utf8",
-		"Decimal(76, 10)":                        "utf8",
-		"Decimal(18, 4)":                         "decimal(18, 4)",
-		"Decimal32(2)":                           "decimal(9, 2)",
-		"DateTime('Asia/Tokyo')":                 "timestamp[us, tz=UTC]",
-		"DateTime64(9)":                          "timestamp[us, tz=UTC]",
-		"DateTime64(4, 'Europe/Paris')":          "timestamp[us, tz=UTC]",
-		"Array(DateTime64(9))":                   "",
-		"Time":                                   "time64[us]",
-		"Time64(3)":                              "time64[us]",
-		"Time64(9)":                              "time64[us]",
-		"Array(Time)":                            "",
-		"Array(Array(Nullable(Int8)))":           "list<item: list<item: int16, nullable>, nullable>",
-		"Array(UInt64)":                          "list<item: decimal(20, 0), nullable>",
-		"Map(LowCardinality(String), UInt16)":    "",
-		"Tuple(a Int32, `b c` Nullable(String))": "",
-		"Array(Tuple(Int8, String))":             "",
-		"Enum8('a,b' = 1, 'c' = 2)":              "utf8",
-		"SimpleAggregateFunction(max, UInt64)":   "decimal(20, 0)",
-		"FixedString(16)":                        "binary",
-		"Array(JSON)":                            "",
-		"Variant(Int64, String)":                 "",
-		"AggregateFunction(uniq, String)":        "",
-		"Nested(a Int32)":                        "",
-	} {
+	// Each line is a type and how it reads, empty if it doesn't.
+	types := `
+Int64                                  -> int64
+Int8                                   -> int16
+UInt8                                  -> int16
+UInt16                                 -> int32
+UInt32                                 -> int64
+UInt64                                 -> decimal(20, 0)
+Nullable(Int128)                       -> utf8
+UInt256                                -> utf8
+LowCardinality(Nullable(String))       -> utf8
+Decimal(76, 10)                        -> utf8
+Decimal(18, 4)                         -> decimal(18, 4)
+Decimal32(2)                           -> decimal(9, 2)
+DateTime('Asia/Tokyo')                 -> timestamp[us, tz=UTC]
+DateTime64(9)                          -> timestamp[us, tz=UTC]
+DateTime64(4, 'Europe/Paris')          -> timestamp[us, tz=UTC]
+Array(DateTime64(9))                   ->
+Time                                   -> time64[us]
+Time64(3)                              -> time64[us]
+Time64(9)                              -> time64[us]
+Array(Time)                            ->
+Array(Array(Nullable(Int8)))           -> list<item: list<item: int16, nullable>, nullable>
+Array(UInt64)                          -> list<item: decimal(20, 0), nullable>
+Map(LowCardinality(String), UInt16)    ->
+Array(Tuple(Int8, String))             ->
+Enum8('a,b' = 1, 'c' = 2)              -> utf8
+SimpleAggregateFunction(max, UInt64)   -> decimal(20, 0)
+FixedString(16)                        -> binary
+Array(JSON)                            ->
+Variant(Int64, String)                 ->
+AggregateFunction(uniq, String)        ->
+Nested(a Int32)                        ->
+` + "Tuple(a Int32, `b c` Nullable(String)) ->\n"
+	for line := range strings.Lines(types) {
+		typ, want, ok := strings.Cut(line, " ->")
+		if !ok {
+			continue
+		}
+		typ, want = strings.TrimSpace(typ), strings.TrimSpace(want)
 		dt, err := arrowType(parseType(typ))
 		got := ""
 		if err == nil {

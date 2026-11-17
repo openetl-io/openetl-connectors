@@ -20,6 +20,16 @@ type Marker struct {
 
 func (m Marker) Is(e destination.Epoch) bool { return m.Generation == e.Generation && m.N == e.N }
 
+// Mark is the marker of stream applied in e; an ended overwrite's swaps
+// its read in as target.
+func Mark(e destination.Epoch, stream string, ended bool, read, target string) Marker {
+	m := Marker{Stream: stream, Generation: e.Generation, N: e.N}
+	if ended {
+		m.Swap, m.Target = read, target
+	}
+	return m
+}
+
 // Store is how a destination applies an epoch's staged streams, S, and
 // keeps their markers.
 type Store[S any] interface {

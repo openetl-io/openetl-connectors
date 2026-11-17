@@ -381,29 +381,11 @@ func (s *Source) Read(ctx context.Context, req source.ReadRequest, out source.Em
 			return s.readSplit(ctx, conns, tables, cs, sp, e)
 		})
 	}
-	if len(cdc) == 0 {
-		return readRest(ctx, limit)
+	var readCDC func(context.Context) error
+	if len(cdc) > 0 {
+		readCDC = func(ctx context.Context) error { return s.readCDC(ctx, conns, req, cdc, tables, out) }
 	}
-	// With one connection the log waits for the tables, since it never ends.
-	if limit == 1 {
-		if err := readRest(ctx, 1); err != nil {
-			return err
-		}
-		return s.readCDC(ctx, conns, req, cdc, tables, out)
-	}
-	ctx, cancel := context.WithCancelCause(ctx)
-	defer cancel(nil)
-	var wg sync.WaitGroup
-	wg.Go(func() {
-		if err := readRest(ctx, limit-1); err != nil {
-			cancel(err)
-		}
-	})
-	if err := s.readCDC(ctx, conns, req, cdc, tables, out); err != nil {
-		cancel(err)
-	}
-	wg.Wait()
-	return context.Cause(ctx)
+	return keysplit.ReadWithCDC(ctx, limit, readRest, readCDC)
 }
 
 // readSplit reads one split of a table read in full or incrementally, on a

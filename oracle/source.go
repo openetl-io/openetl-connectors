@@ -13,7 +13,6 @@ import (
 	"slices"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/apache/arrow-go/v18/arrow/memory"
@@ -484,7 +483,9 @@ func (s *Source) Read(ctx context.Context, req source.ReadRequest, out source.Em
 		return err
 	}
 	defer func() { _ = db.Close() }()
-	conns := &connPool{db: db, held: make(chan struct{}, limit)}
+	conns := &connPool{DB: db, Held: make(chan struct{}, limit), Failed: func(err error) error {
+		return classify(fmt.Errorf("oracle: connect: %w", err))
+	}}
 	tables, schema, err := s.tables(ctx, db)
 	if err != nil {
 		return err
@@ -516,30 +517,11 @@ func (s *Source) Read(ctx context.Context, req source.ReadRequest, out source.Em
 			return s.readSplit(ctx, conns, schema, tables, cs, sp, until, e)
 		})
 	}
-	if len(cdc) == 0 {
-		return readRest(ctx, limit)
+	var readCDC func(context.Context) error
+	if len(cdc) > 0 {
+		readCDC = func(ctx context.Context) error { return s.readCDC(ctx, conns, req, cdc, tables, out) }
 	}
-	// With one connection the redo log waits for the tables, since a
-	// continuous read of it never ends.
-	if limit == 1 {
-		if err := readRest(ctx, 1); err != nil {
-			return err
-		}
-		return s.readCDC(ctx, conns, req, cdc, tables, out)
-	}
-	ctx, cancel := context.WithCancelCause(ctx)
-	defer cancel(nil)
-	var wg sync.WaitGroup
-	wg.Go(func() {
-		if err := readRest(ctx, limit-1); err != nil {
-			cancel(err)
-		}
-	})
-	if err := s.readCDC(ctx, conns, req, cdc, tables, out); err != nil {
-		cancel(err)
-	}
-	wg.Wait()
-	return context.Cause(ctx)
+	return keysplit.ReadWithCDC(ctx, limit, readRest, readCDC)
 }
 
 // undeclared fails a read of a table with a column whose values are sent as
@@ -568,11 +550,11 @@ func (s *Source) readSplit(ctx context.Context, conns *connPool, schema string, 
 			return fmt.Errorf("oracle: %s state: %w", cs.Name, err)
 		}
 	}
-	conn, err := conns.get(ctx)
+	conn, err := conns.Get(ctx)
 	if err != nil {
 		return err
 	}
-	defer conns.put(conn)
+	defer conns.Put(conn)
 	t, _ := findTable(tables, cs.Name)
 	b := newBatcher(memory.DefaultAllocator, t.cols, false)
 	defer b.release()

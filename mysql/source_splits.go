@@ -219,46 +219,7 @@ func (s *Source) resplit(ctx context.Context, conn *sql.Conn, t table, r *keyspl
 	return splits, err
 }
 
-// connPool holds at most as many of a read's connections at a time as it
-// has room for.
-type connPool struct {
-	db   *sql.DB
-	held chan struct{}
-}
-
-func (p *connPool) get(ctx context.Context) (*sql.Conn, error) {
-	select {
-	case p.held <- struct{}{}:
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	}
-	c, err := p.db.Conn(ctx)
-	if err != nil {
-		<-p.held
-		return nil, classify(fmt.Errorf("mysql: connect: %w", err))
-	}
-	return c, nil
-}
-
-// tryGet returns nil if the read holds as many as it may, or can't have more.
-func (p *connPool) tryGet(ctx context.Context) *sql.Conn {
-	select {
-	case p.held <- struct{}{}:
-	default:
-		return nil
-	}
-	c, err := p.db.Conn(ctx)
-	if err != nil {
-		<-p.held
-		return nil
-	}
-	return c
-}
-
-func (p *connPool) put(c *sql.Conn) {
-	_ = c.Close()
-	<-p.held
-}
+type connPool = keysplit.Conns
 
 func intRemainder(r keyRange, pos *string, single bool) (low, high *big.Int, err error) {
 	return keysplit.IntRemainder("mysql", r.Lo, r.Hi, pos, single)

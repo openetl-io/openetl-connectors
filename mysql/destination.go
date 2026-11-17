@@ -816,20 +816,11 @@ func (w *writer) prepare(ctx context.Context, desc staged, s stagedStream) (prep
 
 // jsonNames returns the distinct strings in the JSON arrays of rel's col.
 func (w *writer) jsonNames(ctx context.Context, rel, col string) ([]string, error) {
-	rows, err := w.db.QueryContext(ctx, "SELECT DISTINCT j.c FROM "+rel+" x, JSON_TABLE(x."+quoteIdent(col)+", '$[*]' COLUMNS (c varchar(255) PATH '$')) j WHERE j.c IS NOT NULL ORDER BY j.c")
+	out, err := sqlstage.Strings(ctx, w.db, "SELECT DISTINCT j.c FROM "+rel+" x, JSON_TABLE(x."+quoteIdent(col)+", '$[*]' COLUMNS (c varchar(255) PATH '$')) j WHERE j.c IS NOT NULL ORDER BY j.c")
 	if err != nil {
 		return nil, classify(fmt.Errorf("mysql: read %s of the staging: %w", col, err))
 	}
-	defer func() { _ = rows.Close() }()
-	var out []string
-	for rows.Next() {
-		var c string
-		if err := rows.Scan(&c); err != nil {
-			return nil, err
-		}
-		out = append(out, c)
-	}
-	return out, rows.Err()
+	return out, nil
 }
 
 // acrossLanes returns the columns of tables, each staging of one stream on
@@ -1406,21 +1397,8 @@ func (w *writer) Exists(ctx context.Context, table string) (bool, error) {
 // labelled returns the database's tables whose names start with prefix,
 // with their comments.
 func (w *writer) labelled(ctx context.Context, prefix string) ([][2]string, error) {
-	rows, err := w.db.QueryContext(ctx, `SELECT TABLE_NAME, TABLE_COMMENT FROM information_schema.TABLES
-		WHERE TABLE_SCHEMA = ? AND TABLE_TYPE = 'BASE TABLE' AND LEFT(TABLE_NAME, ?) = ?`, w.schema, len(prefix), prefix)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = rows.Close() }()
-	var out [][2]string
-	for rows.Next() {
-		var t [2]string
-		if err := rows.Scan(&t[0], &t[1]); err != nil {
-			return nil, err
-		}
-		out = append(out, t)
-	}
-	return out, rows.Err()
+	return sqlstage.Pairs(w.db.QueryContext(ctx, `SELECT TABLE_NAME, TABLE_COMMENT FROM information_schema.TABLES
+		WHERE TABLE_SCHEMA = ? AND TABLE_TYPE = 'BASE TABLE' AND LEFT(TABLE_NAME, ?) = ?`, w.schema, len(prefix), prefix))
 }
 
 // DropStale drops what earlier generations of the pipeline staged. None of

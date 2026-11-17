@@ -204,3 +204,39 @@ func applyRows[P any](ctx context.Context, name string, tx *sql.Tx, a Applier[P]
 	}
 	return n, nil
 }
+
+// Strings are the text of the first column of query's rows.
+func Strings(ctx context.Context, db *sql.DB, query string) ([]string, error) {
+	rows, err := db.QueryContext(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	var out []string
+	for rows.Next() {
+		var c string
+		if err := rows.Scan(&c); err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+// Pairs are the text of the first two columns of rows, which a query
+// returned with err.
+func Pairs(rows *sql.Rows, err error) ([][2]string, error) {
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	var out [][2]string
+	for rows.Next() {
+		var t [2]string
+		if err := rows.Scan(&t[0], &t[1]); err != nil {
+			return nil, err
+		}
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}

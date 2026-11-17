@@ -3,110 +3,19 @@
 package sqlserver
 
 import (
-	"encoding/json"
-	"fmt"
 	"slices"
 	"strconv"
-	"sync"
 	"sync/atomic"
 	"testing"
 
-	"github.com/apache/arrow-go/v18/arrow"
-
+	"github.com/openetl-io/openetl-connectors/connectortest"
 	"github.com/openetl-io/openetl/sdk/go/source"
 )
 
-// splitEvent is what a split emitted: rows' values in one column, or a
-// resume point or completion.
-type splitEvent struct {
-	split    string
-	rows     []string
-	resume   bool
-	complete bool
-	state    string
-	added    []source.Split
-}
-
-// splitCapture records what a source emits on each split, in order, keeping
-// one column of its rows.
-type splitCapture struct {
-	col     string
-	onBatch func(stream, split string)
-	mu      sync.Mutex
-	events  []splitEvent
-}
-
-func (c *splitCapture) Rows(stream string, _ []json.RawMessage) error {
-	return fmt.Errorf("unexpected raw rows on %s", stream)
-}
-func (c *splitCapture) Records(stream string, b arrow.RecordBatch) error {
-	return c.Split(stream, source.WholeStream).Records(b)
-}
-func (c *splitCapture) ResumePoint(stream string, state []byte) error {
-	return c.Split(stream, source.WholeStream).ResumePoint(state)
-}
-func (c *splitCapture) Complete(stream string, next []byte) error {
-	return c.Split(stream, source.WholeStream).Complete(next)
-}
-func (c *splitCapture) Split(stream, id string) source.SplitEmitter { return splitSink{c, stream, id} }
-
-func (c *splitCapture) add(e splitEvent) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.events = append(c.events, e)
-}
-
-type splitSink struct {
-	c          *splitCapture
-	stream, id string
-}
-
-func (s splitSink) Rows([]json.RawMessage) error {
-	return fmt.Errorf("unexpected raw rows on %s", s.stream)
-}
-func (s splitSink) Records(b arrow.RecordBatch) error {
-	if s.c.onBatch != nil {
-		s.c.onBatch(s.stream, s.id)
-	}
-	col := b.Column(b.Schema().FieldIndices(s.c.col)[0])
-	rows := make([]string, col.Len())
-	for i := range rows {
-		rows[i] = col.ValueStr(i)
-	}
-	b.Release()
-	s.c.add(splitEvent{split: s.id, rows: rows})
-	return nil
-}
-func (s splitSink) ResumePoint(state []byte, added ...source.Split) error {
-	s.c.add(splitEvent{split: s.id, resume: true, state: string(state), added: added})
-	return nil
-}
-func (s splitSink) Complete(next []byte, added ...source.Split) error {
-	s.c.add(splitEvent{split: s.id, complete: true, state: string(next), added: added})
-	return nil
-}
-
-func (c *splitCapture) values() []string {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	var out []string
-	for _, e := range c.events {
-		out = append(out, e.rows...)
-	}
-	return out
-}
-
-func (c *splitCapture) of(split string) []splitEvent {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	var out []splitEvent
-	for _, e := range c.events {
-		if e.split == split {
-			out = append(out, e)
-		}
-	}
-	return out
-}
+type (
+	splitEvent   = connectortest.SplitEvent
+	splitCapture = connectortest.SplitCapture
+)
 
 func sameValues(t *testing.T, got []string, n int) {
 	t.Helper()
@@ -140,13 +49,13 @@ func TestSplitsReadEveryRowOnce(t *testing.T) {
 		t.Fatalf("%d splits", len(splits))
 	}
 	cs.Splits = splits
-	c := &splitCapture{col: "n"}
+	c := &splitCapture{Col: "n"}
 	if err := s.Read(t.Context(), source.ReadRequest{Streams: []source.ConfiguredStream{cs}, Lanes: 4}, c); err != nil {
 		t.Fatal(err)
 	}
-	sameValues(t, c.values(), 5000)
+	sameValues(t, c.Values(), 5000)
 	for _, sp := range splits {
-		if ev := c.of(sp.ID); len(ev) == 0 || !ev[len(ev)-1].complete {
+		if ev := c.Of(sp.ID); len(ev) == 0 || !ev[len(ev)-1].Complete {
 			t.Errorf("split %s didn't complete", sp.ID)
 		}
 	}
@@ -160,9 +69,9 @@ func TestResplit(t *testing.T) {
 	e.exec("INSERT INTO $schema.t SELECT n, n FROM (SELECT TOP (100) ROW_NUMBER() OVER (ORDER BY (SELECT 1)) AS n FROM sys.all_objects) x")
 	s := e.source(`, "chunkRows": 20`)
 	cs := source.ConfiguredStream{Name: "t", SyncMode: source.FullRefresh, Splits: []source.Split{{ID: "a", State: []byte(`{}`)}}}
-	c := &splitCapture{col: "n"}
+	c := &splitCapture{Col: "n"}
 	var asked atomic.Bool
-	c.onBatch = func(stream, split string) {
+	c.OnBatch = func(stream, split string) {
 		if split == "a" && !asked.Swap(true) {
 			if ok, err := s.Resplit(t.Context(), stream, split); err != nil || !ok {
 				t.Errorf("asked to split: %v, %v", ok, err)
@@ -172,26 +81,26 @@ func TestResplit(t *testing.T) {
 	if err := s.Read(t.Context(), source.ReadRequest{Streams: []source.ConfiguredStream{cs}, Lanes: 2}, c); err != nil {
 		t.Fatal(err)
 	}
-	sameValues(t, c.values(), 100)
+	sameValues(t, c.Values(), 100)
 	var cut *splitEvent
-	for _, ev := range c.of("a") {
-		if len(ev.added) > 0 {
+	for _, ev := range c.Of("a") {
+		if len(ev.Added) > 0 {
 			cut = &ev
 			break
 		}
 	}
 	if cut == nil {
-		t.Fatalf("split a never added a split: %+v", c.of("a"))
+		t.Fatalf("split a never added a split: %+v", c.Of("a"))
 	}
-	if len(c.of(cut.added[0].ID)) == 0 {
-		t.Errorf("the new split %s read nothing", cut.added[0].ID)
+	if len(c.Of(cut.Added[0].ID)) == 0 {
+		t.Errorf("the new split %s read nothing", cut.Added[0].ID)
 	}
-	rest := &splitCapture{col: "n"}
-	cs.Splits = []source.Split{{ID: "a", State: []byte(cut.state)}, cut.added[0]}
+	rest := &splitCapture{Col: "n"}
+	cs.Splits = []source.Split{{ID: "a", State: []byte(cut.State)}, cut.Added[0]}
 	if err := s.Read(t.Context(), source.ReadRequest{Streams: []source.ConfiguredStream{cs}, Lanes: 2}, rest); err != nil {
 		t.Fatal(err)
 	}
-	got := rest.values()
+	got := rest.Values()
 	if len(got) == 0 || slices.Contains(got, "1") || !slices.Contains(got, "100") {
 		t.Errorf("resumed %v", got)
 	}
@@ -206,34 +115,34 @@ func TestIncremental(t *testing.T) {
 			e.exec("CREATE TABLE $schema.t (id int PRIMARY KEY, at datetime2, rv rowversion)")
 			e.exec("INSERT INTO $schema.t (id, at) SELECT n, DATEADD(day, n, '2026-01-01') FROM (SELECT TOP (5) ROW_NUMBER() OVER (ORDER BY (SELECT 1)) AS n FROM sys.all_objects) x")
 			s := e.source(`, "chunkRows": 2`)
-			first := &splitCapture{col: "id"}
+			first := &splitCapture{Col: "id"}
 			cs := source.ConfiguredStream{Name: "t", SyncMode: source.Incremental, Cursor: cursor}
 			if err := s.Read(t.Context(), source.ReadRequest{Streams: []source.ConfiguredStream{cs}}, first); err != nil {
 				t.Fatal(err)
 			}
-			ev := first.of(source.WholeStream)
-			if got := first.values(); !slices.Equal(got, []string{"1", "2", "3", "4", "5"}) || !ev[len(ev)-1].complete {
+			ev := first.Of(source.WholeStream)
+			if got := first.Values(); !slices.Equal(got, []string{"1", "2", "3", "4", "5"}) || !ev[len(ev)-1].Complete {
 				t.Fatalf("first read %v", got)
 			}
 			// From the second resume point, the rest.
 			var resumes []string
 			for _, x := range ev {
-				if x.resume {
-					resumes = append(resumes, x.state)
+				if x.Resume {
+					resumes = append(resumes, x.State)
 				}
 			}
-			mid := &splitCapture{col: "id"}
+			mid := &splitCapture{Col: "id"}
 			cs.State = []byte(resumes[1])
 			if err := s.Read(t.Context(), source.ReadRequest{Streams: []source.ConfiguredStream{cs}}, mid); err != nil {
 				t.Fatal(err)
 			}
-			if got := mid.values(); !slices.Equal(got, []string{"5"}) {
+			if got := mid.Values(); !slices.Equal(got, []string{"5"}) {
 				t.Errorf("from %s: %v", resumes[1], got)
 			}
 			e.exec("UPDATE $schema.t SET at = '2027-01-01' WHERE id = 2")
 			e.exec("INSERT INTO $schema.t (id, at) VALUES (6, '2027-01-02')")
-			next := &splitCapture{col: "id"}
-			cs.State = []byte(ev[len(ev)-1].state)
+			next := &splitCapture{Col: "id"}
+			cs.State = []byte(ev[len(ev)-1].State)
 			if err := s.Read(t.Context(), source.ReadRequest{Streams: []source.ConfiguredStream{cs}}, next); err != nil {
 				t.Fatal(err)
 			}
@@ -243,7 +152,7 @@ func TestIncremental(t *testing.T) {
 			if cursor == "rv" {
 				want = []string{"2", "6"}
 			}
-			if got := next.values(); !slices.Equal(got, want) {
+			if got := next.Values(); !slices.Equal(got, want) {
 				t.Errorf("next read %v, want %v", got, want)
 			}
 		})
@@ -269,23 +178,23 @@ func TestIncrementalRowversionWaitsForOpenTransactions(t *testing.T) {
 	e.exec("INSERT INTO $schema.t (id) VALUES (2)")
 	s := e.source("")
 	cs := source.ConfiguredStream{Name: "t", SyncMode: source.Incremental, Cursor: "rv"}
-	first := &splitCapture{col: "id"}
+	first := &splitCapture{Col: "id"}
 	if err := s.Read(t.Context(), source.ReadRequest{Streams: []source.ConfiguredStream{cs}}, first); err != nil {
 		t.Fatal(err)
 	}
-	if got := first.values(); !slices.Equal(got, []string{"1"}) {
+	if got := first.Values(); !slices.Equal(got, []string{"1"}) {
 		t.Errorf("read with a transaction open %v", got)
 	}
 	if err := tx.Commit(); err != nil {
 		t.Fatal(err)
 	}
-	ev := first.of(source.WholeStream)
-	cs.State = []byte(ev[len(ev)-1].state)
-	next := &splitCapture{col: "id"}
+	ev := first.Of(source.WholeStream)
+	cs.State = []byte(ev[len(ev)-1].State)
+	next := &splitCapture{Col: "id"}
 	if err := s.Read(t.Context(), source.ReadRequest{Streams: []source.ConfiguredStream{cs}}, next); err != nil {
 		t.Fatal(err)
 	}
-	if got := next.values(); !slices.Equal(got, []string{"2"}) {
+	if got := next.Values(); !slices.Equal(got, []string{"2"}) {
 		t.Errorf("read after the commit %v", got)
 	}
 }

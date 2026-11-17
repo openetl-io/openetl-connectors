@@ -161,11 +161,11 @@ type scnSample struct {
 // flashback query, then the changes of transactions that committed after
 // it, from the redo log through LogMiner.
 func (s *Source) readCDC(ctx context.Context, conns *connPool, req source.ReadRequest, streams []source.ConfiguredStream, tables []table, out source.Emitter) error {
-	conn, err := conns.get(ctx)
+	conn, err := conns.Get(ctx)
 	if err != nil {
 		return err
 	}
-	defer conns.put(conn)
+	defer conns.Put(conn)
 	defer endLogMiner(context.WithoutCancel(ctx), conn)
 	// The read holds what may be the pool's only connection.
 	schema := s.cfg.Schema

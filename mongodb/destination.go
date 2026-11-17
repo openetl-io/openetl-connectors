@@ -314,20 +314,6 @@ func seqConverter(t arrow.DataType) convert {
 	return c
 }
 
-func listStrings(a arrow.Array, i int) []string {
-	l := storage(a).(*array.List)
-	if l.IsNull(i) {
-		return nil
-	}
-	from, to := l.ValueOffsets(i)
-	vals := l.ListValues().(*array.String)
-	out := make([]string, 0, to-from)
-	for j := from; j < to; j++ {
-		out = append(out, vals.Value(int(j)))
-	}
-	return out
-}
-
 // rows are a batch's rows as staged documents. A document's _id is its key
 // where its stream is keyed, its _openetl_id where its stream is deduped,
 // and an ObjectId otherwise, given here so that applying it again finds it.
@@ -380,7 +366,7 @@ func (w *writer) rows(cfg destination.Stream, batch arrow.RecordBatch) ([]any, e
 		}
 		var keep []string
 		if heldCol >= 0 {
-			if held := listStrings(batch.Column(heldCol), i); len(held) > 0 {
+			if held := docstore.ListStrings(batch.Column(heldCol), i); len(held) > 0 {
 				version, _ := convs[idCol](batch.Column(idCol), i)
 				m := bson.D{}
 				for _, c := range held {
@@ -393,7 +379,7 @@ func (w *writer) rows(cfg destination.Stream, batch arrow.RecordBatch) ([]any, e
 			}
 		}
 		if unchangedCol >= 0 && cfg.Mode == destination.Merge {
-			keep = append(keep, listStrings(batch.Column(unchangedCol), i)...)
+			keep = append(keep, docstore.ListStrings(batch.Column(unchangedCol), i)...)
 		}
 		raw, err := bson.Marshal(doc)
 		if err != nil {
@@ -445,7 +431,7 @@ func (w *writer) patchRows(cfg destination.Stream, batch arrow.RecordBatch) ([]a
 			p = append(p, bson.E{Key: "k", Value: k})
 		}
 		f := bson.D{}
-		for _, col := range listStrings(batch.Column(heldCol), i) {
+		for _, col := range docstore.ListStrings(batch.Column(heldCol), i) {
 			c, ok := fills[col]
 			if !ok {
 				return nil, fmt.Errorf("a patch fills %q, which it has no column for", col)
@@ -1000,11 +986,7 @@ func (w *writer) settleRecorded(ctx context.Context, e destination.Epoch, commit
 }
 
 func (w *writer) Mark(s stagedStream, e destination.Epoch) marker {
-	m := marker{Stream: s.Name, Generation: e.Generation, N: e.N}
-	if s.Mode == destination.Overwrite && s.Ended {
-		m.Swap, m.Target = s.Read, s.Target
-	}
-	return m
+	return docstore.Mark(e, s.Name, s.Mode == destination.Overwrite && s.Ended, s.Read, s.Target)
 }
 
 func (w *writer) DropStaging(ctx context.Context, s stagedStream) error {

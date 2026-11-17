@@ -251,28 +251,4 @@ func parseNum(s string, up bool) (n *big.Int, exact bool, err error) {
 	return q, false, nil
 }
 
-// connPool holds at most as many of a read's connections at a time as it
-// has room for.
-type connPool struct {
-	db   *sql.DB
-	held chan struct{}
-}
-
-func (p *connPool) get(ctx context.Context) (*sql.Conn, error) {
-	select {
-	case p.held <- struct{}{}:
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	}
-	c, err := p.db.Conn(ctx)
-	if err != nil {
-		<-p.held
-		return nil, classify(fmt.Errorf("oracle: connect: %w", err))
-	}
-	return c, nil
-}
-
-func (p *connPool) put(c *sql.Conn) {
-	_ = c.Close()
-	<-p.held
-}
+type connPool = keysplit.Conns

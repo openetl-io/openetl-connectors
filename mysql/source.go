@@ -12,7 +12,6 @@ import (
 	"slices"
 	"strconv"
 	"strings"
-	"sync"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
@@ -348,7 +347,9 @@ func (s *Source) Read(ctx context.Context, req source.ReadRequest, out source.Em
 		return err
 	}
 	defer func() { _ = db.Close() }()
-	conns := &connPool{db: db, held: make(chan struct{}, limit)}
+	conns := &connPool{DB: db, Held: make(chan struct{}, limit), Failed: func(err error) error {
+		return classify(fmt.Errorf("mysql: connect: %w", err))
+	}}
 	tables, err := s.tables(ctx, db, srv)
 	if err != nil {
 		return err
@@ -376,30 +377,11 @@ func (s *Source) Read(ctx context.Context, req source.ReadRequest, out source.Em
 			return s.readSplit(ctx, conns, tables, cs, sp, until, e)
 		})
 	}
-	if len(cdc) == 0 {
-		return readRest(ctx, limit)
+	var readCDC func(context.Context) error
+	if len(cdc) > 0 {
+		readCDC = func(ctx context.Context) error { return s.readCDC(ctx, conns, srv, req, cdc, tables, out) }
 	}
-	// With one connection the binlog waits for the tables, since it never
-	// ends.
-	if limit == 1 {
-		if err := readRest(ctx, 1); err != nil {
-			return err
-		}
-		return s.readCDC(ctx, conns, srv, req, cdc, tables, out)
-	}
-	ctx, cancel := context.WithCancelCause(ctx)
-	defer cancel(nil)
-	var wg sync.WaitGroup
-	wg.Go(func() {
-		if err := readRest(ctx, limit-1); err != nil {
-			cancel(err)
-		}
-	})
-	if err := s.readCDC(ctx, conns, srv, req, cdc, tables, out); err != nil {
-		cancel(err)
-	}
-	wg.Wait()
-	return context.Cause(ctx)
+	return keysplit.ReadWithCDC(ctx, limit, readRest, readCDC)
 }
 
 // readSplit reads one split of a table read in full or incrementally, on a
@@ -412,11 +394,11 @@ func (s *Source) readSplit(ctx context.Context, conns *connPool, tables []table,
 			return fmt.Errorf("mysql: %s state: %w", cs.Name, err)
 		}
 	}
-	conn, err := conns.get(ctx)
+	conn, err := conns.Get(ctx)
 	if err != nil {
 		return err
 	}
-	defer conns.put(conn)
+	defer conns.Put(conn)
 	t, _ := findTable(tables, cs.Name)
 	b, err := newBatcher(memory.DefaultAllocator, t.cols, false)
 	if err != nil {

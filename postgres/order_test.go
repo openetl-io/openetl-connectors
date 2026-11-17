@@ -248,14 +248,14 @@ func TestSplitsByAUniqueIndex(t *testing.T) {
 	if len(splits) < 5 {
 		t.Fatalf("%d splits", len(splits))
 	}
-	c := &splitCapture{col: "id"}
+	c := &splitCapture{Col: "id"}
 	cs := source.ConfiguredStream{Name: "t", Splits: splits}
 	if err := s.Read(t.Context(), source.ReadRequest{Streams: []source.ConfiguredStream{cs}, Lanes: 3}, c); err != nil {
 		t.Fatal(err)
 	}
-	got := c.values()
+	got := c.Values()
 	slices.Sort(got)
-	if len(slices.Compact(got)) != 2000 || len(c.values()) != 2000 {
-		t.Errorf("read %d rows, %d distinct", len(c.values()), len(slices.Compact(got)))
+	if len(slices.Compact(got)) != 2000 || len(c.Values()) != 2000 {
+		t.Errorf("read %d rows, %d distinct", len(c.Values()), len(slices.Compact(got)))
 	}
 }

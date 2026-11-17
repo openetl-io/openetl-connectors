@@ -1,4 +1,4 @@
-// Package connectortest is what the connectors' tests share: a recorder of
+// Package connectortest is what the connectors' tests share: recorders of
 // what a read emits, and a check's items' statuses.
 package connectortest
 
@@ -30,7 +30,7 @@ type Recorder struct {
 
 type Emitted struct {
 	Stream, Split string
-	// A batch's Rows, each field's value as text; a null isn't there.
+	// A batch's rows, each field's value as text; a null isn't there.
 	Rows             []map[string]string
 	Resume, Complete bool
 	State            []byte

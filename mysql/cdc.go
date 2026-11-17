@@ -207,11 +207,11 @@ type cdcReader struct {
 // binlog reaches it, and emitted before the changes after. Nothing is written
 // to the source.
 func (s *Source) readCDC(ctx context.Context, conns *connPool, srv server, req source.ReadRequest, cfgs []source.ConfiguredStream, tables []table, out source.Emitter) error {
-	conn, err := conns.get(ctx)
+	conn, err := conns.Get(ctx)
 	if err != nil {
 		return err
 	}
-	defer conns.put(conn)
+	defer conns.Put(conn)
 	r := &cdcReader{ctx: ctx, s: s, out: out, conns: conns, conn: conn, srv: srv, continuous: req.Continuous, rels: map[uint64]*relation{}}
 	if err := r.checkServer(ctx); err != nil {
 		return err
@@ -488,7 +488,7 @@ func (r *cdcReader) snapshotRanges(ctx context.Context, t table, state cdcState)
 	cursor := state.Snapshot
 	switch {
 	case state.File == "" || cursor != nil && cursor.After == nil && len(cursor.Ranges) == 0:
-		if cap(r.conns.held) == 1 {
+		if cap(r.conns.Held) == 1 {
 			return []*snapshotRange{{}}, nil
 		}
 		ranges, err := r.s.keyRanges(ctx, r.conn, t, r.s.cfg.SnapshotChunkRows)
@@ -1111,11 +1111,11 @@ func (r *cdcReader) readChunks(ctx context.Context) error {
 	conns := []*sql.Conn{r.conn}
 	defer func() {
 		for _, c := range conns[1:] {
-			r.conns.put(c)
+			r.conns.Put(c)
 		}
 	}()
 	for len(conns) < len(todo) {
-		c := r.conns.tryGet(ctx)
+		c := r.conns.TryGet(ctx)
 		if c == nil {
 			break
 		}

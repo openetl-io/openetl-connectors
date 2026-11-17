@@ -106,7 +106,7 @@ func TestReadsStopAtUntil(t *testing.T) {
 			`{"after":["80"],"lo":"40","hi":"100"}`: {"62", "80", "10"},
 		} {
 			c := readSplitUntil(t, s, from, until, nil)
-			got := c.values()
+			got := c.Values()
 			if strconv.Itoa(len(got)) != want[2] || got[0] != want[0] || got[len(got)-1] != want[1] {
 				t.Errorf("read %v, want %s to %s", got, want[0], want[1])
 			}
@@ -166,7 +166,7 @@ func readSplitUntil(t *testing.T, s *Source, from, until string, onBatch func(st
 	if from != "" {
 		sp.State = []byte(from)
 	}
-	c := &splitCapture{col: "id", onBatch: onBatch}
+	c := &splitCapture{Col: "id", OnBatch: onBatch}
 	cs := source.ConfiguredStream{Name: "t", Splits: []source.Split{sp}}
 	if err := s.Read(t.Context(), source.ReadRequest{Streams: []source.ConfiguredStream{cs}}, c); err != nil {
 		t.Fatal(err)
@@ -176,9 +176,10 @@ func readSplitUntil(t *testing.T, s *Source, from, until string, onBatch func(st
 
 func splitEndsAt(t *testing.T, c *splitCapture, until string) {
 	t.Helper()
-	n := len(c.events)
-	if n < 2 || !c.events[n-2].resume || c.events[n-2].state != until || !c.events[n-1].complete || c.events[n-1].state != until {
-		t.Errorf("ended with %+v, want a resume point and a completion at %s", c.events[max(n-2, 0):], until)
+	ev := c.Events()
+	n := len(ev)
+	if n < 2 || !ev[n-2].Resume || ev[n-2].State != until || !ev[n-1].Complete || ev[n-1].State != until {
+		t.Errorf("ended with %+v, want a resume point and a completion at %s", ev[max(n-2, 0):], until)
 	}
 }
 

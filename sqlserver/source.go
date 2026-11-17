@@ -10,7 +10,6 @@ import (
 	"slices"
 	"strconv"
 	"strings"
-	"sync"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
@@ -286,19 +285,7 @@ func (s *Source) Read(ctx context.Context, req source.ReadRequest, out source.Em
 	if len(rest) == 0 {
 		return readCDC(ctx)
 	}
-	ctx, cancel := context.WithCancelCause(ctx)
-	defer cancel(nil)
-	var wg sync.WaitGroup
-	wg.Go(func() {
-		if err := readRest(ctx, limit); err != nil {
-			cancel(err)
-		}
-	})
-	if err := readCDC(ctx); err != nil {
-		cancel(err)
-	}
-	wg.Wait()
-	return context.Cause(ctx)
+	return keysplit.Alongside(ctx, func(ctx context.Context) error { return readRest(ctx, limit) }, readCDC)
 }
 
 // readSplit reads one split of a table read in full or incrementally.
