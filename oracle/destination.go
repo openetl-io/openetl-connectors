@@ -127,6 +127,13 @@ func (d *Destination) Open(ctx context.Context, cfg destination.OpenConfig) (des
 	}
 	w.Dialect = sqlstage.Dialect[*stagingTable]{Name: "oracle", Open: cfg, Streams: w.streams,
 		StagingName: stagingName, ReadName: readName, TargetTable: targetTable, SQL: w}
+	w.Own = sqlstage.Own{DB: db, Name: "oracle", Pipeline: cfg.Pipeline, Generation: cfg.Generation, Classify: classify,
+		FenceRow: func(lock string) string {
+			return "SELECT generation FROM " + w.own(fenceTable) + " WHERE pipeline = :1 " + lock
+		},
+		Marked: "SELECT COUNT(*) FROM " + w.own(loadsTable) + " WHERE pipeline = :1 AND stream = :2 AND generation = :3 AND epoch = :4",
+		Mark:   "INSERT INTO " + w.own(loadsTable) + " (pipeline, stream, generation, epoch) VALUES (:1, :2, :3, :4)",
+		Trim:   "DELETE FROM " + w.own(loadsTable) + " WHERE pipeline = :1 AND epoch < :2"}
 	return w, nil
 }
 
@@ -159,6 +166,7 @@ type writer struct {
 	boolean bool
 	streams map[string]destination.Stream
 	sqlstage.Epochs[*stagingTable]
+	sqlstage.Own
 	// Only Commit, Recover and ApplySchema use these: indexes known to
 	// exist, by name, and whether the target schema is.
 	indexed map[string]bool
@@ -436,7 +444,7 @@ func (w *writer) Apply(ctx context.Context, desc staged, streams []stagedStream,
 	if len(todo) == 0 {
 		// Applied, perhaps by a newer generation's Recover, which then stops
 		// this one.
-		return w.fencedOut(ctx)
+		return w.Unfenced(ctx)
 	}
 	prep := make(map[string]prepared, len(todo))
 	for _, s := range todo {
@@ -445,7 +453,7 @@ func (w *writer) Apply(ctx context.Context, desc staged, streams []stagedStream,
 		}
 	}
 	if slices.ContainsFunc(todo, func(s stagedStream) bool { return s.Mode == modeOverwrite }) {
-		err := w.fenced(ctx, func() error {
+		err := w.Fenced(ctx, "FOR UPDATE", func() error {
 			return w.dropAbandonedReads(ctx, func(stream, table string) bool {
 				return slices.ContainsFunc(todo, func(s stagedStream) bool {
 					return s.Mode == modeOverwrite && digest(16, s.Name) == stream && table != s.Read
@@ -478,93 +486,10 @@ func (w *writer) Apply(ctx context.Context, desc staged, streams []stagedStream,
 	return nil
 }
 
-// fencedOut fails if a newer generation raised the fence.
-func (w *writer) fencedOut(ctx context.Context) error {
-	var fence uint64
-	err := w.db.QueryRowContext(ctx, "SELECT generation FROM "+w.own(fenceTable)+" WHERE pipeline = :1", w.cfg.Pipeline).Scan(&fence)
-	switch {
-	case errors.Is(err, sql.ErrNoRows):
-		return nil
-	case err == nil && fence > w.cfg.Generation:
-		return fmt.Errorf("%w: fence is %d, applier is %d", destination.ErrFenced, fence, w.cfg.Generation)
-	}
-	return classify(err)
-}
-
-// fence reads the pipeline's fence in tx, locking its row, and fails if a
-// newer generation raised it. Oracle has no shared row lock, so applies of
-// one pipeline take turns.
-func (w *writer) fence(ctx context.Context, tx *sql.Tx) error {
-	var fence uint64
-	err := tx.QueryRowContext(ctx, "SELECT generation FROM "+w.own(fenceTable)+" WHERE pipeline = :1 FOR UPDATE", w.cfg.Pipeline).Scan(&fence)
-	if errors.Is(err, sql.ErrNoRows) {
-		return errors.New("oracle: the fence row is missing; Recover must run first")
-	}
-	if err != nil {
-		return classify(fmt.Errorf("oracle: lock fence: %w", err))
-	}
-	if fence > w.cfg.Generation {
-		return fmt.Errorf("%w: fence is %d, applier is %d", destination.ErrFenced, fence, w.cfg.Generation)
-	}
-	return nil
-}
-
-// fenced runs fn, which may run DDL on other connections, while a
-// transaction holds the fence row, so that a newer generation's Recover
-// waits for it and a fenced writer can't run it.
-func (w *writer) fenced(ctx context.Context, fn func() error) error {
-	tx, err := w.db.BeginTx(ctx, nil)
-	if err != nil {
-		return classify(err)
-	}
-	defer func() { _ = tx.Rollback() }()
-	if err := w.fence(ctx, tx); err != nil {
-		return err
-	}
-	if err := fn(); err != nil {
-		return err
-	}
-	return tx.Commit()
-}
-
 func (w *writer) applyTx(ctx context.Context, desc staged, streams []stagedStream, prep map[string]prepared, collapsed map[string]uint64) error {
-	skipped := map[string]uint64{}
-	tx, err := w.db.BeginTx(ctx, nil)
-	if err != nil {
-		return classify(err)
-	}
-	defer func() { _ = tx.Rollback() }()
-	if err := w.fence(ctx, tx); err != nil {
-		return err
-	}
-	for _, s := range streams {
-		var done int
-		if err := tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM "+w.own(loadsTable)+" WHERE pipeline = :1 AND stream = :2 AND generation = :3 AND epoch = :4",
-			w.cfg.Pipeline, s.Name, desc.Generation, desc.Epoch).Scan(&done); err != nil {
-			return classify(fmt.Errorf("oracle: read marker for %s: %w", s.Name, err))
-		}
-		if done > 0 {
-			continue
-		}
-		n, err := w.applyStream(ctx, tx, s, prep[s.Name])
-		if err != nil {
-			return classify(fmt.Errorf("oracle: apply %s: %w", s.Name, err))
-		}
-		if s.Deduped() && s.Rows > n {
-			skipped[s.Name] = s.Rows - n
-		}
-		if _, err := tx.ExecContext(ctx, "INSERT INTO "+w.own(loadsTable)+" (pipeline, stream, generation, epoch) VALUES (:1, :2, :3, :4)",
-			w.cfg.Pipeline, s.Name, desc.Generation, desc.Epoch); err != nil {
-			return classify(fmt.Errorf("oracle: write marker for %s: %w", s.Name, err))
-		}
-	}
-	if err := tx.Commit(); err != nil {
-		return classify(err)
-	}
-	for name, n := range skipped {
-		collapsed[name] += n
-	}
-	return nil
+	return w.ApplyTx(ctx, nil, "FOR UPDATE", desc, streams, func(tx *sql.Tx, s stagedStream) (uint64, error) {
+		return w.applyStream(ctx, tx, s, prep[s.Name])
+	}, collapsed)
 }
 
 // applyStream applies one stream's staging in tx, and returns the rows it
@@ -686,7 +611,7 @@ func (w *writer) prepare(ctx context.Context, desc staged, s stagedStream) (prep
 		}
 		if len(cols) == 0 {
 			// A newer generation's Recover drops what older ones staged.
-			if err := w.fencedOut(ctx); err != nil {
+			if err := w.Unfenced(ctx); err != nil {
 				return p, err
 			}
 			return p, fmt.Errorf("oracle: staging for %s in epoch %d-g%d is missing", s.Name, desc.Epoch, desc.Generation)
@@ -1303,21 +1228,6 @@ func (w *writer) dropOwn(ctx context.Context, table string) {
 	_ = w.ddl(ctx, "DROP TABLE "+w.own(table)+" PURGE", 942)
 }
 
-func (w *writer) Unapplied(ctx context.Context, desc staged, streams []stagedStream) ([]stagedStream, error) {
-	var todo []stagedStream
-	for _, s := range streams {
-		var done int
-		if err := w.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM "+w.own(loadsTable)+" WHERE pipeline = :1 AND stream = :2 AND generation = :3 AND epoch = :4",
-			w.cfg.Pipeline, s.Name, desc.Generation, desc.Epoch).Scan(&done); err != nil {
-			return nil, classify(fmt.Errorf("oracle: read marker for %s: %w", s.Name, err))
-		}
-		if done == 0 {
-			todo = append(todo, s)
-		}
-	}
-	return todo, nil
-}
-
 func (w *writer) DropStaging(ctx context.Context, streams []stagedStream) {
 	for _, s := range streams {
 		for _, t := range slices.Concat(s.Stagings, s.Patches) {
@@ -1391,14 +1301,6 @@ func (w *writer) Exists(ctx context.Context, table string) (bool, error) {
 		return false, classify(err)
 	}
 	return n > 0, nil
-}
-
-// TrimMarkers deletes the pipeline's markers below an applied epoch. Recovery
-// checks only HEAD's, and HEAD never moves back past an applied epoch; a lost
-// one moves it back to the previous record, whose markers it then checks.
-// Best effort, like dropStaging.
-func (w *writer) TrimMarkers(ctx context.Context, applied uint64) {
-	_, _ = w.db.ExecContext(ctx, "DELETE FROM "+w.own(loadsTable)+" WHERE pipeline = :1 AND epoch < :2", w.cfg.Pipeline, applied)
 }
 
 // ownTables returns the user's tables whose names start with prefix.

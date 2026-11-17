@@ -13,6 +13,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/jackc/pgx/v5"
 
+	"github.com/openetl-io/openetl-connectors/sqlstage"
 	"github.com/openetl-io/openetl/sdk/go/destination"
 )
 
@@ -302,7 +303,7 @@ func TestRecoverAcrossLanes(t *testing.T) {
 	write(t, lanes[0], e2, "users", batch(t, id, `[{"id": 4}]`))
 	write(t, lanes[1], e2, "users", batch(t, id, `[{"id": 5}]`))
 	st2 := precommitAll(t, e2, lanes...)
-	if _, err := env.conn.Exec(ctx, "DROP TABLE "+pgx.Identifier{env.schema, stagingName("p1", "users", e2, 1)}.Sanitize()); err != nil {
+	if _, err := env.conn.Exec(ctx, "DROP TABLE "+pgx.Identifier{env.schema, sqlstage.StagingName("p1", "users", e2, 1)}.Sanitize()); err != nil {
 		t.Fatal(err)
 	}
 	w3 := env.openStreams(3, destination.ScopePipeline, streams...)
@@ -341,7 +342,7 @@ func TestRecoverOfAPartlyAppliedEpochNeedsItsStaging(t *testing.T) {
 	if _, err := env.conn.Exec(ctx, "INSERT INTO "+pgx.Identifier{env.schema, "_openetl_loads"}.Sanitize()+" (pipeline, stream, generation, epoch) VALUES ('p1', 'users', 1, 1)"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := env.conn.Exec(ctx, "DROP TABLE "+pgx.Identifier{env.schema, stagingName("p1", "orders", e1, 1)}.Sanitize()); err != nil {
+	if _, err := env.conn.Exec(ctx, "DROP TABLE "+pgx.Identifier{env.schema, sqlstage.StagingName("p1", "orders", e1, 1)}.Sanitize()); err != nil {
 		t.Fatal(err)
 	}
 	w2 := env.openStreams(2, destination.ScopeStream, streams...)
@@ -358,7 +359,7 @@ func TestDescriptorsFromBeforeLanes(t *testing.T) {
 	recov(t, w, 1, destination.Epoch{}, nil)
 	e1 := destination.Epoch{Generation: 1, N: 1}
 	write(t, w, e1, "users", batch(t, []arrow.Field{idField}, `[{"id": 1}, {"id": 2}]`))
-	name := stagingName("p1", "users", e1, 0)
+	name := sqlstage.StagingName("p1", "users", e1, 0)
 	precommit(t, w, e1)
 	old, err := json.Marshal(map[string]any{"generation": 1, "epoch": 1, "streams": []map[string]any{{"name": "users", "table": "users", "staging": name}}})
 	if err != nil {

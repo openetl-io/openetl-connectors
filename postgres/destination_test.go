@@ -20,6 +20,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/jackc/pgx/v5"
 
+	"github.com/openetl-io/openetl-connectors/sqlstage"
 	"github.com/openetl-io/openetl/sdk/go/destination"
 )
 
@@ -245,7 +246,7 @@ func TestRecoverReportsLost(t *testing.T) {
 		t.Fatal(err)
 	}
 	st := precommit(t, w1, e)
-	if _, err := env.conn.Exec(ctx, "DROP TABLE "+pgx.Identifier{env.schema, stagingName("p1", "users", e, 0)}.Sanitize()); err != nil {
+	if _, err := env.conn.Exec(ctx, "DROP TABLE "+pgx.Identifier{env.schema, sqlstage.StagingName("p1", "users", e, 0)}.Sanitize()); err != nil {
 		t.Fatal(err)
 	}
 	w2 := env.open(2, destination.ScopePipeline, "users")
@@ -305,7 +306,7 @@ func TestRecoverTrimsMarkers(t *testing.T) {
 		t.Fatal(err)
 	}
 	st := precommit(t, w2, lost)
-	if _, err := env.conn.Exec(ctx, "DROP TABLE "+pgx.Identifier{env.schema, stagingName("p1", "users", lost, 0)}.Sanitize()); err != nil {
+	if _, err := env.conn.Exec(ctx, "DROP TABLE "+pgx.Identifier{env.schema, sqlstage.StagingName("p1", "users", lost, 0)}.Sanitize()); err != nil {
 		t.Fatal(err)
 	}
 	w3 := env.open(3, destination.ScopePipeline, "users")
@@ -367,7 +368,7 @@ func TestRecoverDropsStaleStaging(t *testing.T) {
 		if err := w.Write(ctx, e, "users", rows); err != nil {
 			t.Fatal(err)
 		}
-		return pgx.Identifier{env.schema, stagingName(pipeline, "users", e, 0)}.Sanitize()
+		return pgx.Identifier{env.schema, sqlstage.StagingName(pipeline, "users", e, 0)}.Sanitize()
 	}
 	exists := func(table string) bool {
 		var ok bool
@@ -622,7 +623,7 @@ func TestDedupeRebuildsAnInvalidIndex(t *testing.T) {
 	if _, err := w.Commit(ctx, e1, []destination.Staged{precommit(t, w, e1)}); err != nil {
 		t.Fatal(err)
 	}
-	index := pgx.Identifier{indexName("events")}.Sanitize()
+	index := pgx.Identifier{sqlstage.IndexName("events")}.Sanitize()
 	for _, q := range []string{
 		"DROP INDEX $schema." + index,
 		"INSERT INTO $schema.events (id, _openetl_id) VALUES (1, '02020202-0202-0202-0202-020202020202')",
@@ -647,7 +648,7 @@ func TestDedupeRebuildsAnInvalidIndex(t *testing.T) {
 	if _, err := w2.Commit(ctx, e2, []destination.Staged{precommit(t, w2, e2)}); err != nil {
 		t.Fatal(err)
 	}
-	if n := env.count("SELECT count(*) FROM pg_index i JOIN pg_indexes x ON x.indexname = '" + indexName("events") + "' AND x.schemaname = '" + env.schema + "'" +
+	if n := env.count("SELECT count(*) FROM pg_index i JOIN pg_indexes x ON x.indexname = '" + sqlstage.IndexName("events") + "' AND x.schemaname = '" + env.schema + "'" +
 		" WHERE i.indexrelid = to_regclass('$schema." + index + "') AND i.indisvalid AND NOT i.indisunique AND x.indexdef LIKE '%(_openetl_id)'"); n != 1 {
 		t.Errorf("the index on _openetl_id wasn't built again")
 	}

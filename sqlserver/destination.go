@@ -13,9 +13,7 @@ package sqlserver
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
 	"database/sql"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -112,7 +110,17 @@ func (d *Destination) Open(ctx context.Context, cfg destination.OpenConfig) (des
 		w.streams[s.Name] = s
 	}
 	w.Dialect = sqlstage.Dialect[*stagingTable]{Name: "sqlserver", Open: cfg, Streams: w.streams,
-		StagingName: stagingName, ReadName: readName, TargetTable: targetTable, SQL: w}
+		StagingName: sqlstage.StagingName, ReadName: sqlstage.ReadName, TargetTable: targetTable, SQL: w}
+	w.Own = sqlstage.Own{DB: db, Name: "sqlserver", Pipeline: cfg.Pipeline, Generation: cfg.Generation, Classify: classify,
+		FenceRow: func(lock string) string {
+			if lock != "" {
+				lock = " WITH (" + lock + ")"
+			}
+			return "SELECT generation FROM " + w.fenceTable() + lock + " WHERE pipeline = @p1"
+		},
+		Marked: "SELECT count(*) FROM " + w.loadsTable() + " WHERE pipeline = @p1 AND stream = @p2 AND generation = @p3 AND epoch = @p4",
+		Mark:   "INSERT INTO " + w.loadsTable() + " (pipeline, stream, generation, epoch) VALUES (@p1, @p2, @p3, @p4)",
+		Trim:   "DELETE FROM " + w.loadsTable() + " WHERE pipeline = @p1 AND epoch < @p2"}
 	return w, nil
 }
 
@@ -122,6 +130,7 @@ type writer struct {
 	schema  string
 	streams map[string]destination.Stream
 	sqlstage.Epochs[*stagingTable]
+	sqlstage.Own
 	// Only Commit and Recover use it: tables with an _openetl_id index, or
 	// one on their key.
 	indexed map[string]bool
@@ -167,30 +176,6 @@ const (
 
 var metadataColumns = []string{idColumn, opColumn, seqColumn, syncedColumn, deletedColumn, unchangedColumn, heldColumn}
 
-func indexName(table string) string {
-	h := sha256.Sum256([]byte(table))
-	return "_openetl_id_" + hex.EncodeToString(h[:12])
-}
-
-func keyIndexName(table string) string {
-	h := sha256.Sum256([]byte(table))
-	return "_openetl_key_" + hex.EncodeToString(h[:12])
-}
-
-func stagingName(pipeline, stream string, e destination.Epoch, lane int) string {
-	name := pipeline + "\x00" + stream + "\x00" + strconv.FormatUint(e.Generation, 10) + "\x00" + strconv.FormatUint(e.N, 10)
-	if lane > 0 {
-		name += "\x00" + strconv.Itoa(lane)
-	}
-	h := sha256.Sum256([]byte(name))
-	return "_openetl_stage_" + hex.EncodeToString(h[:12])
-}
-
-func readName(pipeline, stream string, start time.Time) string {
-	h := sha256.Sum256([]byte(pipeline + "\x00" + stream + "\x00" + strconv.FormatInt(start.UnixMicro(), 10)))
-	return "_openetl_read_" + hex.EncodeToString(h[:12])
-}
-
 // Stage bulk-copies a batch into the stream's staging table for epoch e in
 // tables, which it creates, labelled, or widens.
 func (w *writer) Stage(ctx context.Context, tables map[uint64]map[string]*stagingTable, name string, e destination.Epoch, stream, target string, key []string, batch arrow.RecordBatch) (*stagingTable, error) {
@@ -205,7 +190,7 @@ func (w *writer) Stage(ctx context.Context, tables map[uint64]map[string]*stagin
 		tables[e.N] = byStream
 	}
 	st := byStream[stream]
-	label := stagingLabel{Pipeline: w.cfg.Pipeline, Generation: e.Generation, Epoch: e.N}
+	label := sqlstage.StagingLabel{Pipeline: w.cfg.Pipeline, Generation: e.Generation, Epoch: e.N}
 	if st == nil {
 		st = &stagingTable{Table: sqlstage.Table{Name: name, Target: target, Key: key}}
 		if err := w.createLabelled(ctx, st.Name, label, cols, true); err != nil {
@@ -273,22 +258,6 @@ func (w *writer) bulk(ctx context.Context, db execer, table string, cols []colum
 	}
 	_, err = stmt.ExecContext(ctx)
 	return classify(err)
-}
-
-// stagingLabel labels each staging table, so that Recover can find what
-// earlier generations of the pipeline staged.
-type stagingLabel struct {
-	Pipeline   string `json:"pipeline"`
-	Generation uint64 `json:"generation"`
-	Epoch      uint64 `json:"epoch"`
-}
-
-// readLabel labels each read table, so that applies and Recover can find
-// reads that were abandoned.
-type readLabel struct {
-	Pipeline string `json:"pipeline"`
-	Stream   string `json:"stream"`
-	Table    string `json:"table"`
 }
 
 // createLabelled creates a table, unless it exists, with its label in an
@@ -442,7 +411,7 @@ func (w *writer) Apply(ctx context.Context, desc staged, streams []stagedStream,
 	if len(todo) == 0 {
 		// Applied, perhaps by a newer generation, which this one must
 		// then stop for.
-		return w.fenced(ctx)
+		return w.Unfenced(ctx)
 	}
 	prep := make(map[string]prepared, len(todo))
 	for _, s := range todo {
@@ -463,19 +432,6 @@ func (w *writer) Apply(ctx context.Context, desc staged, streams []stagedStream,
 	return nil
 }
 
-// fenced fails with ErrFenced if a newer generation has raised the fence.
-func (w *writer) fenced(ctx context.Context) error {
-	var fence uint64
-	err := w.db.QueryRowContext(ctx, "SELECT generation FROM "+w.fenceTable()+" WHERE pipeline = @p1", w.cfg.Pipeline).Scan(&fence)
-	switch {
-	case err != nil && !errors.Is(err, sql.ErrNoRows):
-		return classify(fmt.Errorf("sqlserver: read fence: %w", err))
-	case fence > w.cfg.Generation:
-		return fmt.Errorf("%w: fence is %d, applier is %d", destination.ErrFenced, fence, w.cfg.Generation)
-	}
-	return nil
-}
-
 func (w *writer) fenceTable() string { return w.ident("_openetl_fence") }
 func (w *writer) loadsTable() string { return w.ident("_openetl_loads") }
 
@@ -483,51 +439,9 @@ func (w *writer) loadsTable() string { return w.ident("_openetl_loads") }
 // shared with lock HOLDLOCK, for applies of different streams at once, and
 // alone with UPDLOCK.
 func (w *writer) applyTx(ctx context.Context, desc staged, streams []stagedStream, prep map[string]prepared, lock string, collapsed map[string]uint64) error {
-	skipped := map[string]uint64{}
-	tx, err := w.db.BeginTx(ctx, nil)
-	if err != nil {
-		return classify(err)
-	}
-	defer func() { _ = tx.Rollback() }()
-	var fence uint64
-	err = tx.QueryRowContext(ctx, "SELECT generation FROM "+w.fenceTable()+" WITH ("+lock+") WHERE pipeline = @p1", w.cfg.Pipeline).Scan(&fence)
-	if errors.Is(err, sql.ErrNoRows) {
-		return errors.New("sqlserver: the fence row is missing; Recover must run first")
-	}
-	if err != nil {
-		return classify(fmt.Errorf("sqlserver: lock fence: %w", err))
-	}
-	if fence > w.cfg.Generation {
-		return fmt.Errorf("%w: fence is %d, applier is %d", destination.ErrFenced, fence, w.cfg.Generation)
-	}
-	for _, s := range streams {
-		var done int
-		if err := tx.QueryRowContext(ctx, "SELECT count(*) FROM "+w.loadsTable()+" WHERE pipeline = @p1 AND stream = @p2 AND generation = @p3 AND epoch = @p4",
-			w.cfg.Pipeline, s.Name, desc.Generation, desc.Epoch).Scan(&done); err != nil {
-			return classify(fmt.Errorf("sqlserver: read marker for %s: %w", s.Name, err))
-		}
-		if done > 0 {
-			continue
-		}
-		n, err := w.applyStream(ctx, tx, s, prep[s.Name])
-		if err != nil {
-			return classify(fmt.Errorf("sqlserver: apply %s: %w", s.Name, err))
-		}
-		if s.Deduped() && s.Rows > n {
-			skipped[s.Name] = s.Rows - n
-		}
-		if _, err := tx.ExecContext(ctx, "INSERT INTO "+w.loadsTable()+" (pipeline, stream, generation, epoch) VALUES (@p1, @p2, @p3, @p4)",
-			w.cfg.Pipeline, s.Name, desc.Generation, desc.Epoch); err != nil {
-			return classify(fmt.Errorf("sqlserver: write marker for %s: %w", s.Name, err))
-		}
-	}
-	if err := tx.Commit(); err != nil {
-		return classify(err)
-	}
-	for name, n := range skipped {
-		collapsed[name] += n
-	}
-	return nil
+	return w.ApplyTx(ctx, nil, lock, desc, streams, func(tx *sql.Tx, s stagedStream) (uint64, error) {
+		return w.applyStream(ctx, tx, s, prep[s.Name])
+	}, collapsed)
 }
 
 // applyStream applies one stream's staging in tx, and returns the rows it
@@ -559,7 +473,7 @@ func (w *writer) applyRows(ctx context.Context, tx *sql.Tx, s stagedStream, p pr
 	}
 	var n uint64
 	if s.Mode == modeOverwrite {
-		if err := w.dropAbandonedReads(ctx, tx, func(l readLabel, table string) bool { return l.Stream == s.Name && table != s.Read }); err != nil {
+		if err := w.dropAbandonedReads(ctx, tx, func(l sqlstage.ReadLabel, table string) bool { return l.Stream == s.Name && table != s.Read }); err != nil {
 			return 0, err
 		}
 	}
@@ -898,7 +812,7 @@ func (w *writer) prepare(ctx context.Context, desc staged, s stagedStream) (prep
 		}
 		if len(cols) == 0 {
 			// A newer generation's Recover drops what older ones staged.
-			if err := w.fenced(ctx); err != nil {
+			if err := w.Unfenced(ctx); err != nil {
 				return p, err
 			}
 			return p, fmt.Errorf("sqlserver: staging for %s in epoch %d-g%d is missing", s.Name, desc.Epoch, desc.Generation)
@@ -933,7 +847,7 @@ func (w *writer) prepare(ctx context.Context, desc staged, s stagedStream) (prep
 		}
 	}
 	if s.Dedupe && cols != nil {
-		if err := w.ensureIndex(ctx, s.Into(), indexName(s.Into()), false, []string{idColumn}); err != nil {
+		if err := w.ensureIndex(ctx, s.Into(), sqlstage.IndexName(s.Into()), false, []string{idColumn}); err != nil {
 			return p, fmt.Errorf("sqlserver: index %s on %s: %w", idColumn, s.Into(), err)
 		}
 	}
@@ -1041,7 +955,7 @@ func (w *writer) preparePatch(ctx context.Context, desc staged, s stagedStream) 
 		return nil, rows, err
 	}
 	if s.Mode != modeMerge {
-		if err := w.ensureIndex(ctx, s.Table, indexName(s.Table), false, []string{idColumn}); err != nil {
+		if err := w.ensureIndex(ctx, s.Table, sqlstage.IndexName(s.Table), false, []string{idColumn}); err != nil {
 			return nil, rows, fmt.Errorf("sqlserver: index %s on %s: %w", idColumn, s.Table, err)
 		}
 	}
@@ -1079,7 +993,7 @@ func (w *writer) ensureRead(ctx context.Context, s stagedStream, cols []column) 
 		for i, c := range cols {
 			want[i] = targetType(c)
 		}
-		label := readLabel{Pipeline: w.cfg.Pipeline, Stream: s.Name, Table: s.Table}
+		label := sqlstage.ReadLabel{Pipeline: w.cfg.Pipeline, Stream: s.Name, Table: s.Table}
 		if err := w.createLabelled(ctx, s.Read, label, want, false); err != nil {
 			return fmt.Errorf("sqlserver: create the read table for %s: %w", s.Name, err)
 		}
@@ -1140,7 +1054,7 @@ func (w *writer) ensureKey(ctx context.Context, table string, key []string) ([]c
 		unique = unique && !isText(cols[i].typ) && !isBinary(cols[i].typ)
 		indexed = indexed && indexable(cols[i].typ)
 	}
-	name := keyIndexName(table)
+	name := sqlstage.KeyIndexName(table)
 	if w.indexed[name] || !indexed {
 		return cols, nil
 	}
@@ -1493,21 +1407,6 @@ func (w *writer) columnTypes(ctx context.Context, table string) ([]column, error
 	return have[table].cols, nil
 }
 
-func (w *writer) Unapplied(ctx context.Context, desc staged, streams []stagedStream) ([]stagedStream, error) {
-	var todo []stagedStream
-	for _, s := range streams {
-		var done int
-		if err := w.db.QueryRowContext(ctx, "SELECT count(*) FROM "+w.loadsTable()+" WHERE pipeline = @p1 AND stream = @p2 AND generation = @p3 AND epoch = @p4",
-			w.cfg.Pipeline, s.Name, desc.Generation, desc.Epoch).Scan(&done); err != nil {
-			return nil, classify(fmt.Errorf("sqlserver: read marker for %s: %w", s.Name, err))
-		}
-		if done == 0 {
-			todo = append(todo, s)
-		}
-	}
-	return todo, nil
-}
-
 // DropStaging is best effort: staging left behind is never applied twice,
 // because its marker exists.
 func (w *writer) DropStaging(ctx context.Context, streams []stagedStream) {
@@ -1587,14 +1486,6 @@ func (w *writer) raiseFence(ctx context.Context, gen uint64) error {
 	return classify(tx.Commit())
 }
 
-// TrimMarkers deletes the pipeline's markers below an applied epoch. Recovery
-// checks only HEAD's, and HEAD never moves back past an applied epoch; a lost
-// one moves it back to the previous record, whose markers it then checks.
-// Best effort, like dropStaging.
-func (w *writer) TrimMarkers(ctx context.Context, applied uint64) {
-	_, _ = w.db.ExecContext(ctx, "DELETE FROM "+w.loadsTable()+" WHERE pipeline = @p1 AND epoch < @p2", w.cfg.Pipeline, applied)
-}
-
 type querier interface {
 	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
 	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
@@ -1630,7 +1521,7 @@ func (w *writer) DropStale(ctx context.Context, gen uint64) {
 		return
 	}
 	for _, t := range labelled {
-		var l stagingLabel
+		var l sqlstage.StagingLabel
 		if json.Unmarshal([]byte(t[1]), &l) == nil && l.Pipeline == w.cfg.Pipeline && l.Generation < gen {
 			_, _ = w.db.ExecContext(ctx, "DROP TABLE IF EXISTS "+w.ident(t[0]))
 		}
@@ -1640,13 +1531,13 @@ func (w *writer) DropStale(ctx context.Context, gen uint64) {
 // dropAbandonedReads drops the pipeline's read tables that drop says were
 // abandoned, in q: an apply's transaction, which holds the fence, so a
 // zombie can't drop a read that continues.
-func (w *writer) dropAbandonedReads(ctx context.Context, q querier, drop func(l readLabel, table string) bool) error {
+func (w *writer) dropAbandonedReads(ctx context.Context, q querier, drop func(l sqlstage.ReadLabel, table string) bool) error {
 	labelled, err := w.labelled(ctx, q, "_openetl_read_")
 	if err != nil {
 		return fmt.Errorf("sqlserver: find abandoned reads: %w", err)
 	}
 	for _, t := range labelled {
-		var l readLabel
+		var l sqlstage.ReadLabel
 		if json.Unmarshal([]byte(t[1]), &l) == nil && l.Pipeline == w.cfg.Pipeline && drop(l, t[0]) {
 			if _, err := q.ExecContext(ctx, "DROP TABLE IF EXISTS "+w.ident(t[0])); err != nil {
 				return fmt.Errorf("sqlserver: drop an abandoned read of %s: %w", l.Stream, err)
@@ -1660,7 +1551,7 @@ func (w *writer) dropAbandonedReads(ctx context.Context, q querier, drop func(l 
 // overwrite, once Recover has raised the fence. Best effort, like
 // dropStaging.
 func (w *writer) DropRemovedReads(ctx context.Context) {
-	_ = w.dropAbandonedReads(ctx, w.db, func(l readLabel, _ string) bool {
+	_ = w.dropAbandonedReads(ctx, w.db, func(l sqlstage.ReadLabel, _ string) bool {
 		return w.streams[l.Stream].Mode != destination.Overwrite
 	})
 }

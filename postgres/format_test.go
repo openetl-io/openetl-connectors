@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/openetl-io/openetl-connectors/sqlstage"
 	"github.com/openetl-io/openetl/sdk/go/destination"
 )
 
@@ -23,9 +24,9 @@ func TestPersistedFormats(t *testing.T) {
 		want string
 	}{
 		{desc, `{"generation":3,"epoch":7,"streams":[{"name":"s","table":"t","staging":"a","wider":["b"],"dedupe":true,"dedupe_epoch":true,"rows":9,"mode":"merge","key":["id"],"hard_deletes":true,"read":"r","ended":true,"last":["l"],"patch":"p","fills":{"f":"g"},"wider_patches":["q"]}]}`},
-		{stagingLabel{Pipeline: "p", Generation: 3, Epoch: 7}, `{"pipeline":"p","generation":3,"epoch":7}`},
-		{readLabel{Pipeline: "p", Stream: "s", Table: "t"}, `{"pipeline":"p","stream":"s","table":"t"}`},
-		{[]string{stagingName("p", "s", e, 0), stagingName("p", "s", e, 2), patchName("p", "s", e, 0), readName("p", "s", time.UnixMicro(1000)), indexName("t"), keyIndexName("t")},
+		{sqlstage.StagingLabel{Pipeline: "p", Generation: 3, Epoch: 7}, `{"pipeline":"p","generation":3,"epoch":7}`},
+		{sqlstage.ReadLabel{Pipeline: "p", Stream: "s", Table: "t"}, `{"pipeline":"p","stream":"s","table":"t"}`},
+		{[]string{sqlstage.StagingName("p", "s", e, 0), sqlstage.StagingName("p", "s", e, 2), patchName("p", "s", e, 0), sqlstage.ReadName("p", "s", time.UnixMicro(1000)), sqlstage.IndexName("t"), sqlstage.KeyIndexName("t")},
 			`["_openetl_stage_ced8e3942f116e6017cb2d67","_openetl_stage_f3ef35e747c935d0772bf64c","_openetl_stage_cec0f0e9013c894c4d4b7776","_openetl_read_7878dc485bb14cc50ee5b782","_openetl_id_e3b98a4da31a127d4bde6e43","_openetl_key_e3b98a4da31a127d4bde6e43"]`},
 	} {
 		b, err := json.Marshal(c.got)
@@ -39,5 +40,5 @@ func TestPersistedFormats(t *testing.T) {
 }
 
 func patchName(pipeline, stream string, e destination.Epoch, lane int) string {
-	return stagingName(pipeline, stream+"\x00patch", e, lane)
+	return sqlstage.StagingName(pipeline, stream+"\x00patch", e, lane)
 }
