@@ -91,17 +91,36 @@ jobs:
         id: packages
         env:
           # The services each package's tests need, of what
-          # .github/actions/services starts: postgres, s3, iceberg (which
-          # needs s3), glue, kafka, registry (which needs kafka) and kinesis.
-          # A package that isn't listed gets them all. records is shared.
+          # .github/actions/services starts: postgres, mysql, mariadb,
+          # sqlserver, oracle, clickhouse, mongodb, dynamodb, s3, gcs,
+          # azurite, iceberg (which needs s3), glue, kafka, kafka-sasl and
+          # registry (which need kafka) and kinesis. A package that isn't
+          # listed gets them all; one listed with none gets none. records,
+          # sqlstage, keysplit, objstore, docstore and connectortest
+          # are shared.
           SERVICES: |
             postgres: postgres
-            kafka: kafka registry
+            mysql: mysql mariadb
+            sqlserver: sqlserver
+            oracle: oracle
+            clickhouse: clickhouse
+            mongodb: mongodb
+            dynamodb: dynamodb
+            kafka: kafka registry kafka-sasl
             kinesis: kinesis kafka registry
             iceberg: s3 iceberg glue
             s3: s3
+            gcs: gcs
+            azureblob: azurite
+            objstore: s3 gcs azurite
             records: kafka registry
-          ALL_SERVICES: postgres s3 iceberg glue kafka registry kinesis
+            sqlstage:
+            keysplit:
+            docstore:
+            connectortest:
+          ALL_SERVICES: >-
+            postgres mysql mariadb sqlserver oracle clickhouse mongodb dynamodb
+            s3 gcs azurite iceberg glue kafka kafka-sasl registry kinesis
           EVENT: ${{ github.event_name }}
           PR: ${{ github.event.pull_request.number }}
           GH_TOKEN: ${{ github.token }}
@@ -139,8 +158,9 @@ jobs:
           # entry KIND NAME DIR is a job of the matrix.
           entry() {
             local needs
-            needs=$(awk -v p="$2" -F': *' '$1 == p { print $2 }' <<<"$SERVICES")
-            jq -nc --arg kind "$1" --arg name "$2" --arg dir "$3" --arg services "${needs:-$ALL_SERVICES}" \
+            needs=$(awk -v p="$2" -F': *' '$1 == p { print "=" $2 }' <<<"$SERVICES")
+            needs=${needs:-=$ALL_SERVICES}
+            jq -nc --arg kind "$1" --arg name "$2" --arg dir "$3" --arg services "${needs#=}" \
               '{job: "\($kind) \($name)", kind: $kind, name: $name, dir: $dir, services: $services}'
           }
           {
@@ -222,7 +242,7 @@ jobs:
           OPENETL_TEST_GLUE_ENDPOINT: ${{ contains(format(' {0} ', matrix.services), ' glue ') && 'http://127.0.0.1:5000' || '' }}
         run: |
           # shellcheck disable=SC2086
-          go test -race -tags integration -count=1 $PKGS
+          go test -race -tags integration -count=1 -timeout 30m $PKGS
       - name: Packaged as a release packages it, through the conformance kit
         if: matrix.kind == 'package'
         run: .github/test-packages.sh "$NAME"
