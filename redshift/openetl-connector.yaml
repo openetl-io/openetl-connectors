@@ -1,0 +1,12 @@
+name: redshift
+title: Amazon Redshift
+description: Amazon Redshift as a destination, loaded from Parquet in S3 by COPY. Unverified against a cluster.
+license: Apache-2.0
+repository: https://github.com/openetl-io/openetl-connectors
+docs: https://github.com/openetl-io/openetl-connectors/blob/main/redshift/README.md
+logo: https://raw.githubusercontent.com/awslabs/aws-icons-for-plantuml/v23.1/dist/Analytics/Redshift.png
+tags: [warehouse, aws, unverified]
+author: OpenETL
+roles:
+  destination:
+    build: { go: ../cmd/destination-redshift }
