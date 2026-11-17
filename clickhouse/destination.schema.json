@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ClickHouse destination",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["addr"],
+  "x-groups": [
+    {"id": "connection", "title": "Connection", "description": "The server, and the user the destination signs in as."}
+  ],
+  "properties": {
+    "addr": {"type": "string", "title": "Address", "x-group": "connection", "examples": ["clickhouse.example.com:9000", "abc123.us-east-1.aws.clickhouse.cloud:9440"], "description": "host:port of the server's native protocol: 9000, or 9440 with TLS."},
+    "user": {"type": "string", "title": "User", "x-group": "connection", "default": "default", "description": "The user to connect as. Its grants and settings profile are on the connector's page."},
+    "password": {"type": "string", "title": "Password", "x-group": "connection", "x-secret": true, "description": "The user's password."},
+    "tls": {"type": "boolean", "title": "TLS", "x-group": "connection", "default": false, "description": "Connect with TLS, verified against the system's roots, as the secure native port, 9440, needs."},
+    "database": {"type": "string", "title": "Database", "default": "default", "description": "The database tables are written to when the pipeline names no namespace. Created if it doesn't exist and the user may. A database whose name has a dot can't take patches of held cells."}
+  }
+}

@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ClickHouse source",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["addr"],
+  "x-groups": [
+    {"id": "connection", "title": "Connection", "description": "The server, and the user the source signs in as."},
+    {"id": "tables", "title": "Tables", "description": "What the source offers as streams."},
+    {"id": "tuning", "title": "Tuning", "description": "How much a read asks of the server at a time."}
+  ],
+  "properties": {
+    "addr": {"type": "string", "title": "Address", "x-group": "connection", "examples": ["clickhouse.example.com:9000", "abc123.us-east-1.aws.clickhouse.cloud:9440"], "description": "host:port of the server's native protocol: 9000, or 9440 with TLS."},
+    "user": {"type": "string", "title": "User", "x-group": "connection", "default": "default", "description": "The user to connect as."},
+    "password": {"type": "string", "title": "Password", "x-group": "connection", "x-secret": true, "description": "The user's password."},
+    "tls": {"type": "boolean", "title": "TLS", "x-group": "connection", "default": false, "description": "Connect with TLS, verified against the system's roots, as the secure native port, 9440, needs."},
+    "database": {"type": "string", "title": "Database", "x-group": "tables", "default": "default", "description": "The database whose tables are offered as streams."},
+    "tables": {"type": "array", "title": "Tables", "x-group": "tables", "items": {"type": "string"}, "description": "The tables to offer as streams. Empty: every table and view in the database but materialized views, whose rows are in their target tables."},
+    "chunkRows": {"type": "integer", "title": "Rows per chunk", "x-group": "tuning", "x-advanced": true, "minimum": 1, "default": 100000, "description": "Rows per query on a table read in sorting-key order; each chunk ends at a resume point."},
+    "batchRows": {"type": "integer", "title": "Rows per batch", "x-group": "tuning", "x-advanced": true, "minimum": 1, "default": 10000, "description": "Rows per Arrow batch."},
+    "maxConnections": {"type": "integer", "title": "Most connections", "x-group": "tuning", "x-advanced": true, "minimum": 1, "default": 4, "description": "The most connections a read holds, as many as it has lanes up to this."}
+  }
+}

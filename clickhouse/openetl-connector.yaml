@@ -1,0 +1,14 @@
+name: clickhouse
+title: ClickHouse
+description: ClickHouse tables, in full or incrementally, and ClickHouse as a destination with atomic, exactly-once epochs
+license: Apache-2.0
+repository: https://github.com/openetl-io/openetl-connectors
+docs: https://github.com/openetl-io/openetl-connectors/blob/main/clickhouse/README.md
+logo: https://raw.githubusercontent.com/ClickHouse/clickhouse-docs/main/static/img/clickhouse.svg
+tags: [database, warehouse, analytics]
+author: OpenETL
+roles:
+  source:
+    build: { go: ../cmd/source-clickhouse }
+  destination:
+    build: { go: ../cmd/destination-clickhouse }
