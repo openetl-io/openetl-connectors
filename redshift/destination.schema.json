@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Amazon Redshift destination",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["dsn", "bucket", "iamRole"],
+  "x-groups": [
+    {"id": "staging", "title": "S3 staging", "description": "Where each epoch's rows wait, as Parquet files, for Redshift's COPY to load them. The bucket must be in the cluster's region."},
+    {"id": "aws", "title": "AWS credentials", "description": "The role COPY reads the files as, and who uploads them to S3."}
+  ],
+  "properties": {
+    "dsn": {"type": "string", "x-secret": true, "title": "Connection string", "description": "A Postgres connection URL or keyword/value string to the cluster's or workgroup's endpoint and database. Redshift listens on port 5439 unless it was set otherwise; sslmode=verify-full checks its certificate.", "examples": ["postgres://USER:PASSWORD@CLUSTER.ID.REGION.redshift.amazonaws.com:5439/DATABASE?sslmode=verify-full"]},
+    "schema": {"type": "string", "default": "public", "title": "Schema", "description": "Used when the pipeline names no namespace. Created if missing."},
+    "bucket": {"type": "string", "title": "Bucket", "description": "The S3 bucket the connector stages files in, in the same region as the cluster. Each file is deleted once COPY has loaded it.", "x-group": "staging"},
+    "prefix": {"type": "string", "title": "Prefix", "description": "The key prefix of the staged files, such as openetl/staging. Letters, digits and !-_.*()/ only.", "x-group": "staging"},
+    "region": {"type": "string", "title": "AWS region", "description": "The bucket's region, which must be the cluster's. Without one, the AWS default.", "x-group": "staging"},
+    "iamRole": {"type": "string", "title": "IAM role", "description": "The ARN of an IAM role associated with the cluster or workgroup that can read the staged files, which COPY assumes; roles chained with commas, or default for its default role. COPY of Parquet takes no access key, so a role is needed.", "examples": ["arn:aws:iam::123456789012:role/RedshiftCopy"], "x-group": "aws"},
+    "accessKeyId": {"type": "string", "x-secret": true, "title": "Access key ID", "description": "An AWS access key that uploads and deletes the staged files. Without one, the AWS default credentials where the connector runs do.", "x-group": "aws"},
+    "secretAccessKey": {"type": "string", "x-secret": true, "title": "Secret access key", "description": "The access key's secret.", "x-group": "aws"},
+    "sessionToken": {"type": "string", "x-secret": true, "title": "Session token", "description": "The session token of temporary credentials, with accessKeyId and secretAccessKey.", "x-group": "aws", "x-advanced": true}
+  }
+}
