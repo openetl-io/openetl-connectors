@@ -1,23 +1,23 @@
 ---
 title: Amazon S3
-description: Read Parquet, Avro, CSV and JSON Lines files, and write Parquet, CSV and JSON Lines files, on Amazon S3, S3-compatible stores, Google Cloud Storage, Azure Blob Storage or a local disk.
+description: Read Parquet, Avro, CSV and JSON Lines files, and write Parquet, CSV and JSON Lines files, on Amazon S3, S3-compatible stores such as MinIO and Cloudflare R2, or a local disk.
 ---
 
-The `s3` package has a source and a destination for files in object storage. Despite its name, both roles work with four stores, picked by the URL's scheme:
+The `s3` package has a source and a destination for files on Amazon S3, on another store with S3's API, or on a local filesystem, picked by the URL's scheme:
 
 | Store | URL |
 | --- | --- |
-| Amazon S3, or another S3-compatible store | `s3://BUCKET/PREFIX` |
-| Google Cloud Storage | `gs://BUCKET/PREFIX` |
-| Azure Blob Storage | `azblob://CONTAINER/PREFIX` |
+| Amazon S3, or an [S3-compatible store](#s3-compatible-stores) | `s3://BUCKET/PREFIX` |
 | A local filesystem | `file:///ABSOLUTE/PATH` |
 
 The source reads the files that a glob matches as a stream, in Parquet, Avro, CSV or JSON Lines. The destination writes each stream as a directory of Parquet, CSV or JSON Lines files, and appends each epoch's files exactly once, or replaces a table's files at once when a read ends.
 
 > [!NOTE]
-> 0.1.0-alpha has the destination's Parquet appends on S3 and local disks. The source, Google Cloud Storage, Azure Blob Storage, the destination's CSV and JSON Lines, and overwrite are from 0.2.0.
+> 0.1.0-alpha has the destination's Parquet appends on S3 and local disks. The source, the destination's CSV and JSON Lines, and overwrite are from 0.2.0.
 
-Both roles are tested on a local filesystem, against SeaweedFS's S3 API, against fake-gcs-server for Google Cloud Storage, and against Azurite for Azure Blob Storage. The destination's Parquet appends have also run against Amazon S3. CI tests none of the cloud services themselves. See [Limits](#limits) for what the emulators can't show.
+Google Cloud Storage and Azure Blob Storage have packages of their own, which read and write files as this one does: [`gcs`](../gcs/README.md) and [`azureblob`](../azureblob/README.md).
+
+Both roles are tested on a local filesystem and against SeaweedFS's S3 API. The destination's Parquet appends have also run against Amazon S3. CI doesn't test Amazon S3 itself. See [Limits](#limits) for what SeaweedFS can't show.
 
 ## Connecting
 
@@ -25,23 +25,17 @@ The source and the destination share their connection settings. Keep keys in sec
 
 ### Amazon S3
 
-Set `region`. For another S3-compatible store, set `endpoint` too; the connector then uses path-style addressing.
+Set `region`. With `accessKeyId` and `secretAccessKey`, the connector uses those keys. Without them, it uses the AWS SDK's default credential chain, which finds only what the runner gives it. By default, the runner gives it no AWS credentials. Name an IAM role in the connector's `aws.role`, which the runner assumes for it, on EC2 and EKS alike. [Run on AWS](https://github.com/openetl-io/openetl/blob/main/docs/self-host/aws.md#credentials-for-connectors) explains the setup, and the runner's `inherit` setting. Keys in the config are used even if the connector names a role.
 
-With `accessKeyId` and `secretAccessKey`, the connector uses those keys. Without them, it uses the AWS SDK's default credential chain, which finds only what the runner gives it. By default, the runner gives it no AWS credentials. Name an IAM role in the connector's `aws.role`, which the runner assumes for it, on EC2 and EKS alike. [Run on AWS](https://github.com/openetl-io/openetl/blob/main/docs/self-host/aws.md#credentials-for-connectors) explains the setup, and the runner's `inherit` setting. Keys in the config are used even if the connector names a role.
+### S3-compatible stores
 
-### Google Cloud Storage
+A store with S3's API, such as MinIO, Cloudflare R2 or Ceph, takes the same settings, with `endpoint` set to its S3 API's URL, `region` to one the store takes, and its keys in `accessKeyId` and `secretAccessKey`. With `endpoint`, the connector addresses buckets by path, `ENDPOINT/BUCKET/KEY`, rather than by host name.
 
-From 0.2.0. Set `serviceAccountKey` to a service account's JSON key. Without it, the connector uses Google's application default credentials. With `endpoint` and no key, it sends no credentials at all, which is what an emulator such as fake-gcs-server expects.
+Only SeaweedFS's S3 API is tested; the stores named here aren't. Appends need only S3's reads, writes, copies, deletes and listings. Overwrite also needs the store to honor S3's conditional writes, `If-None-Match` and `If-Match`: a pipeline that overwrites runs the destination's `store.conditional-write` preflight, which warns as `conditional_writes_ignored` on a store that ignores them, as [Checks and preflights](#checks-and-preflights) says.
 
-### Azure Blob Storage
+### Local filesystem
 
-From 0.2.0. Set one of these:
-
-- `accountName` and `accountKey`, the account's shared key.
-- `accountName` and `sasToken`, a shared access signature for the container.
-- `connectionString`, which names the account and its key or SAS.
-
-With none of them, the connector uses Azure's default credentials (`DefaultAzureCredential`) for `accountName`. `endpoint` sets the blob service's URL, such as Azurite's `http://127.0.0.1:10000/devstoreaccount1`; without it, the URL is `https://ACCOUNT.blob.core.windows.net`.
+A `file://` URL names a directory on the runner's disk, which the destination creates. It takes none of the store's settings. Overwrite's manifest is written under a file lock.
 
 ### Checks and preflights
 
@@ -49,11 +43,11 @@ From 0.2.0, a check reports these items, in order, for either role. Each one aft
 
 | Item | What it checks |
 | --- | --- |
-| `net.dns`, `net.connect`, `net.tls` | The store's API resolves, accepts a connection and, over HTTPS, completes a TLS handshake: `endpoint`, or the cloud's own (`s3.REGION.amazonaws.com`, `storage.googleapis.com`, `ACCOUNT.blob.core.windows.net`). Without `endpoint`, a failure here only warns, since a runner can reach a cloud through a proxy that the store's SDK uses and a direct connection doesn't. |
+| `net.dns`, `net.connect`, `net.tls` | The store's API resolves, accepts a connection and, over HTTPS, completes a TLS handshake: `endpoint`, or `s3.REGION.amazonaws.com`. Without `endpoint`, a failure here only warns, since a runner can reach AWS through a proxy that the store's SDK uses and a direct connection doesn't. |
 | `store.auth` | The store accepts the credentials. If the store knows the identity but refuses it access, this item passes, and the items after it show what access is missing. |
-| `store.bucket` | The bucket or container exists. |
-| `store.list` | The identity lists the files under `url`: `s3:ListBucket`, `storage.objects.list`, or List Blobs. |
-| `store.write`, `store.delete` | The destination's only: it writes a file under `URL/_openetl/` (`s3:PutObject`, `storage.objects.create`, or Put Blob), then deletes it (`s3:DeleteObject`, `storage.objects.delete`, or Delete Blob). |
+| `store.bucket` | The bucket exists. |
+| `store.list` | The identity lists the files under `url`: `s3:ListBucket`. |
+| `store.write`, `store.delete` | The destination's only: it writes a file under `URL/_openetl/` (`s3:PutObject`), then deletes it (`s3:DeleteObject`). |
 
 A permission the store refuses fails as `privilege_missing`, naming the privilege.
 
@@ -102,8 +96,8 @@ metadata:
 spec:
   connector: s3
   config:
-    url: gs://my-bucket/landing
-    serviceAccountKey: { secret: gcs-key }
+    url: s3://my-bucket/landing
+    region: eu-west-1
     streams:
       - name: orders
         glob: orders/**/*.parquet
@@ -181,9 +175,10 @@ metadata:
 spec:
   connector: s3
   config:
-    url: azblob://lake/openetl
-    accountName: mylake
-    accountKey: { secret: lake-key }
+    url: s3://lake/openetl
+    region: eu-west-1
+    accessKeyId: { secret: lake-key-id }
+    secretAccessKey: { secret: lake-key }
 ```
 
 The [config schema](./destination.schema.json) has every setting.
@@ -208,7 +203,7 @@ A continuous pipeline commits every minute unless it sets its own `delivery.comm
 
 ### Permissions
 
-The credentials need to read, write, copy, delete and list objects under the URL. Overwrite also needs conditional writes, and depends on the store honouring them: S3's `If-None-Match` and `If-Match`, Google Cloud Storage's generation preconditions, and Azure's `If-None-Match` and `If-Match` access conditions. The destination's check writes and deletes an object under `_openetl/`. The source needs to list and read objects under the URL.
+The credentials need to read, write, copy, delete and list objects under the URL. On Amazon S3 that's `s3:ListBucket` on the bucket, and `s3:GetObject`, `s3:PutObject` and `s3:DeleteObject` on its objects under the URL. Overwrite also needs the store to honor conditional writes, `If-None-Match` and `If-Match`, which the `store.conditional-write` preflight checks. The destination's check writes and deletes an object under `_openetl/`. The source needs to list and read objects under the URL.
 
 ## Types
 
@@ -283,6 +278,5 @@ The destination adds new columns: later files have them, and earlier files don't
 - Discovery reads every file's footer or header, so it takes longer with more files.
 - The destination doesn't merge or deduplicate.
 - Overwrite relies on the store's conditional writes. On an S3-compatible store that ignores `If-Match` and `If-None-Match`, a stale attempt could write an older read's manifest over a newer one's.
-- The emulators answer over plain HTTP, so the check's `net.tls` item is untested.
-- Only the emulators are tested. fake-gcs-server and the test's SeaweedFS check no credentials, so refused credentials are tested only on Azurite. Azurite has no hierarchical namespace, so Azure Data Lake Storage Gen2 accounts are untested. A cloud store's own consistency and permissions aren't shown by them.
-- An Azure endpoint that doesn't answer takes about half a minute to fail, after the client's retries.
+- SeaweedFS answers over plain HTTP, so the check's `net.tls` item is untested.
+- SeaweedFS is the only S3-compatible store tested, and the test's checks no credentials, so refused credentials are tested only against stand-ins of S3's answers. Amazon S3's own consistency and permissions aren't shown by it.

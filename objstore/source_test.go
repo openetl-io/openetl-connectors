@@ -1,8 +1,7 @@
-package s3
+package objstore
 
 import (
 	"bytes"
-	"compress/gzip"
 	"context"
 	"encoding/json"
 	"errors"
@@ -20,9 +19,8 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/apache/arrow-go/v18/parquet"
 	"github.com/apache/arrow-go/v18/parquet/pqarrow"
-	"github.com/klauspost/compress/snappy"
-	"github.com/klauspost/compress/zstd"
 
+	"github.com/openetl-io/openetl-connectors/objstore/internal/testfiles"
 	protocolv1 "github.com/openetl-io/openetl/sdk/go/protocol/v1"
 	"github.com/openetl-io/openetl/sdk/go/source"
 )
@@ -57,24 +55,11 @@ func sourceTests(t *testing.T, newStore func(*testing.T) map[string]any) {
 func put(t *testing.T, cfg map[string]any, files map[string][]byte) {
 	t.Helper()
 	b, _ := json.Marshal(cfg)
-	var sc StoreConfig
-	if err := json.Unmarshal(b, &sc); err != nil {
-		t.Fatal(err)
-	}
-	st, err := parseStore(sc)
+	d, err := testDestination(b)
 	if err != nil {
 		t.Fatal(err)
 	}
-	bucket, err := st.open(t.Context())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = bucket.Close() }()
-	for _, k := range slices.Sorted(maps.Keys(files)) {
-		if err := bucket.WriteAll(t.Context(), k, files[k], nil); err != nil {
-			t.Fatal(err)
-		}
-	}
+	testfiles.Put(t, d.bucket, files)
 }
 
 func newSource(t *testing.T, cfg map[string]any, streams ...map[string]any) *Source {
@@ -82,62 +67,11 @@ func newSource(t *testing.T, cfg map[string]any, streams ...map[string]any) *Sou
 	c := maps.Clone(cfg)
 	c["streams"] = streams
 	b, _ := json.Marshal(c)
-	s, err := NewSource(b)
+	s, err := testSource(b)
 	if err != nil {
 		t.Fatal(err)
 	}
 	return s
-}
-
-// parquetOf is a Parquet file of rows, as JSON, with rowGroup rows in each
-// row group.
-func parquetOf(t *testing.T, sc *arrow.Schema, rows string, rowGroup int64) []byte {
-	t.Helper()
-	rec, _, err := array.RecordFromJSON(memory.DefaultAllocator, sc, strings.NewReader(rows))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer rec.Release()
-	var buf bytes.Buffer
-	w, err := pqarrow.NewFileWriter(sc, &buf, parquet.NewWriterProperties(parquet.WithMaxRowGroupLength(rowGroup)), pqarrow.DefaultWriterProps())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := w.Write(rec); err != nil {
-		t.Fatal(err)
-	}
-	if err := w.Close(); err != nil {
-		t.Fatal(err)
-	}
-	return buf.Bytes()
-}
-
-func gz(t *testing.T, s string) []byte {
-	var buf bytes.Buffer
-	w := gzip.NewWriter(&buf)
-	_, _ = w.Write([]byte(s))
-	if err := w.Close(); err != nil {
-		t.Fatal(err)
-	}
-	return buf.Bytes()
-}
-
-func zst(t *testing.T, s string) []byte {
-	w, err := zstd.NewWriter(nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return w.EncodeAll([]byte(s), nil)
-}
-
-func sz(t *testing.T, s string) []byte {
-	var buf bytes.Buffer
-	w := snappy.NewBufferedWriter(&buf)
-	_, _ = w.Write([]byte(s))
-	if err := w.Close(); err != nil {
-		t.Fatal(err)
-	}
-	return buf.Bytes()
 }
 
 // emitted is what a read sent, by stream and split.

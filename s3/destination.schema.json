@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "Files on S3, Google Cloud Storage, Azure Blob Storage or a local disk: destination",
+  "title": "Files on Amazon S3 or a local disk: destination",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -10,13 +10,13 @@
     "url": {
       "type": "string",
       "title": "URL",
-      "description": "Where the tables go: s3://bucket/prefix, gs://bucket/prefix and azblob://container/prefix (from 0.2.0), or file:// and an absolute path. Each stream's table is a directory of files under it.",
+      "description": "Where the tables go: s3://bucket/prefix, or file:// and an absolute path. Each stream's table is a directory of files under it.",
       "x-group": "location"
     },
     "endpoint": {
       "type": "string",
       "title": "Endpoint",
-      "description": "The store's endpoint, for one other than its cloud's own: an S3-compatible store's (with path-style addressing), the Google Cloud Storage JSON API's, such as an emulator's, or the Azure blob service's URL, such as Azurite's http://127.0.0.1:10000/devstoreaccount1. Not for file:// URLs.",
+      "description": "An S3-compatible store's endpoint, such as MinIO's, Cloudflare R2's or SeaweedFS's, with path-style addressing. Empty for Amazon S3. Not for file:// URLs.",
       "x-group": "location",
       "x-format": "uri",
       "x-advanced": true
@@ -24,57 +24,22 @@
     "region": {
       "type": "string",
       "title": "Region",
-      "description": "S3: the bucket's AWS region.",
+      "description": "The bucket's AWS region.",
       "x-group": "s3"
     },
     "accessKeyId": {
       "type": "string",
       "x-secret": true,
       "title": "Access key ID",
-      "description": "S3: an AWS access key. Without one, the AWS default credentials.",
+      "description": "An AWS access key. Without one, the AWS default credentials.",
       "x-group": "s3"
     },
     "secretAccessKey": {
       "type": "string",
       "x-secret": true,
       "title": "Secret access key",
-      "description": "S3: the access key's secret.",
+      "description": "The access key's secret.",
       "x-group": "s3"
-    },
-    "serviceAccountKey": {
-      "type": "string",
-      "x-secret": true,
-      "title": "Service account key",
-      "description": "Google Cloud Storage: a service account's JSON key, as its text. Without one, Google's default credentials, or none at all with an endpoint, as an emulator takes. From 0.2.0.",
-      "x-group": "gcs",
-      "x-format": "multiline"
-    },
-    "accountName": {
-      "type": "string",
-      "title": "Account name",
-      "description": "Azure Blob Storage: the storage account. Needed with accountKey, sasToken or Azure's default credentials, unless the endpoint names it. From 0.2.0.",
-      "x-group": "azure"
-    },
-    "accountKey": {
-      "type": "string",
-      "x-secret": true,
-      "title": "Account key",
-      "description": "Azure Blob Storage: the account's shared key. Set at most one of accountKey, sasToken and connectionString; without any, Azure's default credentials. From 0.2.0.",
-      "x-group": "azure"
-    },
-    "sasToken": {
-      "type": "string",
-      "x-secret": true,
-      "title": "SAS token",
-      "description": "Azure Blob Storage: a shared access signature for the container, the query string it is. From 0.2.0.",
-      "x-group": "azure"
-    },
-    "connectionString": {
-      "type": "string",
-      "x-secret": true,
-      "title": "Connection string",
-      "description": "Azure Blob Storage: the account's connection string, which names the account and its key or a SAS. From 0.2.0.",
-      "x-group": "azure"
     },
     "format": {
       "type": "string",
@@ -119,17 +84,7 @@
     {
       "id": "s3",
       "title": "Amazon S3",
-      "description": "For s3:// URLs: the region and keys."
-    },
-    {
-      "id": "gcs",
-      "title": "Google Cloud Storage",
-      "description": "For gs:// URLs: the service account."
-    },
-    {
-      "id": "azure",
-      "title": "Azure Blob Storage",
-      "description": "For azblob:// URLs: the account and its credentials."
+      "description": "The region and keys."
     },
     {
       "id": "files",

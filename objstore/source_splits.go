@@ -1,4 +1,4 @@
-package s3
+package objstore
 
 import (
 	"cmp"
@@ -48,7 +48,7 @@ func rangeOf(id string, st *readState) (hashRange, error) {
 	}
 	var r hashRange
 	if n, err := fmt.Sscanf(id, "files-%x-%x", &r.Lo, &r.Hi); err != nil || n != 2 || r.Lo > r.Hi || r.Hi > wholeRange.Hi {
-		return r, fmt.Errorf("s3: split %q isn't one of this source's", id)
+		return r, fmt.Errorf("objstore: split %q isn't one of this source's", id)
 	}
 	return r, nil
 }
@@ -87,7 +87,7 @@ func (s *Source) Splits(_ context.Context, cs source.ConfiguredStream, ended []s
 		var st readState
 		if len(sp.State) > 0 {
 			if err := json.Unmarshal(sp.State, &st); err != nil {
-				return nil, fmt.Errorf("s3: split %q's state: %w", sp.ID, err)
+				return nil, fmt.Errorf("objstore: split %q's state: %w", sp.ID, err)
 			}
 		}
 		r, err := rangeOf(sp.ID, &st)
@@ -102,12 +102,12 @@ func (s *Source) Splits(_ context.Context, cs source.ConfiguredStream, ended []s
 	at := uint64(0)
 	for _, r := range sorted {
 		if r.Lo != at {
-			return nil, fmt.Errorf("s3: stream %q's last read's splits don't cover its files once each", cs.Name)
+			return nil, fmt.Errorf("objstore: stream %q's last read's splits don't cover its files once each", cs.Name)
 		}
 		at = r.Hi
 	}
 	if at != wholeRange.Hi {
-		return nil, fmt.Errorf("s3: stream %q's last read's splits don't cover its files once each", cs.Name)
+		return nil, fmt.Errorf("objstore: stream %q's last read's splits don't cover its files once each", cs.Name)
 	}
 	return out, nil
 }

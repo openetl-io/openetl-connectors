@@ -1,4 +1,4 @@
-package s3
+package objstore
 
 import (
 	"bytes"
@@ -39,7 +39,7 @@ func newDest(t *testing.T, cfg, extra map[string]any) *Destination {
 		cfg[k] = v
 	}
 	b, _ := json.Marshal(cfg)
-	d, err := NewDestination(b)
+	d, err := testDestination(b)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -640,7 +640,7 @@ func testSwapRefusesStale(e *env) {
 			if err != nil {
 				return nil, nil
 			}
-			return versionOf(a), nil
+			return st.version(a), nil
 		}
 	}
 	key := "swap/obj"
@@ -654,7 +654,7 @@ func testSwapRefusesStale(e *env) {
 	if err != nil {
 		e.t.Fatal(err)
 	}
-	v1 := versionOf(a)
+	v1 := st.version(a)
 	if err := st.swap(ctx, e.b, key, []byte("2"), nil, v1, check(key)); err != nil {
 		e.t.Fatal(err)
 	}

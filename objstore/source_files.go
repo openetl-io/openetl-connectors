@@ -1,4 +1,4 @@
-package s3
+package objstore
 
 import (
 	"cmp"
@@ -98,7 +98,7 @@ func (s *streamSpec) list(ctx context.Context, b *blob.Bucket, r hashRange, incr
 			break
 		}
 		if err != nil {
-			return nil, fmt.Errorf("s3: list %s: %w", s.prefix, err)
+			return nil, fmt.Errorf("objstore: list %s: %w", s.prefix, err)
 		}
 		if obj.IsDir || !s.glob.MatchString(obj.Key) || !r.has(obj.Key) {
 			continue

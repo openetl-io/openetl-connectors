@@ -1,5 +1,6 @@
-// Package s3 has the files connectors of S3, Google Cloud Storage, Azure
-// Blob Storage and local filesystems.
+// Package objstore is what the files connectors share: the source and the
+// destination of Parquet, Avro, CSV and JSON Lines files in a bucket, which
+// each connector's Store opens, or on a local filesystem.
 //
 // The destination writes each stream's table as a directory of Parquet, CSV
 // or JSON Lines files. Writes stream each stream's batches into files staged
@@ -13,10 +14,9 @@
 // epoch the read ends in swaps the table's manifest to them with the
 // store's conditional write, which refuses to move it back to an older
 // epoch's.
-package s3
+package objstore
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -38,8 +38,11 @@ import (
 	"github.com/openetl-io/openetl-connectors/records"
 )
 
+// DestinationConfig is where the destination writes, and how: the settings
+// of every connector's destination, besides its store's.
 type DestinationConfig struct {
-	StoreConfig
+	// SCHEME://BUCKET/PREFIX, or file:// and an absolute path.
+	URL string `json:"url"`
 	// parquet, csv or jsonl. Default parquet.
 	Format string `json:"format"`
 	// Parquet: zstd, snappy, gzip or none, default zstd. CSV and JSON Lines:
@@ -61,6 +64,18 @@ const (
 	manifestPath = "_symlink_format_manifest/manifest"
 )
 
+// DestinationCapabilities: files appear one at a time as Commit copies them,
+// so an epoch is never visible at once across streams.
+var DestinationCapabilities = destination.Capabilities{
+	Class:                 destination.StageAndApply,
+	Scopes:                []destination.Scope{destination.ScopeStream},
+	DefaultCommitInterval: time.Minute,
+	MinCommitInterval:     time.Second,
+	NanosecondTimestamps:  true,
+	WriteModes:            []destination.WriteMode{destination.Append, destination.Overwrite},
+	WriterLanes:           16,
+}
+
 type Destination struct {
 	cfg   DestinationConfig
 	store *store
@@ -73,14 +88,14 @@ var (
 	_ destination.ReadTracker = (*writer)(nil)
 )
 
-func NewDestination(config []byte) (*Destination, error) {
+// NewDestination is the destination of config, whose store's settings
+// decode into settings, which store makes the store of.
+func NewDestination(config []byte, settings any, store NewStore) (*Destination, error) {
 	cfg := DestinationConfig{Format: formatParquet, FileSize: defaultFileSize}
-	dec := json.NewDecoder(bytes.NewReader(config))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&cfg); err != nil {
-		return nil, fmt.Errorf("s3: config: %w", err)
+	if err := decode(config, &cfg, settings); err != nil {
+		return nil, err
 	}
-	st, err := parseStore(cfg.StoreConfig)
+	st, err := newStore(cfg.URL, store)
 	if err != nil {
 		return nil, err
 	}
@@ -90,20 +105,20 @@ func NewDestination(config []byte) (*Destination, error) {
 			cfg.Compression = "zstd"
 		}
 		if _, ok := parquetCodecs[cfg.Compression]; !ok {
-			return nil, fmt.Errorf("s3: Parquet compression %q is none of zstd, snappy, gzip and none", cfg.Compression)
+			return nil, fmt.Errorf("objstore: Parquet compression %q is none of zstd, snappy, gzip and none", cfg.Compression)
 		}
 	case formatCSV, formatJSONL:
 		if cfg.Compression == "" {
 			cfg.Compression = "none"
 		}
 		if cfg.Compression != "gzip" && cfg.Compression != "zstd" && cfg.Compression != "none" {
-			return nil, fmt.Errorf("s3: %s compression %q is none of gzip, zstd and none", cfg.Format, cfg.Compression)
+			return nil, fmt.Errorf("objstore: %s compression %q is none of gzip, zstd and none", cfg.Format, cfg.Compression)
 		}
 	default:
-		return nil, fmt.Errorf("s3: format %q is none of parquet, csv and jsonl", cfg.Format)
+		return nil, fmt.Errorf("objstore: format %q is none of parquet, csv and jsonl", cfg.Format)
 	}
 	if cfg.FileSize < 1<<20 {
-		return nil, fmt.Errorf("s3: fileSize %d is under 1 MiB", cfg.FileSize)
+		return nil, fmt.Errorf("objstore: fileSize %d is under 1 MiB", cfg.FileSize)
 	}
 	return &Destination{cfg: cfg, store: st}, nil
 }
@@ -115,15 +130,15 @@ func (d *Destination) bucket(ctx context.Context) (*blob.Bucket, error) { return
 func (d *Destination) Open(ctx context.Context, cfg destination.OpenConfig) (destination.Writer, error) {
 	for _, s := range cfg.Streams {
 		if s.Mode != destination.Append && s.Mode != destination.Overwrite {
-			return nil, fmt.Errorf("s3: stream %q: only append and overwrite writes are supported", s.Name)
+			return nil, fmt.Errorf("objstore: stream %q: only append and overwrite writes are supported", s.Name)
 		}
 	}
 	if cfg.Pipeline == "" || strings.ContainsAny(cfg.Pipeline, "/.") {
-		return nil, fmt.Errorf("s3: pipeline %q can't name files", cfg.Pipeline)
+		return nil, fmt.Errorf("objstore: pipeline %q can't name files", cfg.Pipeline)
 	}
 	b, err := d.bucket(ctx)
 	if err != nil {
-		return nil, classify(err)
+		return nil, d.store.classify(err)
 	}
 	wctx, cancel := context.WithCancel(context.WithoutCancel(ctx))
 	return &writer{
@@ -250,13 +265,13 @@ func (w *writer) startPart(e destination.Epoch, stream string, ef *epochFiles, s
 	bw, err := w.b.NewWriter(ctx, p.file.Staged, &blob.WriterOptions{ContentType: contentType(w.d.cfg.Format)})
 	if err != nil {
 		cancel()
-		return nil, fmt.Errorf("s3: stage %s: %w", p.file.Staged, err)
+		return nil, fmt.Errorf("objstore: stage %s: %w", p.file.Staged, err)
 	}
 	p.fw, err = newFileWriter(w.d.cfg.Format, w.d.cfg.Compression, sc, bw)
 	if err != nil {
 		cancel()
 		_ = bw.Close()
-		return nil, fmt.Errorf("s3: stage %s: %w", p.file.Staged, err)
+		return nil, fmt.Errorf("objstore: stage %s: %w", p.file.Staged, err)
 	}
 	p.cancel = cancel
 	return p, nil
@@ -286,7 +301,7 @@ func (p *part) finish() (stagedFile, error) {
 	defer p.cancel()
 	p.file.Rows = p.fw.rows()
 	if err := p.fw.close(); err != nil {
-		return p.file, fmt.Errorf("s3: stage %s: %w", p.file.Staged, err)
+		return p.file, fmt.Errorf("objstore: stage %s: %w", p.file.Staged, err)
 	}
 	return p.file, nil
 }
@@ -308,13 +323,13 @@ func (w *writer) EndRead(_ context.Context, e destination.Epoch, stream string) 
 }
 
 func (w *writer) Write(_ context.Context, e destination.Epoch, stream string, batch arrow.RecordBatch) (err error) {
-	defer func() { err = classify(err) }()
+	defer func() { err = w.d.store.classify(err) }()
 	mode := w.mode(stream)
 	if mode == 0 {
-		return fmt.Errorf("s3: unknown stream %q", stream)
+		return fmt.Errorf("objstore: unknown stream %q", stream)
 	}
 	if _, ok := w.starts[stream]; mode == destination.Overwrite && !ok {
-		return fmt.Errorf("s3: stream %q overwrites, but its read has no start", stream)
+		return fmt.Errorf("objstore: stream %q overwrites, but its read has no start", stream)
 	}
 	if batch.NumRows() == 0 {
 		return nil
@@ -347,7 +362,7 @@ func (w *writer) Write(_ context.Context, e destination.Epoch, stream string, ba
 		ef.open = p
 	}
 	if err := ef.open.fw.write(batch); err != nil {
-		return fmt.Errorf("s3: stream %q: %w", stream, err)
+		return fmt.Errorf("objstore: stream %q: %w", stream, err)
 	}
 	if ef.open.fw.size() >= w.d.cfg.FileSize {
 		return w.close(ef)
@@ -368,7 +383,7 @@ func (w *writer) close(ef *epochFiles) error {
 // PreCommit closes the epoch's files. They are durable once closed, and
 // outside every table until Commit copies them in.
 func (w *writer) PreCommit(_ context.Context, e destination.Epoch) (_ destination.Staged, err error) {
-	defer func() { err = classify(err) }()
+	defer func() { err = w.d.store.classify(err) }()
 	desc := staged{Generation: e.Generation, Epoch: e.N}
 	byStream := w.parts[e.N]
 	delete(w.parts, e.N)
@@ -391,7 +406,7 @@ func (w *writer) PreCommit(_ context.Context, e destination.Epoch) (_ destinatio
 		}
 		if s.Mode == destination.Overwrite {
 			if _, ok := w.starts[s.Name]; !ok {
-				return nil, fmt.Errorf("s3: stream %q overwrites, but its read has no start", s.Name)
+				return nil, fmt.Errorf("objstore: stream %q overwrites, but its read has no start", s.Name)
 			}
 			ss.Read = strconv.FormatInt(w.starts[s.Name].UnixMicro(), 10)
 		}
@@ -406,16 +421,16 @@ func (w *writer) PreCommit(_ context.Context, e destination.Epoch) (_ destinatio
 func (w *writer) descriptor(e destination.Epoch, committables []destination.Staged) (staged, error) {
 	out := staged{Generation: e.Generation, Epoch: e.N}
 	if len(committables) == 0 {
-		return out, errors.New("s3: no staged descriptor")
+		return out, errors.New("objstore: no staged descriptor")
 	}
 	at := map[string]int{}
 	for _, c := range committables {
 		var d staged
 		if err := json.Unmarshal(c, &d); err != nil {
-			return out, fmt.Errorf("s3: staged descriptor: %w", err)
+			return out, fmt.Errorf("objstore: staged descriptor: %w", err)
 		}
 		if d.Generation != e.Generation || d.Epoch != e.N {
-			return out, fmt.Errorf("s3: the staged descriptor is for epoch %d-g%d, not %d-g%d", d.Epoch, d.Generation, e.N, e.Generation)
+			return out, fmt.Errorf("objstore: the staged descriptor is for epoch %d-g%d, not %d-g%d", d.Epoch, d.Generation, e.N, e.Generation)
 		}
 		for _, st := range d.Streams {
 			i, ok := at[st.Name]
@@ -431,7 +446,7 @@ func (w *writer) descriptor(e destination.Epoch, committables []destination.Stag
 				m.Table = st.Table
 			}
 			if m.Read != st.Read {
-				return out, fmt.Errorf("s3: epoch %d-g%d: the lanes' descriptors name different reads of %s", e.N, e.Generation, st.Name)
+				return out, fmt.Errorf("objstore: epoch %d-g%d: the lanes' descriptors name different reads of %s", e.N, e.Generation, st.Name)
 			}
 		}
 	}
@@ -444,7 +459,7 @@ func (w *writer) descriptor(e destination.Epoch, committables []destination.Stag
 }
 
 func (w *writer) Commit(ctx context.Context, e destination.Epoch, committables []destination.Staged) (_ destination.Committed, err error) {
-	defer func() { err = classify(err) }()
+	defer func() { err = w.d.store.classify(err) }()
 	d, err := w.descriptor(e, committables)
 	if err != nil {
 		return destination.Committed{}, err
@@ -474,7 +489,7 @@ func (w *writer) apply(ctx context.Context, d staged, st stagedStream) error {
 			}
 		}
 		if err != nil {
-			return fmt.Errorf("s3: apply %s: %w", st.Name, err)
+			return fmt.Errorf("objstore: apply %s: %w", st.Name, err)
 		}
 	}
 	if st.Ended {
@@ -487,7 +502,7 @@ func (w *writer) apply(ctx context.Context, d staged, st stagedStream) error {
 		return err
 	}
 	if err := w.b.WriteAll(ctx, marker, body, &blob.WriterOptions{ContentType: "application/json"}); err != nil {
-		return fmt.Errorf("s3: write the marker of %s: %w", st.Name, err)
+		return fmt.Errorf("objstore: write the marker of %s: %w", st.Name, err)
 	}
 	return nil
 }
@@ -516,7 +531,7 @@ func (w *writer) manifest(ctx context.Context, table string) (*version, manifest
 	m.epoch, _ = strconv.ParseUint(a.Metadata["epoch"], 10, 64)
 	m.generation, _ = strconv.ParseUint(a.Metadata["generation"], 10, 64)
 	m.read, _ = strconv.ParseInt(a.Metadata["read"], 10, 64)
-	return versionOf(a), m, nil
+	return w.d.store.version(a), m, nil
 }
 
 // publish makes the read's files the table's: it writes the manifest that
@@ -526,14 +541,14 @@ func (w *writer) manifest(ctx context.Context, table string) (*version, manifest
 func (w *writer) publish(ctx context.Context, d staged, st stagedStream) error {
 	read, err := strconv.ParseInt(st.Read, 10, 64)
 	if err != nil {
-		return fmt.Errorf("s3: stream %s's read %q: %w", st.Name, st.Read, err)
+		return fmt.Errorf("objstore: stream %s's read %q: %w", st.Name, st.Read, err)
 	}
 	ours := manifestState{epoch: d.Epoch, generation: d.Generation, read: read}
 	key := st.Table + "/" + manifestPath
 	for {
 		was, cur, err := w.manifest(ctx, st.Table)
 		if err != nil {
-			return fmt.Errorf("s3: read %s: %w", key, err)
+			return fmt.Errorf("objstore: read %s: %w", key, err)
 		}
 		if was != nil && !cur.before(ours) {
 			ours = cur
@@ -546,7 +561,7 @@ func (w *writer) publish(ctx context.Context, d staged, st stagedStream) error {
 			obj, err := it.Next(ctx)
 			if err != nil {
 				if !errors.Is(err, io.EOF) {
-					return fmt.Errorf("s3: list %s: %w", dir, err)
+					return fmt.Errorf("objstore: list %s: %w", dir, err)
 				}
 				break
 			}
@@ -563,7 +578,7 @@ func (w *writer) publish(ctx context.Context, d staged, st stagedStream) error {
 			continue
 		}
 		if err != nil {
-			return fmt.Errorf("s3: write %s: %w", key, err)
+			return fmt.Errorf("objstore: write %s: %w", key, err)
 		}
 		break
 	}
@@ -611,7 +626,7 @@ func (w *writer) dropStaged(d staged) {
 }
 
 func (w *writer) Recover(ctx context.Context, gen uint64, e destination.Epoch, committables []destination.Staged) (_ destination.Recovery, err error) {
-	defer func() { err = classify(err) }()
+	defer func() { err = w.d.store.classify(err) }()
 	r, err := w.recover(ctx, e, committables)
 	if err != nil {
 		return 0, err
@@ -673,7 +688,7 @@ func (w *writer) recover(ctx context.Context, e destination.Epoch, committables 
 	case copied == 0 && len(missing) == len(d.Streams):
 		return destination.Lost, nil
 	default:
-		return 0, fmt.Errorf("s3: epoch %d-g%d is partly applied and the staging for the rest is gone", d.Epoch, d.Generation)
+		return 0, fmt.Errorf("objstore: epoch %d-g%d is partly applied and the staging for the rest is gone", d.Epoch, d.Generation)
 	}
 }
 

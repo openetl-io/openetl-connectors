@@ -1,4 +1,4 @@
-package s3
+package objstore
 
 import (
 	"bufio"
@@ -48,14 +48,14 @@ type sink struct {
 // changed is the error of a file that changed while it was read: the next
 // attempt reads it again.
 func changed(key string) error {
-	return sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_TRANSIENT, fmt.Errorf("s3: %s changed while it was read", key))
+	return sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_TRANSIENT, fmt.Errorf("objstore: %s changed while it was read", key))
 }
 
 // undeclared is the error of a column the read's request doesn't declare:
 // the next attempt's discovery declares it.
 func undeclared(key, column string) error {
 	return sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_TRANSIENT,
-		fmt.Errorf("s3: %s has column %q, which the stream doesn't declare yet: the next attempt discovers it, unless discovery's sample of the files misses it, which the stream's columns then need to name", key, column))
+		fmt.Errorf("objstore: %s has column %q, which the stream doesn't declare yet: the next attempt discovers it, unless discovery's sample of the files misses it, which the stream's columns then need to name", key, column))
 }
 
 // open opens the file from offset, and fails if it isn't the version
@@ -63,7 +63,7 @@ func undeclared(key, column string) error {
 func open(ctx context.Context, b *blob.Bucket, o object, offset int64) (*blob.Reader, error) {
 	r, err := b.NewRangeReader(ctx, o.Key, offset, -1, nil)
 	if err != nil {
-		return nil, fmt.Errorf("s3: read %s: %w", o.Key, err)
+		return nil, fmt.Errorf("objstore: read %s: %w", o.Key, err)
 	}
 	if !sameVersion(r.ModTime(), r.Size(), o) {
 		_ = r.Close()
@@ -93,7 +93,7 @@ func (r *rangeReaderAt) ReadAt(p []byte, off int64) (int, error) {
 	n := min(int64(len(p)), r.o.Size-off)
 	rr, err := r.b.NewRangeReader(r.ctx, r.o.Key, off, n, nil)
 	if err != nil {
-		return 0, fmt.Errorf("s3: read %s: %w", r.o.Key, err)
+		return 0, fmt.Errorf("objstore: read %s: %w", r.o.Key, err)
 	}
 	defer func() { _ = rr.Close() }()
 	if !sameVersion(rr.ModTime(), rr.Size(), r.o) {
@@ -141,12 +141,12 @@ func control(cols []arrow.Array, location string, o object, first int64, n int) 
 func parquetSchema(ctx context.Context, b *blob.Bucket, o object) (*arrow.Schema, error) {
 	pf, err := file.NewParquetReader(&rangeReaderAt{ctx: ctx, b: b, o: o})
 	if err != nil {
-		return nil, fmt.Errorf("s3: %s: %w", o.Key, err)
+		return nil, fmt.Errorf("objstore: %s: %w", o.Key, err)
 	}
 	defer func() { _ = pf.Close() }()
 	_, sc, err := parquetReader(pf, pqarrow.ArrowReadProperties{})
 	if err != nil {
-		return nil, fmt.Errorf("s3: %s: %w", o.Key, err)
+		return nil, fmt.Errorf("objstore: %s: %w", o.Key, err)
 	}
 	return sc, nil
 }
@@ -186,7 +186,7 @@ func nextBatch(rr pqarrow.RecordReader, key string, rg int, sc *arrow.Schema) (o
 					ext = append(ext, strconv.Quote(f.Name))
 				}
 			}
-			ok, err = false, fmt.Errorf("s3: %s: row group %d: can't read the file's columns (of an extension type: %s): %v", key, rg, strings.Join(ext, ", "), r)
+			ok, err = false, fmt.Errorf("objstore: %s: row group %d: can't read the file's columns (of an extension type: %s): %v", key, rg, strings.Join(ext, ", "), r)
 		}
 	}()
 	return rr.Next(), nil
@@ -199,16 +199,16 @@ func (s *Source) readParquet(ctx context.Context, b *blob.Bucket, o object, at f
 	props.BufferedStreamEnabled, props.BufferSize = true, 1<<20
 	pf, err := file.NewParquetReader(&rangeReaderAt{ctx: ctx, b: b, o: o}, file.WithReadProps(props))
 	if err != nil {
-		return fmt.Errorf("s3: %s: %w", o.Key, err)
+		return fmt.Errorf("objstore: %s: %w", o.Key, err)
 	}
 	defer func() { _ = pf.Close() }()
 	fr, sc, err := parquetReader(pf, pqarrow.ArrowReadProperties{BatchSize: parquetBatch})
 	if err != nil {
-		return fmt.Errorf("s3: %s: %w", o.Key, err)
+		return fmt.Errorf("objstore: %s: %w", o.Key, err)
 	}
 	stored, err := fr.Schema()
 	if err != nil {
-		return fmt.Errorf("s3: %s: %w", o.Key, err)
+		return fmt.Errorf("objstore: %s: %w", o.Key, err)
 	}
 	// Each column's logical type in the file, and the stream's.
 	fields := make([]arrow.Field, 0, sc.NumFields()+3)
@@ -236,7 +236,7 @@ func (s *Source) readParquet(ctx context.Context, b *blob.Bucket, o object, at f
 	for rg := at.RowGroup; rg < n; rg++ {
 		rr, err := fr.GetRecordReader(ctx, nil, []int{rg})
 		if err != nil {
-			return fmt.Errorf("s3: %s: row group %d: %w", o.Key, rg, err)
+			return fmt.Errorf("objstore: %s: row group %d: %w", o.Key, rg, err)
 		}
 		for {
 			ok, err := nextBatch(rr, o.Key, rg, stored)
@@ -260,7 +260,7 @@ func (s *Source) readParquet(ctx context.Context, b *blob.Bucket, o object, at f
 				if err != nil {
 					releaseAll(arrs)
 					rr.Release()
-					return fmt.Errorf("s3: %s: column %q: %w", o.Key, f.Name, err)
+					return fmt.Errorf("objstore: %s: column %q: %w", o.Key, f.Name, err)
 				}
 				arrs = append(arrs, c)
 				bf := stream[i].field
@@ -282,7 +282,7 @@ func (s *Source) readParquet(ctx context.Context, b *blob.Bucket, o object, at f
 		err = rr.Err()
 		rr.Release()
 		if err != nil {
-			return fmt.Errorf("s3: %s: row group %d: %w", o.Key, rg, err)
+			return fmt.Errorf("objstore: %s: row group %d: %w", o.Key, rg, err)
 		}
 		if rg+1 < n {
 			if err := out.resume(filePos{RowGroup: rg + 1, Records: line - 1}); err != nil {
@@ -324,7 +324,7 @@ func (s *streamSpec) openText(ctx context.Context, b *blob.Bucket, o object, off
 	dec, err := decompress(compression, raw)
 	if err != nil {
 		_ = raw.Close()
-		return nil, fmt.Errorf("s3: %s: %w", o.Key, err)
+		return nil, fmt.Errorf("objstore: %s: %w", o.Key, err)
 	}
 	var r io.Reader = dec
 	if s.encoding != nil {
@@ -378,7 +378,7 @@ func (s *Source) readCSV(ctx context.Context, b *blob.Bucket, spec *streamSpec, 
 	}
 	if err != nil {
 		ts.closer()
-		return fmt.Errorf("s3: %s: %w", o.Key, err)
+		return fmt.Errorf("objstore: %s: %w", o.Key, err)
 	}
 	if at.Offset > 0 {
 		if seekable, _ := compressionOf(o.Key); seekable == "none" && spec.encoding == nil {
@@ -391,7 +391,7 @@ func (s *Source) readCSV(ctx context.Context, b *blob.Bucket, spec *streamSpec, 
 			for ts.base+cr.offset < at.Offset {
 				if _, _, err := cr.read(); err != nil {
 					ts.closer()
-					return fmt.Errorf("s3: %s: skip to %d: %w", o.Key, at.Offset, err)
+					return fmt.Errorf("objstore: %s: skip to %d: %w", o.Key, at.Offset, err)
 				}
 			}
 		}
@@ -404,7 +404,7 @@ func (s *Source) readCSV(ctx context.Context, b *blob.Bucket, spec *streamSpec, 
 		pending = ts.base + cr.offset
 		fields, quoted, err := cr.read()
 		if err != nil && !errors.Is(err, io.EOF) {
-			return nil, nil, fmt.Errorf("s3: %s: record %d: %w", o.Key, line, err)
+			return nil, nil, fmt.Errorf("objstore: %s: record %d: %w", o.Key, line, err)
 		}
 		return fields, quoted, err
 	}
@@ -444,7 +444,7 @@ func (s *Source) readCSV(ctx context.Context, b *blob.Bucket, spec *streamSpec, 
 				case i < len(names):
 					name = names[i]
 				case spec.csvHeader || len(spec.cfg.CSV.ColumnNames) > 0:
-					return fmt.Errorf("s3: %s: record %d has %d fields, and the header %d", o.Key, line, len(fields), len(names))
+					return fmt.Errorf("objstore: %s: record %d has %d fields, and the header %d", o.Key, line, len(fields), len(names))
 				}
 				sb, err := builder(name)
 				if err != nil {
@@ -542,11 +542,11 @@ func (s *Source) readJSONL(ctx context.Context, b *blob.Bucket, spec *streamSpec
 		size := 0
 		for len(rows) < batchRecords && size < batchBytes && !errors.Is(err, io.EOF) {
 			if err != nil {
-				return fmt.Errorf("s3: %s: %w", o.Key, err)
+				return fmt.Errorf("objstore: %s: %w", o.Key, err)
 			}
 			var obj map[string]json.RawMessage
 			if err := json.Unmarshal(text, &obj); err != nil || obj == nil {
-				return fmt.Errorf("s3: %s: record %d isn't a JSON object: %.80s", o.Key, line, text)
+				return fmt.Errorf("objstore: %s: record %d isn't a JSON object: %.80s", o.Key, line, text)
 			}
 			for k := range obj {
 				if declared != nil && !declared[k] {

@@ -1,5 +1,5 @@
-// Command source-s3 serves the files source, for S3, Google Cloud Storage,
-// Azure Blob Storage and local files, as an external connector.
+// Command source-s3 serves the files source of Amazon S3, S3-compatible stores and local files, as an
+// external connector.
 package main
 
 import (

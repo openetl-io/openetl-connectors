@@ -1,4 +1,4 @@
-package s3
+package objstore
 
 import (
 	"context"
@@ -240,5 +240,5 @@ func (t *typedColumns) of(ctx context.Context, b *blob.Bucket, spec *streamSpec)
 // which the next attempt reads.
 func unplanned(key, column string) error {
 	return sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_TRANSIENT,
-		fmt.Errorf("s3: %s has column %q of a type the stream's other files don't, and was written after the read started: the next attempt reads it", key, column))
+		fmt.Errorf("objstore: %s has column %q of a type the stream's other files don't, and was written after the read started: the next attempt reads it", key, column))
 }

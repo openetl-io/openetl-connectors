@@ -1,4 +1,4 @@
-package s3
+package objstore
 
 import (
 	"bytes"
@@ -6,17 +6,13 @@ import (
 	"errors"
 	"fmt"
 	"maps"
-	"math/big"
 	"slices"
 	"strings"
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/extensions"
-	"github.com/twmb/avro"
-	"github.com/twmb/avro/ocf"
 	"gocloud.dev/blob"
 
 	"github.com/openetl-io/openetl/sdk/go/check"
@@ -148,66 +144,6 @@ func testTypesAcrossFiles(t *testing.T, cfg map[string]any) {
 		t.Errorf("a file of a type the read didn't see: %v", err)
 	}
 	checkBatches(t, cat, out)
-}
-
-const avroSchema = `{"type": "record", "name": "Event", "fields": [
-	{"name": "b", "type": "boolean"},
-	{"name": "i", "type": "int"},
-	{"name": "l", "type": "long"},
-	{"name": "f", "type": "float"},
-	{"name": "d", "type": "double"},
-	{"name": "s", "type": "string"},
-	{"name": "raw", "type": "bytes"},
-	{"name": "color", "type": {"type": "enum", "name": "Color", "symbols": ["RED", "GREEN"]}},
-	{"name": "fx", "type": {"type": "fixed", "name": "Two", "size": 2}},
-	{"name": "price", "type": {"type": "bytes", "logicalType": "decimal", "precision": 10, "scale": 2}},
-	{"name": "day", "type": {"type": "int", "logicalType": "date"}},
-	{"name": "tms", "type": {"type": "int", "logicalType": "time-millis"}},
-	{"name": "tus", "type": {"type": "long", "logicalType": "time-micros"}},
-	{"name": "atms", "type": {"type": "long", "logicalType": "timestamp-millis"}},
-	{"name": "atus", "type": {"type": "long", "logicalType": "timestamp-micros"}},
-	{"name": "local", "type": {"type": "long", "logicalType": "local-timestamp-micros"}},
-	{"name": "id", "type": {"type": "string", "logicalType": "uuid"}},
-	{"name": "maybe", "type": ["null", "string"]},
-	{"name": "either", "type": ["null", "int", "string"]},
-	{"name": "rec", "type": {"type": "record", "name": "Inner", "fields": [{"name": "n", "type": "int"}]}},
-	{"name": "arr", "type": {"type": "array", "items": "long"}},
-	{"name": "m", "type": {"type": "map", "values": "string"}}
-]}`
-
-func avroEvent(i int) map[string]any {
-	at := time.Date(2026, 1, 2, 3, 4, 5, 678_000_000, time.UTC)
-	ev := map[string]any{
-		"b": i%2 == 0, "i": int32(-i), "l": int64(i) << 40, "f": float32(1.5), "d": 0.1, "s": fmt.Sprint("s", i),
-		"raw": []byte{1, 2}, "color": "GREEN", "fx": [2]byte{3, 4}, "price": big.NewRat(-1234567891, 100),
-		"day": at, "tms": 3*time.Hour + 4*time.Millisecond, "tus": 5 * time.Microsecond, "atms": at, "atus": at.Add(time.Microsecond),
-		"local": at, "id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8", "maybe": nil, "either": int32(i),
-		"rec": map[string]any{"n": int32(i)}, "arr": []any{int64(1), int64(2)}, "m": map[string]any{"k": "v"},
-	}
-	if i%2 == 1 {
-		ev["maybe"], ev["either"] = "yes", "two"
-	}
-	return ev
-}
-
-// avroOf is an object container file of n events, from first, in blocks of
-// block records.
-func avroOf(t *testing.T, first, n, block int) []byte {
-	t.Helper()
-	var buf bytes.Buffer
-	w, err := ocf.NewWriter(&buf, avro.MustParse(avroSchema), ocf.WithBlockCount(block), ocf.WithCodec(ocf.SnappyCodec()))
-	if err != nil {
-		t.Fatal(err)
-	}
-	for i := first; i < first+n; i++ {
-		if err := w.Encode(avroEvent(i)); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if err := w.Close(); err != nil {
-		t.Fatal(err)
-	}
-	return buf.Bytes()
 }
 
 func testAvro(t *testing.T, cfg map[string]any) {
@@ -460,7 +396,7 @@ func TestPreflightNames(t *testing.T) {
 		t.Error(err)
 	}
 	b, _ := json.Marshal(cfg)
-	d, err := NewDestination(b)
+	d, err := testDestination(b)
 	if err != nil {
 		t.Fatal(err)
 	}

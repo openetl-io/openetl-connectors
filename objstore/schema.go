@@ -1,4 +1,4 @@
-package s3
+package objstore
 
 import (
 	"context"
@@ -36,7 +36,7 @@ func schemaKey(table string) string { return reserved + "/schemas/" + table + ".
 // refuses the change: a person takes it by removing the record, as the
 // refusal says.
 func (w *writer) ApplySchema(ctx context.Context, streams []destination.StreamSchema) (out destination.SchemaApplied, err error) {
-	defer func() { err = classify(err) }()
+	defer func() { err = w.d.store.classify(err) }()
 	for _, s := range streams {
 		allow := slices.ContainsFunc(w.cfg.Streams, func(c destination.Stream) bool { return c.Name == s.Name && c.AllowTypeChanges })
 		table := w.tableOf(s.Schema, s.Name)
@@ -46,10 +46,10 @@ func (w *writer) ApplySchema(ctx context.Context, streams []destination.StreamSc
 		switch {
 		case gcerrors.Code(err) == gcerrors.NotFound:
 		case err != nil:
-			return out, fmt.Errorf("s3: read %s: %w", key, err)
+			return out, fmt.Errorf("objstore: read %s: %w", key, err)
 		default:
 			if err := json.Unmarshal(b, &rec); err != nil {
-				return out, fmt.Errorf("s3: %s: %w", key, err)
+				return out, fmt.Errorf("objstore: %s: %w", key, err)
 			}
 		}
 		have := map[string]string{}
@@ -84,7 +84,7 @@ func (w *writer) ApplySchema(ctx context.Context, streams []destination.StreamSc
 			return out, err
 		}
 		if err := w.b.WriteAll(ctx, key, b, &blob.WriterOptions{ContentType: "application/json"}); err != nil {
-			return out, fmt.Errorf("s3: write %s: %w", key, err)
+			return out, fmt.Errorf("objstore: write %s: %w", key, err)
 		}
 	}
 	return out, nil

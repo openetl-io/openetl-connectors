@@ -19,9 +19,11 @@ The official connectors for [OpenETL](https://github.com/openetl-io/openetl): th
 | [Kafka](./kafka/README.md) | Topics, in JSON, Avro or Protobuf | Topics, in one transaction per epoch; exactly once |
 | [Amazon Kinesis](./kinesis/README.md) | Data streams, shard by shard | Data streams, a record per row; at least once |
 | [Apache Iceberg](./iceberg/README.md) | | Tables, through a REST catalog or AWS Glue; exactly once |
-| [Amazon S3](./s3/README.md) | Parquet, Avro, CSV and JSON Lines files, on S3, Google Cloud Storage, Azure Blob Storage or a local disk | Parquet, CSV and JSON Lines files, on the same stores; exactly once |
+| [Amazon S3](./s3/README.md) | Parquet, Avro, CSV and JSON Lines files, on S3, S3-compatible stores such as MinIO and Cloudflare R2, or a local disk | Parquet, CSV and JSON Lines files, on the same stores; exactly once |
+| [Google Cloud Storage](./gcs/README.md) | Parquet, Avro, CSV and JSON Lines files | Parquet, CSV and JSON Lines files; exactly once |
+| [Azure Blob Storage](./azureblob/README.md) | Parquet, Avro, CSV and JSON Lines files | Parquet, CSV and JSON Lines files; exactly once |
 
-Exactly once is what a destination gives a stream whose source replays exactly, as a full refresh and a change-by-change read do here, and Kafka's and Kinesis's sources. A stream read by a cursor column, a SQL Server table that change tracking or change data capture can read, and the S3 source's files may repeat rows; each page says what those get.
+Exactly once is what a destination gives a stream whose source replays exactly, as a full refresh and a change-by-change read do here, and Kafka's and Kinesis's sources. A stream read by a cursor column, a SQL Server table that change tracking or change data capture can read, and the files sources' files may repeat rows; each page says what those get.
 
 ## Use one
 

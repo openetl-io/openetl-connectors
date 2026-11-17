@@ -1,0 +1,102 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Files on Azure Blob Storage: destination",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "url"
+  ],
+  "properties": {
+    "url": {
+      "type": "string",
+      "title": "URL",
+      "description": "Where the tables go: azblob://container/prefix. Each stream's table is a directory of files under it.",
+      "x-group": "location"
+    },
+    "endpoint": {
+      "type": "string",
+      "title": "Endpoint",
+      "description": "The blob service's URL, for one other than https://ACCOUNT.blob.core.windows.net, such as Azurite's http://127.0.0.1:10000/devstoreaccount1.",
+      "x-group": "location",
+      "x-format": "uri",
+      "x-advanced": true
+    },
+    "accountName": {
+      "type": "string",
+      "title": "Account name",
+      "description": "The storage account. Needed with accountKey, sasToken or Azure's default credentials, unless the endpoint names it.",
+      "x-group": "azure"
+    },
+    "accountKey": {
+      "type": "string",
+      "x-secret": true,
+      "title": "Account key",
+      "description": "The account's shared key. Set at most one of accountKey, sasToken and connectionString; without any, Azure's default credentials.",
+      "x-group": "azure"
+    },
+    "sasToken": {
+      "type": "string",
+      "x-secret": true,
+      "title": "SAS token",
+      "description": "A shared access signature for the container, the query string it is.",
+      "x-group": "azure"
+    },
+    "connectionString": {
+      "type": "string",
+      "x-secret": true,
+      "title": "Connection string",
+      "description": "The account's connection string, which names the account and its key or a SAS.",
+      "x-group": "azure"
+    },
+    "format": {
+      "type": "string",
+      "enum": [
+        "parquet",
+        "csv",
+        "jsonl"
+      ],
+      "default": "parquet",
+      "title": "Format",
+      "description": "The files' format: Parquet, CSV with a header line, or JSON Lines.",
+      "x-group": "files"
+    },
+    "compression": {
+      "type": "string",
+      "enum": [
+        "zstd",
+        "snappy",
+        "gzip",
+        "none"
+      ],
+      "title": "Compression",
+      "description": "Parquet: zstd (the default), snappy, gzip or none, inside the file. CSV and JSON Lines: gzip, zstd or none (the default), the whole file, which gets the extension .gz or .zst.",
+      "x-group": "files"
+    },
+    "fileSize": {
+      "type": "integer",
+      "minimum": 1048576,
+      "default": 268435456,
+      "title": "File size",
+      "description": "Bytes a file reaches, compressed, before the next one starts.",
+      "x-group": "files",
+      "x-advanced": true
+    }
+  },
+  "x-groups": [
+    {
+      "id": "location",
+      "title": "Location",
+      "description": "Where the files are, and the address of the store's API."
+    },
+    {
+      "id": "azure",
+      "title": "Azure Blob Storage",
+      "description": "The account and its credentials."
+    },
+    {
+      "id": "files",
+      "title": "Files",
+      "description": "How each table's files are written."
+    }
+  ]
+}

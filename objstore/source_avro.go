@@ -1,4 +1,4 @@
-package s3
+package objstore
 
 import (
 	"context"
@@ -35,13 +35,13 @@ func openAvro(ctx context.Context, b *blob.Bucket, o object) (*ocf.Reader, func(
 	dec, err := decompress(compression, raw)
 	if err != nil {
 		_ = raw.Close()
-		return nil, nil, fmt.Errorf("s3: %s: %w", o.Key, err)
+		return nil, nil, fmt.Errorf("objstore: %s: %w", o.Key, err)
 	}
 	r, err := ocf.NewReader(dec)
 	if err != nil {
 		_ = dec.Close()
 		_ = raw.Close()
-		return nil, nil, fmt.Errorf("s3: %s: %w", o.Key, err)
+		return nil, nil, fmt.Errorf("objstore: %s: %w", o.Key, err)
 	}
 	return r, func() { _ = r.Close(); _ = dec.Close(); _ = raw.Close() }, nil
 }
@@ -51,7 +51,7 @@ func openAvro(ctx context.Context, b *blob.Bucket, o object) (*ocf.Reader, func(
 func avroRecord(key string, s *avro.Schema) ([]avro.SchemaField, error) {
 	root := s.Root()
 	if root.Type != "record" {
-		return nil, fmt.Errorf("s3: %s holds %s values, not records", key, root.Type)
+		return nil, fmt.Errorf("objstore: %s holds %s values, not records", key, root.Type)
 	}
 	return root.Fields, nil
 }
@@ -282,7 +282,7 @@ func (s *Source) readAvro(ctx context.Context, b *blob.Bucket, o object, at file
 			if errors.Is(err, io.EOF) {
 				return nil, io.EOF
 			}
-			return nil, fmt.Errorf("s3: %s: record %d: %w", o.Key, line, err)
+			return nil, fmt.Errorf("objstore: %s: record %d: %w", o.Key, line, err)
 		}
 		m, _ := v.(map[string]any)
 		return m, nil
@@ -304,10 +304,10 @@ func (s *Source) readAvro(ctx context.Context, b *blob.Bucket, o object, at file
 			for i, f := range fs {
 				v, verr := avroJSON(&fs[i].Type, rec[f.Name], stream[i].field)
 				if verr != nil {
-					return fmt.Errorf("s3: %s: record %d: field %q: %w", o.Key, line, f.Name, verr)
+					return fmt.Errorf("objstore: %s: record %d: field %q: %w", o.Key, line, f.Name, verr)
 				}
 				if obj[f.Name], verr = json.Marshal(v); verr != nil {
-					return fmt.Errorf("s3: %s: record %d: field %q: %w", o.Key, line, f.Name, verr)
+					return fmt.Errorf("objstore: %s: record %d: field %q: %w", o.Key, line, f.Name, verr)
 				}
 			}
 			obj[fileColumn], obj[lineColumn], obj[modifiedColumn] = location, json.RawMessage(strconv.FormatInt(line, 10)), modified

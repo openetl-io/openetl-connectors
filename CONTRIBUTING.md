@@ -30,7 +30,7 @@ The CDC tests need the server to run with `wal_level = logical`, and a user that
 
 The Iceberg tests need an Iceberg REST catalog at `OPENETL_TEST_ICEBERG_URI` (default `http://127.0.0.1:8181`) whose warehouse is the `iceberg` bucket of an S3 store at `OPENETL_TEST_S3_ENDPOINT` (default `http://127.0.0.1:8333`). openetl's compose file runs both (`make deps-up`); the tests create the bucket. With `OPENETL_TEST_GLUE_ENDPOINT` set to a Glue endpoint, such as moto's (`docker run -p 5000:5000 motoserver/moto:5.2.5`), they run against Glue too (on macOS, port 5000 is AirPlay's: map moto to another, such as `-p 5055:5000`).
 
-The S3 tests run against `file://` by default, and with `-tags integration` against the S3 store too, in a bucket they create, and against fake-gcs-server at `OPENETL_TEST_GCS_ENDPOINT` (default `http://127.0.0.1:4443`) and Azurite at `OPENETL_TEST_AZURE_ENDPOINT` (default `http://127.0.0.1:10000/devstoreaccount1`).
+The files tests, `objstore`'s, run against `file://` by default, and with `-tags integration` against the S3 store too, in a bucket they create, and against fake-gcs-server at `OPENETL_TEST_GCS_ENDPOINT` (default `http://127.0.0.1:4443`) and Azurite at `OPENETL_TEST_AZURE_ENDPOINT` (default `http://127.0.0.1:10000/devstoreaccount1`). `s3`, `gcs` and `azureblob` run the conformance suite against theirs.
 
 The Kafka tests need a broker at `OPENETL_TEST_KAFKA_BROKERS` (default `127.0.0.1:9092`), a second one that takes SASL_SSL at `OPENETL_TEST_KAFKA_SASL_BROKERS` (default `127.0.0.1:9094`), and a Confluent-compatible schema registry at `OPENETL_TEST_SCHEMA_REGISTRY` (default `http://127.0.0.1:8081`). openetl's compose file runs Kafka and Karapace; the SASL_SSL broker, with its users and certificate, is the service `kafka-sasl` of `.github/actions/services`.
 
@@ -74,7 +74,7 @@ The `openetl` CLI is openetl's `main`, copied out of the image `ghcr.io/openetl-
 Each package directory has an `openetl-connector.yaml`: its name, metadata, and how each role is built. The `openetl` CLI does the rest, so nothing here is specific to this repository:
 
 ```sh
-openetl connector validate --require author,logo,description,license postgres mysql sqlserver oracle clickhouse mongodb dynamodb kafka kinesis iceberg s3
+openetl connector validate --require author,logo,description,license postgres mysql sqlserver oracle clickhouse mongodb dynamodb kafka kinesis iceberg s3 gcs azureblob
 openetl connector package --tag postgres/v0.2.0
 ```
 
@@ -114,10 +114,11 @@ Each package directory holds its `openetl-connector.yaml`, its config schemas an
 - `mongodb/`: the MongoDB source and destination.
 - `dynamodb/`: the DynamoDB source and destination.
 - `iceberg/`: the Iceberg destination.
-- `s3/`: files on S3, S3-compatible stores, Google Cloud Storage, Azure Blob Storage or a local disk: a source of Parquet, Avro, CSV and JSON Lines, and a destination that writes Parquet, CSV and JSON Lines.
+- `s3/`, `gcs/`, `azureblob/`: files on Amazon S3, S3-compatible stores or a local disk; on Google Cloud Storage; and on Azure Blob Storage: a source of Parquet, Avro, CSV and JSON Lines, and a destination that writes Parquet, CSV and JSON Lines.
 - `kafka/`: the Kafka source and destination.
 - `kinesis/`: the Kinesis source and destination.
 - `records/`: the record layout and formats Kafka and Kinesis share: JSON, and Avro and Protobuf with a schema registry.
 - `keysplit/`: what the sources share of reading a table in splits of its key: the splits being read, which `Resplit` divides, an incremental read's floor, and what's left of an integer key's range.
+- `objstore/`: what the files connectors share: their source and destination, and each store's part in `s3store/`, `gcsstore/` and `azurestore/`, so a connector's executable has only its own cloud's SDK. `Conformance`, with the `integration` tag, runs the conformance suite on a connector's store.
 - `sqlstage/`: what the SQL destinations share of an epoch's staging: its staging tables, the descriptor `PreCommit` returns, and how `Commit` merges the lanes' descriptors.
 - `cmd/<executable>/`: one `main` per connector, which hands the connector to `sdk.Serve`.

@@ -1,4 +1,4 @@
-package s3
+package objstore
 
 import (
 	"bytes"
@@ -21,9 +21,11 @@ import (
 	"github.com/openetl-io/openetl/sdk/go/source"
 )
 
-// SourceConfig is where the source's files are, and its streams.
+// SourceConfig is where the source's files are, and its streams: the
+// settings of every connector's source, besides its store's.
 type SourceConfig struct {
-	StoreConfig
+	// SCHEME://BUCKET/PREFIX, or file:// and an absolute path.
+	URL     string         `json:"url"`
 	Streams []StreamConfig `json:"streams"`
 	// How long before the newest file an incremental read has read it still
 	// looks for files it hasn't: a Go duration. Default 1h.
@@ -91,25 +93,25 @@ var (
 	_ source.Splitter    = (*Source)(nil)
 )
 
-func NewSource(config []byte) (*Source, error) {
+// NewSource is the source of config, whose store's settings decode into
+// settings, which store makes the store of.
+func NewSource(config []byte, settings any, store NewStore) (*Source, error) {
 	var cfg SourceConfig
-	dec := json.NewDecoder(bytes.NewReader(config))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&cfg); err != nil {
-		return nil, fmt.Errorf("s3: config: %w", err)
+	if err := decode(config, &cfg, settings); err != nil {
+		return nil, err
 	}
-	st, err := parseStore(cfg.StoreConfig)
+	st, err := newStore(cfg.URL, store)
 	if err != nil {
 		return nil, err
 	}
 	s := &Source{cfg: cfg, store: st, lookback: time.Hour, streams: map[string]*streamSpec{}}
 	if cfg.Lookback != "" {
 		if s.lookback, err = time.ParseDuration(cfg.Lookback); err != nil || s.lookback < 0 {
-			return nil, fmt.Errorf("s3: lookback %q isn't a duration of 0 or more", cfg.Lookback)
+			return nil, fmt.Errorf("objstore: lookback %q isn't a duration of 0 or more", cfg.Lookback)
 		}
 	}
 	if len(cfg.Streams) == 0 {
-		return nil, errors.New("s3: the source has no streams")
+		return nil, errors.New("objstore: the source has no streams")
 	}
 	for _, sc := range cfg.Streams {
 		spec, err := parseStream(sc)
@@ -117,7 +119,7 @@ func NewSource(config []byte) (*Source, error) {
 			return nil, err
 		}
 		if _, dup := s.streams[sc.Name]; dup {
-			return nil, fmt.Errorf("s3: two streams are named %q", sc.Name)
+			return nil, fmt.Errorf("objstore: two streams are named %q", sc.Name)
 		}
 		s.streams[sc.Name] = spec
 	}
@@ -126,12 +128,12 @@ func NewSource(config []byte) (*Source, error) {
 
 func parseStream(sc StreamConfig) (*streamSpec, error) {
 	if sc.Name == "" || sc.Glob == "" {
-		return nil, errors.New("s3: a stream needs a name and a glob")
+		return nil, errors.New("objstore: a stream needs a name and a glob")
 	}
 	spec := &streamSpec{cfg: sc, delim: ',', quote: '"', csvHeader: sc.CSV.Header == nil || *sc.CSV.Header}
 	var err error
 	if spec.glob, spec.prefix, err = globRegexp(strings.TrimPrefix(sc.Glob, "/")); err != nil {
-		return nil, fmt.Errorf("s3: stream %q: %w", sc.Name, err)
+		return nil, fmt.Errorf("objstore: stream %q: %w", sc.Name, err)
 	}
 	switch sc.Format {
 	case formatParquet, formatJSONL, formatAvro:
@@ -145,31 +147,31 @@ func parseStream(sc StreamConfig) (*streamSpec, error) {
 			case len(c.v) == 1 && c.v[0] != '\n' && c.v[0] != '\r':
 				*c.to = c.v[0]
 			default:
-				return nil, fmt.Errorf("s3: stream %q: the CSV %s %q isn't one ASCII character", sc.Name, c.name, c.v)
+				return nil, fmt.Errorf("objstore: stream %q: the CSV %s %q isn't one ASCII character", sc.Name, c.name, c.v)
 			}
 		}
 		if spec.delim == spec.quote {
-			return nil, fmt.Errorf("s3: stream %q: the CSV delimiter and quote are the same", sc.Name)
+			return nil, fmt.Errorf("objstore: stream %q: the CSV delimiter and quote are the same", sc.Name)
 		}
 		if spec.csvHeader && len(sc.CSV.ColumnNames) > 0 {
-			return nil, fmt.Errorf("s3: stream %q: columnNames are for CSV files without a header", sc.Name)
+			return nil, fmt.Errorf("objstore: stream %q: columnNames are for CSV files without a header", sc.Name)
 		}
 		spec.nulls = map[string]bool{}
 		for _, n := range cmpOr(sc.CSV.NullValues, []string{""}) {
 			spec.nulls[n] = true
 		}
 	default:
-		return nil, fmt.Errorf("s3: stream %q: format %q is none of parquet, avro, csv and jsonl", sc.Name, sc.Format)
+		return nil, fmt.Errorf("objstore: stream %q: format %q is none of parquet, avro, csv and jsonl", sc.Name, sc.Format)
 	}
 	if sc.CSV.Encoding != "" && !strings.EqualFold(sc.CSV.Encoding, "utf-8") && !strings.EqualFold(sc.CSV.Encoding, "utf8") {
 		if spec.encoding, err = htmlindex.Get(sc.CSV.Encoding); err != nil {
-			return nil, fmt.Errorf("s3: stream %q: encoding %q: %w", sc.Name, sc.CSV.Encoding, err)
+			return nil, fmt.Errorf("objstore: stream %q: encoding %q: %w", sc.Name, sc.CSV.Encoding, err)
 		}
 	}
 	for _, name := range sortedKeys(sc.Columns) {
 		f, err := declaredField(name, sc.Columns[name])
 		if err != nil {
-			return nil, fmt.Errorf("s3: stream %q: %w", sc.Name, err)
+			return nil, fmt.Errorf("objstore: stream %q: %w", sc.Name, err)
 		}
 		spec.declared = append(spec.declared, f)
 	}
@@ -193,7 +195,7 @@ func sortedKeys[V any](m map[string]V) []string {
 }
 
 func (s *Source) Discover(ctx context.Context) (_ source.Catalog, err error) {
-	defer func() { err = classify(err) }()
+	defer func() { err = s.store.classify(err) }()
 	b, err := s.store.open(ctx)
 	if err != nil {
 		return source.Catalog{}, err
@@ -301,7 +303,7 @@ func (s *streamSpec) sampleCSV(ctx context.Context, b *blob.Bucket, o object, se
 		return nil
 	}
 	if err != nil {
-		return fmt.Errorf("s3: %s: %w", o.Key, err)
+		return fmt.Errorf("objstore: %s: %w", o.Key, err)
 	}
 	for _, n := range names {
 		seen(n)
@@ -312,7 +314,7 @@ func (s *streamSpec) sampleCSV(ctx context.Context, b *blob.Bucket, o object, se
 			break
 		}
 		if err != nil {
-			return fmt.Errorf("s3: %s: %w", o.Key, err)
+			return fmt.Errorf("objstore: %s: %w", o.Key, err)
 		}
 		for i, f := range fields {
 			name := "f" + fmt.Sprint(i)
@@ -343,11 +345,11 @@ func (s *streamSpec) sampleJSONL(ctx context.Context, b *blob.Bucket, o object, 
 			break
 		}
 		if err != nil {
-			return fmt.Errorf("s3: %s: %w", o.Key, err)
+			return fmt.Errorf("objstore: %s: %w", o.Key, err)
 		}
 		var obj map[string]json.RawMessage
 		if err := json.Unmarshal(text, &obj); err != nil {
-			return fmt.Errorf("s3: %s: a line isn't a JSON object: %.80s", o.Key, text)
+			return fmt.Errorf("objstore: %s: a line isn't a JSON object: %.80s", o.Key, text)
 		}
 		for _, k := range sortedKeys(obj) {
 			seen(k).json(obj[k])
@@ -359,12 +361,12 @@ func (s *streamSpec) sampleJSONL(ctx context.Context, b *blob.Bucket, o object, 
 func (s *Source) Read(ctx context.Context, req source.ReadRequest, out source.Emitter) error {
 	b, err := s.store.open(ctx)
 	if err != nil {
-		return classify(err)
+		return s.store.classify(err)
 	}
 	defer func() { _ = b.Close() }()
 	typed := &typedColumns{}
 	return source.ReadSplits(ctx, req, out, func(ctx context.Context, cs source.ConfiguredStream, sp source.Split, se source.SplitEmitter) error {
-		return classify(s.readSplit(ctx, b, typed, cs, sp, se))
+		return s.store.classify(s.readSplit(ctx, b, typed, cs, sp, se))
 	})
 }
 
@@ -373,13 +375,13 @@ func (s *Source) Read(ctx context.Context, req source.ReadRequest, out source.Em
 func (s *Source) readSplit(ctx context.Context, b *blob.Bucket, typed *typedColumns, cs source.ConfiguredStream, sp source.Split, out source.SplitEmitter) error {
 	spec, ok := s.streams[cs.Name]
 	if !ok {
-		return fmt.Errorf("s3: unknown stream %q", cs.Name)
+		return fmt.Errorf("objstore: unknown stream %q", cs.Name)
 	}
 	incremental := cs.SyncMode == source.Incremental
 	var st readState
 	if len(sp.State) > 0 {
 		if err := json.Unmarshal(sp.State, &st); err != nil {
-			return fmt.Errorf("s3: stream %q's state: %w", cs.Name, err)
+			return fmt.Errorf("objstore: stream %q's state: %w", cs.Name, err)
 		}
 	}
 	r, err := rangeOf(sp.ID, &st)
@@ -548,4 +550,4 @@ func (s *Source) readSplit(ctx context.Context, b *blob.Bucket, typed *typedColu
 }
 
 // errStop ends a file's read at the read's until.
-var errStop = errors.New("s3: the read is at its until")
+var errStop = errors.New("objstore: the read is at its until")

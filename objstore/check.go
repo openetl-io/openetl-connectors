@@ -1,6 +1,7 @@
-package s3
+package objstore
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -15,7 +16,6 @@ import (
 	"gocloud.dev/gcerrors"
 
 	"github.com/openetl-io/openetl-connectors/records"
-	sdk "github.com/openetl-io/openetl/sdk/go"
 	"github.com/openetl-io/openetl/sdk/go/check"
 	"github.com/openetl-io/openetl/sdk/go/check/netcheck"
 	"github.com/openetl-io/openetl/sdk/go/destination"
@@ -46,58 +46,26 @@ var (
 	}
 )
 
-// privileges are what each store calls the access an action needs.
-var privileges = map[string]map[string]string{
-	"list":   {"s3": "s3:ListBucket", "gs": "storage.objects.list", "azblob": "List Blobs", "file": "read and execute"},
-	"read":   {"s3": "s3:GetObject", "gs": "storage.objects.get", "azblob": "Read (Get Blob)", "file": "read"},
-	"write":  {"s3": "s3:PutObject", "gs": "storage.objects.create", "azblob": "Write (Put Blob)", "file": "write"},
-	"delete": {"s3": "s3:DeleteObject", "gs": "storage.objects.delete", "azblob": "Delete (Delete Blob)", "file": "write"},
-}
-
 // denied is err as a check's failure: a permission the store refused names
 // the privilege action needs on where.
 func (s *store) denied(err error, action, where string) error {
-	err = classify(err)
+	err = s.classify(err)
 	if f := check.Classify(err); f != nil && f.Code == protocolv1.ErrorCode_ERROR_CODE_PERMISSION_DENIED {
-		return check.PrivilegeMissing.Wrap(err, "principal", "The connector's identity", "privilege", privileges[action][s.u.Scheme], "object", where)
+		privilege := map[string]string{"list": "read and execute", "read": "read", "write": "write", "delete": "write"}[action]
+		if s.st != nil {
+			privilege = s.st.Privilege(action)
+		}
+		return check.PrivilegeMissing.Wrap(err, "principal", "The connector's identity", "privilege", privilege, "object", where)
 	}
 	return err
 }
 
-// address is the host and port the store's API answers at, whether it
-// starts with TLS, and whether the config names it; empty for file:// URLs.
-func (s *store) address() (addr string, tls, named bool) {
-	endpoint := s.cfg.Endpoint
-	named = endpoint != ""
-	switch s.u.Scheme {
-	case "file":
-		return "", false, false
-	case "s3":
-		if endpoint == "" {
-			endpoint = "https://s3.amazonaws.com"
-			switch {
-			case strings.HasPrefix(s.cfg.Region, "cn-"):
-				endpoint = "https://s3." + s.cfg.Region + ".amazonaws.com.cn"
-			case s.cfg.Region != "":
-				endpoint = "https://s3." + s.cfg.Region + ".amazonaws.com"
-			}
-		}
-	case "gs":
-		if endpoint == "" {
-			endpoint = "https://storage.googleapis.com"
-		}
-	case "azblob":
-		if endpoint == "" && !s.cfg.ConnectionString.IsZero() {
-			endpoint = connectionEndpoint(s.cfg.ConnectionString.Reveal())
-			named = endpoint != ""
-		}
-		if endpoint == "" {
-			endpoint = "https://" + s.accountName() + ".blob.core.windows.net"
-		}
-	}
+// hostPort is the host and port of an endpoint's URL, and whether a
+// connection to it starts with TLS.
+func hostPort(endpoint string) (addr string, tls bool) {
 	u, err := url.Parse(endpoint)
 	if err != nil || u.Host == "" {
-		return endpoint, false, named
+		return endpoint, false
 	}
 	port := u.Port()
 	if port == "" {
@@ -106,20 +74,18 @@ func (s *store) address() (addr string, tls, named bool) {
 			port = "80"
 		}
 	}
-	return net.JoinHostPort(u.Hostname(), port), u.Scheme != "http", named
+	return net.JoinHostPort(u.Hostname(), port), u.Scheme != "http"
 }
 
-// credentialField is the config's credential that's set; empty for none.
-func (s *store) credentialField() string {
-	for _, c := range []struct {
-		name string
-		v    sdk.Secret
-	}{{"accessKeyId", s.cfg.AccessKeyID}, {"serviceAccountKey", s.cfg.ServiceAccountKey}, {"accountKey", s.cfg.AccountKey}, {"sasToken", s.cfg.SASToken}, {"connectionString", s.cfg.ConnectionString}} {
-		if !c.v.IsZero() {
-			return c.name
-		}
+// list lists a file under the URL.
+func (s *store) list(ctx context.Context) error {
+	b, err := s.open(ctx)
+	if err != nil {
+		return err
 	}
-	return ""
+	defer func() { _ = b.Close() }()
+	_, _, err = b.ListPage(ctx, blob.FirstPageToken, 1, nil)
+	return err
 }
 
 // itemNames are each name's item name: check.Name's, made unique where two
@@ -138,87 +104,48 @@ func itemNames(prefix string, names []string) []string {
 	return out
 }
 
-// connectionEndpoint is an Azure connection string's blob endpoint.
-func connectionEndpoint(cs string) string {
-	kv := map[string]string{}
-	for part := range strings.SplitSeq(cs, ";") {
-		if k, v, ok := strings.Cut(part, "="); ok {
-			kv[strings.ToLower(strings.TrimSpace(k))] = strings.TrimSpace(v)
-		}
-	}
-	if e := kv["blobendpoint"]; e != "" {
-		return e
-	}
-	if kv["accountname"] == "" {
-		return ""
-	}
-	return cmpOrString(kv["defaultendpointsprotocol"], "https") + "://" + kv["accountname"] + ".blob." + cmpOrString(kv["endpointsuffix"], "core.windows.net")
-}
-
-func cmpOrString(a, b string) string {
-	if a != "" {
-		return a
-	}
-	return b
-}
-
 // storeChecks are both roles' checks of the store: its network path, that it
 // takes the credentials, that the bucket or container exists, and that the
 // identity lists the URL.
 func (s *store) storeChecks() []check.Check {
 	var checks []check.Check
-	field := "url"
-	if s.cfg.Endpoint != "" {
-		field = "endpoint"
+	if s.st == nil {
+		return []check.Check{{
+			Name: "store.list", Kind: check.Permission, Title: "List the files under {url}", Field: "url", Params: check.Params{"url": s.url},
+			Run: func(ctx context.Context, _ *check.Probe) error {
+				return s.denied(s.list(ctx), "list", s.prefix)
+			},
+		}}
 	}
-	if addr, tls, named := s.address(); addr != "" {
+	endpoint, setting := s.st.Endpoint()
+	if addr, tls := hostPort(endpoint); addr != "" {
 		if tls {
 			checks = netcheck.ReachTLS(addr, nil)
 		} else {
 			checks = netcheck.Reach(addr)
 		}
 		for i := range checks {
-			checks[i].Field = field
+			checks[i].Field = cmp.Or(setting, "url")
 			// A runner may reach the cloud's own address only through a
 			// proxy, which the SDKs take and a dial doesn't.
-			checks[i].Advisory = !named
+			checks[i].Advisory = setting == ""
 		}
 	}
-	params := check.Params{"url": s.cfg.URL}
+	params := check.Params{"url": s.url}
 	// One listing serves the checks that follow it.
 	var listed error
-	list := func(ctx context.Context) error {
-		b, err := s.open(ctx)
-		if err != nil {
-			return err
-		}
-		defer func() { _ = b.Close() }()
-		_, _, err = b.ListPage(ctx, blob.FirstPageToken, 1, nil)
-		return err
-	}
-	if s.u.Scheme == "file" {
-		return append(checks, check.Check{
-			Name: "store.list", Kind: check.Permission, Title: "List the files under {url}", Field: "url", Params: params,
-			Run: func(ctx context.Context, _ *check.Probe) error {
-				return s.denied(list(ctx), "list", s.prefix)
-			},
-		})
-	}
 	var needs []string
 	if len(checks) > 0 {
 		needs = []string{checks[len(checks)-1].Name}
 	}
-	what := "bucket"
-	if s.u.Scheme == "azblob" {
-		what = "container"
-	}
-	bucket := check.Params{"url": s.cfg.URL, "bucket": s.bucket, "what": what}
+	what := s.st.Container()
+	bucket := check.Params{"url": s.url, "bucket": s.bucket, "what": what}
 	return append(checks,
 		check.Check{
-			Name: "store.auth", Kind: check.Authentication, Title: "Sign in to the store of {url}", Field: s.credentialField(), Params: params, Needs: needs,
+			Name: "store.auth", Kind: check.Authentication, Title: "Sign in to the store of {url}", Field: s.st.Credential(), Params: params, Needs: needs,
 			Run: func(ctx context.Context, _ *check.Probe) error {
-				listed = list(ctx)
-				err := classify(listed)
+				listed = s.list(ctx)
+				err := s.classify(listed)
 				switch f := check.Classify(err); {
 				case err == nil, f.Code == protocolv1.ErrorCode_ERROR_CODE_PERMISSION_DENIED, gcerrors.Code(listed) == gcerrors.NotFound:
 					// The store knows the identity, whatever it may do.
@@ -279,7 +206,7 @@ func (s *Source) Preflight(req source.PreflightRequest) []check.Check {
 				Run: func(ctx context.Context, p *check.Probe) error {
 					b, err := s.store.open(ctx)
 					if err != nil {
-						return classify(err)
+						return s.store.classify(err)
 					}
 					defer func() { _ = b.Close() }()
 					it := b.List(&blob.ListOptions{Prefix: spec.prefix})
@@ -289,7 +216,7 @@ func (s *Source) Preflight(req source.PreflightRequest) []check.Check {
 							return check.Warn(noFiles.Fail())
 						}
 						if err != nil {
-							return s.store.denied(fmt.Errorf("s3: list %s: %w", spec.prefix, err), "list", s.cfg.URL)
+							return s.store.denied(fmt.Errorf("objstore: list %s: %w", spec.prefix, err), "list", s.cfg.URL)
 						}
 						if obj.IsDir || !spec.glob.MatchString(obj.Key) {
 							continue
@@ -297,7 +224,7 @@ func (s *Source) Preflight(req source.PreflightRequest) []check.Check {
 						p.Param("file", s.store.location(obj.Key))
 						r, err := b.NewRangeReader(ctx, obj.Key, 0, 1, nil)
 						if err != nil {
-							return s.store.denied(fmt.Errorf("s3: read %s: %w", obj.Key, err), "read", s.store.location(obj.Key))
+							return s.store.denied(fmt.Errorf("objstore: read %s: %w", obj.Key, err), "read", s.store.location(obj.Key))
 						}
 						_ = r.Close()
 						found = &object{Key: obj.Key, Modified: obj.ModTime, Size: obj.Size}
@@ -316,7 +243,7 @@ func (s *Source) Preflight(req source.PreflightRequest) []check.Check {
 					p.Param("file", s.store.location(found.Key))
 					b, err := s.store.open(ctx)
 					if err != nil {
-						return classify(err)
+						return s.store.classify(err)
 					}
 					defer func() { _ = b.Close() }()
 					seen := func(string) *inferred { return &inferred{} }
@@ -331,7 +258,7 @@ func (s *Source) Preflight(req source.PreflightRequest) []check.Check {
 						err = spec.sampleJSONL(ctx, b, *found, seen)
 					}
 					if err != nil {
-						if c := check.Classify(classify(err)); c.Reason != check.Unknown.Name {
+						if c := check.Classify(s.store.classify(err)); c.Reason != check.Unknown.Name {
 							return c
 						}
 						return wrongFormat.Wrap(err)
@@ -356,11 +283,11 @@ func (d *Destination) Checks() []check.Check {
 			Run: func(ctx context.Context, p *check.Probe) error {
 				b, err := d.bucket(ctx)
 				if err != nil {
-					return classify(err)
+					return d.store.classify(err)
 				}
 				defer func() { _ = b.Close() }()
 				if err := b.WriteAll(ctx, key, nil, nil); err != nil {
-					return d.store.denied(fmt.Errorf("s3: write %s: %w", key, err), "write", d.cfg.URL)
+					return d.store.denied(fmt.Errorf("objstore: write %s: %w", key, err), "write", d.cfg.URL)
 				}
 				return nil
 			},
@@ -370,11 +297,11 @@ func (d *Destination) Checks() []check.Check {
 			Run: func(ctx context.Context, p *check.Probe) error {
 				b, err := d.bucket(ctx)
 				if err != nil {
-					return classify(err)
+					return d.store.classify(err)
 				}
 				defer func() { _ = b.Close() }()
 				if err := b.Delete(ctx, key); err != nil {
-					return d.store.denied(fmt.Errorf("s3: delete %s: %w", key, err), "delete", d.cfg.URL)
+					return d.store.denied(fmt.Errorf("objstore: delete %s: %w", key, err), "delete", d.cfg.URL)
 				}
 				return nil
 			},
@@ -427,7 +354,7 @@ func (d *Destination) Preflight(req destination.PreflightRequest) []check.Check 
 					}
 					b, err := d.bucket(ctx)
 					if err != nil {
-						return classify(err)
+						return d.store.classify(err)
 					}
 					defer func() { _ = b.Close() }()
 					key := schemaKey(table)
@@ -436,11 +363,11 @@ func (d *Destination) Preflight(req destination.PreflightRequest) []check.Check 
 					case gcerrors.Code(err) == gcerrors.NotFound:
 						return nil
 					case err != nil:
-						return d.store.denied(fmt.Errorf("s3: read %s: %w", key, err), "read", d.store.location(key))
+						return d.store.denied(fmt.Errorf("objstore: read %s: %w", key, err), "read", d.store.location(key))
 					}
 					var rec schemaRecord
 					if err := json.Unmarshal(data, &rec); err != nil {
-						return fmt.Errorf("s3: %s: %w", key, err)
+						return fmt.Errorf("objstore: %s: %w", key, err)
 					}
 					have := map[string]string{}
 					for _, c := range rec.Columns {
@@ -466,7 +393,7 @@ func (d *Destination) Preflight(req destination.PreflightRequest) []check.Check 
 		Run: func(ctx context.Context, p *check.Probe) error {
 			b, err := d.bucket(ctx)
 			if err != nil {
-				return classify(err)
+				return d.store.classify(err)
 			}
 			defer func() { _ = b.Close() }()
 			key := reserved + "/check-" + uuid.NewString()
@@ -483,7 +410,7 @@ func (d *Destination) Preflight(req destination.PreflightRequest) []check.Check 
 				if err != nil {
 					return nil, err
 				}
-				return versionOf(a), nil
+				return d.store.version(a), nil
 			}
 			for i := range 2 {
 				err := d.store.swap(ctx, b, key, []byte{byte(i)}, nil, nil, now)
@@ -493,7 +420,7 @@ func (d *Destination) Preflight(req destination.PreflightRequest) []check.Check 
 				case i == 1 && err == nil:
 					return unconditional.Fail()
 				case err != nil:
-					return d.store.denied(fmt.Errorf("s3: write %s: %w", key, err), "write", d.cfg.URL)
+					return d.store.denied(fmt.Errorf("objstore: write %s: %w", key, err), "write", d.cfg.URL)
 				}
 			}
 			return nil

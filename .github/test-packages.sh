@@ -729,9 +729,10 @@ SH
     --unreachable "$work/kinesis-dest-closed.json"
 }
 
-# S3, Google Cloud Storage and Azure Blob Storage: a source of CSV and JSON
-# Lines files, and the destination, on each store.
-checks_s3() {
+# files_checks STORE PACKAGE: the files source of CSV and JSON Lines files,
+# and the destination, of PACKAGE on STORE: s3, gcs or azure.
+files_checks() {
+  local store=$1 pkg=$2
   local gcs=${OPENETL_TEST_GCS_ENDPOINT:-http://127.0.0.1:4443}
   local azure=${OPENETL_TEST_AZURE_ENDPOINT:-http://127.0.0.1:10000/devstoreaccount1}
   # Azurite's well-known account key.
@@ -764,7 +765,7 @@ esac
 SH
   chmod +x "$work/put"
   # add writes a file of 5 records to $OPENETL_STREAM's directory in $STORE.
-  script s3-add <<'SH'
+  script files-add <<'SH'
 f=$WORK/add-$(date +%s)-$$
 case $OPENETL_STREAM in
 people) { echo id,name,born; for i in 1 2 3 4 5; do echo "$i,p$i,2026-01-0$i"; done; } | gzip >"$f"; key=people/$(basename "$f").csv.gz ;;
@@ -776,48 +777,50 @@ SH
     printf 'id,name,born\n%d,"a, %d",2026-01-0%d\n%d,,2026-01-0%d\n' "$i" "$i" "$i" "$((i + 10))" "$i" | gzip >"$work/people-$i.csv.gz"
     printf '{"id":%d,"level":"warn","attrs":{"n":%d}}\n{"id":%d,"level":null}\n' "$i" "$i" "$((i + 10))" >"$work/logs-$i.jsonl"
   done
-  local store url endpoint creds closed
-  for store in s3 gcs azure; do
-    case $store in
-    s3) url=s3://packages/$run endpoint=$s3 closed=http://127.0.0.1:1
-      creds='"region": "us-east-1", "accessKeyId": "openetl", "secretAccessKey": "openetl"' ;;
-    gcs) url=gs://packages/$run endpoint=$gcs closed=http://127.0.0.1:1 creds="" ;;
-    azure) url=azblob://packages/$run endpoint=$azure closed=http://127.0.0.1:1/devstoreaccount1
-      creds="\"accountName\": \"devstoreaccount1\", \"accountKey\": \"$azure_key\"" ;;
-    esac
-    closed="\"endpoint\": \"$closed\"${creds:+, $creds}"
-    creds="\"endpoint\": \"$endpoint\"${creds:+, $creds}"
-    "$work/put" "$store" || exit 1
-    for i in 1 2 3; do
-      "$work/put" "$store" "$run/people/$i.csv.gz" "$work/people-$i.csv.gz" &&
-        "$work/put" "$store" "$run/logs/$i.jsonl" "$work/logs-$i.jsonl" || exit 1
-    done
-    streams='"streams": [{"name": "people", "glob": "people/*.csv.gz", "format": "csv", "columns": {"born": "date"}}, {"name": "logs", "glob": "logs/**", "format": "jsonl"}]'
-    config "$store-source" "{\"url\": \"$url/\", $creds, $streams}"
-    config "$store-source-closed" "{\"url\": \"$url/\", $closed, $streams}"
-    config "$store-dest" "{\"url\": \"$url/dest\", $creds}"
-    config "$store-dest-closed" "{\"url\": \"$url/dest\", $closed}"
-    # Only Azurite checks credentials.
-    local source_bad=() dest_bad=()
-    if [ "$store" = azure ]; then
-      local wrong
-      wrong=$(printf 'A%.0s' $(seq 86))==
-      config azure-source-bad "{\"url\": \"$url/\", ${creds/$azure_key/$wrong}, $streams}"
-      config azure-dest-bad "{\"url\": \"$url/dest\", ${creds/$azure_key/$wrong}}"
-      source_bad=(--bad-credentials "$work/azure-source-bad.json")
-      dest_bad=(--bad-credentials "$work/azure-dest-bad.json")
-    fi
-    export STORE=$store
-    check "source-s3 ($store)" s3 --role source \
-      --config "$work/$store-source.json" \
-      --unreachable "$work/$store-source-closed.json" ${source_bad[@]+"${source_bad[@]}"} \
-      --stream people:incremental --stream logs:incremental --add-records-command "$work/s3-add" \
-      --stops-at-until
-    check "destination-s3 ($store)" s3 --role destination \
-      --config "$work/$store-dest.json" \
-      --unreachable "$work/$store-dest-closed.json" ${dest_bad[@]+"${dest_bad[@]}"}
+  local url endpoint creds closed
+  case $store in
+  s3) url=s3://packages/$run endpoint=$s3 closed=http://127.0.0.1:1
+    creds='"region": "us-east-1", "accessKeyId": "openetl", "secretAccessKey": "openetl"' ;;
+  gcs) url=gs://packages/$run endpoint=$gcs closed=http://127.0.0.1:1 creds="" ;;
+  azure) url=azblob://packages/$run endpoint=$azure closed=http://127.0.0.1:1/devstoreaccount1
+    creds="\"accountName\": \"devstoreaccount1\", \"accountKey\": \"$azure_key\"" ;;
+  esac
+  closed="\"endpoint\": \"$closed\"${creds:+, $creds}"
+  creds="\"endpoint\": \"$endpoint\"${creds:+, $creds}"
+  "$work/put" "$store" || exit 1
+  for i in 1 2 3; do
+    "$work/put" "$store" "$run/people/$i.csv.gz" "$work/people-$i.csv.gz" &&
+      "$work/put" "$store" "$run/logs/$i.jsonl" "$work/logs-$i.jsonl" || exit 1
   done
+  streams='"streams": [{"name": "people", "glob": "people/*.csv.gz", "format": "csv", "columns": {"born": "date"}}, {"name": "logs", "glob": "logs/**", "format": "jsonl"}]'
+  config "$store-source" "{\"url\": \"$url/\", $creds, $streams}"
+  config "$store-source-closed" "{\"url\": \"$url/\", $closed, $streams}"
+  config "$store-dest" "{\"url\": \"$url/dest\", $creds}"
+  config "$store-dest-closed" "{\"url\": \"$url/dest\", $closed}"
+  # Only Azurite checks credentials.
+  local source_bad=() dest_bad=()
+  if [[ $store == azure ]]; then
+    local wrong
+    wrong=$(printf 'A%.0s' $(seq 86))==
+    config azure-source-bad "{\"url\": \"$url/\", ${creds/$azure_key/$wrong}, $streams}"
+    config azure-dest-bad "{\"url\": \"$url/dest\", ${creds/$azure_key/$wrong}}"
+    source_bad=(--bad-credentials "$work/azure-source-bad.json")
+    dest_bad=(--bad-credentials "$work/azure-dest-bad.json")
+  fi
+  export STORE=$store
+  check "source-$pkg" "$pkg" --role source \
+    --config "$work/$store-source.json" \
+    --unreachable "$work/$store-source-closed.json" ${source_bad[@]+"${source_bad[@]}"} \
+    --stream people:incremental --stream logs:incremental --add-records-command "$work/files-add" \
+    --stops-at-until
+  check "destination-$pkg" "$pkg" --role destination \
+    --config "$work/$store-dest.json" \
+    --unreachable "$work/$store-dest-closed.json" ${dest_bad[@]+"${dest_bad[@]}"}
 }
+
+checks_s3() { files_checks s3 s3; }
+checks_gcs() { files_checks gcs gcs; }
+checks_azureblob() { files_checks azure azureblob; }
 
 # Iceberg: tables through the REST catalog, in the S3 store's iceberg bucket.
 checks_iceberg() {
