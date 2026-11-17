@@ -1,0 +1,72 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Amazon DynamoDB destination",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "region": {
+      "type": "string",
+      "title": "Region",
+      "description": "The tables' AWS region, such as us-east-1. Default: AWS_REGION where the connector runs, or the AWS default config's.",
+      "examples": [
+        "us-east-1"
+      ],
+      "x-group": "connection"
+    },
+    "endpoint": {
+      "type": "string",
+      "title": "Endpoint",
+      "description": "A DynamoDB-compatible endpoint instead of the region's: a VPC endpoint, or DynamoDB Local's, such as http://127.0.0.1:8000.",
+      "x-format": "uri",
+      "x-advanced": true,
+      "x-group": "connection"
+    },
+    "accessKeyId": {
+      "type": "string",
+      "x-secret": true,
+      "title": "Access key ID",
+      "description": "An AWS access key. Without one, the AWS default credentials: an IAM role the source names, or what the runner passes on.",
+      "x-group": "credentials"
+    },
+    "secretAccessKey": {
+      "type": "string",
+      "x-secret": true,
+      "title": "Secret access key",
+      "description": "The access key's secret. Needed with accessKeyId.",
+      "x-group": "credentials"
+    },
+    "sessionToken": {
+      "type": "string",
+      "x-secret": true,
+      "title": "Session token",
+      "description": "For temporary credentials from AWS STS: their session token, with their access key and secret.",
+      "x-advanced": true,
+      "x-group": "credentials"
+    },
+    "tablePrefix": {
+      "type": "string",
+      "default": "",
+      "pattern": "^[a-zA-Z0-9_.-]*$",
+      "title": "Table prefix",
+      "description": "Starts each table's name where the pipeline names no namespace, such as analytics_. With a namespace, a table is NAMESPACE.TABLE instead. The control table that stages rows and keeps each pipeline's fence is the prefix, or NAMESPACE., and _openetl_state.",
+      "x-group": "tables"
+    }
+  },
+  "x-groups": [
+    {
+      "id": "connection",
+      "title": "Connection",
+      "description": "Where DynamoDB is."
+    },
+    {
+      "id": "credentials",
+      "title": "Credentials",
+      "description": "An access key, or else the AWS default credentials."
+    },
+    {
+      "id": "tables",
+      "title": "Tables",
+      "description": "Where streams' tables are."
+    }
+  ]
+}

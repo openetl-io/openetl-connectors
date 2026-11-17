@@ -1,0 +1,14 @@
+name: azureblob
+title: Azure Blob Storage
+description: Parquet, Avro, CSV and JSON Lines files in Azure Blob Storage, read, and Parquet, CSV and JSON Lines written
+license: Apache-2.0
+repository: https://github.com/openetl-io/openetl-connectors
+docs: https://github.com/openetl-io/openetl-connectors/blob/main/azureblob/README.md
+logo: https://upload.wikimedia.org/wikipedia/commons/f/fa/Microsoft_Azure.svg
+tags: [files, azure]
+author: OpenETL
+roles:
+  source:
+    build: { go: ../cmd/source-azureblob }
+  destination:
+    build: { go: ../cmd/destination-azureblob }

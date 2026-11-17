@@ -72,7 +72,6 @@ type Source struct {
 var (
 	_ source.Source       = (*Source)(nil)
 	_ source.Acknowledger = (*Source)(nil)
-	_ source.Checker      = (*Source)(nil)
 	_ source.Splitter     = (*Source)(nil)
 )
 
@@ -105,8 +104,6 @@ func NewSource(config []byte) (*Source, error) {
 	s.keys = records.NewDecoder(cfg.Format, reg)
 	return s, nil
 }
-
-func (s *Source) Check(ctx context.Context) error { return check(ctx, &s.cfg.Connection) }
 
 func (s *Source) offered(topic string) bool {
 	if strings.HasPrefix(topic, "__") || topic == "_schemas" || topic == defaultMarkerTopic {

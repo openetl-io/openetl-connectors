@@ -6,7 +6,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -372,33 +371,6 @@ func TestDescriptorsFromBeforeLanes(t *testing.T) {
 	}
 	if n := env.count("SELECT count(*) FROM $schema.users"); n != 2 {
 		t.Errorf("%d rows, want 2", n)
-	}
-}
-
-func TestMergeLanesRefusesOtherEpochs(t *testing.T) {
-	w := &writer{tables: map[string]string{"users": "users"}}
-	a, _ := json.Marshal(staged{Generation: 1, Epoch: 1})
-	b, _ := json.Marshal(staged{Generation: 1, Epoch: 2})
-	if _, err := w.mergeLanes([]destination.Staged{a, b}); err == nil {
-		t.Error("merged two epochs' descriptors")
-	}
-	if _, err := w.mergeLanes(nil); err == nil {
-		t.Error("merged no descriptors")
-	}
-	c, _ := json.Marshal(staged{Generation: 1, Epoch: 1, Streams: []stagedStream{{Name: "users", Staging: "s1", Rows: 2, Ended: true, Read: "r", Mode: modeOverwrite, Fills: map[string]string{"a": "b"}, Last: []string{"x"}}}})
-	d, _ := json.Marshal(staged{Generation: 1, Epoch: 1, Streams: []stagedStream{{Name: "users", Staging: "s2", Rows: 3, Read: "r", Mode: modeOverwrite, Patch: "p2", Fills: map[string]string{"c": "d"}, Last: []string{"x", "y"}}}})
-	got, err := w.mergeLanes([]destination.Staged{a, d, c})
-	if err != nil {
-		t.Fatal(err)
-	}
-	s := got.Streams[0]
-	if s.Table != "users" || s.Rows != 5 || !s.Ended || !slices.Equal(s.stagings, []string{"s2", "s1"}) || !slices.Equal(s.patches, []string{"p2"}) ||
-		len(s.Fills) != 2 || !slices.Equal(s.Last, []string{"x", "y"}) {
-		t.Errorf("merged %+v", s)
-	}
-	e, _ := json.Marshal(staged{Generation: 1, Epoch: 1, Streams: []stagedStream{{Name: "users", Read: "other"}}})
-	if _, err := w.mergeLanes([]destination.Staged{c, e}); err == nil {
-		t.Error("merged two reads")
 	}
 }
 

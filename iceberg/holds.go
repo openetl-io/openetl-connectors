@@ -323,7 +323,15 @@ func (w *writer) appendPatched(ctx context.Context, tx *table.Transaction, tbl *
 		}
 		return nil, tx.AddDataFiles(ctx, files, marker, table.WithoutAutoNameMapping())
 	}
-	dels := keysOf(rows, []int{id})
+	// A partitioned table's deletes go to the partitions of the rows they
+	// delete, which a patch doesn't move.
+	delCols := []int{id}
+	for _, c := range partitionColumns(tbl) {
+		if j := columnIndex(sc, c); j >= 0 && j != id {
+			delCols = append(delCols, j)
+		}
+	}
+	dels := keysOf(rows, delCols)
 	defer dels.Release()
 	// WriteRecords releases rows.
 	written, data, err := writeData(ctx, tbl, sc, rows)

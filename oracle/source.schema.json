@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Oracle source",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["dsn"],
+  "x-groups": [
+    {"id": "cdc", "title": "Change data capture", "description": "Only for tables read with cdc."},
+    {"id": "tuning", "title": "Tuning"}
+  ],
+  "properties": {
+    "dsn": {"type": "string", "x-secret": true, "description": "A URL, oracle://USER:PASSWORD@HOST:PORT/SERVICE, naming the pluggable database's service, such as FREEPDB1; the port is 1521 if it's left empty, as HOST:/SERVICE. Options go in its query: TLS with ?SSL=true, verifying the server's certificate unless SSL VERIFY=false, and a wallet with WALLET=/path/to/wallet; CONNECTION TIMEOUT=SECONDS bounds a connection's setup.", "title": "Connection URL", "examples": ["oracle://USER:PASSWORD@HOST:1521/SERVICE", "oracle://USER:PASSWORD@HOST:2484/SERVICE?SSL=true"]},
+    "schema": {"type": "string", "description": "The schema whose tables are offered as streams, as Oracle stores its name, usually in upper case. Default: the user's current schema, its own unless a logon trigger sets another.", "title": "Schema"},
+    "tables": {"type": "array", "items": {"type": "string"}, "description": "The tables to offer as streams, as Oracle stores their names, usually in upper case. Empty: every table in the schema.", "title": "Tables"},
+    "snapshotChunkRows": {"type": "integer", "minimum": 1, "default": 10000, "description": "Rows per chunk of a cdc table's snapshot, read as of an SCN and held in memory until the redo log catches up with it.", "title": "Snapshot chunk rows", "x-group": "cdc", "x-advanced": true},
+    "chunkRows": {"type": "integer", "minimum": 1, "default": 100000, "description": "Rows per query on a table with a primary key whose columns are of types the source orders by; each chunk ends at a resume point.", "title": "Chunk rows", "x-group": "tuning", "x-advanced": true},
+    "batchBytes": {"type": "integer", "minimum": 1, "default": 4194304, "description": "Approximate bytes of values per Arrow batch.", "title": "Batch bytes", "x-group": "tuning", "x-advanced": true},
+    "maxConnections": {"type": "integer", "minimum": 1, "default": 4, "description": "The most connections a read holds, as many as it has lanes up to this. A cdc read's LogMiner session holds one of them.", "title": "Max connections", "x-group": "tuning", "x-advanced": true}
+  }
+}

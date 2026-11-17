@@ -5,20 +5,45 @@ description: Read Kafka topics as streams, and write streams into topics in one 
 
 The `kafka` package has a source and a destination. The source reads each topic as a stream, from where the last read stopped. The destination writes each stream into a topic, a record per row, and commits each epoch in one Kafka transaction, so every row lands exactly once.
 
-Both are tested against Apache Kafka 4.3, without TLS or SASL, and the Karapace schema registry. TLS, SASL and a registry's basic authentication are supported, but no test covers them.
+Both are tested against Apache Kafka 4.3 and the Karapace schema registry: without TLS or SASL, and through a SASL_SSL listener with PLAIN, SCRAM-SHA-256, SCRAM-SHA-512 and OAUTHBEARER. The tests also show that the broker refuses a client certificate its CA didn't sign, but no test signs in with a client certificate the broker accepts. A registry's basic authentication and AWS MSK IAM are supported, but no test runs them against a server: MSK IAM's signed request is tested on its own.
 
 ## Connecting
 
 The source and the destination share their connection settings:
 
-- `brokers`: the bootstrap brokers, as `host:port`.
-- TLS: `tls: true`, and `tlsCa`, `tlsCert` and `tlsKey` for your own certificate authority and for mutual TLS. Setting `tlsCa` or `tlsCert` turns TLS on.
-- SASL: `saslMechanism` (`plain`, `scram-sha-256` or `scram-sha-512`), with `saslUsername` and `saslPassword`.
+- `brokers`: the bootstrap brokers, as `host:port`. The client connects to each broker at the address the cluster advertises for it, so the runner must reach those too.
+- TLS: `tls: true`, and `tlsCa` for your own certificate authority, as PEM text. Setting `tlsCa` or `tlsCert` turns TLS on. For mutual TLS, `tlsCert` and `tlsKey` are the client's certificate and its unencrypted key, also PEM text.
+- SASL: `saslMechanism`, and what it needs:
+  - `plain`, `scram-sha-256` or `scram-sha-512`: `saslUsername` and `saslPassword`. PLAIN sends the password as it is, so use it with TLS.
+  - `oauthbearer` (from 0.2.0): `oauthTokenUrl`, `oauthClientId` and `oauthClientSecret`. The connector gets a token from the token endpoint with the OAuth client-credentials grant, asking for `oauthScopes` if set, and gets a new one before it expires. `oauthExtensions` are SASL extensions sent with the token, such as Confluent Cloud's `logicalCluster` and `identityPoolId`.
+  - `aws-msk-iam` (from 0.2.0): Amazon MSK's IAM access control. The connector signs in with `awsAccessKeyId` and `awsSecretAccessKey` if set, or the AWS SDK's default credentials: the environment, a web identity token, a profile or the instance's role. The region is the one in the brokers' host names.
 - `format`: how values and keys are encoded: `json` (the default), `avro` or `protobuf`. Avro and Protobuf use a schema registry's wire format, so they need `schemaRegistryUrl`, and `schemaRegistryUsername` and `schemaRegistryPassword` if it asks for basic authentication.
 
-Keep `tlsKey`, `saslPassword` and `schemaRegistryPassword` in secrets, as `{ secret: NAME }`.
+Keep `tlsKey`, `saslPassword`, `oauthClientSecret`, `awsAccessKeyId`, `awsSecretAccessKey` and `schemaRegistryPassword` in secrets, as `{ secret: NAME }`.
+
+### Checks
+
+From 0.2.0, `openetl connector check`, and the check OpenETL runs before a pipeline's first sync, report each step on its own:
+
+- Reaching each bootstrap broker, and its TLS handshake with the configured certificates. With several brokers, one that can't be reached only warns.
+- Signing in, as the configured user or OAuth client, and the cluster answering.
+- Reaching every broker the cluster advertises, which is where reads and writes go.
+- Reaching the schema registry and signing in to it, with `avro` or `protobuf`.
+- The source: that each topic in `topics` exists and the credentials may read it, or that at least one topic is offered.
+- The destination: that the credentials may read and write the marker topic, which is meant to be compacted, and the brokers' `transaction.max.timeout.ms`, which bounds the commit interval.
+
+A failed step names what is missing: a wrong password, a certificate the client or the broker doesn't trust, or the operation a principal has no ACL for, such as `User:openetl has no READ on the topic orders`. The checks read the topics' authorized operations, so they need no more than the read or write itself does.
+
+Before a run, the preflight checks each stream:
+
+- The source: that its topic exists and may be read, that the topic keeps records longer than the time between a scheduled pipeline's syncs (a warning otherwise), that the schema registry has the topic's value subject with `avro` or `protobuf` (a warning otherwise), and that the credentials may commit offsets to the consumer group.
+- The destination: that the stream is appended to, that the topic exists and may be written, or may be created; and that the pipeline's transactional IDs may be used. The preflight describes the IDs' transactions and never starts a producer with them, which would fence the pipeline's writers.
 
 ## Source
+
+### Set it up
+
+The credentials need DESCRIBE and READ on the topics, and READ on the consumer group `group`, to commit its offsets. With `avro` or `protobuf`, they need to read the topics' subjects in the schema registry.
 
 ### What it reads
 
@@ -99,7 +124,7 @@ Each epoch is one Kafka transaction across all its topics, on one of three trans
 
 Streams whose source replays exactly land exactly once. A stream that may repeat rows, such as a Postgres table read incrementally, gets at least once: the destination has no way to drop the rows sent again.
 
-A transaction must stay open for less than the brokers' `transaction.max.timeout.ms`, 15 minutes by default, so a pipeline's commit interval can be at most 7 minutes. The destination checks the brokers' setting when it opens, if the credentials may describe their configs. A continuous pipeline commits every 10 seconds unless it sets its own `delivery.commit.interval`.
+A transaction must stay open for less than the brokers' `transaction.max.timeout.ms`, 15 minutes by default, so a pipeline's commit interval can be at most 7 minutes. The destination reads the brokers' setting in its check and when it opens, if the credentials may describe their configs. A continuous pipeline commits every 10 seconds unless it sets its own `delivery.commit.interval`.
 
 ### Jobs on several workers
 
@@ -116,7 +141,7 @@ A transaction that a lost worker left open stays open until the brokers abort it
 
 ### Set it up
 
-The credentials need to write to the topics and create them unless `createTopics` is `false`, to read and write the marker topic, and to use transactional IDs that start with `transactionalIdPrefix`. The marker topic is created with `cleanup.policy=compact` if it doesn't exist.
+The credentials need to write to the topics and create them unless `createTopics` is `false`, to read and write the marker topic, and to use transactional IDs that start with `transactionalIdPrefix`: WRITE on those transactional IDs. The marker topic is created with `cleanup.policy=compact` if it doesn't exist.
 
 ### Example
 

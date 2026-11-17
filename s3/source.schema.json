@@ -1,0 +1,191 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Files on Amazon S3 or a local disk: source",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "url",
+    "streams"
+  ],
+  "properties": {
+    "url": {
+      "type": "string",
+      "title": "URL",
+      "description": "Where the files are: s3://bucket/prefix, or file:// and an absolute path. Each stream's glob is relative to it.",
+      "x-group": "location"
+    },
+    "endpoint": {
+      "type": "string",
+      "title": "Endpoint",
+      "description": "An S3-compatible store's endpoint, such as MinIO's, Cloudflare R2's or SeaweedFS's, with path-style addressing. Empty for Amazon S3. Not for file:// URLs.",
+      "x-group": "location",
+      "x-format": "uri",
+      "x-advanced": true
+    },
+    "region": {
+      "type": "string",
+      "title": "Region",
+      "description": "The bucket's AWS region.",
+      "x-group": "s3"
+    },
+    "accessKeyId": {
+      "type": "string",
+      "x-secret": true,
+      "title": "Access key ID",
+      "description": "An AWS access key. Without one, the AWS default credentials.",
+      "x-group": "s3"
+    },
+    "secretAccessKey": {
+      "type": "string",
+      "x-secret": true,
+      "title": "Secret access key",
+      "description": "The access key's secret.",
+      "x-group": "s3"
+    },
+    "streams": {
+      "type": "array",
+      "minItems": 1,
+      "title": "Streams",
+      "description": "The streams, each the files a glob matches, of one format.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "name",
+          "glob",
+          "format"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "The stream's name.",
+            "title": "Name"
+          },
+          "glob": {
+            "type": "string",
+            "description": "The files' keys, relative to the URL: * and ? match within a path segment, ** any number of segments, {a,b} either alternative, and [...] a character. The part before the first of them is the prefix the source lists, so start the glob with a fixed directory where you can.",
+            "title": "Glob"
+          },
+          "format": {
+            "type": "string",
+            "enum": [
+              "parquet",
+              "avro",
+              "csv",
+              "jsonl"
+            ],
+            "description": "The files' format: Parquet, Avro object container files, CSV or JSON Lines. A file ending .gz, .gzip, .zst, .zstd, .sz or .snappy is decompressed with gzip, zstd or framed snappy first; Parquet's and Avro's own compression needs nothing.",
+            "title": "Format"
+          },
+          "csv": {
+            "type": "object",
+            "additionalProperties": false,
+            "description": "CSV: how the files are written.",
+            "properties": {
+              "delimiter": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 1,
+                "default": ",",
+                "description": "The character between fields, such as a tab.",
+                "title": "Delimiter"
+              },
+              "quote": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 1,
+                "default": "\"",
+                "description": "The character fields are quoted with; doubled inside one, it is the character itself.",
+                "title": "Quote"
+              },
+              "header": {
+                "type": "boolean",
+                "default": true,
+                "description": "Whether each file's first line, after skipRows, names its columns.",
+                "title": "Header"
+              },
+              "columnNames": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "The columns of files without a header, in order. Without them, f0, f1 and so on.",
+                "title": "Column names"
+              },
+              "skipRows": {
+                "type": "integer",
+                "minimum": 0,
+                "default": 0,
+                "description": "Lines to skip at the start of each file, before the header.",
+                "title": "Rows to skip"
+              },
+              "encoding": {
+                "type": "string",
+                "default": "utf-8",
+                "description": "The files' character encoding, as a WHATWG label such as windows-1252 or utf-16le.",
+                "title": "Encoding"
+              },
+              "nullValues": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "default": [
+                  ""
+                ],
+                "description": "Unquoted values that are null. A quoted value never is: \"\" is an empty string.",
+                "title": "Null values"
+              }
+            },
+            "title": "CSV"
+          },
+          "columns": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string",
+              "pattern": "^(string|integer|number|boolean|date|time|timestamp|timestamp_tz|json|binary|decimal\\(\\d+, ?\\d+\\))$"
+            },
+            "description": "Columns' types, by name, over the ones discovery finds: string, integer, number, boolean, date, time, timestamp (without a time zone), timestamp_tz, json, binary or decimal(P,S). A column of CSV or JSON Lines that discovery's sample doesn't show must be named here. A Parquet or Avro column named here is sent as text, which OpenETL parses to the type, quarantining a value that doesn't fit.",
+            "title": "Column types"
+          },
+          "primaryKey": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The stream's key. Without one, _file and _line: the file and the record's number in it.",
+            "title": "Primary key"
+          }
+        }
+      },
+      "x-group": "streams"
+    },
+    "lookback": {
+      "type": "string",
+      "default": "1h",
+      "title": "Lookback",
+      "description": "Incremental reads: how long before the newest file read the next read still looks for files it hasn't read, as a duration such as 1h or 30m. S3 dates a multipart upload's object from when the upload started, so a file can appear with a time earlier than files read before it.",
+      "x-group": "streams",
+      "x-format": "duration",
+      "x-advanced": true
+    }
+  },
+  "description": "From 0.2.0.",
+  "x-groups": [
+    {
+      "id": "location",
+      "title": "Location",
+      "description": "Where the files are, and the address of the store's API."
+    },
+    {
+      "id": "s3",
+      "title": "Amazon S3",
+      "description": "The region and keys."
+    },
+    {
+      "id": "streams",
+      "title": "Streams",
+      "description": "The files each stream reads, and how."
+    }
+  ]
+}

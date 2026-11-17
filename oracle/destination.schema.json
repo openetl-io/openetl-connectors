@@ -1,0 +1,10 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Oracle destination",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["dsn"],
+  "properties": {
+    "dsn": {"type": "string", "x-secret": true, "description": "A URL, oracle://USER:PASSWORD@HOST:PORT/SERVICE, naming the pluggable database's service, such as FREEPDB1; the port is 1521 if it's left empty, as HOST:/SERVICE. The user's own schema holds the destination's staging, fence and markers, and is where tables go when the pipeline names no namespace. Options go in its query: TLS with ?SSL=true, verifying the server's certificate unless SSL VERIFY=false, and a wallet with WALLET=/path/to/wallet; CONNECTION TIMEOUT=SECONDS bounds a connection's setup.", "title": "Connection URL", "examples": ["oracle://USER:PASSWORD@HOST:1521/SERVICE", "oracle://USER:PASSWORD@HOST:2484/SERVICE?SSL=true"]}
+  }
+}
