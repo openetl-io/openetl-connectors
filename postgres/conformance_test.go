@@ -60,6 +60,7 @@ func TestSourceConformance(t *testing.T) {
 		Config:         cfg(dsn()),
 		BadCredentials: cfg(badPassword(t)),
 		Unreachable:    cfg(closedPort),
+		StopsAtUntil:   true,
 		AddRecords: func(ctx context.Context, stream string) (int, error) {
 			switch stream {
 			case "events":
