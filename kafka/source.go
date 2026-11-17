@@ -18,6 +18,7 @@ import (
 	"github.com/twmb/franz-go/pkg/kadm"
 	"github.com/twmb/franz-go/pkg/kerr"
 	"github.com/twmb/franz-go/pkg/kgo"
+	"github.com/twmb/franz-go/pkg/kmsg"
 	"github.com/twmb/franz-go/pkg/sr"
 
 	"github.com/openetl-io/openetl-connectors/records"
@@ -47,14 +48,22 @@ const (
 )
 
 const (
-	// A bounded read counts a partition with nothing left before its end
-	// as caught up after this long without records.
-	idleAfter     = 10 * time.Second
 	progressEvery = 10 * time.Second
 	// How often a continuous read looks for new partitions.
 	partitionsEvery = 30 * time.Second
 	// The most records one poll takes, per lane.
 	pollRecords = 5000
+)
+
+// Variables, for tests.
+var (
+	// A bounded read counts a partition with nothing left before its end
+	// as caught up after this long without records.
+	idleAfter = 10 * time.Second
+	// A partition that stops at an offset, and has had no records for this
+	// long without the brokers showing that nothing is left below it, fails
+	// the read.
+	stallAfter = 2 * time.Minute
 )
 
 type Source struct {
@@ -411,7 +420,9 @@ func (s *Source) Read(ctx context.Context, req source.ReadRequest, out source.Em
 	for {
 		if bounded {
 			for _, t := range topics {
-				if err := reads[t].finish(consumer); err != nil {
+				if err := reads[t].finish(consumer, func(p int32, from, u int64) (bool, error) {
+					return reached(ctx, adm, cl, t, p, from, u)
+				}); err != nil {
 					return err
 				}
 			}
@@ -547,8 +558,10 @@ func (s *Source) emit(ctx context.Context, em source.SplitEmitter, records []*kg
 }
 
 // finish stops reading the partitions of a bounded read that have caught up,
-// completing their splits, and the topic once all of them have.
-func (r *topicRead) finish(consumer *kgo.Client) error {
+// completing their splits, and the topic once all of them have. A partition
+// that stops at an offset completes there once it has read up to it, or
+// once reached shows that nothing it could return is left below it.
+func (r *topicRead) finish(consumer *kgo.Client, reached func(p int32, from, u int64) (bool, error)) error {
 	if r.complete {
 		return nil
 	}
@@ -557,15 +570,26 @@ func (r *topicRead) finish(consumer *kgo.Client) error {
 		if r.done[p] || (r.next[p] < r.end[p] && time.Since(r.moved[p]) <= idleAfter) {
 			continue
 		}
-		r.done[p] = true
-		pause = append(pause, p)
 		u, until := r.until[p]
-		if until {
-			// The read stops at u, which an earlier read reached; offsets
-			// below it that it hasn't now are gone: an aborted transaction,
-			// its marker, or records that compaction removed since.
+		if until && r.next[p] < u {
+			// Short of the stop, which an earlier read reached: what's
+			// below it is gone, as an aborted transaction and its marker
+			// once compaction has removed them, or not fetched yet.
+			ok, err := reached(p, r.next[p], u)
+			if !ok {
+				if idle := time.Since(r.moved[p]); idle > stallAfter {
+					why := "it has records there it hasn't returned"
+					if err != nil {
+						why = err.Error()
+					}
+					return sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_TRANSIENT, fmt.Errorf("kafka: %s partition %d: the read stops at offset %d and is at %d, and for %v the brokers haven't shown that nothing is left between: %s", r.name, p, u, r.next[p], idle.Round(time.Second), why))
+				}
+				continue
+			}
 			r.next[p] = u
 		}
+		r.done[p] = true
+		pause = append(pause, p)
 		if r.splits != nil {
 			if err := completeAt(r.splits[p], encodeOffset(r.next[p]), until); err != nil {
 				return err
@@ -583,6 +607,83 @@ func (r *topicRead) finish(consumer *kgo.Client) error {
 		return completeAt(r.whole, encodeState(r.next), r.until != nil)
 	}
 	return nil
+}
+
+// reached says whether a partition holds no record a read-committed fetch
+// returns, control records among them, from offset from up to u: one fetch
+// of its own from the partition's leader passes u, or returns nothing below
+// it while the partition is stable past it. It's false if the fetch returns
+// a record below u, and fails if the brokers don't answer.
+func reached(ctx context.Context, adm *kadm.Client, cl *kgo.Client, topic string, p int32, from, u int64) (bool, error) {
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	for {
+		tds, err := adm.ListTopics(ctx, topic)
+		if err != nil {
+			return false, err
+		}
+		td := tds[topic]
+		pd, ok := td.Partitions[p]
+		switch {
+		case td.Err != nil:
+			return false, td.Err
+		case !ok:
+			return false, fmt.Errorf("no partition %d", p)
+		case pd.Err != nil:
+			return false, pd.Err
+		}
+		req := kmsg.NewPtrFetchRequest()
+		req.ReplicaID, req.MaxWaitMillis, req.MinBytes, req.MaxBytes = -1, 0, 1, 1<<20
+		req.IsolationLevel, req.SessionEpoch = 1, -1
+		rt := kmsg.NewFetchRequestTopic()
+		rt.Topic, rt.TopicID = topic, td.ID
+		rp := kmsg.NewFetchRequestTopicPartition()
+		rp.Partition, rp.FetchOffset, rp.PartitionMaxBytes = p, from, 1<<20
+		rp.CurrentLeaderEpoch, rp.LogStartOffset = -1, -1
+		rt.Partitions = append(rt.Partitions, rp)
+		req.Topics = append(req.Topics, rt)
+		resp, err := cl.Broker(int(pd.Leader)).Request(ctx, req)
+		if err != nil {
+			return false, err
+		}
+		fr := resp.(*kmsg.FetchResponse)
+		if err := kerr.ErrorForCode(fr.ErrorCode); err != nil {
+			return false, err
+		}
+		var got *kmsg.FetchResponseTopicPartition
+		for i := range fr.Topics {
+			if ft := &fr.Topics[i]; ft.Topic == topic || ft.TopicID == td.ID {
+				for j := range ft.Partitions {
+					if ft.Partitions[j].Partition == p {
+						got = &ft.Partitions[j]
+					}
+				}
+			}
+		}
+		if got == nil {
+			return false, fmt.Errorf("the fetch of partition %d had no answer for it", p)
+		}
+		fp, next := kgo.ProcessFetchPartition(kgo.ProcessFetchPartitionOpts{
+			KeepControlRecords: true, Offset: from, IsolationLevel: kgo.ReadCommitted(), Topic: topic, Partition: p,
+		}, got, kgo.DefaultDecompressor(), nil)
+		if fp.Err != nil {
+			return false, fp.Err
+		}
+		if len(fp.Records) > 0 {
+			return fp.Records[0].Offset >= u, nil
+		}
+		switch {
+		case next >= u:
+			return true, nil
+		case next == from:
+			// Nothing at or after from up to where the partition is stable.
+			if fp.LastStableOffset >= u {
+				return true, nil
+			}
+			return false, fmt.Errorf("partition %d is stable only up to %d", p, fp.LastStableOffset)
+		}
+		from = next
+	}
 }
 
 // completeAt completes a split, or the whole stream, at state, after a

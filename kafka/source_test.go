@@ -3,15 +3,19 @@ package kafka
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"maps"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/twmb/franz-go/pkg/kgo"
+	"github.com/twmb/franz-go/pkg/kmsg"
 
+	protocolv1 "github.com/openetl-io/openetl/sdk/go/protocol/v1"
 	"github.com/openetl-io/openetl/sdk/go/source"
 )
 
@@ -171,8 +175,9 @@ func TestASourceCompletesWhereItIsAsked(t *testing.T) {
 
 // Where the offsets just below a stop no longer return records, as once log
 // cleanup has removed an aborted transaction and its marker, a read stops
-// there all the same, at the first record past it, and completes at the
-// stop rather than at the last record it read.
+// there all the same, and completes at the stop rather than at the last
+// record it read: at the first record past it that it fetches, or, if it
+// fetches none, once a fetch of its own shows nothing left below the stop.
 func TestASourceStopsWhereCleanupRemovedTheLastRecords(t *testing.T) {
 	c := fakeCluster(t)
 	addrs := c.ListenAddrs()
@@ -258,6 +263,22 @@ func TestASourceStopsWhereCleanupRemovedTheLastRecords(t *testing.T) {
 	if r := rowsIn(got[source.WholeStream]); !slices.Equal(r, want) || !lastIs(got[source.WholeStream], "complete "+string(whole)) {
 		t.Errorf("the whole stream read %v, and ended with %v", r, got[source.WholeStream])
 	}
+
+	// The read's own fetches return nothing, so only a fetch of the
+	// source's own, which the consumer's long polls aren't, can show that
+	// nothing is left between the last record and the stop.
+	shortWaits(t, 100*time.Millisecond, 10*time.Second)
+	c.ControlKey(int16(kmsg.Fetch), func(req kmsg.Request) (kmsg.Response, error, bool) {
+		c.KeepControl()
+		if req.(*kmsg.FetchRequest).MaxWaitMillis == 0 {
+			return nil, nil, false
+		}
+		return nil, errors.New("held"), true
+	})
+	got = readEvents(t, s, source.ConfiguredStream{Name: topic, Splits: []source.Split{{ID: "p0", State: encodeOffset(5), CompleteAt: []byte(end)}}})
+	if r := rowsIn(got["p0"]); len(r) > 0 || !lastIs(got["p0"], "complete "+end) {
+		t.Errorf("with the read's fetches held, a read from 5 to %s read %v, and ended with %v", end, r, got["p0"])
+	}
 }
 
 // offsets are the offsets a read-committed fetch of partition 0 returns up
@@ -279,4 +300,62 @@ func offsets(t *testing.T, addrs []string, topic string, last int64) []int64 {
 		}
 	}
 	return out
+}
+
+// shortWaits makes a bounded read count a partition idle, and a stopped one
+// stalled, sooner.
+func shortWaits(t *testing.T, idle, stall time.Duration) {
+	idleAfter, stallAfter = idle, stall
+	t.Cleanup(func() { idleAfter, stallAfter = 10*time.Second, 2*time.Minute })
+}
+
+// A partition short of where its read stops, whose broker doesn't answer its
+// fetches, doesn't complete at the stop, which would skip the records below
+// it: the read fails, to be tried again. One whose broker answers again
+// reads them, and completes at the stop.
+func TestAStopIsReachedOnlyWhenTheBrokerShowsIt(t *testing.T) {
+	shortWaits(t, 100*time.Millisecond, time.Second)
+	c := fakeCluster(t)
+	addrs := c.ListenAddrs()
+	topic := "held"
+	produceRecords(t, addrs, topic, 1, 30, 10)
+	var held atomic.Bool
+	held.Store(true)
+	fetches := atomic.Int64{}
+	c.ControlKey(int16(kmsg.Fetch), func(kmsg.Request) (kmsg.Response, error, bool) {
+		c.KeepControl()
+		if !held.Load() {
+			return nil, nil, false
+		}
+		fetches.Add(1)
+		return nil, errors.New("held"), true
+	})
+	s, err := NewSource(fakeConfig(t, addrs, map[string]any{"topics": []string{topic}}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, sp := range []source.Split{
+		{ID: "p0", State: encodeOffset(0), Until: encodeOffset(30)},
+		{ID: "p0", State: encodeOffset(0), CompleteAt: encodeOffset(30)},
+	} {
+		out := &splitEvents{events: map[string][]string{}}
+		err := s.Read(t.Context(), source.ReadRequest{Streams: []source.ConfiguredStream{{Name: topic, Splits: []source.Split{sp}}}, Pipeline: "p", Lanes: 1}, out)
+		var coded interface{ ErrorCode() protocolv1.ErrorCode }
+		if !errors.As(err, &coded) || coded.ErrorCode() != protocolv1.ErrorCode_ERROR_CODE_TRANSIENT {
+			t.Errorf("with the broker not answering, the read ended with %v and %v", err, out.events["p0"])
+		}
+		if slices.ContainsFunc(out.events["p0"], func(e string) bool { return strings.HasPrefix(e, "complete") }) {
+			t.Errorf("with the broker not answering, the split completed: %v", out.events["p0"])
+		}
+	}
+	if fetches.Load() == 0 {
+		t.Fatal("no fetch was held")
+	}
+
+	shortWaits(t, 100*time.Millisecond, 10*time.Second)
+	time.AfterFunc(time.Second, func() { held.Store(false) })
+	got := readEvents(t, s, source.ConfiguredStream{Name: topic, Splits: []source.Split{{ID: "p0", State: encodeOffset(0), CompleteAt: encodeOffset(30)}}})
+	if r := rowsIn(got["p0"]); !slices.Equal(r, rowsIn(at(0, 0, 30))) || !lastIs(got["p0"], "complete "+string(encodeOffset(30))) {
+		t.Errorf("once the broker answered, the split read %v, and ended with %v", r, got["p0"])
+	}
 }

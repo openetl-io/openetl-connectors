@@ -85,6 +85,14 @@ check() {
   fi
   echo "::endgroup::"
 }
+# stops NAME FLAGS... prints FLAGS, the stops a redo asks for that package
+# NAME honours, where it's packaged from this checkout. A release from before
+# it honoured them is checked without.
+stops() {
+  [[ "$(target "$1")" == "$dist"/* ]] || return 0
+  shift
+  echo "$@"
+}
 # config NAME JSON writes the config $work/NAME.json.
 config() { printf '%s' "$2" >"$work/$1.json"; }
 # script NAME writes stdin as an executable script NAME.
@@ -125,7 +133,8 @@ SH
     --config "$work/pg-source.json" \
     --bad-credentials "$work/pg-source-bad.json" \
     --unreachable "$work/pg-source-closed.json" \
-    --stream users:full_refresh --stream orders:cdc --add-records-command "$work/pg-add"
+    --stream users:full_refresh --stream orders:cdc --add-records-command "$work/pg-add" \
+    $(stops postgres --stops-at-completion)
   config pg-dest "{\"dsn\": \"$PG\"}"
   config pg-dest-bad "{\"dsn\": \"$bad_pg\"}"
   config pg-dest-closed "{\"dsn\": \"$closed_pg\"}"
@@ -158,7 +167,7 @@ SH
   check source-kafka kafka --role source \
     --config "$work/kafka-source.json" \
     --unreachable "$work/kafka-source-closed.json" \
-    --add-records-command "$work/kafka-add"
+    --add-records-command "$work/kafka-add" $(stops kafka --stops-at-until --stops-at-completion)
   config kafka-dest "{\"brokers\": [\"$kafka\"]}"
   config kafka-dest-closed '{"brokers": ["127.0.0.1:1"]}'
   check destination-kafka kafka --role destination \
