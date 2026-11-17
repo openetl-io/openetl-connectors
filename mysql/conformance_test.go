@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/openetl-io/openetl-connectors/sqlstage"
 	"github.com/openetl-io/openetl/sdk/go/conformance"
 	"github.com/openetl-io/openetl/sdk/go/source"
 )
@@ -93,7 +94,7 @@ func TestDestinationConformance(t *testing.T) {
 			BadCredentials: cfg(srv.badPassword(t)),
 			Unreachable:    cfg(closedPort),
 			Read: func(ctx context.Context, namespace, stream string) ([]map[string]any, error) {
-				return readTable(ctx, db, s, namespace, tableName(stream))
+				return readTable(ctx, db, s, namespace, sqlstage.TableName(stream))
 			},
 			Drop: func(ctx context.Context, namespace string) error {
 				_, err := db.ExecContext(ctx, "DROP DATABASE IF EXISTS "+quoteIdent(namespace))
@@ -102,10 +103,10 @@ func TestDestinationConformance(t *testing.T) {
 			NotNull: func(ctx context.Context, namespace, stream, column string) error {
 				var typ string
 				if err := db.QueryRowContext(ctx, "SELECT COLUMN_TYPE FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND COLUMN_NAME = ?",
-					namespace, tableName(stream), column).Scan(&typ); err != nil {
+					namespace, sqlstage.TableName(stream), column).Scan(&typ); err != nil {
 					return err
 				}
-				_, err := db.ExecContext(ctx, "ALTER TABLE "+quoteIdent(namespace)+"."+quoteIdent(tableName(stream))+" MODIFY COLUMN "+quoteIdent(column)+" "+typ+" NOT NULL")
+				_, err := db.ExecContext(ctx, "ALTER TABLE "+quoteIdent(namespace)+"."+quoteIdent(sqlstage.TableName(stream))+" MODIFY COLUMN "+quoteIdent(column)+" "+typ+" NOT NULL")
 				return err
 			},
 			LossyTypes: map[string]string{

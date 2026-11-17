@@ -16,6 +16,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 
+	"github.com/openetl-io/openetl-connectors/sqlstage"
 	"github.com/openetl-io/openetl/sdk/go/destination"
 	"github.com/openetl-io/openetl/sdk/go/source"
 )
@@ -112,7 +113,7 @@ func TestTypeChangeRefusalRestatesTheColumn(t *testing.T) {
 		w := e.open(destination.Stream{Name: "nums", Mode: destination.Append})
 		e.commit(w, 1, "nums", batchOf(t, []arrow.Field{{Name: "x", Type: arrow.PrimitiveTypes.Int32, Nullable: true}}, `[{"x": 1}]`))
 		mustExec(t, e.db, "ALTER TABLE "+quoteIdent(e.database)+".nums MODIFY COLUMN x int NOT NULL DEFAULT 7")
-		md := arrow.NewMetadata([]string{tableKey}, []string{"nums"})
+		md := arrow.NewMetadata([]string{sqlstage.TableKey}, []string{"nums"})
 		wider := arrow.NewSchema([]arrow.Field{{Name: "x", Type: arrow.PrimitiveTypes.Int64, Nullable: true}}, &md)
 		applied, err := w.(destination.SchemaApplier).ApplySchema(t.Context(), []destination.StreamSchema{{Name: "nums", Schema: wider}})
 		if err != nil {

@@ -14,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/openetl-io/openetl-connectors/connectortest"
+	"github.com/openetl-io/openetl-connectors/sqlstage"
 	"github.com/openetl-io/openetl/sdk/go/check"
 	"github.com/openetl-io/openetl/sdk/go/destination"
 	"github.com/openetl-io/openetl/sdk/go/source"
@@ -91,7 +92,7 @@ func TestChecksItemByItem(t *testing.T) {
 	e.exec("GRANT CREATE ON SCHEMA $schema TO " + role)
 	e.exec("GRANT INSERT ON $schema.b TO " + role)
 	// wider writes to b, with a column b lacks, which only b's owner can add.
-	md := arrow.NewMetadata([]string{tableKey}, []string{"b"})
+	md := arrow.NewMetadata([]string{sqlstage.TableKey}, []string{"b"})
 	wider := arrow.NewSchema([]arrow.Field{{Name: "id", Type: arrow.PrimitiveTypes.Int32}, {Name: "extra", Type: arrow.BinaryTypes.String}}, &md)
 	dpf := check.Run(t.Context(), d.Preflight(destination.PreflightRequest{Streams: []destination.Stream{
 		{Name: "b", Mode: destination.Append}, {Name: "b", Mode: destination.Merge, PrimaryKey: []string{"id"}}, {Name: "new"}, {Name: "wider"},

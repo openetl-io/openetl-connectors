@@ -121,6 +121,6 @@ Each package directory holds its `openetl-connector.yaml`, its config schemas an
 - `keysplit/`: what the sources share of reading a table in splits of its key: the splits being read, which `Resplit` divides, an incremental read's floor, how a table's key is cut into ranges, and what's left of an integer key's range.
 - `objstore/`: what the files connectors share: their source and destination, and each store's part in `s3store/`, `gcsstore/` and `azurestore/`, so a connector's executable has only its own cloud's SDK. `Conformance`, with the `integration` tag, runs the conformance suite on a connector's store.
 - `sqlstage/`: what the SQL destinations share: their `Write`, `Patch`, `PreCommit`, `Commit` and `Recover` over each one's SQL, their staging tables and names, the descriptor `PreCommit` returns, and a `database/sql` destination's fence and markers, and how it applies a stream's staging.
-- `docstore/`: what the MongoDB and DynamoDB connectors share: a source's batch of text columns.
+- `docstore/`: what the MongoDB and DynamoDB connectors share: a source's batch of text columns, and a destination's markers and how it settles an epoch's staged streams.
 - `connectortest/`: what the connectors' tests share: a recorder of what a read emits, and a check's items' statuses.
 - `cmd/<executable>/`: one `main` per connector, which hands the connector to `sdk.Serve`.

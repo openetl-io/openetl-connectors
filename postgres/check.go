@@ -567,10 +567,10 @@ func (d *Destination) Preflight(req destination.PreflightRequest) []check.Check 
 	checks := []check.Check{k.Connect(), d.schemaCheck(k, schema)}
 	n := checkNames{}
 	for _, st := range req.Streams {
-		table, key := tableName(st.Name), st.PrimaryKey
+		table, key := sqlstage.TableName(st.Name), st.PrimaryKey
 		var fields []string
 		if sch := req.Schemas[st.Name]; sch != nil {
-			table = targetTable(sch, st.Name)
+			table = sqlstage.TargetTable(sch, st.Name)
 			if k, err := sqlstage.KeyColumns(sch, st.PrimaryKey); err == nil {
 				key = k
 			}

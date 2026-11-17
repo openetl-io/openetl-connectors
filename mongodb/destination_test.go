@@ -194,7 +194,7 @@ func TestOverwriteSwapAgain(t *testing.T) {
 		t.Fatal(err)
 	}
 	m := marker{Stream: "s", Generation: 1, N: 1, Swap: readName("p", "s", start), Target: "s"}
-	if err := w.swap(t.Context(), m); err != nil {
+	if err := w.Swap(t.Context(), m); err != nil {
 		t.Fatal(err)
 	}
 	got := docs(t, db.Collection("s"))

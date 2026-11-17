@@ -1,5 +1,6 @@
 // Package docstore is what the MongoDB and DynamoDB connectors share: a
-// source's batch of text columns.
+// source's batch of text columns, and a destination's markers and how it
+// settles an epoch's staged streams.
 package docstore
 
 import (

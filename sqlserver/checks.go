@@ -513,7 +513,7 @@ func (d *Destination) Preflight(req destination.PreflightRequest) []check.Check 
 		if sch == nil {
 			continue
 		}
-		table := targetTable(sch, st.Name)
+		table := sqlstage.TargetTable(sch, st.Name)
 		c := k.Check(n.of("stream", st.Name, "write"), check.Permission, "Write {stream} to {table}", func(ctx context.Context, p *check.Probe, db *sql.DB) error {
 			want, err := columnsOf(sch)
 			if err != nil {

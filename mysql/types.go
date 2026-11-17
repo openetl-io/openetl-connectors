@@ -29,8 +29,6 @@ const (
 	extensionNameKey = "ARROW:extension:name"
 	jsonExtension    = "arrow.json"
 	uuidExtension    = "arrow.uuid"
-	// The engine names each stream's table in its schema's metadata.
-	tableKey = "openetl.table"
 	// InnoDB's limit on an index's key, in bytes, less room for a key's
 	// columns that aren't text or binary.
 	keyBytes = 3000
@@ -326,29 +324,3 @@ func str(a arrow.Array, i int) string {
 }
 
 func stringValue(a arrow.Array, i int) any { return str(a, i) }
-
-// targetTable is the table the engine named, or for batches that didn't
-// pass through the engine, the stream's name normalized.
-func targetTable(schema *arrow.Schema, stream string) string {
-	if t, ok := schema.Metadata().GetValue(tableKey); ok {
-		return t
-	}
-	return tableName(stream)
-}
-
-// tableName lowercases stream and replaces anything but [a-z0-9_] with _.
-func tableName(stream string) string {
-	var b strings.Builder
-	for _, r := range strings.ToLower(stream) {
-		if r == '_' || (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
-			b.WriteRune(r)
-		} else {
-			b.WriteByte('_')
-		}
-	}
-	s := b.String()
-	if s == "" || (s[0] >= '0' && s[0] <= '9') {
-		s = "_" + s
-	}
-	return s
-}

@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/openetl-io/openetl/sdk/go/destination"
 )
 
@@ -51,4 +52,33 @@ type ReadLabel struct {
 	Pipeline string `json:"pipeline"`
 	Stream   string `json:"stream"`
 	Table    string `json:"table"`
+}
+
+// TableKey is a batch's schema's metadata key for the table the engine named.
+const TableKey = "openetl.table"
+
+// TargetTable is the table the engine named, or for batches that didn't
+// pass through the engine, the stream's name normalized.
+func TargetTable(schema *arrow.Schema, stream string) string {
+	if t, ok := schema.Metadata().GetValue(TableKey); ok {
+		return t
+	}
+	return TableName(stream)
+}
+
+// TableName lowercases stream and replaces anything but [a-z0-9_] with _.
+func TableName(stream string) string {
+	var b strings.Builder
+	for _, r := range strings.ToLower(stream) {
+		if r == '_' || (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+			b.WriteRune(r)
+		} else {
+			b.WriteByte('_')
+		}
+	}
+	s := b.String()
+	if s == "" || (s[0] >= '0' && s[0] <= '9') {
+		s = "_" + s
+	}
+	return s
 }

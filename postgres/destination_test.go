@@ -487,7 +487,7 @@ func TestColumnsNeverChangeType(t *testing.T) {
 
 	sa := w.(destination.SchemaApplier)
 	table := func(name string) *arrow.Metadata {
-		md := arrow.NewMetadata([]string{tableKey}, []string{name})
+		md := arrow.NewMetadata([]string{sqlstage.TableKey}, []string{name})
 		return &md
 	}
 	text := arrow.NewSchema([]arrow.Field{{Name: "x", Type: arrow.BinaryTypes.String, Nullable: true}, nameField}, table("nums"))

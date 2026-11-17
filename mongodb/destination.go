@@ -20,6 +20,7 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 
+	"github.com/openetl-io/openetl-connectors/docstore"
 	sdk "github.com/openetl-io/openetl/sdk/go"
 	"github.com/openetl-io/openetl/sdk/go/destination"
 	protocolv1 "github.com/openetl-io/openetl/sdk/go/protocol/v1"
@@ -622,18 +623,7 @@ func (w *writer) mergeLanes(e destination.Epoch, committables []destination.Stag
 	return out, nil
 }
 
-// marker is a stream's entry in its pipeline's fence: the epoch last
-// applied, and while an overwrite read that ended in it takes its target's
-// place, the read's collection.
-type marker struct {
-	Stream     string `bson:"s"`
-	Generation uint64 `bson:"g"`
-	N          uint64 `bson:"n"`
-	Swap       string `bson:"swap,omitempty"`
-	Target     string `bson:"t,omitempty"`
-}
-
-func (m marker) is(e destination.Epoch) bool { return m.Generation == e.Generation && m.N == e.N }
+type marker = docstore.Marker
 
 type fenceDoc struct {
 	Generation uint64   `bson:"generation"`
@@ -642,9 +632,9 @@ type fenceDoc struct {
 
 func (w *writer) fence() *mongo.Collection { return w.db.Collection(fenceCollection) }
 
-// fenceState is the pipeline's fence: ErrFenced if a newer generation than
+// Markers is the pipeline's fence: ErrFenced if a newer generation than
 // the writer's has raised it.
-func (w *writer) fenceState(ctx context.Context) (map[string]marker, error) {
+func (w *writer) Markers(ctx context.Context) (map[string]marker, error) {
 	var f fenceDoc
 	err := w.fence().FindOne(ctx, bson.D{{Key: "_id", Value: w.cfg.Pipeline}}).Decode(&f)
 	if err != nil && !errors.Is(err, mongo.ErrNoDocuments) {
@@ -660,9 +650,9 @@ func (w *writer) fenceState(ctx context.Context) (map[string]marker, error) {
 	return out, nil
 }
 
-// setMarkers replaces the streams' markers, unless a newer generation has
+// SetMarkers replaces the streams' markers, unless a newer generation has
 // raised the fence: one document's update, so it's either all or none.
-func (w *writer) setMarkers(ctx context.Context, ms []marker) error {
+func (w *writer) SetMarkers(ctx context.Context, ms []marker) error {
 	names := make(bson.A, len(ms))
 	for i, m := range ms {
 		names[i] = m.Stream
@@ -692,73 +682,14 @@ func (w *writer) Commit(ctx context.Context, e destination.Epoch, committables [
 	if err != nil {
 		return destination.Committed{}, err
 	}
-	return w.settle(ctx, e, streams)
+	return docstore.Settle(ctx, w, w.cfg.Scope, e, streams)
 }
 
-func (w *writer) settle(ctx context.Context, e destination.Epoch, streams []stagedStream) (destination.Committed, error) {
-	done := destination.Committed{Collapsed: map[string]uint64{}}
-	markers, err := w.fenceState(ctx)
-	if err != nil {
-		return done, err
-	}
-	var todo []stagedStream
-	for _, s := range streams {
-		if m, ok := markers[s.Name]; ok && m.is(e) {
-			if err := w.swap(ctx, m); err != nil {
-				return done, err
-			}
-			continue
-		}
-		todo = append(todo, s)
-	}
-	groups := [][]stagedStream{todo}
-	if w.cfg.Scope == destination.ScopeStream {
-		groups = groups[:0]
-		for _, s := range todo {
-			groups = append(groups, []stagedStream{s})
-		}
-	}
-	for _, g := range groups {
-		if len(g) == 0 {
-			continue
-		}
-		var ms []marker
-		for _, s := range g {
-			n, err := w.apply(ctx, s)
-			if err != nil {
-				return done, err
-			}
-			if n > 0 {
-				done.Collapsed[s.Name] = n
-			}
-			m := marker{Stream: s.Name, Generation: e.Generation, N: e.N}
-			if s.Mode == destination.Overwrite && s.Ended {
-				m.Swap, m.Target = s.Read, s.Target
-			}
-			ms = append(ms, m)
-		}
-		if err := w.setMarkers(ctx, ms); err != nil {
-			return done, err
-		}
-		for i, s := range g {
-			if err := w.swap(ctx, ms[i]); err != nil {
-				return done, err
-			}
-			for _, st := range s.stages {
-				if err := w.db.Collection(st).Drop(ctx); err != nil {
-					return done, classify(fmt.Errorf("mongodb: drop %s: %w", st, err))
-				}
-			}
-		}
-	}
-	return done, nil
-}
-
-// swap puts an ended overwrite read's collection, which apply created, in
+// Swap puts an ended overwrite read's collection, which apply created, in
 // its target's place, with the target's indexes, and then clears the
-// marker's swap. A read's collection that isn't there has taken its place
+// marker's Swap. A read's collection that isn't there has taken its place
 // already.
-func (w *writer) swap(ctx context.Context, m marker) error {
+func (w *writer) Swap(ctx context.Context, m marker) error {
 	if m.Swap == "" {
 		return nil
 	}
@@ -782,7 +713,7 @@ func (w *writer) swap(ctx context.Context, m marker) error {
 		}
 	}
 	m.Swap = ""
-	return w.setMarkers(ctx, []marker{m})
+	return w.SetMarkers(ctx, []marker{m})
 }
 
 // ensureRead creates an overwrite read's collection, with its target's
@@ -835,9 +766,9 @@ func (w *writer) copyIndexes(ctx context.Context, target, read string) error {
 	return classify(w.db.RunCommand(ctx, bson.D{{Key: "createIndexes", Value: read}, {Key: "indexes", Value: keep}}).Err())
 }
 
-// apply writes a stream's staged rows of every lane, and then its patches.
+// Apply writes a stream's staged rows of every lane, and then its patches.
 // collapsed: the rows dedupe skipped.
-func (w *writer) apply(ctx context.Context, s stagedStream) (collapsed uint64, err error) {
+func (w *writer) Apply(ctx context.Context, s stagedStream) (collapsed uint64, err error) {
 	cfg := s.config()
 	coll := w.db.Collection(s.into())
 	if s.Mode == destination.Overwrite {
@@ -1065,47 +996,42 @@ func (w *writer) settleRecorded(ctx context.Context, e destination.Epoch, commit
 	if err != nil {
 		return 0, err
 	}
-	markers, err := w.fenceState(ctx)
-	if err != nil {
-		return 0, err
+	return docstore.SettleRecorded(ctx, "mongodb", w, w.cfg.Scope, e, streams)
+}
+
+func (w *writer) Mark(s stagedStream, e destination.Epoch) marker {
+	m := marker{Stream: s.Name, Generation: e.Generation, N: e.N}
+	if s.Mode == destination.Overwrite && s.Ended {
+		m.Swap, m.Target = s.Read, s.Target
+	}
+	return m
+}
+
+func (w *writer) DropStaging(ctx context.Context, s stagedStream) error {
+	for _, st := range s.stages {
+		if err := w.db.Collection(st).Drop(ctx); err != nil {
+			return classify(fmt.Errorf("mongodb: drop %s: %w", st, err))
+		}
+	}
+	return nil
+}
+
+func (w *writer) Staging(ctx context.Context, s stagedStream) (present, missing int, err error) {
+	if len(s.stages) == 0 {
+		return 0, 0, nil
 	}
 	names, err := w.db.ListCollectionNames(ctx, bson.D{{Key: "name", Value: bson.D{{Key: "$regex", Value: "^" + stagingPrefix(w.cfg.Pipeline)}}}})
 	if err != nil {
-		return 0, classify(fmt.Errorf("mongodb: list collections of %s: %w", w.db.Name(), err))
+		return 0, 0, classify(fmt.Errorf("mongodb: list collections of %s: %w", w.db.Name(), err))
 	}
-	present, missing, swaps := 0, 0, false
-	for _, s := range streams {
-		if m, ok := markers[s.Name]; ok && m.is(e) {
-			swaps = swaps || m.Swap != ""
-			continue
-		}
-		for _, st := range s.stages {
-			if slices.Contains(names, st) {
-				present++
-			} else {
-				missing++
-			}
-		}
-		if len(s.stages) == 0 {
+	for _, st := range s.stages {
+		if slices.Contains(names, st) {
 			present++
+		} else {
+			missing++
 		}
 	}
-	switch {
-	case present == 0 && missing == 0:
-		if _, err := w.settle(ctx, e, streams); err != nil {
-			return 0, err
-		}
-		if swaps {
-			return destination.Redone, nil
-		}
-		return destination.Applied, nil
-	case missing == 0:
-		_, err := w.settle(ctx, e, streams)
-		return destination.Redone, err
-	case present == 0:
-		return destination.Lost, nil
-	}
-	return 0, fmt.Errorf("mongodb: epoch %d.%d's staging is partly gone, %d of %d collections", e.Generation, e.N, missing, present+missing)
+	return present, missing, nil
 }
 
 // dropStale drops what generations before gen staged.

@@ -19,6 +19,7 @@ import (
 	"github.com/go-mysql-org/go-mysql/replication"
 	"github.com/go-sql-driver/mysql"
 
+	"github.com/openetl-io/openetl-connectors/sqlstage"
 	sdk "github.com/openetl-io/openetl/sdk/go"
 	"github.com/openetl-io/openetl/sdk/go/check"
 	"github.com/openetl-io/openetl/sdk/go/check/netcheck"
@@ -722,9 +723,9 @@ func (d *Destination) Preflight(req destination.PreflightRequest) []check.Check 
 	checks := []check.Check{k.Connect(), db}
 	n := checkNames{}
 	for _, st := range req.Streams {
-		table := tableName(st.Name)
+		table := sqlstage.TableName(st.Name)
 		if sch := req.Schemas[st.Name]; sch != nil {
-			table = targetTable(sch, st.Name)
+			table = sqlstage.TargetTable(sch, st.Name)
 		}
 		ident := quoteIdent(database) + "." + quoteIdent(table)
 		c := k.Check(n.name("stream", st.Name, "write"), check.Permission, "Write {stream} to {table}", func(ctx context.Context, p *check.Probe, db *sql.DB) error {

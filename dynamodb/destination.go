@@ -23,6 +23,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 	"golang.org/x/sync/errgroup"
 
+	"github.com/openetl-io/openetl-connectors/docstore"
 	sdk "github.com/openetl-io/openetl/sdk/go"
 	"github.com/openetl-io/openetl/sdk/go/destination"
 	protocolv1 "github.com/openetl-io/openetl/sdk/go/protocol/v1"
@@ -229,7 +230,7 @@ func (w *writer) StartReads(ctx context.Context, starts map[string]time.Time) er
 	for stream, start := range starts {
 		current[hash(stream)] = readName(w.cfg.Pipeline, stream, start) + "#"
 	}
-	markers, err := w.fenceState(ctx)
+	markers, err := w.Markers(ctx)
 	if err != nil {
 		return err
 	}
@@ -672,20 +673,9 @@ func cmpOr(a, b string) string {
 	return b
 }
 
-// marker is a stream's entry in its pipeline's fence: the epoch last
-// applied, and while an overwrite read that ended in it takes its target's
-// place, the read's name.
-type marker struct {
-	Stream     string
-	Generation uint64
-	N          uint64
-	Swap       string
-	Target     string
-}
+type marker = docstore.Marker
 
-func (m marker) is(e destination.Epoch) bool { return m.Generation == e.Generation && m.N == e.N }
-
-func (m marker) attribute() types.AttributeValue {
+func markerAttribute(m marker) types.AttributeValue {
 	return &types.AttributeValueMemberM{Value: map[string]types.AttributeValue{
 		"g": num(strconv.FormatUint(m.Generation, 10)), "n": num(strconv.FormatUint(m.N, 10)), "swap": str(m.Swap), "t": str(m.Target),
 	}}
@@ -709,9 +699,9 @@ func stringOf(av types.AttributeValue) string {
 	return ""
 }
 
-// fenceState is the pipeline's markers: ErrFenced if a newer generation
+// Markers is the pipeline's markers: ErrFenced if a newer generation
 // than the writer's has raised its fence.
-func (w *writer) fenceState(ctx context.Context) (map[string]marker, error) {
+func (w *writer) Markers(ctx context.Context) (map[string]marker, error) {
 	res, err := w.db.GetItem(ctx, &dynamodb.GetItemInput{TableName: aws.String(w.control), Key: fenceKey(w.cfg.Pipeline), ConsistentRead: aws.Bool(true)})
 	if err != nil {
 		return nil, classify(fmt.Errorf("dynamodb: read the fence: %w", err))
@@ -737,12 +727,12 @@ func (w *writer) fenceState(ctx context.Context) (map[string]marker, error) {
 	return out, nil
 }
 
-// setMarkers replaces the streams' markers, unless a newer generation has
+// SetMarkers replaces the streams' markers, unless a newer generation has
 // raised the fence: one item's update, so it's either all or none, of the
 // markers as the fence had them, which only the writer of the fence's
 // generation changes.
-func (w *writer) setMarkers(ctx context.Context, ms []marker) error {
-	markers, err := w.fenceState(ctx)
+func (w *writer) SetMarkers(ctx context.Context, ms []marker) error {
+	markers, err := w.Markers(ctx)
 	if err != nil {
 		return err
 	}
@@ -751,7 +741,7 @@ func (w *writer) setMarkers(ctx context.Context, ms []marker) error {
 	}
 	applied := map[string]types.AttributeValue{}
 	for name, m := range markers {
-		applied[name] = m.attribute()
+		applied[name] = markerAttribute(m)
 	}
 	_, err = w.db.UpdateItem(ctx, &dynamodb.UpdateItemInput{
 		TableName: aws.String(w.control), Key: fenceKey(w.cfg.Pipeline),
@@ -782,72 +772,13 @@ func (w *writer) Commit(ctx context.Context, e destination.Epoch, committables [
 	if err != nil {
 		return destination.Committed{}, err
 	}
-	return w.settle(ctx, e, streams)
+	return docstore.Settle(ctx, w, w.cfg.Scope, e, streams)
 }
 
-func (w *writer) settle(ctx context.Context, e destination.Epoch, streams []stagedStream) (destination.Committed, error) {
-	done := destination.Committed{Collapsed: map[string]uint64{}}
-	markers, err := w.fenceState(ctx)
-	if err != nil {
-		return done, err
-	}
-	var todo []stagedStream
-	for _, s := range streams {
-		if m, ok := markers[s.Name]; ok && m.is(e) {
-			if err := w.swap(ctx, m); err != nil {
-				return done, err
-			}
-			continue
-		}
-		todo = append(todo, s)
-	}
-	groups := [][]stagedStream{todo}
-	if w.cfg.Scope == destination.ScopeStream {
-		groups = groups[:0]
-		for _, s := range todo {
-			groups = append(groups, []stagedStream{s})
-		}
-	}
-	for _, g := range groups {
-		if len(g) == 0 {
-			continue
-		}
-		var ms []marker
-		for _, s := range g {
-			n, err := w.apply(ctx, s)
-			if err != nil {
-				return done, err
-			}
-			if n > 0 {
-				done.Collapsed[s.Name] = n
-			}
-			m := marker{Stream: s.Name, Generation: e.Generation, N: e.N}
-			if s.Mode == destination.Overwrite && s.Ended {
-				m.Swap, m.Target = s.Read, s.Target
-			}
-			ms = append(ms, m)
-		}
-		if err := w.setMarkers(ctx, ms); err != nil {
-			return done, err
-		}
-		for i, s := range g {
-			if err := w.swap(ctx, ms[i]); err != nil {
-				return done, err
-			}
-			for _, parts := range s.parts {
-				if err := w.deletePartitions(ctx, parts); err != nil {
-					return done, err
-				}
-			}
-		}
-	}
-	return done, nil
-}
-
-// apply writes a stream's staged rows of every lane; an overwrite's go to
+// Apply writes a stream's staged rows of every lane; an overwrite's go to
 // its read's partitions, until the read ends and swap writes them.
 // collapsed: the rows dedupe skipped.
-func (w *writer) apply(ctx context.Context, s stagedStream) (collapsed uint64, err error) {
+func (w *writer) Apply(ctx context.Context, s stagedStream) (collapsed uint64, err error) {
 	if s.Mode == destination.Overwrite {
 		return 0, w.copyToRead(ctx, s)
 	}
@@ -876,11 +807,11 @@ func (w *writer) copyToRead(ctx context.Context, s stagedStream) error {
 	return nil
 }
 
-// swap writes an ended overwrite read's rows to its target, each tagged
+// Swap writes an ended overwrite read's rows to its target, each tagged
 // with the read, deletes the target's items the read didn't write, and then
-// clears the marker's swap. It applies alike however often it runs, and
+// clears the marker's Swap. It applies alike however often it runs, and
 // isn't atomic: while it runs, readers see the old items and the new.
-func (w *writer) swap(ctx context.Context, m marker) error {
+func (w *writer) Swap(ctx context.Context, m marker) error {
 	if m.Swap == "" {
 		return nil
 	}
@@ -903,7 +834,7 @@ func (w *writer) swap(ctx context.Context, m marker) error {
 		}
 	}
 	m.Swap = ""
-	return w.setMarkers(ctx, []marker{m})
+	return w.SetMarkers(ctx, []marker{m})
 }
 
 // sweep deletes the items of target that the read tagged tag didn't write.
@@ -1265,12 +1196,12 @@ func (w *writer) Recover(ctx context.Context, gen uint64, e destination.Epoch, c
 		}
 	}
 	// A swap an earlier epoch's marker still has, which a crash cut short.
-	markers, err := w.fenceState(ctx)
+	markers, err := w.Markers(ctx)
 	if err != nil {
 		return 0, err
 	}
 	for _, name := range slices.Sorted(maps.Keys(markers)) {
-		if err := w.swap(ctx, markers[name]); err != nil {
+		if err := w.Swap(ctx, markers[name]); err != nil {
 			return 0, err
 		}
 	}
@@ -1287,54 +1218,46 @@ func (w *writer) settleRecorded(ctx context.Context, e destination.Epoch, commit
 	if err != nil {
 		return 0, err
 	}
-	markers, err := w.fenceState(ctx)
-	if err != nil {
-		return 0, err
+	return docstore.SettleRecorded(ctx, "dynamodb", w, w.cfg.Scope, e, streams)
+}
+
+func (w *writer) Mark(s stagedStream, e destination.Epoch) marker {
+	m := marker{Stream: s.Name, Generation: e.Generation, N: e.N}
+	if s.Mode == destination.Overwrite && s.Ended {
+		m.Swap, m.Target = s.Read, s.Target
 	}
-	present, missing, swaps := 0, 0, false
-	for _, s := range streams {
-		if m, ok := markers[s.Name]; ok && m.is(e) {
-			swaps = swaps || m.Swap != ""
-			continue
+	return m
+}
+
+func (w *writer) DropStaging(ctx context.Context, s stagedStream) error {
+	for _, parts := range s.parts {
+		if err := w.deletePartitions(ctx, parts); err != nil {
+			return err
 		}
-		if len(s.parts) == 0 {
-			present++
-		}
-		for _, ps := range s.parts {
-			for _, p := range ps {
-				res, err := w.db.Query(ctx, &dynamodb.QueryInput{
-					TableName: aws.String(w.control), ConsistentRead: aws.Bool(true), Limit: aws.Int32(1),
-					KeyConditionExpression:    aws.String("#p = :p"),
-					ExpressionAttributeNames:  map[string]string{"#p": "p"},
-					ExpressionAttributeValues: map[string]types.AttributeValue{":p": str(p)},
-				})
-				if err != nil {
-					return 0, classify(fmt.Errorf("dynamodb: read staging: %w", err))
-				}
-				if len(res.Items) > 0 {
-					present++
-				} else {
-					missing++
-				}
+	}
+	return nil
+}
+
+func (w *writer) Staging(ctx context.Context, s stagedStream) (present, missing int, err error) {
+	for _, ps := range s.parts {
+		for _, p := range ps {
+			res, err := w.db.Query(ctx, &dynamodb.QueryInput{
+				TableName: aws.String(w.control), ConsistentRead: aws.Bool(true), Limit: aws.Int32(1),
+				KeyConditionExpression:    aws.String("#p = :p"),
+				ExpressionAttributeNames:  map[string]string{"#p": "p"},
+				ExpressionAttributeValues: map[string]types.AttributeValue{":p": str(p)},
+			})
+			if err != nil {
+				return 0, 0, classify(fmt.Errorf("dynamodb: read staging: %w", err))
+			}
+			if len(res.Items) > 0 {
+				present++
+			} else {
+				missing++
 			}
 		}
 	}
-	switch {
-	case present == 0 && missing == 0:
-		if _, err := w.settle(ctx, e, streams); err != nil {
-			return 0, err
-		}
-		if swaps {
-			return destination.Redone, nil
-		}
-		return destination.Applied, nil
-	case missing == 0:
-		_, err := w.settle(ctx, e, streams)
-		return destination.Redone, err
-	case present == 0:
-		return destination.Lost, nil
-	}
-	return 0, fmt.Errorf("dynamodb: epoch %d.%d's staging is partly gone, %d of %d partitions", e.Generation, e.N, missing, present+missing)
+	return present, missing, nil
 }
 
 func (w *writer) Close(context.Context) error { return nil }

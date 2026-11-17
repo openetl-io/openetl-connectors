@@ -110,7 +110,7 @@ func (d *Destination) Open(ctx context.Context, cfg destination.OpenConfig) (des
 		w.streams[s.Name] = s
 	}
 	w.Dialect = sqlstage.Dialect[*stagingTable]{Name: "sqlserver", Open: cfg, Streams: w.streams,
-		StagingName: sqlstage.StagingName, ReadName: sqlstage.ReadName, TargetTable: targetTable, SQL: w}
+		StagingName: sqlstage.StagingName, ReadName: sqlstage.ReadName, TargetTable: sqlstage.TargetTable, SQL: w}
 	w.Own = sqlstage.Own{DB: db, Name: "sqlserver", Pipeline: cfg.Pipeline, Generation: cfg.Generation, Classify: classify,
 		FenceRow: func(lock string) string {
 			if lock != "" {
@@ -1059,7 +1059,7 @@ func (w *writer) ApplySchema(ctx context.Context, streams []destination.StreamSc
 				keyed(cols, key)
 			}
 		}
-		tables[i], want[i] = targetTable(s.Schema, s.Name), cols
+		tables[i], want[i] = sqlstage.TargetTable(s.Schema, s.Name), cols
 	}
 	have, err := w.catalog(ctx, tables)
 	if err != nil {
