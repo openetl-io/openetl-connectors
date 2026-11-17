@@ -1,0 +1,14 @@
+name: gcs
+title: Google Cloud Storage
+description: Parquet, Avro, CSV and JSON Lines files in Google Cloud Storage, read, and Parquet, CSV and JSON Lines written
+license: Apache-2.0
+repository: https://github.com/openetl-io/openetl-connectors
+docs: https://github.com/openetl-io/openetl-connectors/blob/main/gcs/README.md
+logo: https://upload.wikimedia.org/wikipedia/commons/d/df/Google_Cloud_storage.svg
+tags: [files, gcp]
+author: OpenETL
+roles:
+  source:
+    build: { go: ../cmd/source-gcs }
+  destination:
+    build: { go: ../cmd/destination-gcs }
