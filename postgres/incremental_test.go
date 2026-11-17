@@ -156,7 +156,10 @@ func TestSourceIncrementalCompletesWhereItIsAsked(t *testing.T) {
 	e.exec("INSERT INTO $schema.t VALUES (4, 40)")
 	read := func(state, completeAt string) *capture {
 		t.Helper()
-		cs := source.ConfiguredStream{Name: "t", SyncMode: source.Incremental, Cursor: "seq", State: []byte(state), CompleteAt: []byte(completeAt)}
+		cs := source.ConfiguredStream{Name: "t", SyncMode: source.Incremental, Cursor: "seq", CompleteAt: []byte(completeAt)}
+		if state != "" {
+			cs.State = []byte(state)
+		}
 		c := &capture{}
 		t.Cleanup(c.release)
 		if err := s.Read(t.Context(), source.ReadRequest{Streams: []source.ConfiguredStream{cs}}, c); err != nil {
