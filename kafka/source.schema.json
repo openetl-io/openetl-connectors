@@ -4,24 +4,51 @@
   "type": "object",
   "additionalProperties": false,
   "required": ["brokers"],
+  "x-groups": [
+    {"id": "tls", "title": "TLS"},
+    {"id": "auth", "title": "Authentication", "description": "SASL, to sign in to the brokers. Leave the mechanism unset for none."},
+    {"id": "registry", "title": "Schema registry", "description": "For Avro and Protobuf."},
+    {"id": "reading", "title": "Reading"}
+  ],
   "properties": {
-    "brokers": {"type": "array", "items": {"type": "string"}, "minItems": 1, "description": "Bootstrap brokers, as host:port."},
-    "tls": {"type": "boolean", "default": false, "description": "Connect over TLS. Implied by tlsCa and tlsCert."},
-    "tlsCa": {"type": "string", "description": "PEM certificates to trust, instead of the system's."},
-    "tlsCert": {"type": "string", "description": "A PEM client certificate, for mutual TLS."},
-    "tlsKey": {"type": "string", "x-secret": true, "description": "The client certificate's PEM key."},
-    "tlsServerName": {"type": "string", "description": "The name to verify the brokers' certificates against, if not their host."},
-    "tlsInsecureSkipVerify": {"type": "boolean", "default": false, "description": "Don't verify the brokers' certificates."},
-    "saslMechanism": {"type": "string", "enum": ["plain", "scram-sha-256", "scram-sha-512"], "description": "SASL authentication. Unset: none."},
-    "saslUsername": {"type": "string", "description": "The user saslMechanism authenticates as."},
-    "saslPassword": {"type": "string", "x-secret": true, "description": "The SASL user's password."},
-    "schemaRegistryUrl": {"type": "string", "description": "A Confluent-compatible schema registry. Avro and Protobuf need one."},
-    "schemaRegistryUsername": {"type": "string", "description": "A user for the schema registry's basic authentication. Unset: none."},
-    "schemaRegistryPassword": {"type": "string", "x-secret": true, "description": "The schema registry user's password."},
-    "format": {"type": "string", "enum": ["json", "avro", "protobuf", "string"], "default": "json", "description": "How values and keys are encoded. Avro and Protobuf use the schema registry's wire format; string reads each value as text."},
-    "topics": {"type": "array", "items": {"type": "string"}, "description": "The topics to offer as streams. Empty: every topic the credentials can describe, but internal ones."},
-    "topicPattern": {"type": "string", "description": "A regular expression topics must match to be offered."},
-    "startOffset": {"type": "string", "enum": ["earliest", "latest"], "default": "earliest", "description": "Where a partition's first read starts."},
-    "group": {"type": "string", "description": "The consumer group the read's offsets are committed to once checkpointed, for Kafka's tools. Default: openetl-<pipeline>."}
+    "brokers": {"type": "array", "items": {"type": "string"}, "minItems": 1, "title": "Bootstrap brokers", "examples": [["kafka-1.internal:9092"]], "description": "Bootstrap brokers, as host:port. The client finds the rest of the cluster from them, and connects to each broker at the address the cluster advertises for it."},
+    "tls": {"type": "boolean", "default": false, "title": "Use TLS", "x-group": "tls", "description": "Connect over TLS. Implied by tlsCa and tlsCert."},
+    "tlsCa": {"type": "string", "title": "CA certificates", "x-group": "tls", "x-format": "multiline", "description": "PEM certificates to trust, instead of the system's."},
+    "tlsCert": {"type": "string", "title": "Client certificate", "x-group": "tls", "x-format": "multiline", "description": "A PEM client certificate, for mutual TLS. Needs tlsKey."},
+    "tlsKey": {"type": "string", "x-secret": true, "title": "Client key", "x-group": "tls", "x-format": "multiline", "description": "The client certificate's PEM private key, unencrypted."},
+    "tlsServerName": {"type": "string", "title": "Server name", "x-group": "tls", "x-advanced": true, "description": "The name to verify the brokers' certificates against, if not their host."},
+    "tlsInsecureSkipVerify": {"type": "boolean", "default": false, "title": "Skip verification", "x-group": "tls", "x-advanced": true, "description": "Don't verify the brokers' certificates."},
+    "saslMechanism": {"type": "string", "title": "SASL mechanism", "x-group": "auth", "description": "SASL authentication. Unset: none.", "oneOf": [
+      {"const": "plain", "title": "PLAIN", "description": "A user and password, sent as they are: use it over TLS."},
+      {"const": "scram-sha-256", "title": "SCRAM-SHA-256", "description": "A user and password, never sent."},
+      {"const": "scram-sha-512", "title": "SCRAM-SHA-512", "description": "A user and password, never sent."},
+      {"const": "oauthbearer", "title": "OAUTHBEARER", "description": "From 0.2.0. A token from an OAuth client-credentials grant."},
+      {"const": "aws-msk-iam", "title": "AWS MSK IAM", "description": "From 0.2.0. Amazon MSK's IAM access control, signed with AWS credentials."}
+    ]},
+    "saslUsername": {"type": "string", "title": "Username", "x-group": "auth", "x-when": {"saslMechanism": ["plain", "scram-sha-256", "scram-sha-512"]}, "description": "The user saslMechanism authenticates as, for plain and SCRAM."},
+    "saslPassword": {"type": "string", "x-secret": true, "title": "Password", "x-group": "auth", "x-when": {"saslMechanism": ["plain", "scram-sha-256", "scram-sha-512"]}, "description": "The SASL user's password."},
+    "oauthTokenUrl": {"type": "string", "x-format": "uri", "title": "Token URL", "x-group": "auth", "x-when": {"saslMechanism": "oauthbearer"}, "description": "From 0.2.0. The identity provider's token endpoint, http or https, for oauthbearer: the connector asks it for a token with the client-credentials grant, and asks again before the token expires."},
+    "oauthClientId": {"type": "string", "title": "Client ID", "x-group": "auth", "x-when": {"saslMechanism": "oauthbearer"}, "description": "From 0.2.0. The OAuth client the token is for."},
+    "oauthClientSecret": {"type": "string", "x-secret": true, "title": "Client secret", "x-group": "auth", "x-when": {"saslMechanism": "oauthbearer"}, "description": "From 0.2.0. The OAuth client's secret, sent to the token endpoint with HTTP basic authentication."},
+    "oauthScopes": {"type": "array", "items": {"type": "string"}, "title": "Scopes", "x-group": "auth", "x-when": {"saslMechanism": "oauthbearer"}, "description": "From 0.2.0. Scopes to ask the token for. Empty: none, so the provider's default."},
+    "oauthExtensions": {"type": "object", "additionalProperties": {"type": "string"}, "title": "SASL extensions", "x-group": "auth", "x-advanced": true, "x-when": {"saslMechanism": "oauthbearer"}, "description": "From 0.2.0. SASL extensions sent with the token, such as Confluent Cloud's logicalCluster and identityPoolId."},
+    "awsAccessKeyId": {"type": "string", "x-secret": true, "title": "AWS access key ID", "x-group": "auth", "x-when": {"saslMechanism": "aws-msk-iam"}, "description": "From 0.2.0. For aws-msk-iam, with awsSecretAccessKey. Unset: the AWS SDK's default chain, such as the environment, a web identity or the instance's role. The region is the brokers', from their host names."},
+    "awsSecretAccessKey": {"type": "string", "x-secret": true, "title": "AWS secret access key", "x-group": "auth", "x-when": {"saslMechanism": "aws-msk-iam"}, "description": "From 0.2.0. The access key's secret."},
+    "schemaRegistryUrl": {"type": "string", "x-format": "uri", "title": "Registry URL", "x-group": "registry", "description": "A Confluent-compatible schema registry. Avro and Protobuf need one."},
+    "schemaRegistryUsername": {"type": "string", "title": "Registry username", "x-group": "registry", "description": "A user for the schema registry's basic authentication. Unset: none."},
+    "schemaRegistryPassword": {"type": "string", "x-secret": true, "title": "Registry password", "x-group": "registry", "description": "The schema registry user's password."},
+    "format": {"type": "string", "default": "json", "title": "Format", "description": "How values and keys are encoded.", "oneOf": [
+      {"const": "json", "title": "JSON", "description": "JSON values, whose columns and types come from the records."},
+      {"const": "avro", "title": "Avro", "description": "The schema registry's Avro wire format."},
+      {"const": "protobuf", "title": "Protobuf", "description": "The schema registry's Protobuf wire format."},
+      {"const": "string", "title": "String", "description": "Each value as text, into the column value."}
+    ]},
+    "topics": {"type": "array", "items": {"type": "string"}, "title": "Topics", "description": "The topics to offer as streams. Empty: every topic the credentials can describe, but internal ones."},
+    "topicPattern": {"type": "string", "x-format": "regex", "title": "Topic pattern", "description": "A regular expression topics must match to be offered."},
+    "startOffset": {"type": "string", "default": "earliest", "title": "Start offset", "x-group": "reading", "description": "Where a partition's first read starts.", "oneOf": [
+      {"const": "earliest", "title": "Earliest", "description": "The oldest record the partition keeps."},
+      {"const": "latest", "title": "Latest", "description": "Records written after the first read starts."}
+    ]},
+    "group": {"type": "string", "title": "Consumer group", "x-group": "reading", "x-advanced": true, "description": "The consumer group the read's offsets are committed to once checkpointed, for Kafka's tools. Default: openetl-<pipeline>."}
   }
 }
