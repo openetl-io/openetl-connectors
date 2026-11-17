@@ -327,7 +327,11 @@ func (s *Source) readSplit(ctx context.Context, conns *connPool, tables []table,
 	defer conns.put(ctx, conn)
 	t := tables[slices.IndexFunc(tables, func(t table) bool { return t.name == cs.Name })]
 	if cs.SyncMode == source.Incremental {
-		return s.readIncremental(ctx, conn, t, sp.ID, cs.Cursor, st, out)
+		completeAt := sp.CompleteAt
+		if len(cs.Splits) == 0 {
+			completeAt = cs.CompleteAt
+		}
+		return s.readIncremental(ctx, conn, t, sp.ID, cs.Cursor, st, completeAt, out)
 	}
 	return s.readTable(ctx, conn, t, sp.ID, st, out)
 }
@@ -419,7 +423,10 @@ func afterKey(key, after []string, arg func(string) string) string {
 // to the cursor's highest value when the read started, in (cursor, key)
 // order. It completes with that value as the next read's floor, so the rows
 // that hold it are read again then. Rows with a NULL cursor aren't read.
-func (s *Source) readIncremental(ctx context.Context, conn *pgx.Conn, t table, id, cursor string, st sourceState, out source.SplitEmitter) error {
+// completeAt, if set, is a completion this source sent before: the read
+// goes up to its floor, which was that read's highest value, and completes
+// with it.
+func (s *Source) readIncremental(ctx context.Context, conn *pgx.Conn, t table, id, cursor string, st sourceState, completeAt []byte, out source.SplitEmitter) error {
 	ci, err := cursorColumn(t, cursor)
 	if err != nil {
 		return err
@@ -434,12 +441,25 @@ func (s *Source) readIncremental(ctx context.Context, conn *pgx.Conn, t table, i
 	for i, c := range t.cols {
 		cols[i] = pgx.Identifier{c.name}.Sanitize()
 	}
+	end := func() error { return complete(out, sourceState{Since: st.Until}) }
+	if completeAt != nil {
+		end = func() error { return out.Complete(completeAt) }
+	}
 	if st.Until == nil {
 		var until *string
-		if err := conn.QueryRow(ctx, "SELECT max("+cols[ci]+")::text FROM "+ident).Scan(&until); err != nil {
+		if completeAt != nil {
+			var at sourceState
+			if err := json.Unmarshal(completeAt, &at); err != nil {
+				return fmt.Errorf("postgres: where %s completes: %w", t.name, err)
+			}
+			until = at.Since
+		} else if err := conn.QueryRow(ctx, "SELECT max("+cols[ci]+")::text FROM "+ident).Scan(&until); err != nil {
 			return classify(fmt.Errorf("postgres: read %s: %w", t.name, err))
 		}
 		if until == nil {
+			if completeAt != nil {
+				return end()
+			}
 			return complete(out, sourceState{Since: st.Since})
 		}
 		st = sourceState{Since: st.Since, Until: until}
@@ -469,7 +489,7 @@ func (s *Source) readIncremental(ctx context.Context, conn *pgx.Conn, t table, i
 				return err
 			}
 		}
-		return complete(out, sourceState{Since: st.Until})
+		return end()
 	}
 
 	order := []string{cols[ci]}
@@ -518,7 +538,7 @@ func (s *Source) readIncremental(ctx context.Context, conn *pgx.Conn, t table, i
 			return err
 		}
 		if ended {
-			return complete(out, sourceState{Since: st.Until})
+			return end()
 		}
 	}
 }

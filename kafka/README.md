@@ -75,9 +75,7 @@ spec:
 
 Reads replay exactly: a read resumed from a checkpoint yields the same records, in the same order, as long as the topic still has them.
 
-From 0.2.0, a read that OpenETL gives an end stops there: it reads each partition up to the offset it was given, sends a resume point there, and completes. OpenETL does this when it reads a writer lane's part of an epoch again on [several workers](#jobs-on-several-workers), so the second read returns the same records as the first, as long as the topic still has them.
-
-OpenETL gives no end for a partition whose read completed in that epoch, as a scheduled pipeline's does in its last epoch. The second read then goes to the partition's end, as it is then. It returns the same records only if none were added since, and otherwise fails with `POSITION_LOST`.
+From 0.2.0, a read that OpenETL gives an end stops there: it reads each partition up to the offset it was given, sends a resume point there, and completes there. OpenETL does this when it reads a writer lane's part of an epoch again on [several workers](#jobs-on-several-workers), so the second read returns the same records as the first, as long as the topic still has them. The end is a resume point the first read sent, or, for a partition whose read completed in that epoch, as a scheduled pipeline's does in its last epoch, the offset it completed at. Records added since are left for the next sync. Where the offsets just below the end no longer hold records the read returns, as once compaction has removed an aborted transaction and its marker, the read still completes at the end.
 
 ## Destination
 

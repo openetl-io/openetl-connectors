@@ -118,6 +118,12 @@ The log then carries each updated or deleted row's old values in full, large val
 
 Full refresh and CDC streams replay exactly: a read resumed from a checkpoint yields the same rows in the same order. OpenETL counts incremental streams as ones that may repeat rows, because of the rows at the cursor's last value, and the destination's capabilities decide what guarantee that leaves.
 
+From 0.2.0, a read that OpenETL gives an end stops there. OpenETL does this when it reads a writer lane's part of an epoch again on [several workers](https://github.com/openetl-io/openetl/blob/main/docs/pipelines/workers.md), so the second read returns what the first did. The end is a resume point the first read sent, or, where the stream's read completed in that epoch, as a scheduled pipeline's does in its last one, where it completed.
+
+- **CDC**: the end is a position in the write-ahead log. The read returns the changes of the transactions that committed before it and none after, though the log has moved on, then sends a resume point there if the end was one, and completes there. A stream whose part of the epoch began before its snapshot was read ignores the end: its chunks would be read as the table is now, not as they were, so OpenETL fails the attempt with `POSITION_LOST` unless the read happens to end where the first did.
+- **Incremental**: the end of a read that completed is the highest cursor value it read up to. The read goes up to that value rather than the column's highest now, and completes there. It returns the rows that hold cursor values up to it now, so rows written or changed below it since make it differ from the first read.
+- **Full refresh**, and incremental reads that ended at a resume point, ignore the end: the second read returns what the first did as long as the table hasn't changed.
+
 ## Destination
 
 ### What it writes

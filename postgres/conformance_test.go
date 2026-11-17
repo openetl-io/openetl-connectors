@@ -84,6 +84,7 @@ func TestSourceConformance(t *testing.T) {
 			{Name: "kinds", Mode: source.FullRefresh},
 			{Name: "orders", Mode: source.CDC},
 		},
+		StopsAtCompletion: true,
 	}.Test(t)
 }
 

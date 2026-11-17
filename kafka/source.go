@@ -274,7 +274,8 @@ type topicRead struct {
 	end  map[int32]int64
 	done map[int32]bool
 	// Bounded reads: the partitions whose read stops at an offset the
-	// request gives, reading no record from it on.
+	// request gives, its until or complete_at, reading no record from it
+	// on. Such a partition completes at that offset.
 	until map[int32]int64
 	// Bounded reads: when each partition last moved.
 	moved map[int32]time.Time
@@ -284,6 +285,16 @@ type topicRead struct {
 	// The topic's retention.ms; 0 if unknown or unlimited.
 	retention time.Duration
 	complete  bool
+}
+
+// stopOf is where a read that isn't continuous stops: its until, or its
+// complete_at, which is never set with it. Both are offsets this source
+// sent, at a resume point or a completion. Nil: where the read would end.
+func stopOf(until, completeAt []byte) []byte {
+	if until != nil {
+		return until
+	}
+	return completeAt
 }
 
 func positionLost(err error) error {
@@ -312,8 +323,8 @@ func (s *Source) Read(ctx context.Context, req source.ReadRequest, out source.Em
 			if r.next, err = parseState(st.State); err != nil {
 				return err
 			}
-			if st.Until != nil && !req.Continuous {
-				if r.until, err = parseState(st.Until); err != nil {
+			if stop := stopOf(st.Until, st.CompleteAt); stop != nil && !req.Continuous {
+				if r.until, err = parseState(stop); err != nil {
 					return err
 				}
 			}
@@ -328,10 +339,10 @@ func (s *Source) Read(ctx context.Context, req source.ReadRequest, out source.Em
 					return err
 				}
 				r.splits[p] = out.Split(st.Name, sp.ID)
-				if sp.Until != nil && !req.Continuous {
+				if stop := stopOf(sp.Until, sp.CompleteAt); stop != nil && !req.Continuous {
 					var u splitState
-					if err := json.Unmarshal(sp.Until, &u); err != nil {
-						return fmt.Errorf("kafka: until of split %s: %w", sp.ID, err)
+					if err := json.Unmarshal(stop, &u); err != nil {
+						return fmt.Errorf("kafka: where split %s stops: %w", sp.ID, err)
 					}
 					if r.until == nil {
 						r.until = map[int32]int64{}
@@ -452,6 +463,9 @@ func (s *Source) Read(ctx context.Context, req source.ReadRequest, out source.Em
 				continue
 			}
 			if u, ok := r.until[rec.Partition]; ok && rec.Offset >= u {
+				// Every record before u has been fetched: the read reached u,
+				// even where the fetch no longer returns the last of them.
+				r.next[rec.Partition] = max(r.next[rec.Partition], u)
 				continue
 			}
 			r.next[rec.Partition] = rec.Offset + 1
@@ -545,8 +559,14 @@ func (r *topicRead) finish(consumer *kgo.Client) error {
 		}
 		r.done[p] = true
 		pause = append(pause, p)
+		u, until := r.until[p]
+		if until {
+			// The read stops at u, which an earlier read reached; offsets
+			// below it that it hasn't now are gone: an aborted transaction,
+			// its marker, or records that compaction removed since.
+			r.next[p] = u
+		}
 		if r.splits != nil {
-			_, until := r.until[p]
 			if err := completeAt(r.splits[p], encodeOffset(r.next[p]), until); err != nil {
 				return err
 			}
@@ -566,7 +586,7 @@ func (r *topicRead) finish(consumer *kgo.Client) error {
 }
 
 // completeAt completes a split, or the whole stream, at state, after a
-// resume point there if the request said where its read ends.
+// resume point there if the request said where its read stops.
 func completeAt(em source.SplitEmitter, state []byte, until bool) error {
 	if until {
 		if err := em.ResumePoint(state); err != nil {

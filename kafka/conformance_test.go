@@ -42,6 +42,8 @@ func TestSourceConformance(t *testing.T) {
 			next[topic] += 7
 			return 7, produceErr(ctx, topic, from, 7)
 		},
+		StopsAtUntil:      true,
+		StopsAtCompletion: true,
 	}.Test(t)
 }
 
