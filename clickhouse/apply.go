@@ -12,6 +12,7 @@ import (
 
 	ch "github.com/ClickHouse/clickhouse-go/v2"
 
+	"github.com/openetl-io/openetl-connectors/sqlstage"
 	sdk "github.com/openetl-io/openetl/sdk/go"
 	"github.com/openetl-io/openetl/sdk/go/destination"
 	protocolv1 "github.com/openetl-io/openetl/sdk/go/protocol/v1"
@@ -641,7 +642,7 @@ func (w *writer) ApplySchema(ctx context.Context, streams []destination.StreamSc
 		var key []string
 		if cfg.Mode == destination.Merge {
 			var err error
-			if key, err = keyColumns(s.Schema, cfg.PrimaryKey); err != nil {
+			if key, err = sqlstage.KeyColumns(s.Schema, cfg.PrimaryKey); err != nil {
 				return out, fmt.Errorf("clickhouse: stream %q: %w", s.Name, err)
 			}
 		}

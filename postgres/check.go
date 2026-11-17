@@ -17,6 +17,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/stdlib"
 
+	"github.com/openetl-io/openetl-connectors/sqlstage"
 	sdk "github.com/openetl-io/openetl/sdk/go"
 	"github.com/openetl-io/openetl/sdk/go/check"
 	"github.com/openetl-io/openetl/sdk/go/check/netcheck"
@@ -570,7 +571,7 @@ func (d *Destination) Preflight(req destination.PreflightRequest) []check.Check 
 		var fields []string
 		if sch := req.Schemas[st.Name]; sch != nil {
 			table = targetTable(sch, st.Name)
-			if k, err := keyColumns(sch, st.PrimaryKey); err == nil {
+			if k, err := sqlstage.KeyColumns(sch, st.PrimaryKey); err == nil {
 				key = k
 			}
 			for _, f := range sch.Fields() {

@@ -12,6 +12,7 @@ import (
 	ch "github.com/ClickHouse/clickhouse-go/v2"
 	"github.com/apache/arrow-go/v18/arrow"
 
+	"github.com/openetl-io/openetl-connectors/sqlstage"
 	"github.com/openetl-io/openetl/sdk/go/check"
 	"github.com/openetl-io/openetl/sdk/go/check/netcheck"
 	"github.com/openetl-io/openetl/sdk/go/check/sqlcheck"
@@ -591,7 +592,7 @@ func (d *Destination) preflightStream(ctx context.Context, k *sqlcheck.Kit, db *
 		var key []string
 		if st.Mode == destination.Merge {
 			var err error
-			if key, err = keyColumns(schema, st.PrimaryKey); err != nil {
+			if key, err = sqlstage.KeyColumns(schema, st.PrimaryKey); err != nil {
 				f := check.ConfigInvalid.Wrap(err)
 				f.Message, f.Fix = "{stream} merges on a column its schema doesn't have.", "Give the stream a primary key of its columns."
 				return f

@@ -9,6 +9,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow"
 	go_ora "github.com/sijms/go-ora/v2"
 
+	"github.com/openetl-io/openetl-connectors/sqlstage"
 	"github.com/openetl-io/openetl/sdk/go/check"
 	"github.com/openetl-io/openetl/sdk/go/check/sqlcheck"
 	"github.com/openetl-io/openetl/sdk/go/destination"
@@ -213,7 +214,7 @@ func (d *Destination) Preflight(req destination.PreflightRequest) []check.Check 
 					return noKey.Fail("why", "has no primary key")
 				}
 				if s != nil {
-					if _, err := keyColumns(s, st.PrimaryKey); err != nil {
+					if _, err := sqlstage.KeyColumns(s, st.PrimaryKey); err != nil {
 						return noKey.Fail("why", err.Error())
 					}
 				}
@@ -256,7 +257,7 @@ func (d *Destination) Preflight(req destination.PreflightRequest) []check.Check 
 			}
 			var key []string
 			if st.Mode == destination.Merge {
-				key, _ = keyColumns(s, st.PrimaryKey)
+				key, _ = sqlstage.KeyColumns(s, st.PrimaryKey)
 			}
 			cols, err := destColumns(s, key, major(c) >= 23)
 			if err != nil {

@@ -13,6 +13,7 @@ import (
 	mssql "github.com/microsoft/go-mssqldb"
 	"github.com/microsoft/go-mssqldb/msdsn"
 
+	"github.com/openetl-io/openetl-connectors/sqlstage"
 	"github.com/openetl-io/openetl/sdk/go/check"
 	"github.com/openetl-io/openetl/sdk/go/check/netcheck"
 	"github.com/openetl-io/openetl/sdk/go/check/sqlcheck"
@@ -519,7 +520,7 @@ func (d *Destination) Preflight(req destination.PreflightRequest) []check.Check 
 				return check.ConfigInvalid.Wrap(err)
 			}
 			if st.Mode == destination.Merge {
-				if key, err := keyColumns(sch, st.PrimaryKey); err == nil {
+				if key, err := sqlstage.KeyColumns(sch, st.PrimaryKey); err == nil {
 					keyed(want, key)
 				}
 			}

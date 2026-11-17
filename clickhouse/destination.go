@@ -18,6 +18,7 @@ import (
 	"github.com/ClickHouse/clickhouse-go/v2/lib/driver"
 	"github.com/apache/arrow-go/v18/arrow"
 
+	"github.com/openetl-io/openetl-connectors/sqlstage"
 	"github.com/openetl-io/openetl/sdk/go/destination"
 )
 
@@ -250,93 +251,26 @@ func targetTable(schema *arrow.Schema, stream string) string {
 	return stream
 }
 
-// keyColumns returns the destination names of a stream's primary key, which
-// the catalog gives by source name.
-func keyColumns(schema *arrow.Schema, key []string) ([]string, error) {
-	renamed := map[string]string{}
-	if v, ok := schema.Metadata().GetValue(sourceNamesKey); ok {
-		var names map[string]string
-		if err := json.Unmarshal([]byte(v), &names); err != nil {
-			return nil, fmt.Errorf("its %s metadata: %w", sourceNamesKey, err)
-		}
-		for dst, src := range names {
-			renamed[src] = dst
-		}
-	}
-	out := make([]string, len(key))
-	for i, k := range key {
-		out[i] = k
-		if dst, ok := renamed[k]; ok {
-			out[i] = dst
-		}
-		if len(schema.FieldIndices(out[i])) == 0 {
-			return nil, fmt.Errorf("it merges on %q, which its batches don't have", k)
-		}
-	}
-	return out, nil
-}
-
 func (w *writer) Write(ctx context.Context, e destination.Epoch, stream string, batch arrow.RecordBatch) error {
-	cfg, ok := w.streams[stream]
+	key, ok, err := sqlstage.RowsKey("clickhouse", w.streams, w.starts, stream, batch)
 	if !ok {
-		return fmt.Errorf("clickhouse: unknown stream %q", stream)
-	}
-	if batch.NumRows() == 0 {
-		return nil
-	}
-	if cfg.Dedupe != destination.DedupeNone && len(batch.Schema().FieldIndices(idColumn)) == 0 {
-		return fmt.Errorf("clickhouse: stream %q is deduped at apply, but its batches have no %s", stream, idColumn)
-	}
-	if _, ok := w.starts[stream]; cfg.Mode == destination.Overwrite && !ok {
-		return fmt.Errorf("clickhouse: stream %q overwrites, but its read has no start", stream)
-	}
-	var key []string
-	if cfg.Mode == destination.Merge {
-		var err error
-		if key, err = keyColumns(batch.Schema(), cfg.PrimaryKey); err != nil {
-			return fmt.Errorf("clickhouse: stream %q: %w", stream, err)
-		}
+		return err
 	}
 	ls := w.laneStaging(w.staging, stagingName(w.cfg.Pipeline, stream, e, w.cfg.Lane), e, stream, targetTable(batch.Schema(), stream), key)
 	w.setTable(stream, ls.target)
-	for _, f := range batch.Schema().Fields() {
-		if v, _ := f.Metadata.GetValue(destination.HeldKey); v == "last" && !slices.Contains(ls.last, f.Name) {
-			ls.last = append(ls.last, f.Name)
-		}
-	}
+	ls.last = sqlstage.Last(batch.Schema(), ls.last)
 	return w.add(ctx, e, ls, batch)
 }
 
 // Patch stages patches in tables of their own, which Commit applies after
 // the epoch's rows.
 func (w *writer) Patch(ctx context.Context, e destination.Epoch, stream string, batch arrow.RecordBatch) error {
-	cfg, ok := w.streams[stream]
-	switch {
-	case !ok:
-		return fmt.Errorf("clickhouse: unknown stream %q", stream)
-	case cfg.Mode == destination.Overwrite:
-		return fmt.Errorf("clickhouse: stream %q overwrites, and takes no patches", stream)
-	case batch.NumRows() == 0:
-		return nil
-	case len(batch.Schema().FieldIndices(idColumn)) == 0 || len(batch.Schema().FieldIndices(heldColumn)) == 0:
-		return fmt.Errorf("clickhouse: patches for %q need %s and %s", stream, idColumn, heldColumn)
-	}
-	var key []string
-	if cfg.Mode == destination.Merge {
-		var err error
-		if key, err = keyColumns(batch.Schema(), cfg.PrimaryKey); err != nil {
-			return fmt.Errorf("clickhouse: patches for %q: %w", stream, err)
-		}
+	key, ok, err := sqlstage.PatchesKey("clickhouse", w.streams, stream, batch)
+	if !ok {
+		return err
 	}
 	ls := w.laneStaging(w.patches, patchName(w.cfg.Pipeline, stream, e, w.cfg.Lane), e, stream, targetTable(batch.Schema(), stream), key)
-	for _, f := range batch.Schema().Fields() {
-		if held, ok := f.Metadata.GetValue(destination.FillsKey); ok {
-			if ls.fills == nil {
-				ls.fills = map[string]string{}
-			}
-			ls.fills[f.Name] = held
-		}
-	}
+	ls.fills = sqlstage.Fills(batch.Schema(), ls.fills)
 	return w.add(ctx, e, ls, batch)
 }
 

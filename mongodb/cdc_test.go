@@ -34,7 +34,7 @@ func waitFor(t *testing.T, d time.Duration, what string, cond func() bool) {
 // ends; done has its error.
 func follow(t *testing.T, s *Source, stream string, state []byte, columns []string) (*recorder, <-chan error) {
 	t.Helper()
-	ctx, cancel := context.WithCancel(t.Context())
+	ctx := t.Context()
 	rec := &recorder{}
 	done := make(chan error, 1)
 	go func() {
@@ -43,8 +43,8 @@ func follow(t *testing.T, s *Source, stream string, state []byte, columns []stri
 		}}, rec)
 		close(done)
 	}()
+	// t.Context() is canceled before cleanups run.
 	t.Cleanup(func() {
-		cancel()
 		for range done {
 		}
 	})

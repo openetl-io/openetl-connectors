@@ -37,3 +37,7 @@ func TestPersistedFormats(t *testing.T) {
 		}
 	}
 }
+
+func patchName(pipeline, stream string, e destination.Epoch, lane int) string {
+	return stagingName(pipeline, stream+"\x00patch", e, lane)
+}

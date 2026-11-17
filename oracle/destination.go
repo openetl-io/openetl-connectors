@@ -125,6 +125,8 @@ func (d *Destination) Open(ctx context.Context, cfg destination.OpenConfig) (des
 	for _, s := range cfg.Streams {
 		w.streams[s.Name] = s
 	}
+	w.Dialect = sqlstage.Dialect[*stagingTable]{Name: "oracle", Open: cfg, Streams: w.streams,
+		StagingName: stagingName, ReadName: readName, TargetTable: targetTable, SQL: w}
 	return w, nil
 }
 
@@ -214,10 +216,6 @@ func stagingName(pipeline, stream string, e destination.Epoch, lane int) string 
 	return stageName(pipeline, e.Generation, stream, strconv.FormatUint(e.N, 10), strconv.Itoa(lane))
 }
 
-func patchName(pipeline, stream string, e destination.Epoch, lane int) string {
-	return stagingName(pipeline, stream+"\x00patch", e, lane)
-}
-
 // readName names an overwrite read's table by its pipeline and stream, which
 // dropAbandonedReads reads back from it.
 func readName(pipeline, stream string, start time.Time) string {
@@ -227,83 +225,9 @@ func readName(pipeline, stream string, start time.Time) string {
 func indexName(schema, table string) string    { return "_openetl_id_" + digest(24, schema, table) }
 func keyIndexName(schema, table string) string { return "_openetl_key_" + digest(24, schema, table) }
 
-func (w *writer) Write(ctx context.Context, e destination.Epoch, stream string, batch arrow.RecordBatch) error {
-	cfg, ok := w.streams[stream]
-	if !ok {
-		return fmt.Errorf("oracle: unknown stream %q", stream)
-	}
-	if batch.NumRows() == 0 {
-		return nil
-	}
-	if cfg.Dedupe != destination.DedupeNone && len(batch.Schema().FieldIndices(colID)) == 0 {
-		return fmt.Errorf("oracle: stream %q is deduped at apply, but its batches have no %s", stream, colID)
-	}
-	if _, ok := w.Starts[stream]; cfg.Mode == destination.Overwrite && !ok {
-		return fmt.Errorf("oracle: stream %q overwrites, but its read has no start", stream)
-	}
-	var key []string
-	if cfg.Mode == destination.Merge {
-		var err error
-		if key, err = keyColumns(batch.Schema(), cfg.PrimaryKey); err != nil {
-			return fmt.Errorf("oracle: stream %q: %w", stream, err)
-		}
-	}
-	st, err := w.stage(ctx, w.Staging, stagingName(w.cfg.Pipeline, stream, e, w.cfg.Lane), e, stream, targetTable(batch.Schema(), stream), key, batch)
-	if err != nil {
-		return err
-	}
-	w.SetTable(stream, st.Target)
-	for _, f := range batch.Schema().Fields() {
-		if v, _ := f.Metadata.GetValue(destination.HeldKey); v == "last" && !slices.Contains(st.Last, f.Name) {
-			st.Last = append(st.Last, f.Name)
-		}
-	}
-	return nil
-}
-
-// Patch stages patches in a table of their own, which Commit applies after
-// the epoch's rows, in the same transaction and under the same marker.
-func (w *writer) Patch(ctx context.Context, e destination.Epoch, stream string, batch arrow.RecordBatch) error {
-	cfg, ok := w.streams[stream]
-	switch {
-	case !ok:
-		return fmt.Errorf("oracle: unknown stream %q", stream)
-	case cfg.Mode != destination.Merge && cfg.Mode != destination.Append:
-		return fmt.Errorf("oracle: stream %q overwrites, and takes no patches", stream)
-	case batch.NumRows() == 0:
-		return nil
-	case len(batch.Schema().FieldIndices(colID)) == 0 || len(batch.Schema().FieldIndices(colHeld)) == 0:
-		return fmt.Errorf("oracle: patches for %q need %s and %s", stream, colID, colHeld)
-	}
-	var key []string
-	if cfg.Mode == destination.Merge {
-		var err error
-		if key, err = keyColumns(batch.Schema(), cfg.PrimaryKey); err != nil {
-			return fmt.Errorf("oracle: patches for %q: %w", stream, err)
-		}
-	}
-	target := w.Table(stream)
-	if target == "" {
-		target = targetTable(batch.Schema(), stream)
-	}
-	st, err := w.stage(ctx, w.Patches, patchName(w.cfg.Pipeline, stream, e, w.cfg.Lane), e, stream, target, key, batch)
-	if err != nil {
-		return err
-	}
-	for _, f := range batch.Schema().Fields() {
-		if held, ok := f.Metadata.GetValue(destination.FillsKey); ok {
-			if st.Fills == nil {
-				st.Fills = map[string]string{}
-			}
-			st.Fills[f.Name] = held
-		}
-	}
-	return nil
-}
-
-// stage inserts a batch into the stream's staging table for epoch e in
+// Stage inserts a batch into the stream's staging table for epoch e in
 // tables, which it creates or widens.
-func (w *writer) stage(ctx context.Context, tables map[uint64]map[string]*stagingTable, name string, e destination.Epoch, stream, target string, key []string, batch arrow.RecordBatch) (*stagingTable, error) {
+func (w *writer) Stage(ctx context.Context, tables map[uint64]map[string]*stagingTable, name string, e destination.Epoch, stream, target string, key []string, batch arrow.RecordBatch) (*stagingTable, error) {
 	if err := validName("table", target); err != nil {
 		return nil, err
 	}
@@ -421,32 +345,6 @@ func bound(v any) int {
 	return 22
 }
 
-// keyColumns returns the destination names of a stream's primary key, which
-// the catalog gives by source name.
-func keyColumns(schema *arrow.Schema, key []string) ([]string, error) {
-	renamed := map[string]string{}
-	if v, ok := schema.Metadata().GetValue(metaSourceNames); ok {
-		var names map[string]string
-		if err := json.Unmarshal([]byte(v), &names); err != nil {
-			return nil, fmt.Errorf("its %s metadata: %w", metaSourceNames, err)
-		}
-		for dst, src := range names {
-			renamed[src] = dst
-		}
-	}
-	out := make([]string, len(key))
-	for i, k := range key {
-		out[i] = k
-		if dst, ok := renamed[k]; ok {
-			out[i] = dst
-		}
-		if len(schema.FieldIndices(out[i])) == 0 {
-			return nil, fmt.Errorf("it merges on %q, which its batches don't have", k)
-		}
-	}
-	return out, nil
-}
-
 // validName refuses a name Oracle can't quote.
 func validName(what, name string) error {
 	if name == "" || strings.ContainsAny(name, "\"\x00") {
@@ -528,28 +426,10 @@ func typesOf(cols []dcol) map[string]string {
 	return out
 }
 
-// PreCommit has nothing to flush: every Write committed its rows to staging.
-func (w *writer) PreCommit(_ context.Context, e destination.Epoch) (destination.Staged, error) {
-	return w.Describe(w.cfg, e, readName)
-}
-
-func (w *writer) Commit(ctx context.Context, _ destination.Epoch, committables []destination.Staged) (destination.Committed, error) {
-	desc, err := w.mergeLanes(committables)
-	if err != nil {
-		return destination.Committed{}, err
-	}
-	c := destination.Committed{Collapsed: map[string]uint64{}}
-	return c, w.apply(ctx, desc, desc.Streams, c.Collapsed)
-}
-
-func (w *writer) mergeLanes(committables []destination.Staged) (staged, error) {
-	return w.MergeLanes("oracle", committables)
-}
-
-// apply applies each stream that has no marker yet, then drops its staging.
+// Apply applies each stream that has no marker yet, then drops its staging.
 // It adds the rows each deduped stream skipped to collapsed.
-func (w *writer) apply(ctx context.Context, desc staged, streams []stagedStream, collapsed map[string]uint64) error {
-	todo, err := w.unapplied(ctx, desc, streams)
+func (w *writer) Apply(ctx context.Context, desc staged, streams []stagedStream, collapsed map[string]uint64) error {
+	todo, err := w.Unapplied(ctx, desc, streams)
 	if err != nil {
 		return err
 	}
@@ -594,7 +474,7 @@ func (w *writer) apply(ctx context.Context, desc staged, streams []stagedStream,
 			w.dropOwn(ctx, t)
 		}
 	}
-	w.dropStaging(ctx, todo)
+	w.DropStaging(ctx, todo)
 	return nil
 }
 
@@ -1111,7 +991,7 @@ func (w *writer) ApplySchema(ctx context.Context, streams []destination.StreamSc
 	for i, s := range streams {
 		var key []string
 		if cfg := w.streams[s.Name]; cfg.Mode == destination.Merge {
-			key, _ = keyColumns(s.Schema, cfg.PrimaryKey)
+			key, _ = sqlstage.KeyColumns(s.Schema, cfg.PrimaryKey)
 		}
 		cols, err := destColumns(s.Schema, key, w.boolean)
 		if err != nil {
@@ -1423,7 +1303,7 @@ func (w *writer) dropOwn(ctx context.Context, table string) {
 	_ = w.ddl(ctx, "DROP TABLE "+w.own(table)+" PURGE", 942)
 }
 
-func (w *writer) unapplied(ctx context.Context, desc staged, streams []stagedStream) ([]stagedStream, error) {
+func (w *writer) Unapplied(ctx context.Context, desc staged, streams []stagedStream) ([]stagedStream, error) {
 	var todo []stagedStream
 	for _, s := range streams {
 		var done int
@@ -1438,7 +1318,7 @@ func (w *writer) unapplied(ctx context.Context, desc staged, streams []stagedStr
 	return todo, nil
 }
 
-func (w *writer) dropStaging(ctx context.Context, streams []stagedStream) {
+func (w *writer) DropStaging(ctx context.Context, streams []stagedStream) {
 	for _, s := range streams {
 		for _, t := range slices.Concat(s.Stagings, s.Patches) {
 			w.dropOwn(ctx, t)
@@ -1470,7 +1350,9 @@ func (w *writer) ensureSchema(ctx context.Context) error {
 	return nil
 }
 
-func (w *writer) Recover(ctx context.Context, gen uint64, e destination.Epoch, committables []destination.Staged) (destination.Recovery, error) {
+// Fence makes the schema and the fence and marker tables, and raises the
+// fence to gen.
+func (w *writer) Fence(ctx context.Context, gen uint64) error {
 	for _, q := range []string{
 		"CREATE TABLE " + w.own(fenceTable) + " (pipeline VARCHAR2(512 BYTE) PRIMARY KEY, generation NUMBER(20) NOT NULL)",
 		"CREATE TABLE " + w.own(loadsTable) + ` (pipeline VARCHAR2(512 BYTE) NOT NULL, stream VARCHAR2(2000 BYTE) NOT NULL,
@@ -1478,7 +1360,7 @@ func (w *writer) Recover(ctx context.Context, gen uint64, e destination.Epoch, c
 			PRIMARY KEY (pipeline, stream, generation, epoch))`,
 	} {
 		if err := w.ddl(ctx, q, 955); err != nil {
-			return 0, fmt.Errorf("oracle: prepare the schema %s: %w", w.user, err)
+			return fmt.Errorf("oracle: prepare the schema %s: %w", w.user, err)
 		}
 	}
 	// Waits for applies that hold the fence row. Two that insert it at once
@@ -1491,70 +1373,31 @@ func (w *writer) Recover(ctx context.Context, gen uint64, e destination.Epoch, c
 		_, err = w.db.ExecContext(ctx, raise, w.cfg.Pipeline, gen)
 	}
 	if err != nil {
-		return 0, classify(fmt.Errorf("oracle: raise fence: %w", err))
+		return classify(fmt.Errorf("oracle: raise fence: %w", err))
 	}
 	var raised uint64
 	if err := w.db.QueryRowContext(ctx, "SELECT generation FROM "+w.own(fenceTable)+" WHERE pipeline = :1", w.cfg.Pipeline).Scan(&raised); err != nil {
-		return 0, classify(fmt.Errorf("oracle: raise fence: %w", err))
+		return classify(fmt.Errorf("oracle: raise fence: %w", err))
 	}
 	if raised != gen {
-		return 0, fmt.Errorf("%w: recovering as generation %d, and the fence is %d", destination.ErrFenced, gen, raised)
+		return fmt.Errorf("%w: recovering as generation %d, and the fence is %d", destination.ErrFenced, gen, raised)
 	}
-	if e.IsZero() {
-		w.dropRemovedReads(ctx)
-		return destination.Applied, nil
-	}
-
-	desc, err := w.mergeLanes(committables)
-	if err != nil {
-		return 0, err
-	}
-	missing, err := w.unapplied(ctx, desc, desc.Streams)
-	if err != nil {
-		return 0, err
-	}
-	// An overwrite read that ended without rows in the epoch needs no
-	// staging.
-	needs, present := 0, 0
-	for _, m := range missing {
-		for _, t := range slices.Concat(m.Stagings, m.Patches) {
-			needs++
-			var n int
-			if err := w.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM all_tables WHERE owner = :1 AND table_name = :2", w.user, t).Scan(&n); err != nil {
-				return 0, classify(err)
-			}
-			present += n
-		}
-	}
-	var r destination.Recovery
-	switch {
-	case len(missing) == 0:
-		w.dropStaging(ctx, desc.Streams)
-		r = destination.Applied
-	case present == needs:
-		if err := w.apply(ctx, desc, missing, map[string]uint64{}); err != nil {
-			return 0, err
-		}
-		r = destination.Redone
-	case len(missing) == len(desc.Streams):
-		// Nothing of it is visible, and some lane's staging is gone.
-		r = destination.Lost
-	default:
-		return 0, fmt.Errorf("oracle: epoch %d-g%d is partly applied and the staging for the rest is gone", desc.Epoch, desc.Generation)
-	}
-	if r != destination.Lost {
-		w.trimMarkers(ctx, desc.Epoch)
-	}
-	w.dropStale(ctx, gen)
-	w.dropRemovedReads(ctx)
-	return r, nil
+	return nil
 }
 
-// trimMarkers deletes the pipeline's markers below an applied epoch. Recovery
+func (w *writer) Exists(ctx context.Context, table string) (bool, error) {
+	var n int
+	if err := w.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM all_tables WHERE owner = :1 AND table_name = :2", w.user, table).Scan(&n); err != nil {
+		return false, classify(err)
+	}
+	return n > 0, nil
+}
+
+// TrimMarkers deletes the pipeline's markers below an applied epoch. Recovery
 // checks only HEAD's, and HEAD never moves back past an applied epoch; a lost
 // one moves it back to the previous record, whose markers it then checks.
 // Best effort, like dropStaging.
-func (w *writer) trimMarkers(ctx context.Context, applied uint64) {
+func (w *writer) TrimMarkers(ctx context.Context, applied uint64) {
 	_, _ = w.db.ExecContext(ctx, "DELETE FROM "+w.own(loadsTable)+" WHERE pipeline = :1 AND epoch < :2", w.cfg.Pipeline, applied)
 }
 
@@ -1576,10 +1419,10 @@ func (w *writer) ownTables(ctx context.Context, prefix string) ([]string, error)
 	return out, rows.Err()
 }
 
-// dropStale drops what earlier generations of the pipeline staged. None of
+// DropStale drops what earlier generations of the pipeline staged. None of
 // it can be applied once HEAD's epoch is recovered: the fence stops their
 // commits. Best effort, like dropStaging.
-func (w *writer) dropStale(ctx context.Context, gen uint64) {
+func (w *writer) DropStale(ctx context.Context, gen uint64) {
 	prefix := stagePrefix + digest(16, w.cfg.Pipeline) + "_"
 	tables, err := w.ownTables(ctx, prefix)
 	if err != nil {
@@ -1613,10 +1456,10 @@ func (w *writer) dropAbandonedReads(ctx context.Context, drop func(stream, table
 	return nil
 }
 
-// dropRemovedReads drops the read tables of streams that no longer
+// DropRemovedReads drops the read tables of streams that no longer
 // overwrite, once Recover has raised the fence. Best effort, like
 // dropStaging.
-func (w *writer) dropRemovedReads(ctx context.Context) {
+func (w *writer) DropRemovedReads(ctx context.Context) {
 	_ = w.dropAbandonedReads(ctx, func(stream, _ string) bool {
 		for name, s := range w.streams {
 			if digest(16, name) == stream {

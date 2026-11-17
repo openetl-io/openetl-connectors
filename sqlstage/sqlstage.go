@@ -103,10 +103,10 @@ func (t *Table) All() []string { return append(slices.Clone(t.Earlier), t.Name) 
 func (t *Table) Base() *Table { return t }
 
 // Epochs is a writer's staging of the epochs it hasn't pre-committed, by
-// epoch and stream; T is its staging table. Only Write, Patch, StartReads,
-// EndRead and PreCommit use it, but for Table, which Commit and Recover use
-// too.
+// epoch and stream; T is its staging table. Its Write, Patch, PreCommit,
+// Commit and Recover are the destination's, in Dialect's SQL.
 type Epochs[T interface{ Base() *Table }] struct {
+	Dialect Dialect[T]
 	Staging map[uint64]map[string]T
 	Patches map[uint64]map[string]T
 	Starts  map[string]time.Time
