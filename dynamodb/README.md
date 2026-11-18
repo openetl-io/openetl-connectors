@@ -203,6 +203,7 @@ DynamoDB has no multi-table transaction for a whole epoch, and no table rename:
 - Readers can see part of an epoch while it's applied, and after a crash, until the next attempt applies the rest.
 - An overwrite's switch from old items to new isn't atomic. Readers see both while it runs.
 - A replaced attempt that's still applying finishes the writes it started. They're the same writes the next attempt makes, except for a stream appended without deduplication, whose rows the next attempt stages again, with other `_openetl_row`s, and which can then land twice.
+- An overwrite's switch isn't fenced: its puts and its deletes of the items the read didn't write are plain writes, and only the marker after them is checked against the fence. A replaced attempt still switching a read in, after the next attempt has finished that switch and then switched a later read in, deletes the later read's items, so the target can be left with few of its items or none until the stream is read again.
 
 Each row costs about three writes: staging it, applying it, and deleting it from staging. A merged row that keeps a target value, or a soft delete, also reads the item. Recovery and the start of an overwrite read scan the control table. Up to 16 writer lanes write at once. A continuous pipeline commits every 10 seconds unless it sets its own `delivery.commit.interval`.
 

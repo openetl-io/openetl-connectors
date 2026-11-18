@@ -33,11 +33,18 @@ func (p *Conns) Get(ctx context.Context) (*sql.Conn, error) {
 }
 
 // TryGet returns nil if the read holds as many as it may, or can't have
-// more.
+// more: as when DB has as many connections in use as it may open, which it
+// would otherwise wait for, though the caller may be holding one. The look
+// at DB and the take after it aren't one step, so a connection taken
+// between them without Get can still make it wait for that one.
 func (p *Conns) TryGet(ctx context.Context) *sql.Conn {
 	select {
 	case p.Held <- struct{}{}:
 	default:
+		return nil
+	}
+	if s := p.DB.Stats(); s.MaxOpenConnections > 0 && s.InUse >= s.MaxOpenConnections {
+		<-p.Held
 		return nil
 	}
 	c, err := p.DB.Conn(ctx)
