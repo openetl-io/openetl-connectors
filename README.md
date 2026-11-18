@@ -20,6 +20,7 @@ The official connectors for [OpenETL](https://github.com/openetl-io/openetl): th
 | [Amazon Kinesis](./kinesis/README.md) | Data streams, shard by shard | Data streams, a record per row; at least once |
 | [Apache Iceberg](./iceberg/README.md) | | Tables, through a REST catalog or AWS Glue; exactly once |
 | [Amazon S3](./s3/README.md) | Parquet, Avro, CSV and JSON Lines files, on S3, S3-compatible stores such as MinIO and Cloudflare R2, or a local disk | Parquet, CSV and JSON Lines files, on the same stores; exactly once |
+| [Google Cloud Storage](./gcs/README.md) | Parquet, Avro, CSV and JSON Lines files | Parquet, CSV and JSON Lines files; exactly once |
 
 Exactly once is what a destination gives a stream whose source replays exactly: a change-by-change read does here, as do Kafka's and Kinesis's sources, and a full refresh does while its table is unchanged. Other reads, such as one by a cursor column, may repeat rows; each page says what they get.
 
