@@ -74,7 +74,7 @@ The `openetl` CLI is openetl's `main`, copied out of the image `ghcr.io/openetl-
 Each package directory has an `openetl-connector.yaml`: its name, metadata, and how each role is built. The `openetl` CLI does the rest, so nothing here is specific to this repository:
 
 ```sh
-openetl connector validate --require author,logo,description,license postgres mysql sqlserver clickhouse mongodb kafka kinesis iceberg s3
+openetl connector validate --require author,logo,description,license postgres mysql sqlserver oracle clickhouse mongodb kafka kinesis iceberg s3
 openetl connector package --tag postgres/v0.2.0
 ```
 
@@ -109,6 +109,7 @@ Each package directory holds its `openetl-connector.yaml`, its config schemas an
 - `postgres/`: the Postgres source and destination.
 - `mysql/`: the MySQL source and destination, which work against MariaDB too.
 - `sqlserver/`: the SQL Server source and destination.
+- `oracle/`: the Oracle Database source and destination.
 - `clickhouse/`: the ClickHouse source and destination.
 - `mongodb/`: the MongoDB source and destination.
 - `iceberg/`: the Iceberg destination.
