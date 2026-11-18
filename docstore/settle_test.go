@@ -18,6 +18,9 @@ type store struct {
 	applied      []string
 	// The next DropStaging calls that fail.
 	failDrops int
+	// A newer generation raises the fence after Markers' first call.
+	newer bool
+	reads int
 }
 
 func newStore(staged ...string) *store {
@@ -29,6 +32,9 @@ func newStore(staged ...string) *store {
 }
 
 func (s *store) Markers(context.Context) (map[string]Marker, error) {
+	if s.reads++; s.newer && s.reads > 1 {
+		return nil, destination.ErrFenced
+	}
 	return maps.Clone(s.markers), nil
 }
 
@@ -102,5 +108,13 @@ func TestSettleRecordedIsLostOnlyWhenNothingApplied(t *testing.T) {
 	}
 	if len(st.applied) > 0 {
 		t.Errorf("applied %v", st.applied)
+	}
+}
+
+func TestSettleRecordedIsLostOnlyBehindItsOwnFence(t *testing.T) {
+	st := newStore()
+	st.gone["a"], st.newer = true, true
+	if r, err := SettleRecorded(t.Context(), "db", st, destination.ScopePipeline, epoch, []string{"a"}); !errors.Is(err, destination.ErrFenced) {
+		t.Errorf("with a newer generation's fence raised meanwhile, recovery is %v, %v; want fenced", r, err)
 	}
 }

@@ -33,7 +33,8 @@ func Mark(e destination.Epoch, stream string, ended bool, read, target string) M
 // Store is how a destination applies an epoch's staged streams, S, and
 // keeps their markers.
 type Store[S any] interface {
-	// Markers are the pipeline's, by stream.
+	// Markers are the pipeline's, by stream: destination.ErrFenced once a
+	// newer generation than the writer's has raised the fence.
 	Markers(ctx context.Context) (map[string]Marker, error)
 	// SetMarkers replaces the streams' markers, all or none, unless a newer
 	// generation has raised the fence.
@@ -149,6 +150,11 @@ func SettleRecorded[S any](ctx context.Context, name string, st Store[S], scope 
 		_, err := Settle(ctx, st, scope, e, streams)
 		return destination.Redone, err
 	case present == 0 && applied == 0:
+		// Unless a newer generation has raised the fence since, applied
+		// the epoch and dropped its staging, which Markers then refuses.
+		if _, err := st.Markers(ctx); err != nil {
+			return 0, err
+		}
 		return destination.Lost, nil
 	case present == 0:
 		// With ScopeStream, some streams applied before the rest's
