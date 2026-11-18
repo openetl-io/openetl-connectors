@@ -74,6 +74,10 @@ func seqOf(commit pglogrepl.LSN, n uint64) decimal128.Num {
 // position: for tests.
 var afterChunkSnapshot func()
 
+// beforeStartReplication, if set, runs once a read has checked its slot's
+// position, before it takes the slot: for tests.
+var beforeStartReplication func()
+
 // cdcState is a CDC stream's state.
 type cdcState struct {
 	Slot string `json:"slot"`
@@ -303,30 +307,13 @@ func (s *Source) readCDC(ctx context.Context, conns *connPool, req source.ReadRe
 	if err != nil {
 		return err
 	}
-	r.confirmed = confirmed
-	// The slot can't stream the log before its confirmed position, so a read
-	// from before it would skip changes: a stream acknowledged past while it
-	// wasn't read, or a redo from a position acknowledged since.
-	for _, st := range r.streams {
-		if st.from != 0 && st.from < confirmed {
-			return positionLost("postgres: %s resumes from %s, and replication slot %q was acknowledged up to %s and streams nothing before it, so the changes between can't be read again; its table needs a snapshot again", st.t.name, st.from, r.slot, confirmed)
-		}
+	if err := r.startAt(confirmed); err != nil {
+		return err
 	}
 	if !r.continuous {
 		if r.target, err = r.end(ctx); err != nil {
 			return err
 		}
-	}
-	// From the earliest stream's position, or the slot's if a stream has
-	// none.
-	start := r.streams[0].from
-	for _, st := range r.streams {
-		start = min(start, st.from)
-	}
-	start = max(start, confirmed)
-	r.pos = start
-	for _, st := range r.streams {
-		st.resumed = max(st.from, start)
 	}
 
 	rc := s.conn.Config.Copy()
@@ -335,7 +322,10 @@ func (s *Source) readCDC(ctx context.Context, conns *connPool, req source.ReadRe
 		return classify(fmt.Errorf("postgres: replication connection: %w", err))
 	}
 	defer func() { _ = r.repl.Close(context.WithoutCancel(ctx)) }()
-	err = pglogrepl.StartReplication(ctx, r.repl, r.slot, start, pglogrepl.StartReplicationOptions{
+	if beforeStartReplication != nil {
+		beforeStartReplication()
+	}
+	err = pglogrepl.StartReplication(ctx, r.repl, r.slot, r.pos, pglogrepl.StartReplicationOptions{
 		PluginArgs: []string{"proto_version '1'", "publication_names " + quoteLiteral(pgx.Identifier{r.pub}.Sanitize())},
 	})
 	if err != nil {
@@ -346,7 +336,49 @@ func (s *Source) readCDC(ctx context.Context, conns *connPool, req source.ReadRe
 	}
 	unset := s.setReader(r)
 	defer unset()
+	// The slot may have been advanced since ensureSlot, by Committed without
+	// a read, or by another process; it streams from where it was advanced
+	// to. Now that the read holds it, only the read's own status moves it.
+	if confirmed, err = r.slotConfirmed(ctx); err != nil {
+		return err
+	}
+	if err := r.startAt(confirmed); err != nil {
+		return err
+	}
 	return r.run(ctx)
+}
+
+// startAt checks that the slot, confirmed up to confirmed, can stream every
+// stream's changes, and sets where the read starts: the earliest stream's
+// position, or the slot's if it's later or a stream has none.
+func (r *cdcReader) startAt(confirmed pglogrepl.LSN) error {
+	// The slot can't stream the log before its confirmed position, so a read
+	// from before it would skip changes: a stream acknowledged past while it
+	// wasn't read, or a redo from a position acknowledged since.
+	for _, st := range r.streams {
+		if st.from != 0 && st.from < confirmed {
+			return positionLost("postgres: %s resumes from %s, and replication slot %q was acknowledged up to %s and streams nothing before it, so the changes between can't be read again; its table needs a snapshot again", st.t.name, st.from, r.slot, confirmed)
+		}
+	}
+	start := r.streams[0].from
+	for _, st := range r.streams {
+		start = min(start, st.from)
+	}
+	start = max(start, confirmed)
+	r.confirmed, r.pos = confirmed, start
+	for _, st := range r.streams {
+		st.resumed = max(st.from, start)
+	}
+	return nil
+}
+
+// slotConfirmed is the slot's confirmed position.
+func (r *cdcReader) slotConfirmed(ctx context.Context) (pglogrepl.LSN, error) {
+	var at string
+	if err := r.conn.QueryRow(ctx, "SELECT confirmed_flush_lsn::text FROM pg_replication_slots WHERE slot_name = $1", r.slot).Scan(&at); err != nil {
+		return 0, classify(fmt.Errorf("postgres: replication slot %q: %w", r.slot, err))
+	}
+	return pglogrepl.ParseLSN(at)
 }
 
 // stopAt sets where a bounded read of the stream stops: its until, or its
