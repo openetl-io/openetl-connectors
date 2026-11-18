@@ -15,6 +15,7 @@ var DestinationConfigSchema []byte
 var DestinationCapabilities = destination.Capabilities{
 	Class:                 destination.StageAndApply,
 	Scopes:                []destination.Scope{destination.ScopePipeline, destination.ScopeStream},
+	DedupeAtApply:         true,
 	DefaultCommitInterval: time.Minute,
 	MinCommitInterval:     time.Second,
 	WriteModes:            []destination.WriteMode{destination.Append, destination.Overwrite, destination.Merge},

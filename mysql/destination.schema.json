@@ -1,0 +1,37 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "MySQL destination",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["dsn"],
+  "x-groups": [
+    {"id": "tls", "title": "TLS", "description": "How connections use TLS, in place of the dsn's tls parameter."}
+  ],
+  "properties": {
+    "dsn": {"type": "string", "x-secret": true, "title": "Connection string", "description": "A DSN as the Go MySQL driver spells it, or a mysql:// URL.", "examples": ["USER:PASSWORD@tcp(HOST:3306)/DATABASE", "mysql://USER:PASSWORD@HOST:3306/DATABASE"]},
+    "database": {"type": "string", "title": "Database", "description": "The database tables are written to when the pipeline names no namespace. Default: the DSN's database."},
+    "tls": {
+      "type": "object",
+      "additionalProperties": false,
+      "title": "TLS",
+      "x-group": "tls",
+      "description": "How connections use TLS, in place of the dsn's tls parameter. Leave it out to go by the dsn.",
+      "properties": {
+        "mode": {
+          "type": "string", "title": "Mode", "default": "verify-identity",
+          "description": "How connections use TLS.",
+          "oneOf": [
+            {"const": "disabled", "title": "Disabled", "description": "No TLS."},
+            {"const": "preferred", "title": "Preferred", "description": "TLS if the server has it, without verifying its certificate; plaintext otherwise."},
+            {"const": "required", "title": "Required", "description": "TLS, without verifying the server's certificate."},
+            {"const": "verify-ca", "title": "Verify CA", "description": "TLS, with a certificate signed by ca."},
+            {"const": "verify-identity", "title": "Verify identity", "description": "As verify-ca, and the certificate names the dsn's host."}
+          ]
+        },
+        "ca": {"type": "string", "title": "CA certificates", "x-format": "multiline", "x-when": {"tls.mode": ["verify-ca", "verify-identity"]}, "description": "PEM certificates of the authorities that sign the server's certificate, for verify-ca and verify-identity. Empty: the system's."},
+        "cert": {"type": "string", "title": "Client certificate", "x-format": "multiline", "x-when": {"tls.mode": ["preferred", "required", "verify-ca", "verify-identity"]}, "description": "A client certificate, PEM, for a user created with REQUIRE X509 or REQUIRE SUBJECT. Needs key."},
+        "key": {"type": "string", "title": "Client key", "x-secret": true, "x-format": "multiline", "x-when": {"tls.mode": ["preferred", "required", "verify-ca", "verify-identity"]}, "description": "The client certificate's private key, PEM, unencrypted."}
+      }
+    }
+  }
+}
