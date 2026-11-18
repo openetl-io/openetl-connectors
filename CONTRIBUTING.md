@@ -74,7 +74,7 @@ The `openetl` CLI is openetl's `main`, copied out of the image `ghcr.io/openetl-
 Each package directory has an `openetl-connector.yaml`: its name, metadata, and how each role is built. The `openetl` CLI does the rest, so nothing here is specific to this repository:
 
 ```sh
-openetl connector validate --require author,logo,description,license postgres clickhouse kafka kinesis iceberg s3
+openetl connector validate --require author,logo,description,license postgres mysql clickhouse kafka kinesis iceberg s3
 openetl connector package --tag postgres/v0.2.0
 ```
 
@@ -107,6 +107,7 @@ The `docs` workflow calls the site's deploy hook, the secret `CLOUDFLARE_DEPLOY_
 Each package directory holds its `openetl-connector.yaml`, its config schemas and its page, `README.md`.
 
 - `postgres/`: the Postgres source and destination.
+- `mysql/`: the MySQL source and destination, which work against MariaDB too.
 - `clickhouse/`: the ClickHouse source and destination.
 - `iceberg/`: the Iceberg destination.
 - `s3/`: the Parquet on S3 destination.

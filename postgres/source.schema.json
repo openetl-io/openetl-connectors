@@ -4,15 +4,23 @@
   "type": "object",
   "additionalProperties": false,
   "required": ["dsn"],
+  "x-groups": [
+    {"id": "tls", "title": "TLS", "description": "From 0.2.0. Certificates given in place of the files the dsn's sslrootcert, sslcert and sslkey name."},
+    {"id": "cdc", "title": "Change data capture", "description": "Only for tables read with cdc."},
+    {"id": "tuning", "title": "Tuning"}
+  ],
   "properties": {
-    "dsn": {"type": "string", "x-secret": true, "description": "A connection URL or a keyword/value connection string."},
-    "schema": {"type": "string", "default": "public", "description": "The schema whose tables are offered as streams."},
-    "tables": {"type": "array", "items": {"type": "string"}, "description": "The tables to offer as streams. Empty: every table in the schema."},
-    "chunkRows": {"type": "integer", "minimum": 1, "default": 100000, "description": "Rows per query on a table with a primary key; each chunk ends at a resume point."},
-    "batchBytes": {"type": "integer", "minimum": 1, "default": 4194304, "description": "Approximate bytes of values per Arrow batch."},
-    "publication": {"type": "string", "minLength": 1, "default": "openetl", "description": "The publication that tables read with cdc are in. Created, or given the tables it lacks, if the user may."},
-    "slot": {"type": "string", "pattern": "^[a-z0-9_]{1,63}$", "description": "The replication slot tables read with cdc are read through. Default: one named after the pipeline, openetl_<pipeline>."},
-    "snapshotChunkRows": {"type": "integer", "minimum": 1, "default": 10000, "description": "Rows per chunk of a cdc table's snapshot, which is held in memory until the log catches up with it, a chunk per connection reading it."},
-    "maxConnections": {"type": "integer", "minimum": 1, "default": 4, "description": "The most connections a read holds to read tables, as many as it has lanes up to this. A cdc read's replication connection is one more."}
+    "dsn": {"type": "string", "x-secret": true, "description": "A connection URL or a keyword/value connection string.", "title": "Connection string", "examples": ["postgres://USER:PASSWORD@HOST:5432/DATABASE?sslmode=verify-full"]},
+    "schema": {"type": "string", "default": "public", "description": "The schema whose tables, and from 0.2.0 views, are offered as streams.", "title": "Schema"},
+    "tables": {"type": "array", "items": {"type": "string"}, "description": "The tables to offer as streams, and from 0.2.0 views and materialized views. Empty: every table and view in the schema.", "title": "Tables"},
+    "tlsCa": {"type": "string", "description": "From 0.2.0. PEM certificates of the authorities that sign the server's certificate, given in place of the dsn's sslrootcert file. The server's certificate must chain to them under every sslmode that uses TLS, and also name the dsn's host under verify-full. Setting it makes TLS required: sslmode=disable or allow is refused, and prefer doesn't fall back to a plaintext connection.", "title": "CA certificates", "x-group": "tls", "x-format": "multiline"},
+    "tlsCert": {"type": "string", "description": "From 0.2.0. A PEM client certificate, in place of the dsn's sslcert file, for a server that asks for one, such as with the cert authentication method or clientcert=verify-full. Needs tlsKey, and makes TLS required as tlsCa does.", "title": "Client certificate", "x-group": "tls", "x-format": "multiline"},
+    "tlsKey": {"type": "string", "x-secret": true, "description": "From 0.2.0. The client certificate's private key, PEM, unencrypted, in place of the dsn's sslkey file.", "title": "Client key", "x-group": "tls", "x-format": "multiline"},
+    "publication": {"type": "string", "minLength": 1, "default": "openetl", "description": "The publication that tables read with cdc are in. Created, or given the tables it lacks, if the user may.", "title": "Publication", "x-group": "cdc"},
+    "slot": {"type": "string", "pattern": "^[a-z0-9_]{1,63}$", "description": "The replication slot tables read with cdc are read through. Default: one named after the pipeline, openetl_<pipeline>.", "title": "Replication slot", "x-group": "cdc"},
+    "snapshotChunkRows": {"type": "integer", "minimum": 1, "default": 10000, "description": "Rows per chunk of a cdc table's snapshot, which is held in memory until the log catches up with it, a chunk per connection reading it.", "title": "Snapshot chunk rows", "x-group": "cdc", "x-advanced": true},
+    "chunkRows": {"type": "integer", "minimum": 1, "default": 100000, "description": "Rows per query on a table with a primary key, or from 0.2.0 without one but with a unique index on NOT NULL columns in their own collations, unless other tables inherit from it; each chunk ends at a resume point.", "title": "Chunk rows", "x-group": "tuning", "x-advanced": true},
+    "batchBytes": {"type": "integer", "minimum": 1, "default": 4194304, "description": "Approximate bytes of values per Arrow batch.", "title": "Batch bytes", "x-group": "tuning", "x-advanced": true},
+    "maxConnections": {"type": "integer", "minimum": 1, "default": 4, "description": "The most connections a read holds to read tables, as many as it has lanes up to this. A cdc read's replication connection is one more.", "title": "Max connections", "x-group": "tuning", "x-advanced": true}
   }
 }

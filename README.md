@@ -10,6 +10,7 @@ The official connectors for [OpenETL](https://github.com/openetl-io/openetl): th
 | Connector | As a source | As a destination |
 |---|---|---|
 | [PostgreSQL](./postgres/README.md) | Tables, in full, by a cursor column, or change by change through logical replication | Tables, by appending, overwriting or merging; exactly once |
+| [MySQL and MariaDB](./mysql/README.md) | Tables, in full, by a cursor column, or change by change from the binlog | Tables, by appending, overwriting or merging; exactly once |
 | [ClickHouse](./clickhouse/README.md) | Tables, in full or by a cursor column | Tables, by appending, overwriting or merging; exactly once |
 | [Kafka](./kafka/README.md) | Topics, in JSON, Avro or Protobuf | Topics, in one transaction per epoch; exactly once |
 | [Amazon Kinesis](./kinesis/README.md) | Data streams, shard by shard | Data streams, a record per row; at least once |

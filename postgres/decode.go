@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/apache/arrow-go/v18/arrow"
@@ -14,6 +16,9 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
+
+	sdk "github.com/openetl-io/openetl/sdk/go"
+	protocolv1 "github.com/openetl-io/openetl/sdk/go/protocol/v1"
 )
 
 // colBuilder decodes one column's non-null values into an Arrow builder.
@@ -177,6 +182,10 @@ func newColBuilder(mem memory.Allocator, c sourceColumn) (*colBuilder, error) {
 	case pgtype.NumericOID:
 		cb.declared = numericType(c.typmod)
 	}
+	if tt := typedText(c); tt != nil {
+		b := array.NewBuilder(mem, tt.dt)
+		cb.format, cb.b, cb.add = pgx.TextFormatCode, b, func(v []byte) error { return tt.add(b, v) }
+	}
 	if cb.b == nil {
 		b := array.NewStringBuilder(mem)
 		cb.format, cb.b, cb.add = pgx.TextFormatCode, b, func(v []byte) error { b.BinaryBuilder.Append(v); return nil }
@@ -206,4 +215,279 @@ func numericTypmod(typmod int32) (p, s int32, ok bool) {
 		s -= 0x800 // negative scales, from Postgres 15
 	}
 	return p, s, p >= 1 && p <= 38 && s >= 0 && s <= p
+}
+
+// textTyped is a column the engine can't parse from text, built from
+// Postgres's text form: an interval, or a one-dimensional array whose items
+// have a type of their own in Arrow.
+type textTyped struct {
+	dt  arrow.DataType
+	add func(b array.Builder, v []byte) error
+}
+
+// The array types read as lists, by their items' types.
+var listItems = map[uint32]arrow.DataType{
+	pgtype.BoolArrayOID:    arrow.FixedWidthTypes.Boolean,
+	pgtype.Int2ArrayOID:    arrow.PrimitiveTypes.Int16,
+	pgtype.Int4ArrayOID:    arrow.PrimitiveTypes.Int32,
+	pgtype.Int8ArrayOID:    arrow.PrimitiveTypes.Int64,
+	pgtype.Float4ArrayOID:  arrow.PrimitiveTypes.Float32,
+	pgtype.Float8ArrayOID:  arrow.PrimitiveTypes.Float64,
+	pgtype.TextArrayOID:    arrow.BinaryTypes.String,
+	pgtype.VarcharArrayOID: arrow.BinaryTypes.String,
+	pgtype.BPCharArrayOID:  arrow.BinaryTypes.String,
+}
+
+// typedText is how c is built from text, nil if it goes as text, which the
+// engine parses as its declared type. An array column goes as a list only
+// if it was declared with one dimension.
+func typedText(c sourceColumn) *textTyped {
+	if c.oid == pgtype.IntervalOID {
+		return &textTyped{dt: arrow.FixedWidthTypes.MonthDayNanoInterval, add: func(b array.Builder, v []byte) error {
+			iv, err := parseInterval(string(v))
+			if err != nil {
+				return err
+			}
+			b.(*array.MonthDayNanoIntervalBuilder).Append(iv)
+			return nil
+		}}
+	}
+	item, ok := listItems[c.oid]
+	// A view's columns, and some tables', don't say: their arrays may have
+	// any number of dimensions.
+	if !ok || c.dims != 1 {
+		return nil
+	}
+	padded := c.oid == pgtype.BPCharArrayOID
+	return &textTyped{dt: arrow.ListOf(item), add: func(b array.Builder, v []byte) error {
+		items, err := arrayItems(v)
+		if err != nil {
+			return err
+		}
+		lb := b.(*array.ListBuilder)
+		lb.Append(true)
+		vb := lb.ValueBuilder()
+		for _, it := range items {
+			if it == nil {
+				vb.AppendNull()
+				continue
+			}
+			if padded {
+				it = unpad(it)
+			}
+			if err := appendItem(vb, string(it)); err != nil {
+				return dataInvalid("an array item %q: %v", it, err)
+			}
+		}
+		return nil
+	}}
+}
+
+// appendItem appends an array item's text form.
+func appendItem(b array.Builder, s string) error {
+	switch b := b.(type) {
+	case *array.BooleanBuilder:
+		switch s {
+		case "t":
+			b.Append(true)
+		case "f":
+			b.Append(false)
+		default:
+			return errors.New("not a boolean")
+		}
+	case *array.Int16Builder:
+		n, err := strconv.ParseInt(s, 10, 16)
+		if err != nil {
+			return err
+		}
+		b.Append(int16(n))
+	case *array.Int32Builder:
+		n, err := strconv.ParseInt(s, 10, 32)
+		if err != nil {
+			return err
+		}
+		b.Append(int32(n))
+	case *array.Int64Builder:
+		n, err := strconv.ParseInt(s, 10, 64)
+		if err != nil {
+			return err
+		}
+		b.Append(n)
+	case *array.Float32Builder:
+		f, err := strconv.ParseFloat(s, 32)
+		if err != nil {
+			return err
+		}
+		b.Append(float32(f))
+	case *array.Float64Builder:
+		f, err := strconv.ParseFloat(s, 64)
+		if err != nil {
+			return err
+		}
+		b.Append(f)
+	case *array.StringBuilder:
+		b.Append(s)
+	default:
+		return fmt.Errorf("no item type %T", b)
+	}
+	return nil
+}
+
+func dataInvalid(format string, args ...any) error {
+	return sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_DATA_INVALID, fmt.Errorf(format, args...))
+}
+
+// arrayItems are a one-dimensional array's items in Postgres's text form,
+// nil for NULL. Bounds it states, such as [0:1]={a,b}, aren't kept. An array
+// of more dimensions has no list to go in: it's DATA_INVALID.
+func arrayItems(v []byte) ([][]byte, error) {
+	s := v
+	if len(s) > 0 && s[0] == '[' {
+		eq := bytes.IndexByte(s, '=')
+		if eq < 0 {
+			return nil, dataInvalid("an array %q", v)
+		}
+		if bytes.Count(s[:eq], []byte("[")) > 1 {
+			return nil, dataInvalid("an array of more than one dimension, %.40q, has no list to go in; read the column cast to text, through a view", v)
+		}
+		s = s[eq+1:]
+	}
+	if len(s) < 2 || s[0] != '{' || s[len(s)-1] != '}' {
+		return nil, dataInvalid("an array %q", v)
+	}
+	s = s[1 : len(s)-1]
+	if len(s) > 0 && s[0] == '{' {
+		return nil, dataInvalid("an array of more than one dimension, %.40q, has no list to go in; read the column cast to text, through a view", v)
+	}
+	var out [][]byte
+	if len(s) == 0 {
+		return out, nil
+	}
+	for i := 0; ; {
+		var item []byte
+		quoted, escaped := i < len(s) && s[i] == '"', false
+		if quoted {
+			i++
+		}
+		for ; i < len(s); i++ {
+			c := s[i]
+			if c == '\\' && i+1 < len(s) {
+				i++
+				item, escaped = append(item, s[i]), true
+				continue
+			}
+			if quoted && c == '"' || !quoted && c == ',' {
+				break
+			}
+			item = append(item, c)
+		}
+		if quoted {
+			if i >= len(s) {
+				return nil, dataInvalid("an array %q", v)
+			}
+			i++
+		}
+		switch {
+		case !quoted && !escaped && bytes.EqualFold(item, []byte("NULL")):
+			out = append(out, nil)
+		case item == nil:
+			out = append(out, []byte{})
+		default:
+			out = append(out, item)
+		}
+		if i >= len(s) {
+			return out, nil
+		}
+		if s[i] != ',' {
+			return nil, dataInvalid("an array %q", v)
+		}
+		i++
+	}
+}
+
+// parseInterval reads an interval as Postgres writes it with IntervalStyle
+// iso_8601, such as P1Y2M3DT4H5M6.5S or P-1DT-2H. The engine's interval
+// holds months, days and nanoseconds, so one whose hours, minutes and
+// seconds are past about 292 years, or an infinite one, has nowhere to go:
+// it's DATA_INVALID.
+func parseInterval(s string) (arrow.MonthDayNanoInterval, error) {
+	past := func() (arrow.MonthDayNanoInterval, error) {
+		return arrow.MonthDayNanoInterval{}, dataInvalid("an interval of %s is past what the engine's interval holds; read the column cast to text, through a view", s)
+	}
+	rest, ok := strings.CutPrefix(s, "P")
+	if !ok {
+		if s == "infinity" || s == "-infinity" {
+			return past()
+		}
+		return arrow.MonthDayNanoInterval{}, dataInvalid("an interval %q", s)
+	}
+	var months, days, micros int64
+	timePart := false
+	for rest != "" {
+		if rest[0] == 'T' {
+			timePart, rest = true, rest[1:]
+			continue
+		}
+		end := strings.IndexAny(rest, "YMWDHS")
+		if end <= 0 {
+			return arrow.MonthDayNanoInterval{}, dataInvalid("an interval %q", s)
+		}
+		num, unit := rest[:end], rest[end]
+		rest = rest[end+1:]
+		if !timePart || unit != 'S' {
+			n, err := strconv.ParseInt(num, 10, 64)
+			if err != nil {
+				return arrow.MonthDayNanoInterval{}, dataInvalid("an interval %q", s)
+			}
+			var per int64
+			switch {
+			case !timePart && unit == 'Y':
+				months += n * 12
+			case !timePart && unit == 'M':
+				months += n
+			case !timePart && unit == 'W':
+				days += n * 7
+			case !timePart && unit == 'D':
+				days += n
+			case timePart && unit == 'H':
+				per = 3_600_000_000
+			case timePart && unit == 'M':
+				per = 60_000_000
+			default:
+				return arrow.MonthDayNanoInterval{}, dataInvalid("an interval %q", s)
+			}
+			if per != 0 {
+				if n > math.MaxInt64/per || n < math.MinInt64/per {
+					return past()
+				}
+				micros += n * per
+			}
+			continue
+		}
+		neg := strings.HasPrefix(num, "-")
+		whole, frac, _ := strings.Cut(strings.TrimPrefix(num, "-"), ".")
+		if len(frac) > 6 {
+			return arrow.MonthDayNanoInterval{}, dataInvalid("an interval %q", s)
+		}
+		w, err := strconv.ParseInt(whole, 10, 64)
+		f, ferr := strconv.ParseInt(frac+strings.Repeat("0", 6-len(frac)), 10, 64)
+		if err != nil || ferr != nil {
+			return arrow.MonthDayNanoInterval{}, dataInvalid("an interval %q", s)
+		}
+		if w > (math.MaxInt64-f)/1_000_000 {
+			return past()
+		}
+		us := w*1_000_000 + f
+		if neg {
+			us = -us
+		}
+		micros += us
+	}
+	if months > math.MaxInt32 || months < math.MinInt32 || days > math.MaxInt32 || days < math.MinInt32 {
+		return past()
+	}
+	if micros > math.MaxInt64/1000 || micros < math.MinInt64/1000 {
+		return past()
+	}
+	return arrow.MonthDayNanoInterval{Months: int32(months), Days: int32(days), Nanoseconds: micros * 1000}, nil
 }
