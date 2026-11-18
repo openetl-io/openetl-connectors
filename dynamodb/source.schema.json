@@ -1,0 +1,115 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Amazon DynamoDB source",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "region": {
+      "type": "string",
+      "title": "Region",
+      "description": "The tables' AWS region, such as us-east-1. Default: AWS_REGION where the connector runs, or the AWS default config's.",
+      "examples": [
+        "us-east-1"
+      ],
+      "x-group": "connection"
+    },
+    "endpoint": {
+      "type": "string",
+      "title": "Endpoint",
+      "description": "A DynamoDB-compatible endpoint instead of the region's: a VPC endpoint, or DynamoDB Local's, such as http://127.0.0.1:8000. Its streams are read at the same endpoint.",
+      "x-format": "uri",
+      "x-advanced": true,
+      "x-group": "connection"
+    },
+    "accessKeyId": {
+      "type": "string",
+      "x-secret": true,
+      "title": "Access key ID",
+      "description": "An AWS access key. Without one, the AWS default credentials: an IAM role the source names, or what the runner passes on.",
+      "x-group": "credentials"
+    },
+    "secretAccessKey": {
+      "type": "string",
+      "x-secret": true,
+      "title": "Secret access key",
+      "description": "The access key's secret. Needed with accessKeyId.",
+      "x-group": "credentials"
+    },
+    "sessionToken": {
+      "type": "string",
+      "x-secret": true,
+      "title": "Session token",
+      "description": "For temporary credentials from AWS STS: their session token, with their access key and secret.",
+      "x-advanced": true,
+      "x-group": "credentials"
+    },
+    "tables": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "title": "Tables",
+      "description": "The tables to offer as streams. Empty: every table in the region the credentials can list.",
+      "x-group": "tables"
+    },
+    "packed": {
+      "type": "boolean",
+      "default": false,
+      "title": "Packed items",
+      "description": "Read each item whole: every stream is the table's key attributes and data, a JSON column with the item in DynamoDB JSON, which keeps every type, instead of a column per top-level attribute. Discovery reads only the keys, and no read fails on a new attribute.",
+      "x-group": "tables"
+    },
+    "sampleSize": {
+      "type": "integer",
+      "minimum": 0,
+      "default": 0,
+      "title": "Discovery sample",
+      "description": "Items discovery reads of each table, from random scan segments, to find its attributes and their types. 0: every item, so that a read never meets an attribute discovery didn't declare, at the cost of a scan of each table per discovery. A sample can miss a rare attribute, and a read that meets it fails and starts again until a sample finds it: set 0, or packed, for tables with rare attributes.",
+      "x-group": "tables",
+      "x-when": {
+        "packed": false
+      }
+    },
+    "segments": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 1000000,
+      "default": 0,
+      "title": "Scan segments",
+      "description": "Parallel scan segments each table is read in, as splits OpenETL can read at once, and in a cdc snapshot. 0: one per GiB the table holds, as DescribeTable reports it, up to 64.",
+      "x-advanced": true,
+      "x-group": "reading"
+    },
+    "scanLimit": {
+      "type": "integer",
+      "minimum": 0,
+      "default": 0,
+      "title": "Items per scan request",
+      "description": "The most items one Scan request reads; each request ends at a resume point. 0: as many as fit DynamoDB's 1 MB page.",
+      "x-advanced": true,
+      "x-group": "reading"
+    }
+  },
+  "x-groups": [
+    {
+      "id": "connection",
+      "title": "Connection",
+      "description": "Where DynamoDB is."
+    },
+    {
+      "id": "credentials",
+      "title": "Credentials",
+      "description": "An access key, or else the AWS default credentials."
+    },
+    {
+      "id": "tables",
+      "title": "Tables",
+      "description": "Which tables are streams, and how their items become columns."
+    },
+    {
+      "id": "reading",
+      "title": "Reading",
+      "description": "How tables are scanned."
+    }
+  ]
+}

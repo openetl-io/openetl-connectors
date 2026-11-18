@@ -74,7 +74,7 @@ The `openetl` CLI is openetl's `main`, copied out of the image `ghcr.io/openetl-
 Each package directory has an `openetl-connector.yaml`: its name, metadata, and how each role is built. The `openetl` CLI does the rest, so nothing here is specific to this repository:
 
 ```sh
-openetl connector validate --require author,logo,description,license postgres mysql sqlserver oracle clickhouse mongodb kafka kinesis iceberg s3
+openetl connector validate --require author,logo,description,license postgres mysql sqlserver oracle clickhouse mongodb dynamodb kafka kinesis iceberg s3
 openetl connector package --tag postgres/v0.2.0
 ```
 
@@ -112,6 +112,7 @@ Each package directory holds its `openetl-connector.yaml`, its config schemas an
 - `oracle/`: the Oracle Database source and destination.
 - `clickhouse/`: the ClickHouse source and destination.
 - `mongodb/`: the MongoDB source and destination.
+- `dynamodb/`: the DynamoDB source and destination.
 - `iceberg/`: the Iceberg destination.
 - `s3/`: files on Amazon S3, S3-compatible stores or a local disk: a source of Parquet, Avro, CSV and JSON Lines, and a destination that writes Parquet, CSV and JSON Lines.
 - `kafka/`: the Kafka source and destination.
