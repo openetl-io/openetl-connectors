@@ -3,8 +3,10 @@ package postgres
 import (
 	"encoding/binary"
 	"math"
+	"slices"
 	"testing"
 
+	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -137,6 +139,58 @@ func TestBigEndianInts(t *testing.T) {
 		}
 		if n := int16(n); beInt16(binary.BigEndian.AppendUint16(nil, uint16(n))) != n {
 			t.Errorf("int16 %d", n)
+		}
+	}
+}
+
+func TestParseInterval(t *testing.T) {
+	for in, want := range map[string]arrow.MonthDayNanoInterval{
+		"PT0S":             {},
+		"P1Y2M3DT4H5M6.5S": {Months: 14, Days: 3, Nanoseconds: ((4*60+5)*60+6)*1e9 + 5e8},
+		"P-1Y-2M-3DT-4H":   {Months: -14, Days: -3, Nanoseconds: -4 * 3600 * 1e9},
+		"PT-0.000001S":     {Nanoseconds: -1000},
+		"P1W":              {Days: 7},
+		"PT2562047H47M16S": {Nanoseconds: 9223372036000000000},
+		"P-178956970Y-8M":  {Months: math.MinInt32},
+		"PT1H-1M":          {Nanoseconds: 59 * 60 * 1e9},
+	} {
+		got, err := parseInterval(in)
+		if err != nil || got != want {
+			t.Errorf("%s = %+v, %v; want %+v", in, got, err, want)
+		}
+	}
+	for _, in := range []string{"infinity", "-infinity", "PT2562048H", "PT-9223372036854S", "1 day", "P1X", "PT1.1234567S", "PTS"} {
+		if got, err := parseInterval(in); err == nil {
+			t.Errorf("%s = %+v, want an error", in, got)
+		}
+	}
+}
+
+func TestArrayItems(t *testing.T) {
+	for in, want := range map[string][]string{
+		`{}`:                    {},
+		`{1,NULL,3}`:            {"1", "<nil>", "3"},
+		`{null,"NULL",""}`:      {"<nil>", "NULL", ""},
+		`{"a,b","q\"u","x\\y"}`: {"a,b", `q"u`, `x\y`},
+		`[0:1]={5,6}`:           {"5", "6"},
+		`{" sp ",plain}`:        {" sp ", "plain"},
+	} {
+		items, err := arrayItems([]byte(in))
+		got := []string{}
+		for _, it := range items {
+			if it == nil {
+				got = append(got, "<nil>")
+			} else {
+				got = append(got, string(it))
+			}
+		}
+		if err != nil || !slices.Equal(got, want) {
+			t.Errorf("%s = %q, %v; want %q", in, got, err, want)
+		}
+	}
+	for _, in := range []string{`{{1,2},{3,4}}`, `[1:2][1:2]={{1,2},{3,4}}`, `{"open`, `1,2`, `{"a"b}`} {
+		if _, err := arrayItems([]byte(in)); err == nil {
+			t.Errorf("%s: no error", in)
 		}
 	}
 }
