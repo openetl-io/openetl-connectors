@@ -1,0 +1,107 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Files on Google Cloud Storage: destination",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "url"
+  ],
+  "if": {
+    "properties": {
+      "format": {
+        "enum": [
+          "csv",
+          "jsonl"
+        ]
+      }
+    },
+    "required": [
+      "format"
+    ]
+  },
+  "then": {
+    "properties": {
+      "compression": {
+        "enum": [
+          "gzip",
+          "zstd",
+          "none"
+        ]
+      }
+    }
+  },
+  "properties": {
+    "url": {
+      "type": "string",
+      "title": "URL",
+      "description": "Where the tables go: gs://bucket/prefix. Each stream's table is a directory of files under it.",
+      "x-group": "location"
+    },
+    "endpoint": {
+      "type": "string",
+      "title": "Endpoint",
+      "description": "The Google Cloud Storage JSON API's endpoint, for one other than Google's, such as fake-gcs-server's. With it and no serviceAccountKey, the connector sends no credentials; with a serviceAccountKey, it needs https.",
+      "x-group": "location",
+      "x-format": "uri",
+      "x-advanced": true
+    },
+    "serviceAccountKey": {
+      "type": "string",
+      "x-secret": true,
+      "title": "Service account key",
+      "description": "A service account's JSON key, as its text. Without one, Google's default credentials, or none at all with an endpoint, as an emulator takes. With an endpoint, the endpoint needs https, as the key's tokens go in each request.",
+      "x-group": "gcs",
+      "x-format": "multiline"
+    },
+    "format": {
+      "type": "string",
+      "enum": [
+        "parquet",
+        "csv",
+        "jsonl"
+      ],
+      "default": "parquet",
+      "title": "Format",
+      "description": "The files' format: Parquet, CSV with a header line, or JSON Lines.",
+      "x-group": "files"
+    },
+    "compression": {
+      "type": "string",
+      "enum": [
+        "zstd",
+        "snappy",
+        "gzip",
+        "none"
+      ],
+      "title": "Compression",
+      "description": "Parquet: zstd (the default), snappy, gzip or none, inside the file. CSV and JSON Lines: gzip, zstd or none (the default), the whole file, which gets the extension .gz or .zst.",
+      "x-group": "files"
+    },
+    "fileSize": {
+      "type": "integer",
+      "minimum": 1048576,
+      "default": 268435456,
+      "title": "File size",
+      "description": "Bytes a file reaches, compressed, before the next one starts.",
+      "x-group": "files",
+      "x-advanced": true
+    }
+  },
+  "x-groups": [
+    {
+      "id": "location",
+      "title": "Location",
+      "description": "Where the files are, and the address of the store's API."
+    },
+    {
+      "id": "gcs",
+      "title": "Google Cloud Storage",
+      "description": "The service account."
+    },
+    {
+      "id": "files",
+      "title": "Files",
+      "description": "How each table's files are written."
+    }
+  ]
+}
