@@ -816,7 +816,8 @@ SH
     dest_bad=(--bad-credentials "$work/azure-dest-bad.json")
   fi
   export STORE=$store
-  check "source-$pkg" "$pkg" --role source \
+  # A package without a source yet has no source to check.
+  [ -d "cmd/source-$pkg" ] && check "source-$pkg" "$pkg" --role source \
     --config "$work/$store-source.json" \
     --unreachable "$work/$store-source-closed.json" ${source_bad[@]+"${source_bad[@]}"} \
     --stream people:incremental --stream logs:incremental --add-records-command "$work/files-add" \
