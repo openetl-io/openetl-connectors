@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "MySQL source",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["dsn"],
+  "x-groups": [
+    {"id": "tls", "title": "TLS", "description": "How connections use TLS, in place of the dsn's tls parameter."},
+    {"id": "cdc", "title": "Change data capture", "description": "Only for tables read with cdc."},
+    {"id": "tuning", "title": "Tuning"}
+  ],
+  "properties": {
+    "dsn": {"type": "string", "x-secret": true, "title": "Connection string", "description": "A DSN as the Go MySQL driver spells it, or a mysql:// URL.", "examples": ["USER:PASSWORD@tcp(HOST:3306)/DATABASE", "mysql://USER:PASSWORD@HOST:3306/DATABASE"]},
+    "database": {"type": "string", "title": "Database", "description": "The database whose tables are offered as streams. Default: the DSN's database."},
+    "tables": {"type": "array", "items": {"type": "string"}, "title": "Tables", "description": "The tables to offer as streams. Empty: every table in the database."},
+    "tls": {
+      "type": "object",
+      "additionalProperties": false,
+      "title": "TLS",
+      "x-group": "tls",
+      "description": "How connections use TLS, the binlog connection's too, in place of the dsn's tls parameter. Leave it out to go by the dsn.",
+      "properties": {
+        "mode": {
+          "type": "string", "title": "Mode", "default": "verify-identity",
+          "description": "How connections use TLS.",
+          "oneOf": [
+            {"const": "disabled", "title": "Disabled", "description": "No TLS."},
+            {"const": "preferred", "title": "Preferred", "description": "TLS if the server has it, without verifying its certificate; plaintext otherwise."},
+            {"const": "required", "title": "Required", "description": "TLS, without verifying the server's certificate."},
+            {"const": "verify-ca", "title": "Verify CA", "description": "TLS, with a certificate signed by ca."},
+            {"const": "verify-identity", "title": "Verify identity", "description": "As verify-ca, and the certificate names the dsn's host."}
+          ]
+        },
+        "ca": {"type": "string", "title": "CA certificates", "x-format": "multiline", "x-when": {"tls.mode": ["verify-ca", "verify-identity"]}, "description": "PEM certificates of the authorities that sign the server's certificate, for verify-ca and verify-identity. Empty: the system's."},
+        "cert": {"type": "string", "title": "Client certificate", "x-format": "multiline", "x-when": {"tls.mode": ["preferred", "required", "verify-ca", "verify-identity"]}, "description": "A client certificate, PEM, for a user created with REQUIRE X509 or REQUIRE SUBJECT. Needs key."},
+        "key": {"type": "string", "title": "Client key", "x-secret": true, "x-format": "multiline", "x-when": {"tls.mode": ["preferred", "required", "verify-ca", "verify-identity"]}, "description": "The client certificate's private key, PEM, unencrypted."}
+      }
+    },
+    "snapshotChunkRows": {"type": "integer", "minimum": 1, "default": 10000, "title": "Snapshot chunk rows", "x-group": "cdc", "x-advanced": true, "description": "Rows per chunk of a cdc table's snapshot. Each chunk's rows are share-locked while it's read, and held in memory until the binlog reaches it, a chunk per connection reading it."},
+    "serverId": {"type": "integer", "minimum": 1, "maximum": 4294967295, "title": "Server ID", "x-group": "cdc", "x-advanced": true, "description": "The server ID the binlog connection presents, which must differ from every replica's of the server. Default: one derived from the pipeline's name, at or above 2147483648."},
+    "chunkRows": {"type": "integer", "minimum": 1, "default": 100000, "title": "Chunk rows", "x-group": "tuning", "x-advanced": true, "description": "Rows per query on a table with a primary key; each chunk ends at a resume point."},
+    "batchBytes": {"type": "integer", "minimum": 1, "default": 4194304, "title": "Batch bytes", "x-group": "tuning", "x-advanced": true, "description": "Approximate bytes of values per Arrow batch."},
+    "maxConnections": {"type": "integer", "minimum": 1, "default": 4, "title": "Max connections", "x-group": "tuning", "x-advanced": true, "description": "The most connections a read holds to read tables, as many as it has lanes up to this. A cdc read's binlog connection is one more."}
+  }
+}
