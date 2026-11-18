@@ -123,10 +123,7 @@ func startLogMiner(ctx context.Context, conn *sql.Conn, from, to uint64) error {
 		if err := covered(logs, from); err != nil {
 			return err
 		}
-		for i, l := range logs {
-			if to != 0 && l.first > to {
-				break
-			}
+		for i, l := range upTo(logs, to) {
 			opt := "SYS.DBMS_LOGMNR.ADDFILE"
 			if i == 0 {
 				opt = "SYS.DBMS_LOGMNR.NEW"
@@ -146,6 +143,15 @@ func startLogMiner(ctx context.Context, conn *sql.Conn, from, to uint64) error {
 		return mining(fmt.Errorf("oracle: start LogMiner from SCN %d: %w", from, err))
 	}
 	return nil
+}
+
+// upTo are the logs, of every thread, that begin at or before SCN to; to 0
+// is all of them.
+func upTo(logs []redoLog, to uint64) []redoLog {
+	if to == 0 {
+		return logs
+	}
+	return slices.DeleteFunc(slices.Clone(logs), func(l redoLog) bool { return l.first > to })
 }
 
 // thisContainer keeps the rows of the container the session is in: mined

@@ -11,7 +11,7 @@ Both use [go-ora](https://github.com/sijms/go-ora), a pure Go driver, so nothing
 
 ### What it reads
 
-Each table in the configured `schema` is a stream, or only the ones `tables` lists; by default the schema is the user's own. Names are as Oracle stores them, which is usually in upper case: `ORDERS`, not `orders`. Views, temporary, nested and external tables aren't offered, and a table's hidden and virtual columns are left out. A column of a type the source can't read, such as `BFILE`, `VECTOR` or an object type, is left out too.
+Each table in the configured `schema` is a stream, or only the ones `tables` lists; by default the schema is the user's own. Names are as Oracle stores them, which is usually in upper case: `ORDERS`, not `orders`. Views, temporary, nested and external tables aren't offered, and a table's hidden and virtual columns are left out. A column of a type the source can't read, such as `BFILE`, `VECTOR` or an object type, is left out too, and a table with no other column isn't offered: naming one in `tables` fails as misconfigured, naming its columns.
 
 A stream can be read three ways, which the pipeline picks with each stream's `sync`:
 
@@ -36,6 +36,8 @@ Connected to a pluggable database, LogMiner finds the logs that hold the redo it
 The source doesn't use `CONTINUOUS_MINE`, which Oracle removed in 19c, nor `COMMITTED_DATA_ONLY`. Changes that are still in the log buffer when a session reads its window aren't in it; the next window starts 5 seconds back from the end of the last, so they're read when they reach the log file, and a change read twice is kept once.
 
 Every change carries a sequence number: its commit's SCN times 10¹² plus its place in the transaction, so the destination applies a key's versions in order.
+
+An update that changes a row's key arrives as two changes: a delete of the row under its old key, with the old values, then the update under the new key. Both have the update's sequence number, as they're of different keys.
 
 ### How CDC hands over from the snapshot
 
@@ -168,9 +170,9 @@ A column dropped moves the columns after it, so a change made before the drop ca
 
 ### Delivery
 
-Full refresh and CDC streams replay exactly: a read resumed from a checkpoint yields the same rows in the same order. OpenETL counts incremental streams as ones that may repeat rows, because of the rows at the cursor's last value, and the destination's capabilities decide what guarantee that leaves.
+Full refresh and CDC streams replay exactly: a read resumed from a resume point sends nothing it sent before it. A CDC read sends the redo log's changes in the order the first read did. A full refresh isn't a snapshot of one moment: a read in key order reads each chunk as the table has it when it reads the chunk, so a row deleted since the read began, or since the read it resumes, isn't sent, and a row changed since is sent as it is then. A table read in a single query has no resume point inside its read, so a read of it that stops starts again from the table's start. OpenETL counts incremental streams as ones that may repeat rows, because of the rows at the cursor's last value, and the destination's capabilities decide what guarantee that leaves.
 
-A read OpenETL asks to end at an earlier resume point (`until`), to read a part again, sends nothing past it, then that resume point, and completes there. A full refresh or incremental read sends the rows between the two resume points again, as the table has them now. A CDC read sends the redo log's changes again as they were, with the same sequence numbers; the snapshot's rows of that part are read again as of the snapshot's SCN, so the stream lands as it did. A CDC position moves with the stream's changes and the redo log's files, not with when a read ended, so a read again from a resume point ends where the first did.
+A read OpenETL asks to end at an earlier resume point (`until`), to read a part again, sends nothing past it, then that resume point, and completes there. A full refresh or incremental read sends the rows between the two resume points again, as the table has them now: a row deleted since isn't sent, and one changed is sent with its values now, so that part doesn't land as it did. A CDC read sends the redo log's changes again as they were, with the same sequence numbers; the snapshot's rows of that part are read again as of the snapshot's SCN, so the stream lands as it did. A CDC position moves with the stream's changes and the redo log's files, not with when a read ended, so a read again from a resume point ends where the first did.
 
 ### Limits
 
@@ -199,8 +201,8 @@ A schema that doesn't exist is created as a user that can't sign in (`CREATE USE
 All three write modes work:
 
 - **Append** inserts each epoch's rows.
-- **Overwrite** writes a read's rows to a table of its own, which replaces the target's rows when the read ends, so the target keeps its old rows until then. A read that ends without rows empties the table.
-- **Merge** upserts each key's latest version, ordered by `_openetl_seq`, so an older version never overwrites a newer one. Deletes are soft unless the pipeline sets `destination.deletes: hard`: the row stays, with `_openetl_deleted` true. A column an update didn't send, such as a LOB that CDC reads as unchanged, keeps the value the table has. Merge needs a unique index on the key, which the destination creates if the table has none; it fails, naming the table, if the table's rows repeat a key.
+- **Overwrite** writes a read's rows to a table of its own, which replaces the target's rows when the read ends, so the target keeps its old rows until then. A read that ends without rows empties the table. The destination learns a stream's table from its schema or its rows, so a read that ends before the stream has had either leaves a table that was already there as it is.
+- **Merge** upserts each key's latest version, ordered by `_openetl_seq`, so an older version never overwrites a newer one. Deletes are soft unless the pipeline sets `destination.deletes: hard`: the row stays, with `_openetl_deleted` true, and its other columns as the table has them, so an update to the row earlier in the same epoch isn't kept. A hard delete removes the row, and its `_openetl_seq` with it: a version older than the delete that arrives in a later epoch inserts the row again. A column an update didn't send, such as a LOB that CDC reads as unchanged, keeps the value the table has. Merge needs a unique index on the key, which the destination creates if the table has none; it fails, naming the table, if the table's rows repeat a key.
 
 Each epoch is staged into tables of its own, then applied with `MERGE`, `INSERT … SELECT` and `UPDATE` statements in one transaction, behind a fence row in `_openetl_fence`, with a marker per stream in `_openetl_loads`. A replaced attempt can't apply, and an epoch is never applied twice. Append and overwrite also skip rows a source sends again, by their `_openetl_id`, and merge keeps each key's latest version. So a stream lands exactly once, or effectively once when it's merged from a source that may repeat rows, unless the pipeline asks for less.
 
@@ -275,7 +277,7 @@ spec:
 
 ### Schema changes
 
-New columns are added to the table, until it has the 1,000 columns Oracle allows; past that, the destination refuses the column.
+New columns are added to the table, until it has 999 columns, one fewer than the 1,000 Oracle allows, as each staging table has a column of its own besides; past that, the destination refuses the column.
 
 A column whose type the table's column holds already, such as a 32-bit integer in a `NUMBER(19)`, is written to it as it is. The destination doesn't change an existing column's type by itself. When a stream's column widens, it refuses the change, the stream holds the column where it can, and the refusal gives the statement that makes the change:
 
@@ -306,7 +308,7 @@ Exactly once, or effectively once when a stream is merged from a source that may
 
 - Table and column names are up to 128 bytes, and can't be empty or hold a double quote (`"`) or NUL. A stream or column with such a name fails.
 - A merge key's text columns share 4,000 bytes: one is a `VARCHAR2(4000 BYTE)`, two are `VARCHAR2(2000 BYTE)` each, and so on; a binary key column is at most `RAW(2000)`. A key value longer than its column fails the epoch.
-- A table has at most 1,000 columns, the destination's own included.
+- A table has at most 999 columns, the destination's own included, as its staging tables have one more.
 - Dates and timestamps are written from year 1 to 9999; a value outside fails the epoch. Oracle counts days before 15 October 1582 in the Julian calendar, so such a date is stored with the year, month and day it arrives with, and 5 to 14 October 1582 become 15 October.
 - A time of day is an `INTERVAL DAY(0) TO SECOND`, as Oracle has no time-of-day type; read it with `EXTRACT`, or add it to a date.
 - go-ora reads an `INTERVAL` to the microsecond; `EXTRACT(SECOND FROM …)` gives the nanoseconds a `SECOND(9)` column keeps.

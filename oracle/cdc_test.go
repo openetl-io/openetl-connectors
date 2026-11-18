@@ -355,6 +355,53 @@ func TestCDCColumnAdded(t *testing.T) {
 	}
 }
 
+// An update that changes a row's key deletes the row under its old key,
+// then writes it under the new, both with the update's sequence number.
+func TestCDCKeyChanged(t *testing.T) {
+	db := testDB(t)
+	cdcTable(t, db, "CDC_REKEY", `(id NUMBER(10) PRIMARY KEY, v VARCHAR2(20))`)
+	exec(t, db, `INSERT INTO cdc_rekey VALUES (1, 'a')`)
+	s := cdcSource(t, "")
+	first := mustRead(t, s, nil, "CDC_REKEY")
+	exec(t, db, `UPDATE cdc_rekey SET id = 10 WHERE id = 1`, `UPDATE cdc_rekey SET v = 'b' WHERE id = 10`)
+	rows := mustRead(t, s, map[string][]byte{"CDC_REKEY": first.state("CDC_REKEY")}, "CDC_REKEY").records("CDC_REKEY")
+	if got, want := cdcChanges(rows, "ID", "V"), []string{"delete 1 a", "update 10 a", "update 10 b"}; !slices.Equal(got, want) {
+		t.Fatalf("changes: got %q, want %q", got, want)
+	}
+	if rows[0]["openetl.seq"] != rows[1]["openetl.seq"] {
+		t.Errorf("the old key's delete has seq %s, the update %s", rows[0]["openetl.seq"], rows[1]["openetl.seq"])
+	}
+}
+
+// A table's LOB the run didn't declare, such as one added since Discover,
+// isn't read from the table for a change.
+func TestCDCUndeclaredLOB(t *testing.T) {
+	db := testDB(t)
+	cdcTable(t, db, "CDC_ULOB", `(id NUMBER(10) PRIMARY KEY, v VARCHAR2(20), cl CLOB)`)
+	exec(t, db, `INSERT INTO cdc_ulob VALUES (1, 'a', 'lob')`)
+	s := cdcSource(t, "")
+	read := func(state []byte) *cdcOut {
+		t.Helper()
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
+		out := newCDCOut()
+		cs := source.ConfiguredStream{Name: "CDC_ULOB", SyncMode: source.CDC, State: state, Columns: []string{"ID", "V"}}
+		if err := s.Read(ctx, source.ReadRequest{Lanes: 1, Streams: []source.ConfiguredStream{cs}}, out); err != nil {
+			t.Fatal(err)
+		}
+		return out
+	}
+	first := read(nil)
+	exec(t, db, `UPDATE cdc_ulob SET v = 'b' WHERE id = 1`)
+	second := read(first.state("CDC_ULOB"))
+	if got, want := cdcChanges(second.records("CDC_ULOB"), "ID", "V"), []string{"update 1 b"}; !slices.Equal(got, want) {
+		t.Fatalf("changes: got %q, want %q", got, want)
+	}
+	if _, ok := second.records("CDC_ULOB")[0]["CL"]; ok {
+		t.Error("the undeclared LOB was sent")
+	}
+}
+
 // A change made before a column is dropped can't be read: the read fails
 // rather than reading it with the wrong columns.
 func TestCDCColumnDropped(t *testing.T) {
@@ -459,5 +506,10 @@ func TestCDCRetention(t *testing.T) {
 	}
 	if ps, err := s.Retention(ctx, "p", map[string][]byte{"CDC_RET": []byte(`{"scn":5,"from":5,"db":"1:1"}`)}, nil); err != nil || ps != nil {
 		t.Errorf("another database's position: got %+v, %v", ps, err)
+	}
+	// Another database's earlier position doesn't hide this one's.
+	ps, err = s.Retention(ctx, "p", map[string][]byte{"CDC_RET": state, "OTHER": []byte(`{"scn":5,"from":5,"db":"1:1"}`)}, nil)
+	if err != nil || len(ps) != 1 || ps[0].LagBytes == nil || ps[0].RetentionLeft != nil {
+		t.Errorf("a position beside another database's: got %+v, %v", ps, err)
 	}
 }

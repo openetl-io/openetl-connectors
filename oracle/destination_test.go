@@ -820,6 +820,77 @@ func TestDestinationOverwriteReads(t *testing.T) {
 	}
 }
 
+// TestDestinationOverwriteReadTypes: an overwrite read's table doesn't
+// change a column's type the stream doesn't allow it to, and takes the type
+// a person widened the target to.
+func TestDestinationOverwriteReadTypes(t *testing.T) {
+	e := newDestEnv(t, "OPENETL_D_READTYPE", ownGrants...)
+	w := e.open(1, destination.OpenConfig{Streams: []destination.Stream{{Name: "O", Mode: destination.Overwrite}}})
+	if err := w.StartReads(t.Context(), map[string]time.Time{"O": time.Date(2026, 11, 1, 0, 0, 0, 0, time.UTC)}); err != nil {
+		t.Fatal(err)
+	}
+	id := arrow.Field{Name: "id", Type: arrow.PrimitiveTypes.Int64}
+	n32 := arrow.Field{Name: "n", Type: arrow.PrimitiveTypes.Int32, Nullable: true}
+	n64 := arrow.Field{Name: "n", Type: arrow.PrimitiveTypes.Int64, Nullable: true}
+	e.commit(w, 1, streamBatch{"O", batchOf(t, []arrow.Field{id, n32}, `[{"id": 1, "n": 7}]`)})
+	readType := func() string {
+		t.Helper()
+		reads, err := w.ownTables(t.Context(), readPrefix)
+		if err != nil || len(reads) != 1 {
+			t.Fatalf("read tables %q, %v", reads, err)
+		}
+		cols, err := w.columnTypes(t.Context(), e.user, reads[0])
+		if err != nil {
+			t.Fatal(err)
+		}
+		return typesOf(cols)["n"]
+	}
+	ep := destination.Epoch{Generation: 1, N: 2}
+	st := e.stage(w, 2, streamBatch{"O", batchOf(t, []arrow.Field{id, n64}, `[{"id": 2, "n": 8589934592}]`)})
+	if _, err := w.Commit(t.Context(), ep, []destination.Staged{st}); err == nil || !strings.Contains(err.Error(), "typeChanges") {
+		t.Fatalf("a type change the stream doesn't allow: %v", err)
+	}
+	if got := readType(); got != "NUMBER(10)" {
+		t.Errorf("after the refusal, the read's n is %s", got)
+	}
+	exec(t, e.admin, `CREATE TABLE "OPENETL_D_READTYPE"."O" ("id" NUMBER(19), "n" NUMBER(19))`)
+	if _, err := w.Commit(t.Context(), ep, []destination.Staged{st}); err != nil {
+		t.Fatalf("after the target was widened: %v", err)
+	}
+	if got := readType(); got != "NUMBER(19)" {
+		t.Errorf("after the target was widened, the read's n is %s", got)
+	}
+}
+
+// TestDestinationFencedKeepsNewerReads: an older generation, for which the
+// stream appends, doesn't drop the read table of a newer one that overwrites
+// it once the newer has raised the fence.
+func TestDestinationFencedKeepsNewerReads(t *testing.T) {
+	e := newDestEnv(t, "OPENETL_D_FENCEREAD", ownGrants...)
+	fields := []arrow.Field{{Name: "id", Type: arrow.PrimitiveTypes.Int64}}
+	old := e.open(1, destination.OpenConfig{Streams: []destination.Stream{{Name: "O", Mode: destination.Append}}})
+	newer := e.open(2, destination.OpenConfig{Streams: []destination.Stream{{Name: "O", Mode: destination.Overwrite}}})
+	if err := newer.StartReads(t.Context(), map[string]time.Time{"O": time.Date(2026, 11, 1, 0, 0, 0, 0, time.UTC)}); err != nil {
+		t.Fatal(err)
+	}
+	e.commit(newer, 1, streamBatch{"O", batchOf(t, fields, `[{"id": 1}]`)})
+	reads := func() []string {
+		t.Helper()
+		tables, err := newer.ownTables(t.Context(), readPrefix)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return tables
+	}
+	if n := len(reads()); n != 1 {
+		t.Fatalf("%d read tables, want 1", n)
+	}
+	old.DropRemovedReads(t.Context())
+	if n := len(reads()); n != 1 {
+		t.Errorf("the fenced generation dropped the newer one's read: %d read tables left", n)
+	}
+}
+
 // TestDestinationPatchesHolds fills held cells of an append stream by
 // _openetl_id and of a merge stream by key, where the target still holds
 // the version a patch comes from.

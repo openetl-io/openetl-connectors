@@ -223,9 +223,9 @@ func declaredSchema(t table) *arrow.Schema {
 // carry, and columns of types it can't read are left out. An XMLTYPE stored
 // as binary XML, the default, is listed as a virtual column over a hidden
 // BLOB, and read. Tables the
-// destination keeps its state in, materialized view logs, and nested,
-// temporary and dropped tables aren't listed. names, if set, limits the
-// tables to those.
+// destination keeps its state in, materialized view logs, nested, temporary
+// and dropped tables, and tables with no column it reads aren't listed.
+// names, if set, limits the tables to those, and each must be listed.
 func describe(ctx context.Context, db queryer, schema string, names []string) ([]table, error) {
 	rows, err := db.QueryContext(ctx, `SELECT c.table_name, c.column_name, c.data_type,
 	  nvl(c.data_precision, -1), nvl(c.data_scale, -1), c.nullable, nvl(c.segment_column_id, -1)
@@ -266,10 +266,16 @@ func describe(ctx context.Context, db queryer, schema string, names []string) ([
 		return nil, classify(err)
 	}
 	for _, n := range names {
-		if !slices.ContainsFunc(tables, func(t table) bool { return t.name == n }) {
+		i := slices.IndexFunc(tables, func(t table) bool { return t.name == n })
+		switch {
+		case i < 0:
 			return nil, configInvalid("oracle: there's no table %s.%s the user can read", schema, n)
+		case len(tables[i].cols) == 0:
+			return nil, configInvalid("oracle: the source can't read any column of %s.%s: %s", schema, n, strings.Join(unread[n], ", "))
 		}
 	}
+	// A table without a column the source reads isn't offered.
+	tables = slices.DeleteFunc(tables, func(t table) bool { return len(t.cols) == 0 })
 	if err := keys(ctx, db, schema, tables); err != nil {
 		return nil, err
 	}
@@ -363,6 +369,7 @@ func keys(ctx context.Context, db queryer, schema string, tables []table) error 
 
 // seqType is a changelog's _openetl_seq: a change's commit SCN times 10^12,
 // plus its place in its transaction from 1; a snapshot's rows' place is 0.
+// The delete of the old key an update moves a row from has the update's.
 var seqType = &arrow.Decimal128Type{Precision: 38, Scale: 0}
 
 const seqPlaces = 1_000_000_000_000
@@ -642,7 +649,9 @@ func (b *batcher) add(vals []any) error {
 	for i, add := range b.adds {
 		v := vals[i]
 		if v == nil {
+			// A null takes its slot in the builder, as a number does.
 			b.rb.Field(i).AppendNull()
+			b.bytes += 8
 			continue
 		}
 		if err := add(v); err != nil {

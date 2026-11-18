@@ -61,6 +61,9 @@ const (
 	maxVarchar = 4000
 	maxRaw     = 2000
 	maxCols    = 1000
+	// A target's columns, of maxCols: its staging tables have
+	// _openetl_ord besides.
+	maxTargetCols = maxCols - 1
 )
 
 var metaColumns = []string{colID, colOp, colSeq, colSynced, colDeleted, colUnchanged, colHeld}

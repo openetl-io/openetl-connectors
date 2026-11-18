@@ -2,8 +2,10 @@ package oracle
 
 import (
 	"encoding/hex"
+	"fmt"
 	"math"
 	"reflect"
+	"slices"
 	"testing"
 	"time"
 
@@ -16,6 +18,8 @@ func TestParseRedo(t *testing.T) {
 		sql  string
 		op   string
 		vals map[string]expr
+		// An UPDATE's WHERE.
+		old map[string]expr
 	}{
 		{
 			sql: `insert into "OPENETL"."T"("ID","C","N") values ('1','it''s',NULL);`,
@@ -29,6 +33,9 @@ func TestParseRedo(t *testing.T) {
 			op:  source.OpUpdate,
 			vals: map[string]expr{
 				"ID": {lit: true, text: "2"}, "NAME": {lit: true, text: "dos"}, "D": {null: true},
+			},
+			old: map[string]expr{
+				"ID": {lit: true, text: "2"}, "NAME": {lit: true, text: "two"}, "D": {null: true},
 			},
 		},
 		{
@@ -52,6 +59,9 @@ func TestParseRedo(t *testing.T) {
 			op:  source.OpUpdate,
 			vals: map[string]expr{
 				"ID": {lit: true, text: "1"}, "N": {null: true}, "CL": {null: true},
+			},
+			old: map[string]expr{
+				"ID": {lit: true, text: "1"}, "N": {null: true},
 			},
 		},
 		{
@@ -83,6 +93,9 @@ func TestParseRedo(t *testing.T) {
 		}
 		if r.op != tc.op || !reflect.DeepEqual(r.vals, tc.vals) {
 			t.Errorf("%s:\n got %s %#v\nwant %s %#v", tc.sql, r.op, r.vals, tc.op, tc.vals)
+		}
+		if !reflect.DeepEqual(r.old, tc.old) {
+			t.Errorf("%s: old values %#v, want %#v", tc.sql, r.old, tc.old)
 		}
 	}
 	for _, bad := range []string{
@@ -210,6 +223,28 @@ func TestCovered(t *testing.T) {
 	}
 }
 
+// A window takes each thread's logs up to its end, though the logs are
+// listed by thread and an earlier thread's run past it.
+func TestUpTo(t *testing.T) {
+	logs := []redoLog{
+		{first: 100, thread: 1, sequence: 7}, {first: 200, thread: 1, sequence: 8}, {first: 300, thread: 1, sequence: 9},
+		{first: 100, thread: 2, sequence: 4}, {first: 260, thread: 2, sequence: 5},
+	}
+	var got []string
+	for _, l := range upTo(logs, 250) {
+		got = append(got, fmt.Sprintf("%d/%d", l.thread, l.sequence))
+	}
+	if want := []string{"1/7", "1/8", "2/4"}; !slices.Equal(got, want) {
+		t.Errorf("up to 250: %v, want %v", got, want)
+	}
+	if n := len(upTo(logs, 0)); n != len(logs) {
+		t.Errorf("up to the current SCN: %d logs", n)
+	}
+	if len(logs) != 5 || logs[2].sequence != 9 {
+		t.Errorf("upTo changed its argument: %v", logs)
+	}
+}
+
 func TestEra(t *testing.T) {
 	// Oracle's 1 BC, as go-ora reads it, is Go's year 0.
 	if got := era(time.Date(-1, 3, 1, 0, 0, 0, 0, time.UTC)); got.Year() != 0 {
@@ -217,5 +252,34 @@ func TestEra(t *testing.T) {
 	}
 	if got := wall(time.Date(-4712, 1, 1, 13, 0, 0, 0, time.UTC)); got.Year() != -4711 {
 		t.Errorf("4712 BC: got year %d", got.Year())
+	}
+}
+
+// Retention reports on the database's earliest position, whatever another
+// database's positions are.
+func TestEarliest(t *testing.T) {
+	positions := []cdcState{{From: 100, DB: "1:5"}, {From: 50, DB: "2:5"}, {From: 80, DB: "1:5"}}
+	if got := earliest(positions, "1:5"); got == nil || got.From != 80 {
+		t.Errorf("of 1:5: %+v", got)
+	}
+	if got := earliest(positions, "3:5"); got != nil {
+		t.Errorf("of 3:5, which has none: %+v", got)
+	}
+}
+
+// An update moves its row when a key column's value changes.
+func TestKeyMoved(t *testing.T) {
+	tb := table{cols: cols("ID NUMBER", "V VARCHAR2"), key: []int{0}}
+	for _, c := range []struct {
+		old, new []any
+		moved    bool
+	}{
+		{[]any{"1", "a"}, []any{"2", "a"}, true},
+		{[]any{"1", "a"}, []any{"1", "b"}, false},
+		{[]any{nil, "a"}, []any{"2", "a"}, false},
+	} {
+		if got := keyMoved(tb, c.old, c.new); got != c.moved {
+			t.Errorf("%v to %v: moved %v", c.old, c.new, got)
+		}
 	}
 }

@@ -128,21 +128,34 @@ func (w *writer) PatchSQL(s stagedStream, p prepared) []string {
 		}
 		by = append(by, "x."+q(colID))
 	}
+	heldOf := func(c string) string {
+		if f, ok := s.Fills[c]; ok {
+			return f
+		}
+		return c
+	}
+	// The last column that fills each held column, whose UPDATE takes it out
+	// of the target's _openetl_held: an UPDATE before it needs it there.
+	last := map[string]string{}
+	for _, c := range cols {
+		if !slices.Contains(metaColumns, c) && !slices.Contains(s.Key, c) {
+			last[heldOf(c)] = c
+		}
+	}
 	var out []string
 	for _, c := range cols {
 		if slices.Contains(metaColumns, c) || slices.Contains(s.Key, c) {
 			continue
 		}
-		held := c
-		if f, ok := s.Fills[c]; ok {
-			held = f
-		}
+		held := heldOf(c)
 		src := `(SELECT * FROM (SELECT x.*, ROW_NUMBER() OVER (PARTITION BY ` + strings.Join(by, ", ") + " ORDER BY x." + q(colOrd) + ` DESC) AS "_openetl_rn" FROM ` +
 			p.patches + " x WHERE " + has("x", colHeld, held) + `) WHERE "_openetl_rn" = 1)`
 		from := " FROM " + src + " p WHERE " + strings.Join(match, " AND ") + " AND p." + q(colID) + " = JSON_VALUE(t." + q(colHeld) + ", " + jsonPath(held) + ")"
-		gone, _ := json.Marshal(map[string]any{held: nil})
-		set := "t." + q(c) + " = (SELECT " + val("p", c, p.patchTypes, p.into) + from + "), t." + q(colHeld) + " = " +
-			nonEmpty("JSON_MERGEPATCH(t."+q(colHeld)+", "+quoteLiteral(string(gone))+" RETURNING CLOB)")
+		set := "t." + q(c) + " = (SELECT " + val("p", c, p.patchTypes, p.into) + from + ")"
+		if last[held] == c {
+			gone, _ := json.Marshal(map[string]any{held: nil})
+			set += ", t." + q(colHeld) + " = " + nonEmpty("JSON_MERGEPATCH(t."+q(colHeld)+", "+quoteLiteral(string(gone))+" RETURNING CLOB)")
+		}
 		if slices.Contains(cols, colSynced) {
 			set += ", t." + q(colSynced) + " = (SELECT " + val("p", colSynced, p.patchTypes, p.into) + from + ")"
 		}

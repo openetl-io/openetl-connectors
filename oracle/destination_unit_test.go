@@ -171,7 +171,8 @@ func TestDestinationTypeChanges(t *testing.T) {
 }
 
 // plan adds new columns, takes what fits, changes in place only what it's
-// allowed to, refuses the rest, and stops adding at Oracle's 1000 columns.
+// allowed to, refuses the rest, and stops adding at 999 columns, as staging
+// has one more.
 func TestDestinationPlan(t *testing.T) {
 	have := &tableInfo{cols: []tableColumn{
 		{dcol: dcol{name: "a", typ: "NUMBER(10)"}}, {dcol: dcol{name: "b", typ: "NUMBER(19)"}}, {dcol: dcol{name: "c", typ: "CLOB"}},
@@ -192,12 +193,15 @@ func TestDestinationPlan(t *testing.T) {
 		t.Errorf("allowed: widen %v, refused %+v", widen, refused)
 	}
 	many := &tableInfo{}
-	for i := range maxCols - 1 {
+	for i := range maxTargetCols - 1 {
 		many.cols = append(many.cols, tableColumn{dcol: dcol{name: "x" + strings.Repeat("y", i), typ: "CLOB"}})
 	}
 	adds, _, refused = plan(`"S"."T"`, many, []dcol{{name: "n1", typ: "CLOB"}, {name: "n2", typ: "CLOB"}}, false)
-	if len(adds) != 1 || len(refused) != 1 || refused[0].Column != "n2" || !strings.Contains(refused[0].Reason, "1000") {
-		t.Errorf("at 999 columns: adds %v, refused %+v", adds, refused)
+	if len(adds) != 1 || len(refused) != 1 || refused[0].Column != "n2" || !strings.Contains(refused[0].Reason, "999 columns") {
+		t.Errorf("at 998 columns: adds %v, refused %+v", adds, refused)
+	}
+	if l := many.limits(); l.MaxColumns != 999 {
+		t.Errorf("limits %+v", l)
 	}
 }
 
@@ -219,5 +223,38 @@ func TestDestinationNameChecks(t *testing.T) {
 	}
 	if err := validName("column", `a"b`); err == nil {
 		t.Error(`a column named a"b passed`)
+	}
+}
+
+// Of two patch columns that fill one held column, the first's UPDATE leaves
+// it held for the second's to match, and the second's takes it out.
+func TestPatchSQLSharedHeldColumn(t *testing.T) {
+	w := &writer{schema: "S", user: "U"}
+	s := stagedStream{Table: "T", Fills: map[string]string{"v__v2": "v"}}
+	types := map[string]string{"v__v2": "CLOB", "v": "NUMBER(10)", colID: "VARCHAR2(36 BYTE)", colHeld: "CLOB"}
+	p := prepared{patch: []string{"v__v2", "v", colID, colHeld}, patches: `"U"."P"`, patchTypes: types, into: types}
+	stmts := w.PatchSQL(s, p)
+	if len(stmts) != 2 {
+		t.Fatalf("%d statements: %q", len(stmts), stmts)
+	}
+	unhold := `t."` + colHeld + `" = `
+	for i, want := range []bool{false, true} {
+		if got := strings.Contains(stmts[i], unhold); got != want {
+			t.Errorf("statement %d takes the held column out: %v, want %v\n%s", i, got, want, stmts[i])
+		}
+	}
+}
+
+// An overwrite read's table takes the type a person widened its target to,
+// where Oracle changes it in place.
+func TestWidenedTo(t *testing.T) {
+	read := &tableInfo{cols: []tableColumn{
+		{dcol: dcol{name: "a", typ: "NUMBER(10)"}}, {dcol: dcol{name: "b", typ: "NUMBER(10)"}},
+		{dcol: dcol{name: "c", typ: "NUMBER(19)"}}, {dcol: dcol{name: "d", typ: "NUMBER(10)"}},
+	}}
+	target := map[string]string{"a": "NUMBER(19)", "b": "CLOB", "c": "NUMBER(19)"}
+	got := widenedTo(read, target)
+	if len(got) != 1 || got[0].name != "a" || got[0].typ != "NUMBER(19)" {
+		t.Errorf("widened %+v, want a to NUMBER(19)", got)
 	}
 }

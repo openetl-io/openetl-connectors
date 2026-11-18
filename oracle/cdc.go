@@ -191,11 +191,12 @@ func (s *Source) readCDC(ctx context.Context, conns *connPool, req source.ReadRe
 		st := &cdcStream{t: t, all: t.cols, bySeg: map[int]int{}}
 		for j, c := range t.cols {
 			st.bySeg[c.seg] = j
-			st.lobs = st.lobs || c.lob()
 		}
 		if st.t, err = declaredOnly(t, cs.Columns); err != nil {
 			return err
 		}
+		// Of the columns sent: a LOB added since Discover isn't.
+		st.lobs = slices.ContainsFunc(st.t.cols, column.lob)
 		if err := r.supplemental(st.t.name); err != nil {
 			return err
 		}
@@ -655,12 +656,26 @@ func (r *cdcReader) commit(tx *txn, scn uint64, at time.Time) error {
 		if err != nil {
 			return fmt.Errorf("oracle: %s at SCN %d: %w", ev.table, ev.scn, err)
 		}
+		seq := seqOf(scn, i+1)
+		if row.old != nil {
+			old, oldUnchanged, err := r.values(st, redoRow{op: source.OpDelete, vals: row.old}, ev)
+			if err != nil {
+				return fmt.Errorf("oracle: %s at SCN %d: %w", ev.table, ev.scn, err)
+			}
+			if keyMoved(st.t, old, vals) {
+				// The row under its old key is deleted first. Their keys differ,
+				// so both take the update's sequence number.
+				if err := st.b.change(old, source.OpDelete, seq, oldUnchanged); err != nil {
+					return fmt.Errorf("oracle: %s: %w", st.t.name, err)
+				}
+			}
+		}
 		if st.lobs && row.op != source.OpDelete {
 			if unchanged, err = r.lobs(st, vals, unchanged, scn); err != nil {
 				return err
 			}
 		}
-		if err := st.b.change(vals, row.op, seqOf(scn, i+1), unchanged); err != nil {
+		if err := st.b.change(vals, row.op, seq, unchanged); err != nil {
 			return fmt.Errorf("oracle: %s: %w", st.t.name, err)
 		}
 		st.dirty, st.last, st.lastAt = true, scn, at
@@ -726,6 +741,21 @@ func (r *cdcReader) values(st *cdcStream, row redoRow, ev redoEvent) ([]any, []s
 		}
 	}
 	return vals, unchanged, nil
+}
+
+// keyMoved is whether an update's row, new, has another key than its old
+// values, old; false where either doesn't say.
+func keyMoved(t table, old, new []any) bool {
+	for _, k := range t.key {
+		c := t.cols[k]
+		if old[k] == nil || new[k] == nil {
+			return false
+		}
+		if keyText(c, old[k]) != keyText(c, new[k]) {
+			return true
+		}
+	}
+	return false
 }
 
 // lobs reads a change's LOB columns from the table as of its commit, by

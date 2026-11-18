@@ -625,9 +625,9 @@ func retentionCheck(k *sqlcheck.Kit, interval time.Duration) check.Check {
 		case !secs.Valid:
 			return noArchives.Fail()
 		}
-		reach := time.Duration(secs.Float64 * float64(time.Second)).Round(time.Minute)
+		reach, short := retentionReach(secs.Float64, interval)
 		p.Param("reach", reach.String())
-		if reach < 2*interval {
+		if short {
 			return shortRetention.Fail()
 		}
 		p.Found("The archived redo log reaches back {reach}, at least twice the {interval} between syncs.")
@@ -636,4 +636,11 @@ func retentionCheck(k *sqlcheck.Kit, interval time.Duration) check.Check {
 	c.Advisory, c.Needs = true, []string{"cdc.privilege.views"}
 	c.Description = "Oracle deletes archived logs as RMAN's deletion policy or the recovery area's size says, not as the pipeline reads them."
 	return c
+}
+
+// retentionReach is how far back secs seconds of archived redo reach, to the
+// minute, and whether they reach back less than twice interval, unrounded.
+func retentionReach(secs float64, interval time.Duration) (time.Duration, bool) {
+	reach := time.Duration(secs * float64(time.Second))
+	return reach.Round(time.Minute), reach < 2*interval
 }

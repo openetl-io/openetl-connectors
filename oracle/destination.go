@@ -753,17 +753,14 @@ func (w *writer) preparePatch(ctx context.Context, desc staged, s stagedStream, 
 
 // ensureRead creates the read's table, in the user's schema, with the
 // target's types where it has the column and they fit, or adds its columns to
-// hold cols. The rows take the target's types when they replace its rows.
+// hold cols. The rows take the target's types when they replace its rows. A
+// column the read's table has narrower than the target takes the target's
+// type: only a person widens a target, after ApplySchema refused to and said
+// how. Any other change of a column's type is the stream's to allow, as the
+// read's rows become the target's.
 func (w *writer) ensureRead(ctx context.Context, s stagedStream, cols []dcol) error {
 	have, err := w.catalog(ctx, w.user, []string{s.Read})
 	if err != nil {
-		return err
-	}
-	if have[s.Read] != nil {
-		refused, err := w.alter(ctx, w.user, s.Read, cols, have[s.Read], true)
-		if err == nil && len(refused) > 0 {
-			err = fmt.Errorf("oracle: column %q of the read table for %s: %s", refused[0].Column, s.Name, refused[0].Reason)
-		}
 		return err
 	}
 	var target map[string]string
@@ -771,6 +768,16 @@ func (w *writer) ensureRead(ctx context.Context, s stagedStream, cols []dcol) er
 		if target, err = w.targetTypes(ctx, s.Table); err != nil {
 			return err
 		}
+	}
+	if read := have[s.Read]; read != nil {
+		refused, err := w.alter(ctx, w.user, s.Read, widenedTo(read, target), read, true)
+		if err == nil && len(refused) == 0 {
+			refused, err = w.alter(ctx, w.user, s.Read, cols, read, w.streams[s.Name].AllowTypeChanges)
+		}
+		if err == nil && len(refused) > 0 {
+			err = fmt.Errorf("oracle: column %q of the read table for %s: %s", refused[0].Column, s.Name, refused[0].Reason)
+		}
+		return err
 	}
 	want := slices.Clone(cols)
 	for i, c := range want {
@@ -782,6 +789,19 @@ func (w *writer) ensureRead(ctx context.Context, s stagedStream, cols []dcol) er
 		return fmt.Errorf("oracle: create the read table for %s: %w", s.Name, err)
 	}
 	return nil
+}
+
+// widenedTo are the columns of read whose type target has wider, at
+// target's type, where Oracle changes it in place. A column it can't is left
+// as it is, and still takes the rows its type fits.
+func widenedTo(read *tableInfo, target map[string]string) []dcol {
+	var out []dcol
+	for _, c := range read.cols {
+		if t, ok := target[c.name]; ok && t != c.typ && fits(c.typ, t) && alterable(c.typ, t) {
+			out = append(out, dcol{name: c.name, typ: t})
+		}
+	}
+	return out
 }
 
 // ensureIndex gives a table an index on cols, in the user's schema, unless
@@ -928,7 +948,7 @@ type tableInfo struct {
 }
 
 func (t *tableInfo) limits() destination.TableLimits {
-	l := destination.TableLimits{MaxColumns: maxCols}
+	l := destination.TableLimits{MaxColumns: maxTargetCols}
 	if t == nil {
 		return l
 	}
@@ -1037,8 +1057,8 @@ func plan(ref string, have *tableInfo, cols []dcol, allow bool) ([]dcol, map[int
 	for _, c := range cols {
 		i := slices.IndexFunc(have.cols, func(x tableColumn) bool { return x.name == c.name })
 		switch {
-		case i < 0 && n >= maxCols:
-			refused = append(refused, full(c, fmt.Sprintf("the table has the %d columns Oracle takes", maxCols)))
+		case i < 0 && n >= maxTargetCols:
+			refused = append(refused, full(c, fmt.Sprintf("the table has %d columns, and its staging needs one of the %d Oracle takes", maxTargetCols, maxCols)))
 			continue
 		case i < 0:
 			adds = append(adds, c)
@@ -1305,16 +1325,19 @@ func (w *writer) dropAbandonedReads(ctx context.Context, drop func(stream, table
 }
 
 // DropRemovedReads drops the read tables of streams that no longer
-// overwrite, once Recover has raised the fence. Best effort, like
-// dropStaging.
+// overwrite, once Recover has raised the fence, and while it holds it: a
+// newer generation that overwrites such a stream may have raised it since.
+// Best effort, like dropStaging.
 func (w *writer) DropRemovedReads(ctx context.Context) {
-	_ = w.dropAbandonedReads(ctx, func(stream, _ string) bool {
-		for name, s := range w.streams {
-			if digest(16, name) == stream {
-				return s.Mode != destination.Overwrite
+	_ = w.Fenced(ctx, "FOR UPDATE", func() error {
+		return w.dropAbandonedReads(ctx, func(stream, _ string) bool {
+			for name, s := range w.streams {
+				if digest(16, name) == stream {
+					return s.Mode != destination.Overwrite
+				}
 			}
-		}
-		return true
+			return true
+		})
 	})
 }
 

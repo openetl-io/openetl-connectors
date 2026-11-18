@@ -354,6 +354,37 @@ func TestSourceRefusesTooLongAnInterval(t *testing.T) {
 	}
 }
 
+// A table with no column the source reads isn't offered, and naming it in
+// tables fails as misconfigured; one with some reads those.
+func TestSourceSkipsTablesWithoutReadableColumns(t *testing.T) {
+	db := testDB(t)
+	srcTable(t, db, "ST_NOCOLS", "(f BFILE)")
+	srcTable(t, db, "ST_SOMECOLS", "(id NUMBER(10) PRIMARY KEY, f BFILE)", `INSERT INTO ST_SOMECOLS (id) VALUES (1)`)
+	cat, err := srcSource(t, testDSN(), "").Discover(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var some *source.CatalogStream
+	for i, cs := range cat.Streams {
+		switch cs.Name {
+		case "ST_NOCOLS":
+			t.Errorf("a table with no column the source reads is offered: %+v", cs)
+		case "ST_SOMECOLS":
+			some = &cat.Streams[i]
+		}
+	}
+	if some == nil || len(some.Schema.Fields()) != 1 || some.Schema.Field(0).Name != "ID" {
+		t.Fatalf("ST_SOMECOLS: %+v", some)
+	}
+	if rows := srcRead(t, srcSource(t, testDSN(), `, "tables": ["ST_SOMECOLS"]`), 1, fullRefresh("ST_SOMECOLS")).rows(); len(rows) != 1 || rows[0]["ID"] != "1" {
+		t.Errorf("ST_SOMECOLS read %v", rows)
+	}
+	_, err = srcSource(t, testDSN(), `, "tables": ["ST_NOCOLS"]`).Discover(t.Context())
+	if code := cdcCode(err); code.String() != "ERROR_CODE_CONFIG_INVALID" || !strings.Contains(err.Error(), "F BFILE") {
+		t.Errorf("naming it: %v", err)
+	}
+}
+
 // A read resumed at any of its resume points yields exactly the rows after
 // it, by keys of every orderable kind.
 func TestSourceChunksAndResumesExactly(t *testing.T) {

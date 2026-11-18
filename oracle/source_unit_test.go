@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/apache/arrow-go/v18/arrow"
+	"github.com/apache/arrow-go/v18/arrow/memory"
 	go_ora "github.com/sijms/go-ora/v2"
 
 	"github.com/openetl-io/openetl/sdk/go/check"
@@ -106,6 +107,11 @@ func TestSourceConfig(t *testing.T) {
 		`{"dsn": "oracle://u:hunter2@h:port/S"}`,
 		`{"dsn": "oracle://u:hunter2@h:1521/S?CONNECTION TIMEOUT=x"}`,
 		`{"dsn": "oracle://u:hunter2@h:1521/S", "chunkRows": "x"}`,
+		// A URL that doesn't parse, which net/url quotes, escaped, and whose
+		// password a / cuts short.
+		`{"dsn": "oracle://u:hunter2\"x@h:1521/S"}`,
+		`{"dsn": "oracle://u:hunter2/x@h:1521/S"}`,
+		`{"dsn": "oracle://u:hunter2%zz@h:1521/S"}`,
 	} {
 		_, err := NewSource([]byte(bad))
 		switch {
@@ -392,5 +398,37 @@ func TestSplitArithmetic(t *testing.T) {
 		if err != nil || low.String() != c.low || high.String() != c.high {
 			t.Errorf("remainder(%+v, %v, %v): %v %v %v", c.r, c.pos, c.single, low, high, err)
 		}
+	}
+}
+
+// The archived redo's reach is compared with twice the interval as it is,
+// and shown to the minute.
+func TestRetentionReach(t *testing.T) {
+	for _, c := range []struct {
+		secs  float64
+		short bool
+		shown string
+	}{
+		{91, true, "2m0s"}, {119.9, true, "2m0s"}, {120, false, "2m0s"}, {3600, false, "1h0m0s"},
+	} {
+		reach, short := retentionReach(c.secs, time.Minute)
+		if short != c.short || reach.String() != c.shown {
+			t.Errorf("%v seconds: reach %v, short %v", c.secs, reach, short)
+		}
+	}
+}
+
+// Rows of nulls count towards a batch's bytes, so a table of them is sent in
+// batches of batchBytes too.
+func TestBatcherCountsNulls(t *testing.T) {
+	b := newBatcher(memory.NewGoAllocator(), cols("A NUMBER", "B VARCHAR2"), false)
+	defer b.release()
+	for range 3 {
+		if err := b.add([]any{nil, nil}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if b.bytes == 0 {
+		t.Error("three rows of nulls have no bytes")
 	}
 }

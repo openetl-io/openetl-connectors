@@ -18,11 +18,11 @@ var _ source.RetentionReporter = (*Source)(nil)
 // otherwise how long is left isn't known. States without a position, or of
 // another database, say nothing.
 func (s *Source) Retention(ctx context.Context, _ string, states map[string][]byte, splits map[string][]source.Split) ([]source.Progress, error) {
-	var first *cdcState
+	var positions []cdcState
 	take := func(b []byte) {
 		var st cdcState
-		if json.Unmarshal(b, &st) == nil && st.DB != "" && st.Snapshot == nil && (first == nil || st.From < first.From) {
-			first = &st
+		if json.Unmarshal(b, &st) == nil && st.DB != "" && st.Snapshot == nil {
+			positions = append(positions, st)
 		}
 	}
 	for _, b := range states {
@@ -33,7 +33,7 @@ func (s *Source) Retention(ctx context.Context, _ string, states map[string][]by
 			take(sp.State)
 		}
 	}
-	if first == nil {
+	if len(positions) == 0 {
 		return nil, nil
 	}
 	db, err := open(ctx, s.cfg.DSN.Reveal(), 1)
@@ -45,7 +45,8 @@ func (s *Source) Retention(ctx context.Context, _ string, states map[string][]by
 	if err := db.QueryRowContext(ctx, `SELECT dbid || ':' || resetlogs_change# FROM v$database`).Scan(&id); err != nil {
 		return nil, classify(fmt.Errorf("oracle: read the database's identity: %w", err))
 	}
-	if id != first.DB {
+	first := earliest(positions, id)
+	if first == nil {
 		return nil, nil
 	}
 	logs, err := redoLogs(ctx, db, first.From)
@@ -69,4 +70,16 @@ func (s *Source) Retention(ctx context.Context, _ string, states map[string][]by
 		p.Lag = new(max(time.Since(*first.At), 0))
 	}
 	return []source.Progress{p}, nil
+}
+
+// earliest is the position of database db that mining starts from
+// earliest; nil if none is of db.
+func earliest(positions []cdcState, db string) *cdcState {
+	var first *cdcState
+	for i, st := range positions {
+		if st.DB == db && (first == nil || st.From < first.From) {
+			first = &positions[i]
+		}
+	}
+	return first
 }

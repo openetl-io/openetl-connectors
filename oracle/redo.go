@@ -4,6 +4,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"maps"
 	"math"
 	"strconv"
 	"strings"
@@ -36,6 +37,8 @@ type redoRow struct {
 	// supplemental logging of all columns fills, with its SET's over them; a
 	// delete's old values. By column name.
 	vals map[string]expr
+	// An UPDATE's old values, from its WHERE; nil for other statements.
+	old map[string]expr
 }
 
 // parseRedo parses a DML statement as LogMiner writes it with
@@ -120,6 +123,7 @@ func parseRedo(sql string) (redoRow, error) {
 				return r, err
 			}
 		}
+		r.old = maps.Clone(r.vals)
 		for n, v := range set {
 			r.vals[n] = v
 		}

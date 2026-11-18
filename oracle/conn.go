@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/url"
 	"strings"
 
 	go_ora "github.com/sijms/go-ora/v2"
@@ -37,7 +38,13 @@ func parseDSN(dsn string) error {
 	if !strings.HasPrefix(strings.ToLower(dsn), "oracle://") {
 		return errors.New("oracle: the dsn is a URL, oracle://user:password@host:port/service")
 	}
-	if _, err := go_ora.ParseConfig(dsn); err != nil {
+	_, err := go_ora.ParseConfig(dsn)
+	if _, ok := errors.AsType[*url.Error](err); ok {
+		// It quotes the URL, escaped, and its cause can quote a piece of the
+		// password, such as one a / cuts short.
+		return errors.New("oracle: the dsn isn't a URL: percent-encode the characters a URL reserves, such as / as %2F and @ as %40, in its user and password")
+	}
+	if err != nil {
 		return errors.New(redacted("oracle: dsn: "+err.Error(), dsn))
 	}
 	return nil
