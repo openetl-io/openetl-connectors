@@ -19,6 +19,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
 
+	protocolv1 "github.com/openetl-io/openetl/sdk/go/protocol/v1"
 	"github.com/openetl-io/openetl/sdk/go/source"
 )
 
@@ -502,6 +503,46 @@ func TestSourceTypes(t *testing.T) {
 		if g := got.column("kinds", c); !slices.Equal(g, w) {
 			t.Errorf("%s = %q, want %q", c, g, w)
 		}
+	}
+}
+
+// A column added since the run's Discover fails a full or incremental read,
+// retryably, as it does a cdc read; the columns it declared read.
+func TestSourceUndeclaredColumn(t *testing.T) {
+	e := newSourceEnv(t)
+	e.exec("CREATE TABLE $schema.t (id int PRIMARY KEY, at datetime2(7))")
+	e.exec("INSERT INTO $schema.t VALUES (1, '2026-01-02')")
+	s := e.source("")
+	for _, cs := range []source.ConfiguredStream{
+		{Name: "t", SyncMode: source.FullRefresh, Columns: []string{"id"}},
+		{Name: "t", SyncMode: source.Incremental, Cursor: "id", Columns: []string{"id"}},
+	} {
+		c := &capturer{}
+		t.Cleanup(c.release)
+		if err := s.Read(t.Context(), source.ReadRequest{Streams: []source.ConfiguredStream{cs}}, c); codeOf(err) != protocolv1.ErrorCode_ERROR_CODE_TRANSIENT {
+			t.Errorf("%v read with at undeclared: %v", cs.SyncMode, err)
+		}
+	}
+	got := readReq(t, s, source.ReadRequest{Streams: []source.ConfiguredStream{{Name: "t", SyncMode: source.FullRefresh, Columns: []string{"id", "at"}}}})
+	if v := got.column("t", "id"); !slices.Equal(v, []string{"1"}) {
+		t.Errorf("declared: %v", v)
+	}
+}
+
+// A sql_variant's text and binary arrive whole, past nvarchar(4000).
+func TestSourceLongVariants(t *testing.T) {
+	e := newSourceEnv(t)
+	e.exec("CREATE TABLE $schema.v (id int PRIMARY KEY, sv sql_variant)")
+	e.exec(`INSERT INTO $schema.v VALUES (1, CONVERT(sql_variant, CONVERT(varchar(8000), REPLICATE('a', 5000)))),
+		(2, CONVERT(sql_variant, CONVERT(varbinary(8000), REPLICATE('ab', 1500))))`)
+	got := read(t, e.source(""), source.FullRefresh, map[string]string{"v": ""}).column("v", "sv")
+	if want := []string{strings.Repeat("a", 5000), "0x" + strings.Repeat("6162", 1500)}; !slices.Equal(got, want) {
+		t.Errorf("sv has %d values, of %v characters", len(got), func() (n []int) {
+			for _, g := range got {
+				n = append(n, len(g))
+			}
+			return n
+		}())
 	}
 }
 

@@ -2,11 +2,13 @@ package sqlserver
 
 import (
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/decimal128"
+	"github.com/apache/arrow-go/v18/arrow/memory"
 
 	"github.com/openetl-io/openetl/sdk/go/check"
 	"github.com/openetl-io/openetl/sdk/go/destination"
@@ -145,6 +147,64 @@ func TestQuoting(t *testing.T) {
 	}
 	if got := alterColumn("[s].[t]", "k", "bigint", true, []string{"_openetl_key_x"}); got != "DROP INDEX [_openetl_key_x] ON [s].[t]; ALTER TABLE [s].[t] ALTER COLUMN [k] bigint NOT NULL;" {
 		t.Errorf("alterColumn = %s", got)
+	}
+}
+
+// A key's or cursor's text holds its whole value: a varchar of up to 8000
+// characters doesn't fit nvarchar(4000).
+func TestTextOf(t *testing.T) {
+	for _, c := range []struct {
+		col  sourceColumn
+		want string
+	}{
+		{sourceColumn{typ: "varchar", maxLength: 8000}, "CONVERT(nvarchar(max), x)"},
+		{sourceColumn{typ: "char", maxLength: 4001}, "CONVERT(nvarchar(max), x)"},
+		{sourceColumn{typ: "varchar", maxLength: 4000}, "CONVERT(nvarchar(4000), x)"},
+		{sourceColumn{typ: "nvarchar", maxLength: 8000}, "CONVERT(nvarchar(4000), x)"},
+		{sourceColumn{typ: "datetime2", scale: 7}, "CONVERT(nvarchar(4000), x, 126)"},
+	} {
+		if got := c.col.textOf("x"); got != c.want {
+			t.Errorf("textOf of %s(%d) = %s, want %s", c.col.typ, c.col.maxLength, got, c.want)
+		}
+	}
+}
+
+// Rows of nulls and empty values count toward a batch's size, so a read of
+// them flushes; a value's bytes count as they did.
+func TestBatchBytes(t *testing.T) {
+	b, err := newBatcher(memory.DefaultAllocator, []sourceColumn{{name: "s", typ: "nvarchar"}, {name: "n", typ: "int"}}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.release()
+	for _, row := range [][]any{{nil, nil}, {"", nil}, {[]byte{}, int64(1)}} {
+		if err := b.add(row); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if b.bytes != 6*slotBytes {
+		t.Errorf("nulls and empty values count %d bytes, want %d", b.bytes, 6*slotBytes)
+	}
+	b.bytes = 0
+	if err := b.add([]any{strings.Repeat("x", 100), int64(1)}); err != nil || b.bytes != 100+slotBytes {
+		t.Errorf("a row of 100 bytes of text and an int counts %d, %v", b.bytes, err)
+	}
+}
+
+// A cdc stream given as its one split, the whole stream, is read from that
+// split's state and to its until, as one given State and Until is; one
+// given another read's splits starts again.
+func TestWholeStream(t *testing.T) {
+	st, until := []byte(`{"method":"change_tracking","position":"7"}`), []byte(`{"method":"change_tracking","position":"9"}`)
+	cs := wholeStream(source.ConfiguredStream{Name: "t", Splits: []source.Split{{ID: source.WholeStream, State: st, Until: until}}})
+	if string(cs.State) != string(st) || string(cs.Until) != string(until) || cs.Splits != nil {
+		t.Errorf("whole split: %+v", cs)
+	}
+	if cs = wholeStream(source.ConfiguredStream{Name: "t", State: st}); string(cs.State) != string(st) {
+		t.Errorf("no splits: %+v", cs)
+	}
+	if cs = wholeStream(source.ConfiguredStream{Name: "t", Splits: []source.Split{{ID: "0", State: st}, {ID: "1"}}}); cs.State != nil || cs.Splits != nil {
+		t.Errorf("key ranges: %+v", cs)
 	}
 }
 

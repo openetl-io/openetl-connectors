@@ -63,11 +63,13 @@ func (c sourceColumn) selectExpr(alias string) string {
 	case "geography", "geometry", "hierarchyid":
 		return "CONVERT(nvarchar(max), " + q + ".ToString())"
 	case "sql_variant":
+		// A variant's varchar holds up to 8000 characters, and its binary as
+		// hex twice as many.
 		return "CASE WHEN SQL_VARIANT_PROPERTY(" + q + ", 'BaseType') IN ('datetime', 'smalldatetime', 'datetime2', 'date', 'time', 'datetimeoffset') " +
 			"THEN CONVERT(nvarchar(4000), " + q + ", 126) " +
-			"WHEN SQL_VARIANT_PROPERTY(" + q + ", 'BaseType') IN ('binary', 'varbinary', 'timestamp') THEN CONVERT(nvarchar(4000), CONVERT(varbinary(8000), " + q + "), 1) " +
+			"WHEN SQL_VARIANT_PROPERTY(" + q + ", 'BaseType') IN ('binary', 'varbinary', 'timestamp') THEN CONVERT(nvarchar(max), CONVERT(varbinary(8000), " + q + "), 1) " +
 			"WHEN SQL_VARIANT_PROPERTY(" + q + ", 'BaseType') IN ('float', 'real') THEN CONVERT(nvarchar(4000), CONVERT(float, " + q + "), 3) " +
-			"ELSE CONVERT(nvarchar(4000), " + q + ") END"
+			"ELSE CONVERT(nvarchar(max), " + q + ") END"
 	}
 	return q
 }
@@ -97,7 +99,13 @@ func (c sourceColumn) textOf(expr string) string {
 		// A rowversion converts to text only as binary.
 		expr = "CONVERT(binary(8), " + expr + ")"
 	}
-	return "CONVERT(nvarchar(4000), " + expr + c.style() + ")"
+	// nvarchar(4000) spells every type's values but a char's or varchar's of
+	// more than 4000 characters.
+	to := "nvarchar(4000)"
+	if (c.typ == "char" || c.typ == "varchar") && c.maxLength > 4000 {
+		to = "nvarchar(max)"
+	}
+	return "CONVERT(" + to + ", " + expr + c.style() + ")"
 }
 
 // fromText is the value of the column's type that text, an nvarchar

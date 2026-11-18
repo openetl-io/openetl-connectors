@@ -2,6 +2,7 @@ package sqlserver
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -132,9 +133,11 @@ func (s *Source) Discover(ctx context.Context) (source.Catalog, error) {
 			// data capture's job harvests seconds later, arrives in the
 			// snapshot and again as its change; a chunk read again to an end
 			// has the rows changed since too. Change tracking keeps each key's
-			// latest change alone, so a read again brings each key changed
-			// since with its row as it is then. The declaration is the
-			// stream's, whichever mode reads it.
+			// latest change alone, so its changes read again to an end leave
+			// out a key changed again past it, and a key the first read sent
+			// in two polls come back once: fewer rows, a redo OpenETL fails
+			// with POSITION_LOST. The declaration is the stream's, whichever
+			// mode reads it.
 			cs.SyncModes, cs.Seq, cs.Replay = append(cs.SyncModes, source.CDC), seqType, source.Superset
 		}
 		cs.Schema = nullability(b.declared, t, cdc)
@@ -300,7 +303,11 @@ func (s *Source) readSplit(ctx context.Context, tables []table, cs source.Config
 	if err := unmarshalState(cs.Name, sp.Until, &until); err != nil {
 		return err
 	}
-	r := &tableRead{s: s, t: tables[slices.IndexFunc(tables, func(t table) bool { return t.name == cs.Name })], id: sp.ID, out: out, until: sp.Until, stop: until}
+	t, err := declaredOnly(tables[slices.IndexFunc(tables, func(t table) bool { return t.name == cs.Name })], cs.Columns)
+	if err != nil {
+		return err
+	}
+	r := &tableRead{s: s, t: t, id: sp.ID, out: out, until: sp.Until, stop: until}
 	if cs.SyncMode == source.Incremental {
 		return r.incremental(ctx, cs.Cursor, st)
 	}
@@ -765,11 +772,16 @@ func (b *batcher) addChange(vals []any, op string, seq decimal128.Num, unchanged
 	return nil
 }
 
+// slotBytes is what a batch counts for a fixed-width value, and for a null
+// or empty one, which still takes its slot, so a batch of them flushes too.
+const slotBytes = 8
+
 func (b *batcher) add(vals []any) error {
 	for i, c := range b.cols {
 		v := vals[i]
 		if v == nil {
 			c.b.AppendNull()
+			b.bytes += slotBytes
 			continue
 		}
 		if err := c.add(v); err != nil {
@@ -777,11 +789,11 @@ func (b *batcher) add(vals []any) error {
 		}
 		switch x := v.(type) {
 		case string:
-			b.bytes += len(x)
+			b.bytes += cmp.Or(len(x), slotBytes)
 		case []byte:
-			b.bytes += len(x)
+			b.bytes += cmp.Or(len(x), slotBytes)
 		default:
-			b.bytes += 8
+			b.bytes += slotBytes
 		}
 	}
 	return nil

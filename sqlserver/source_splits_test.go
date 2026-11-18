@@ -159,6 +159,22 @@ func TestIncremental(t *testing.T) {
 	}
 }
 
+// A varchar cursor's highest value is kept whole, past 4000 characters, so
+// the row that holds it is read.
+func TestIncrementalLongTextCursor(t *testing.T) {
+	e := newSourceEnv(t)
+	e.exec("CREATE TABLE $schema.t (id int PRIMARY KEY, c varchar(8000))")
+	e.exec("INSERT INTO $schema.t VALUES (1, 'a'), (2, REPLICATE('a', 4001))")
+	cs := source.ConfiguredStream{Name: "t", SyncMode: source.Incremental, Cursor: "c"}
+	got := &splitCapture{Col: "id"}
+	if err := e.source("").Read(t.Context(), source.ReadRequest{Streams: []source.ConfiguredStream{cs}}, got); err != nil {
+		t.Fatal(err)
+	}
+	if v := got.Values(); !slices.Equal(v, []string{"1", "2"}) {
+		t.Errorf("read %v", v)
+	}
+}
+
 // A rowversion cursor's read stops below the oldest open transaction's
 // rowversion, whose rows can commit after the read with values below the
 // highest it saw.

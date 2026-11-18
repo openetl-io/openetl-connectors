@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"net/url"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/twmb/franz-go/pkg/sr"
@@ -19,7 +21,7 @@ func (c *Config) RegistryChecks(timeout time.Duration) []check.Check {
 		return nil
 	}
 	var answered error
-	params := check.Params{"url": c.SchemaRegistryURL}
+	params := check.Params{"url": shownURL(c.SchemaRegistryURL)}
 	authField := "schemaRegistryUrl"
 	if c.SchemaRegistryUsername != "" {
 		authField = "schemaRegistryPassword"
@@ -67,4 +69,34 @@ func (c *Config) RegistryChecks(timeout time.Duration) []check.Check {
 			},
 		},
 	}
+}
+
+// shownURL is raw without its userinfo, query and fragment, which can hold
+// credentials, for params, which people see. A "?" or "#" in a password,
+// which ends the authority for url.Parse, doesn't keep the userinfo: an "@"
+// before the path ends it, wherever such a character is.
+func shownURL(raw string) string {
+	scheme, rest := "", raw
+	if i := strings.Index(raw, "://"); i >= 0 {
+		scheme, rest = raw[:i+3], raw[i+3:]
+	}
+	authority := rest
+	if i := strings.IndexByte(rest, '/'); i >= 0 {
+		authority = rest[:i]
+	}
+	if u, err := url.Parse(raw); err == nil && (u.User != nil || !strings.Contains(authority, "@")) {
+		u.User, u.RawQuery, u.ForceQuery, u.Fragment, u.RawFragment = nil, "", false, "", ""
+		return u.String()
+	}
+	// The userinfo ends at the last "@" before the path, or, with none
+	// there, at the last "@" of all, as a "/" in a password puts it after.
+	if i := strings.LastIndexByte(authority, '@'); i >= 0 {
+		rest = rest[i+1:]
+	} else if i := strings.LastIndexByte(rest, '@'); i >= 0 {
+		rest = rest[i+1:]
+	}
+	if i := strings.IndexAny(rest, "?#"); i >= 0 {
+		rest = rest[:i]
+	}
+	return scheme + rest
 }

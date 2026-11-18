@@ -128,6 +128,7 @@ func (s *Source) readCDC(ctx context.Context, req source.ReadRequest, cfgs []sou
 		}
 	}()
 	for _, cs := range cfgs {
+		cs := wholeStream(cs)
 		t := tables[slices.IndexFunc(tables, func(t table) bool { return t.name == cs.Name })]
 		if len(t.key) == 0 {
 			return configInvalid("sqlserver: %s has no primary key, so it can't be read with cdc", t.name)
@@ -386,6 +387,19 @@ func (r *cdcReader) progress(ctx context.Context, tables []*cdcTable) {
 			return
 		}
 	}
+}
+
+// wholeStream is cs with its one split, the whole stream, as its State,
+// Until and CompleteAt: a request may give a stream read whole either way.
+// Other splits, a read's in another mode, are left out, so the table starts
+// again, as Splits says.
+func wholeStream(cs source.ConfiguredStream) source.ConfiguredStream {
+	if len(cs.Splits) == 1 && cs.Splits[0].ID == source.WholeStream {
+		sp := cs.Splits[0]
+		cs.State, cs.Until, cs.CompleteAt = sp.State, sp.Until, sp.CompleteAt
+	}
+	cs.Splits = nil
+	return cs
 }
 
 // declaredOnly narrows t to the columns the run declared. A column added

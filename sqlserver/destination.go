@@ -560,8 +560,9 @@ const latestTable = "#openetl_latest"
 // keys the target doesn't have. A delete keeps the row's other columns as
 // they were, with its metadata columns updated, or with hard deletes
 // removes the row. A column in unchanged that the latest version didn't
-// send takes its value from the key's latest staged version that did, or
-// else keeps the target's. Merge statements, which race and have had bugs
+// send takes its value from the key's latest staged version that did, unless
+// the target's row is newer than that version, or else keeps the target's.
+// Merge statements, which race and have had bugs
 // with concurrent writers, aren't used: the target is locked by key while
 // the apply inserts.
 func (w *writer) MergeSQL(s stagedStream, p prepared) []string {
@@ -643,14 +644,16 @@ func prefixed(cols []string, rel string) string {
 // latest fills the merge's temporary table with each key's latest staged
 // version. Its held columns are an object, as the target's are. With
 // unchanged columns, those the version didn't send come from the key's
-// latest earlier version that sent them, if any, and its
-// _openetl_unchanged then leaves them out.
+// latest earlier version that sent them and isn't older than the target's
+// row, if any, and its _openetl_unchanged then leaves them out.
 func (w *writer) latest(s stagedStream, p prepared, hasSeq bool) string {
 	cols, unchanged := p.cols, p.unchanged
 	q := quote
 	key := make([]string, len(p.key))
 	match := make([]string, len(p.key))
+	target := make([]string, len(p.key))
 	for i, k := range p.key {
+		target[i] = keyEqual("cur", "l", k)
 		// Both are staged, in the same collation.
 		k.collation = ""
 		key[i] = keyPart("x", k)
@@ -662,12 +665,16 @@ func (w *writer) latest(s stagedStream, p prepared, hasSeq bool) string {
 		order = "x." + q(seqColumn) + " DESC, " + order
 		latestFirst = "e." + q(seqColumn) + " DESC, " + latestFirst
 	}
-	// e was staged before l: (seq, place) below, as a row comparison.
-	ep, lp := p.rows.place("e"), p.rows.place("l")
+	// e was staged before l: (seq, place) below, as order ranks them, where a
+	// null seq is below every other.
+	before := rowLess(p.rows.place("e"), p.rows.place("l"))
 	if hasSeq {
-		ep, lp = append([]string{"e." + q(seqColumn)}, ep...), append([]string{"l." + q(seqColumn)}, lp...)
+		es, ls := "e."+q(seqColumn), "l."+q(seqColumn)
+		before = "(" + es + " < " + ls + " OR (" + es + " IS NULL AND " + ls + " IS NOT NULL) OR ((" + es + " = " + ls + " OR (" + es + " IS NULL AND " + ls + " IS NULL)) AND " + before + "))"
+		// Nor older than the target's row, whose value is newer; a missing
+		// seq doesn't stop it, as in MergeSQL.
+		before += " AND NOT EXISTS (SELECT 1 FROM " + w.ident(s.Table) + " AS cur WHERE " + strings.Join(target, " AND ") + " AND cur." + q(seqColumn) + " > " + es + ")"
 	}
-	before := rowLess(ep, lp)
 	sel := make([]string, len(cols))
 	for i, c := range cols {
 		sel[i] = "l." + q(c)
@@ -691,7 +698,9 @@ func (w *writer) latest(s stagedStream, p prepared, hasSeq bool) string {
 				" WHERE " + inArray("l."+q(unchangedColumn), lit) + " AND " + strings.Join(match, " AND ") + " AND " + before +
 				" AND NOT " + inArray("e."+q(unchangedColumn), lit) + " ORDER BY " + latestFirst + ") AS " + pi
 			sel[slices.Index(cols, c)] = "CASE WHEN " + pi + ".found = 1 THEN " + pi + ".v ELSE l." + q(c) + " END AS " + q(c)
-			removed = append(removed, "NOT (u.value = "+lit+" AND "+pi+".found = 1)")
+			// found is null where no version gives the column: IS NOT NULL keeps
+			// the test two-valued, so the column stays unchanged.
+			removed = append(removed, "NOT (u.value = "+lit+" AND "+pi+".found IS NOT NULL)")
 		}
 		sel[slices.Index(cols, unchangedColumn)] = "(SELECT " + jsonArray("u.value") + " FROM OPENJSON(l." + q(unchangedColumn) + ") AS u WHERE " + strings.Join(removed, " AND ") + ") AS " + q(unchangedColumn)
 		if hasHeld {
@@ -700,7 +709,7 @@ func (w *writer) latest(s stagedStream, p prepared, hasSeq bool) string {
 			var given []string
 			for i := range unchanged {
 				pi := "p" + strconv.Itoa(i)
-				given = append(given, "NOT (j.value = "+literal(unchanged[i])+" AND "+pi+".found = 1 AND "+pi+".held = 1)")
+				given = append(given, "NOT (j.value = "+literal(unchanged[i])+" AND "+pi+".found IS NOT NULL AND "+pi+".held = 1)")
 			}
 			sel[slices.Index(cols, heldColumn)] = "(SELECT " + jsonObject("h.k", "h.v") + " FROM (SELECT j.value, " + idText("l."+q(idColumn)) +
 				" FROM OPENJSON(l." + q(heldColumn) + ") AS j WHERE " + strings.Join(given, " AND ") + strings.Join(heldFrom, "") + ") AS h(k, v)) AS " + q(heldColumn)
