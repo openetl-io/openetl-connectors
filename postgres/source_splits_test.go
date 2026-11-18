@@ -19,143 +19,27 @@ import (
 	"testing"
 	"time"
 
-	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 
+	"github.com/openetl-io/openetl-connectors/connectortest"
+	"github.com/openetl-io/openetl-connectors/keysplit"
 	"github.com/openetl-io/openetl/sdk/go/arrowipc"
 	"github.com/openetl-io/openetl/sdk/go/conformance"
 	protocolv1 "github.com/openetl-io/openetl/sdk/go/protocol/v1"
 	"github.com/openetl-io/openetl/sdk/go/source"
 )
 
-// splitEvent is what a split emitted: rows' values in one column, or a resume
-// point or completion.
-type splitEvent struct {
-	stream, split string
-	rows          []string
-	resume        bool
-	complete      bool
-	state         string
-	added         []source.Split
-}
-
-// splitCapture records what a source emits on each split, in order, keeping
-// one column of its rows.
-type splitCapture struct {
-	col string
-	// Runs on the split's reader for each batch, before it's recorded.
-	onBatch func(stream, split string)
-
-	mu     sync.Mutex
-	events []splitEvent
-}
-
-func (c *splitCapture) Rows(stream string, _ []json.RawMessage) error {
-	return fmt.Errorf("unexpected raw rows on %s", stream)
-}
-
-func (c *splitCapture) Records(stream string, b arrow.RecordBatch) error {
-	return c.Split(stream, source.WholeStream).Records(b)
-}
-
-func (c *splitCapture) ResumePoint(stream string, state []byte) error {
-	return c.Split(stream, source.WholeStream).ResumePoint(state)
-}
-
-func (c *splitCapture) Complete(stream string, next []byte) error {
-	return c.Split(stream, source.WholeStream).Complete(next)
-}
-
-func (c *splitCapture) Split(stream, id string) source.SplitEmitter {
-	return splitSink{c, stream, id}
-}
-
-func (c *splitCapture) add(e splitEvent) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.events = append(c.events, e)
-}
-
-type splitSink struct {
-	c          *splitCapture
-	stream, id string
-}
-
-func (s splitSink) Rows([]json.RawMessage) error {
-	return fmt.Errorf("unexpected raw rows on %s", s.stream)
-}
-
-func (s splitSink) Records(b arrow.RecordBatch) error {
-	defer b.Release()
-	if s.c.onBatch != nil {
-		s.c.onBatch(s.stream, s.id)
-	}
-	col := b.Column(b.Schema().FieldIndices(s.c.col)[0])
-	rows := make([]string, col.Len())
-	for i := range rows {
-		rows[i] = col.ValueStr(i)
-	}
-	s.c.add(splitEvent{stream: s.stream, split: s.id, rows: rows})
-	return nil
-}
-
-func (s splitSink) ResumePoint(state []byte, added ...source.Split) error {
-	s.c.add(splitEvent{stream: s.stream, split: s.id, resume: true, state: string(state), added: added})
-	return nil
-}
-
-func (s splitSink) Complete(next []byte, added ...source.Split) error {
-	s.c.add(splitEvent{stream: s.stream, split: s.id, complete: true, state: string(next), added: added})
-	return nil
-}
-
-// values are the column's values read, in the order they were emitted.
-func (c *splitCapture) values() []string {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	var out []string
-	for _, e := range c.events {
-		out = append(out, e.rows...)
-	}
-	return out
-}
-
-func (c *splitCapture) of(split string) []splitEvent {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	var out []splitEvent
-	for _, e := range c.events {
-		if e.split == split {
-			out = append(out, e)
-		}
-	}
-	return out
-}
-
-func (c *splitCapture) added() []source.Split {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	var out []source.Split
-	for _, e := range c.events {
-		out = append(out, e.added...)
-	}
-	return out
-}
-
-func valuesOf(events []splitEvent) []string {
-	var out []string
-	for _, e := range events {
-		out = append(out, e.rows...)
-	}
-	return out
-}
+type (
+	splitEvent   = connectortest.SplitEvent
+	splitCapture = connectortest.SplitCapture
+)
 
 func statesOf(t *testing.T, events []splitEvent) []sourceState {
 	t.Helper()
 	var out []sourceState
 	for _, e := range events {
-		if e.resume {
-			out = append(out, parseState(t, e.state))
+		if e.Resume {
+			out = append(out, parseState(t, e.State))
 		}
 	}
 	return out
@@ -220,6 +104,29 @@ func inSplits(cs source.ConfiguredStream, splits []source.Split) source.Configur
 		cs.Splits = splits
 	}
 	return cs
+}
+
+// keyTable makes $schema.t of cols and n, keyed by key, with rows i from 1
+// to rows of row and i, and analyzes it.
+func (e *sourceEnv) keyTable(cols, key, row string, rows int) {
+	e.exec("CREATE TABLE $schema.t (" + cols + ", n int NOT NULL, PRIMARY KEY (" + key + "))")
+	e.exec(fmt.Sprintf("INSERT INTO $schema.t SELECT %s, i FROM generate_series(1, %d) i", row, rows))
+	e.exec("ANALYZE $schema.t")
+}
+
+// resplitFirst records n, and asks s to split a stream read whole at its
+// first batch.
+func resplitFirst(t *testing.T, s *Source) *splitCapture {
+	rc := &splitCapture{Col: "n"}
+	var asked atomic.Bool
+	rc.OnBatch = func(stream, split string) {
+		if split == source.WholeStream && !asked.Swap(true) {
+			if ok, err := s.Resplit(t.Context(), stream, split); err != nil || !ok {
+				t.Errorf("asked to split: %v, %v", ok, err)
+			}
+		}
+	}
+	return rc
 }
 
 func (e *sourceEnv) mustSplits(s *Source, cs source.ConfiguredStream, ended []source.Split) []source.Split {
@@ -375,9 +282,7 @@ func TestSplitsReadEveryRowOnce(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			e := newSourceEnv(t)
-			e.exec("CREATE TABLE $schema.t (" + c.cols + ", n int NOT NULL, PRIMARY KEY (" + c.key + "))")
-			e.exec("INSERT INTO $schema.t SELECT " + c.row + ", i FROM generate_series(1, 2000) i")
-			e.exec("ANALYZE $schema.t")
+			e.keyTable(c.cols, c.key, c.row, 2000)
 			e.exec("INSERT INTO $schema.t SELECT " + c.row + ", i FROM generate_series(2001, 2200) i")
 			s := e.source(`, "chunkRows": 100`)
 			cs := source.ConfiguredStream{Name: "t", SyncMode: source.FullRefresh}
@@ -385,12 +290,12 @@ func TestSplitsReadEveryRowOnce(t *testing.T) {
 			if (len(splits) < 2) != (name == "few first") {
 				t.Fatalf("%d splits", len(splits))
 			}
-			rc := &splitCapture{col: "n"}
+			rc := &splitCapture{Col: "n"}
 			e.mustRead(s, 4, rc, inSplits(cs, splits))
-			sameValues(t, rc.values(), oneToN(2200))
+			sameValues(t, rc.Values(), oneToN(2200))
 			for _, sp := range splits {
-				events := rc.of(sp.ID)
-				if !events[len(events)-1].complete {
+				events := rc.Of(sp.ID)
+				if !events[len(events)-1].Complete {
 					t.Errorf("split %q ended with %+v", sp.ID, events[len(events)-1])
 				}
 				if sp.State == nil {
@@ -407,10 +312,6 @@ func TestSplitsReadEveryRowOnce(t *testing.T) {
 	}
 }
 
-func sameBound(a, b *string) bool {
-	return (a == nil) == (b == nil) && (a == nil || *a == *b)
-}
-
 // Keys beyond every bound the statistics saw belong to the first and last
 // ranges.
 func TestSplitsCoverKeysOutsideTheHistogram(t *testing.T) {
@@ -425,11 +326,11 @@ func TestSplitsCoverKeysOutsideTheHistogram(t *testing.T) {
 	if len(splits) != 10 {
 		t.Fatalf("%d splits", len(splits))
 	}
-	rc := &splitCapture{col: "n"}
+	rc := &splitCapture{Col: "n"}
 	e.mustRead(s, 3, rc, inSplits(cs, splits))
-	sameValues(t, rc.values(), oneToN(1002))
-	if !slices.Contains(valuesOf(rc.of("0")), "1001") || !slices.Contains(valuesOf(rc.of("9")), "1002") {
-		t.Errorf("first split read %d rows, last %d", len(rc.of("0")), len(rc.of("9")))
+	sameValues(t, rc.Values(), oneToN(1002))
+	if !slices.Contains(connectortest.ValuesOf(rc.Of("0")), "1001") || !slices.Contains(connectortest.ValuesOf(rc.Of("9")), "1002") {
+		t.Errorf("first split read %d rows, last %d", len(rc.Of("0")), len(rc.Of("9")))
 	}
 }
 
@@ -462,8 +363,8 @@ func TestSplitsReadOnAtMostMaxConnections(t *testing.T) {
 			var inFlight, peak, conns atomic.Int64
 			reached := make(chan struct{})
 			var once sync.Once
-			rc := &splitCapture{col: "n"}
-			rc.onBatch = func(string, string) {
+			rc := &splitCapture{Col: "n"}
+			rc.OnBatch = func(string, string) {
 				n := inFlight.Add(1)
 				defer inFlight.Add(-1)
 				for {
@@ -491,7 +392,7 @@ func TestSplitsReadOnAtMostMaxConnections(t *testing.T) {
 				}
 			}
 			e.mustRead(s, c.lanes, rc, inSplits(cs, splits))
-			sameValues(t, rc.values(), oneToN(1000))
+			sameValues(t, rc.Values(), oneToN(1000))
 			if peak.Load() != int64(c.want) {
 				t.Errorf("%d splits at a time, want %d", peak.Load(), c.want)
 			}
@@ -528,13 +429,13 @@ func TestSplitsReadWithTheConnectionsTheServerGives(t *testing.T) {
 	}
 	cs := source.ConfiguredStream{Name: "t"}
 	splits := e.mustSplits(s, cs, nil)
-	rc := &splitCapture{col: "n"}
+	rc := &splitCapture{Col: "n"}
 	e.mustRead(s, 4, rc, inSplits(cs, splits))
-	sameValues(t, rc.values(), oneToN(1000))
+	sameValues(t, rc.Values(), oneToN(1000))
 
 	// With none to give, the read fails as it always has.
 	e.exec("ALTER ROLE " + role + " CONNECTION LIMIT 0")
-	err = s.Read(t.Context(), source.ReadRequest{Streams: []source.ConfiguredStream{cs}, Lanes: 4}, &splitCapture{col: "n"})
+	err = s.Read(t.Context(), source.ReadRequest{Streams: []source.ConfiguredStream{cs}, Lanes: 4}, &splitCapture{Col: "n"})
 	if code := codeOf(err); code != protocolv1.ErrorCode_ERROR_CODE_TRANSIENT {
 		t.Errorf("without connections: %v (%v), want TRANSIENT", err, code)
 	}
@@ -557,9 +458,9 @@ func TestSplitsOfAPartitionedTable(t *testing.T) {
 	if len(splits) != 10 {
 		t.Fatalf("%d splits", len(splits))
 	}
-	rc := &splitCapture{col: "n"}
+	rc := &splitCapture{Col: "n"}
 	e.mustRead(s, 4, rc, inSplits(cs, splits))
-	sameValues(t, rc.values(), oneToN(1000))
+	sameValues(t, rc.Values(), oneToN(1000))
 }
 
 // A read goes on from any mix of splits mid-way, not started and complete,
@@ -572,30 +473,30 @@ func TestSplitsResumeFromAMix(t *testing.T) {
 	s := e.source(`, "chunkRows": 100`)
 	cs := source.ConfiguredStream{Name: "t"}
 	splits := e.mustSplits(s, cs, nil)
-	first := &splitCapture{col: "n"}
+	first := &splitCapture{Col: "n"}
 	e.mustRead(s, 4, first, inSplits(cs, splits))
 
 	var again []source.Split
 	var before []string
 	for i, sp := range splits {
-		events := first.of(sp.ID)
+		events := first.Of(sp.ID)
 		switch i % 3 {
 		case 0: // Complete: not read again.
-			before = append(before, valuesOf(events)...)
+			before = append(before, connectortest.ValuesOf(events)...)
 		case 1: // Mid-way, after its first resume point.
-			at := slices.IndexFunc(events, func(e splitEvent) bool { return e.resume })
-			before = append(before, valuesOf(events[:at])...)
-			again = append(again, source.Split{ID: sp.ID, State: []byte(events[at].state)})
+			at := slices.IndexFunc(events, func(e splitEvent) bool { return e.Resume })
+			before = append(before, connectortest.ValuesOf(events[:at])...)
+			again = append(again, source.Split{ID: sp.ID, State: []byte(events[at].State)})
 		default: // Not started.
 			again = append(again, sp)
 		}
 	}
-	rest := &splitCapture{col: "n"}
+	rest := &splitCapture{Col: "n"}
 	e.mustRead(s, 3, rest, inSplits(cs, again))
-	sameValues(t, append(before, rest.values()...), oneToN(3000))
+	sameValues(t, append(before, rest.Values()...), oneToN(3000))
 	for _, sp := range again {
-		events := rest.of(sp.ID)
-		if !events[len(events)-1].complete {
+		events := rest.Of(sp.ID)
+		if !events[len(events)-1].Complete {
 			t.Errorf("split %q ended with %+v", sp.ID, events[len(events)-1])
 		}
 	}
@@ -624,17 +525,17 @@ func TestSplitsReadIncrementally(t *testing.T) {
 	// What comes after the read starts waits for the next, whichever range it
 	// lands in.
 	e.exec("INSERT INTO $schema.t VALUES (3000, 500, 3000), (0, 400, 3001)")
-	rc := &splitCapture{col: "n"}
+	rc := &splitCapture{Col: "n"}
 	e.mustRead(s, 4, rc, inSplits(cs, splits))
-	sameValues(t, rc.values(), oneToN(2000))
+	sameValues(t, rc.Values(), oneToN(2000))
 	var ended []source.Split
 	for _, sp := range splits {
-		events := rc.of(sp.ID)
+		events := rc.Of(sp.ID)
 		last := events[len(events)-1]
-		if !last.complete || last.state != `{"since":"299"}` {
+		if !last.Complete || last.State != `{"since":"299"}` {
 			t.Errorf("split %q ended with %+v", sp.ID, last)
 		}
-		ended = append(ended, source.Split{ID: sp.ID, State: []byte(last.state)})
+		ended = append(ended, source.Split{ID: sp.ID, State: []byte(last.State)})
 		// Exactly after a resume point.
 		states := statesOf(t, events)
 		if len(states) > 1 && len(states[0].After) != 2 {
@@ -644,14 +545,14 @@ func TestSplitsReadIncrementally(t *testing.T) {
 
 	// A resume mid-way goes on from its (cursor, key).
 	sp := splits[3]
-	events := rc.of(sp.ID)
-	at := slices.IndexFunc(events, func(e splitEvent) bool { return e.resume })
-	if at < 0 || parseState(t, events[at].state).After == nil {
+	events := rc.Of(sp.ID)
+	at := slices.IndexFunc(events, func(e splitEvent) bool { return e.Resume })
+	if at < 0 || parseState(t, events[at].State).After == nil {
 		t.Fatalf("split %q's events %+v", sp.ID, events)
 	}
-	mid := &splitCapture{col: "n"}
-	e.mustRead(s, 1, mid, inSplits(cs, []source.Split{{ID: sp.ID, State: []byte(events[at].state)}}))
-	sameValues(t, append(valuesOf(events[:at]), mid.values()...), valuesOf(events))
+	mid := &splitCapture{Col: "n"}
+	e.mustRead(s, 1, mid, inSplits(cs, []source.Split{{ID: sp.ID, State: []byte(events[at].State)}}))
+	sameValues(t, append(connectortest.ValuesOf(events[:at]), mid.Values()...), connectortest.ValuesOf(events))
 
 	// The next read starts at the floor, reading its rows again.
 	next := e.mustSplits(s, cs, ended)
@@ -660,7 +561,7 @@ func TestSplitsReadIncrementally(t *testing.T) {
 			t.Errorf("next read's split %q: %s", sp.ID, sp.State)
 		}
 	}
-	rc = &splitCapture{col: "n"}
+	rc = &splitCapture{Col: "n"}
 	e.mustRead(s, 4, rc, inSplits(cs, next))
 	var want []string
 	rows, err := e.conn.Query(t.Context(), "SELECT n::text FROM "+e.schema+".t WHERE seq >= 299")
@@ -674,7 +575,7 @@ func TestSplitsReadIncrementally(t *testing.T) {
 		}
 		want = append(want, v)
 	}
-	sameValues(t, rc.values(), want)
+	sameValues(t, rc.Values(), want)
 
 	// A table read in splits that's read whole next takes their floor.
 	whole := e.mustSplits(e.source(`, "chunkRows": 1000000`), cs, ended)
@@ -710,9 +611,9 @@ func TestSplitsReadIncrementallyByAKeyColumn(t *testing.T) {
 			if len(splits) < 2 {
 				t.Fatalf("%d splits", len(splits))
 			}
-			rc := &splitCapture{col: "n"}
+			rc := &splitCapture{Col: "n"}
 			e.mustRead(s, 3, rc, inSplits(cs, splits))
-			sameValues(t, rc.values(), oneToN(1000))
+			sameValues(t, rc.Values(), oneToN(1000))
 		})
 	}
 }
@@ -728,9 +629,9 @@ func TestResplitAfterAChunkPastTheMidpoint(t *testing.T) {
 	hi := "100"
 	state, _ := json.Marshal(sourceState{keyRange: keyRange{Hi: &hi}})
 	cs := source.ConfiguredStream{Name: "t", Splits: []source.Split{{ID: "a", State: state}}}
-	rc := &splitCapture{col: "n"}
+	rc := &splitCapture{Col: "n"}
 	var asked atomic.Bool
-	rc.onBatch = func(stream, split string) {
+	rc.OnBatch = func(stream, split string) {
 		if split == "a" && !asked.Swap(true) {
 			if ok, err := s.Resplit(t.Context(), stream, split); err != nil || !ok {
 				t.Errorf("asked to split: %v, %v", ok, err)
@@ -738,32 +639,32 @@ func TestResplitAfterAChunkPastTheMidpoint(t *testing.T) {
 		}
 	}
 	e.mustRead(s, 1, rc, cs)
-	sameValues(t, rc.values(), oneToN(100))
-	events := rc.of("a")
-	if len(events) < 2 || !events[1].resume || len(events[1].added) != 1 {
+	sameValues(t, rc.Values(), oneToN(100))
+	events := rc.Of("a")
+	if len(events) < 2 || !events[1].Resume || len(events[1].Added) != 1 {
 		t.Fatalf("split a's events: %+v", events)
 	}
-	if got := valuesOf(events[:1]); len(got) != 80 {
+	if got := connectortest.ValuesOf(events[:1]); len(got) != 80 {
 		t.Fatalf("first chunk read %d rows", len(got))
 	}
-	shrunk := parseState(t, events[1].state)
+	shrunk := parseState(t, events[1].State)
 	if shrunk.Hi == nil || *shrunk.Hi != "90" || !slices.Equal(shrunk.After, []string{"80"}) {
-		t.Errorf("split a at %s", events[1].state)
+		t.Errorf("split a at %s", events[1].State)
 	}
-	if want := valuesOf(events); slices.Contains(want, "91") || !slices.Contains(want, "90") {
+	if want := connectortest.ValuesOf(events); slices.Contains(want, "91") || !slices.Contains(want, "90") {
 		t.Errorf("split a read %q", want)
 	}
-	if got := string(events[1].added[0].State); got != `{"lo":"90","hi":"100"}` {
+	if got := string(events[1].Added[0].State); got != `{"lo":"90","hi":"100"}` {
 		t.Errorf("the new split: %s", got)
 	}
-	child := rc.of(events[1].added[0].ID)
-	if got := valuesOf(child); !slices.Equal(got, []string{"91", "92", "93", "94", "95", "96", "97", "98", "99", "100"}) {
+	child := rc.Of(events[1].Added[0].ID)
+	if got := connectortest.ValuesOf(child); !slices.Equal(got, []string{"91", "92", "93", "94", "95", "96", "97", "98", "99", "100"}) {
 		t.Errorf("the new split read %q", got)
 	}
 	// Either part resumes on its own, from the state or the addition.
-	rest := &splitCapture{col: "n"}
-	e.mustRead(s, 2, rest, source.ConfiguredStream{Name: "t", Splits: []source.Split{{ID: "a", State: []byte(events[1].state)}, events[1].added[0]}})
-	sameValues(t, rest.values(), []string{"81", "82", "83", "84", "85", "86", "87", "88", "89", "90", "91", "92", "93", "94", "95", "96", "97", "98", "99", "100"})
+	rest := &splitCapture{Col: "n"}
+	e.mustRead(s, 2, rest, source.ConfiguredStream{Name: "t", Splits: []source.Split{{ID: "a", State: []byte(events[1].State)}, events[1].Added[0]}})
+	sameValues(t, rest.Values(), []string{"81", "82", "83", "84", "85", "86", "87", "88", "89", "90", "91", "92", "93", "94", "95", "96", "97", "98", "99", "100"})
 }
 
 // The last range has no upper bound: the column's max says how far its
@@ -774,22 +675,14 @@ func TestResplitTheLastRange(t *testing.T) {
 	e.exec("CREATE TABLE $schema.t (id int PRIMARY KEY, n int)")
 	e.exec("INSERT INTO $schema.t SELECT i, i FROM generate_series(1, 100) i")
 	s := e.source(`, "chunkRows": 20`)
-	rc := &splitCapture{col: "n"}
-	var asked atomic.Bool
-	rc.onBatch = func(stream, split string) {
-		if split == source.WholeStream && !asked.Swap(true) {
-			if ok, err := s.Resplit(t.Context(), stream, split); err != nil || !ok {
-				t.Errorf("asked to split: %v, %v", ok, err)
-			}
-		}
-	}
+	rc := resplitFirst(t, s)
 	e.mustRead(s, 2, rc, source.ConfiguredStream{Name: "t"})
-	sameValues(t, rc.values(), oneToN(100))
-	added := rc.added()
+	sameValues(t, rc.Values(), oneToN(100))
+	added := rc.Added()
 	if len(added) != 1 || string(added[0].State) != `{"lo":"60"}` {
 		t.Fatalf("added %q", added)
 	}
-	if st := parseState(t, rc.of(source.WholeStream)[1].state); st.Hi == nil || *st.Hi != "60" {
+	if st := parseState(t, rc.Of(source.WholeStream)[1].State); st.Hi == nil || *st.Hi != "60" {
 		t.Errorf("the whole stream at %+v", st)
 	}
 }
@@ -839,14 +732,12 @@ func TestResplitAtHistogramBounds(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			e := newSourceEnv(t)
-			e.exec("CREATE TABLE $schema.t (" + c.cols + ", n int NOT NULL, PRIMARY KEY (" + c.key + "))")
-			e.exec("INSERT INTO $schema.t SELECT " + c.row + ", i FROM generate_series(1, 1000) i")
-			e.exec("ANALYZE $schema.t")
+			e.keyTable(c.cols, c.key, c.row, 1000)
 			s := e.source(`, "chunkRows": 50`)
-			rc := &splitCapture{col: "n"}
+			rc := &splitCapture{Col: "n"}
 			var asked atomic.Int64
 			var wrong atomic.Value
-			rc.onBatch = func(stream, split string) {
+			rc.OnBatch = func(stream, split string) {
 				// Each read split asks to split itself, a few times.
 				if asked.Add(1) > 12 {
 					return
@@ -859,12 +750,12 @@ func TestResplitAtHistogramBounds(t *testing.T) {
 			if err := wrong.Load(); err != nil {
 				t.Error(err)
 			}
-			sameValues(t, rc.values(), oneToN(1000))
-			if n := len(rc.added()); n == 0 {
+			sameValues(t, rc.Values(), oneToN(1000))
+			if n := len(rc.Added()); n == 0 {
 				t.Errorf("no split was added")
 			}
 			seen := map[string]bool{source.WholeStream: true}
-			for _, a := range rc.added() {
+			for _, a := range rc.Added() {
 				if seen[a.ID] {
 					t.Errorf("split %q added twice", a.ID)
 				}
@@ -881,10 +772,10 @@ func TestResplitWithoutBoundsRefuses(t *testing.T) {
 	e.exec("CREATE TABLE $schema.t (id text PRIMARY KEY, n int) WITH (autovacuum_enabled = false)")
 	e.exec("INSERT INTO $schema.t SELECT lpad(i::text, 4, '0'), i FROM generate_series(1, 100) i")
 	s := e.source(`, "chunkRows": 20`)
-	rc := &splitCapture{col: "n"}
+	rc := &splitCapture{Col: "n"}
 	var calls atomic.Int64
 	var answers [3]atomic.Bool
-	rc.onBatch = func(stream, split string) {
+	rc.OnBatch = func(stream, split string) {
 		i := calls.Add(1) - 1
 		if i >= int64(len(answers)) {
 			return
@@ -896,8 +787,8 @@ func TestResplitWithoutBoundsRefuses(t *testing.T) {
 		answers[i].Store(ok)
 	}
 	e.mustRead(s, 2, rc, source.ConfiguredStream{Name: "t"})
-	sameValues(t, rc.values(), oneToN(100))
-	if n := len(rc.added()); n != 0 {
+	sameValues(t, rc.Values(), oneToN(100))
+	if n := len(rc.Added()); n != 0 {
 		t.Errorf("added %d splits without statistics", n)
 	}
 	if !answers[0].Load() || answers[1].Load() || answers[2].Load() {
@@ -938,9 +829,9 @@ func TestResplitRefuses(t *testing.T) {
 	}
 
 	// Not keyed, unknown, and already asked.
-	rc := &splitCapture{col: "n"}
+	rc := &splitCapture{Col: "n"}
 	var once sync.Once
-	rc.onBatch = func(stream, split string) {
+	rc.OnBatch = func(stream, split string) {
 		once.Do(func() {
 			if ask("keyed", "other") {
 				t.Error("split an unknown split")
@@ -957,13 +848,13 @@ func TestResplitRefuses(t *testing.T) {
 		})
 	}
 	e.mustRead(s, 2, rc, source.ConfiguredStream{Name: "keyed"})
-	if len(rc.added()) != 1 {
-		t.Errorf("added %q", rc.added())
+	if len(rc.Added()) != 1 {
+		t.Errorf("added %q", rc.Added())
 	}
 
 	// A table without a key.
-	rc = &splitCapture{col: "n"}
-	rc.onBatch = func(stream, split string) {
+	rc = &splitCapture{Col: "n"}
+	rc.OnBatch = func(stream, split string) {
 		if ask(stream, split) {
 			t.Error("split a table without a key")
 		}
@@ -971,33 +862,33 @@ func TestResplitRefuses(t *testing.T) {
 	e.mustRead(s, 1, rc, source.ConfiguredStream{Name: "loose"})
 
 	// A split on its last chunk: its next ask is too late.
-	rc = &splitCapture{col: "n"}
+	rc = &splitCapture{Col: "n"}
 	lo := "80"
 	state, _ := json.Marshal(sourceState{keyRange: keyRange{Lo: &lo}})
-	rc.onBatch = func(stream, split string) {
+	rc.OnBatch = func(stream, split string) {
 		if !ask(stream, split) {
 			t.Error("refused a split whose chunk isn't known to be its last")
 		}
 	}
 	e.mustRead(s, 1, rc, source.ConfiguredStream{Name: "keyed", Splits: []source.Split{{ID: "tail", State: state}}})
-	if len(rc.added()) != 0 {
-		t.Errorf("added %q past the last row", rc.added())
+	if len(rc.Added()) != 0 {
+		t.Errorf("added %q past the last row", rc.Added())
 	}
 
 	// A range with no keys left to divide, once its first chunk is read.
 	hi := "41"
 	state, _ = json.Marshal(sourceState{keyRange: keyRange{Hi: &hi}})
-	rc = &splitCapture{col: "n"}
+	rc = &splitCapture{Col: "n"}
 	calls := 0
-	rc.onBatch = func(stream, split string) {
+	rc.OnBatch = func(stream, split string) {
 		calls++
 		if calls == 2 && ask(stream, split) {
 			t.Error("took an ask for a range with no keys to divide")
 		}
 	}
 	e.mustRead(s, 1, rc, source.ConfiguredStream{Name: "keyed", Splits: []source.Split{{ID: "short", State: state}}})
-	if calls != 2 || len(rc.added()) != 0 {
-		t.Errorf("%d batches, added %q", calls, rc.added())
+	if calls != 2 || len(rc.Added()) != 0 {
+		t.Errorf("%d batches, added %q", calls, rc.Added())
 	}
 }
 
@@ -1023,24 +914,16 @@ func TestResplitACompositeKey(t *testing.T) {
 	e.exec("CREATE TABLE $schema.t (a int, b int, n int NOT NULL, PRIMARY KEY (a, b))")
 	e.exec("INSERT INTO $schema.t SELECT i / 10, i % 10, i + 1 FROM generate_series(0, 99) i")
 	s := e.source(`, "chunkRows": 25`)
-	rc := &splitCapture{col: "n"}
-	var asked atomic.Bool
-	rc.onBatch = func(stream, split string) {
-		if split == source.WholeStream && !asked.Swap(true) {
-			if ok, err := s.Resplit(t.Context(), stream, split); err != nil || !ok {
-				t.Errorf("asked to split: %v, %v", ok, err)
-			}
-		}
-	}
+	rc := resplitFirst(t, s)
 	e.mustRead(s, 2, rc, source.ConfiguredStream{Name: "t"})
-	sameValues(t, rc.values(), oneToN(100))
-	events := rc.of(source.WholeStream)
-	st := parseState(t, events[1].state)
+	sameValues(t, rc.Values(), oneToN(100))
+	events := rc.Of(source.WholeStream)
+	st := parseState(t, events[1].State)
 	// Read up to (2, 4); the rest of a = 2 stays below.
 	if !slices.Equal(st.After, []string{"2", "4"}) || st.Hi == nil || *st.Hi != "5" {
-		t.Errorf("the lower part: %s", events[1].state)
+		t.Errorf("the lower part: %s", events[1].State)
 	}
-	if got := string(rc.added()[0].State); got != `{"lo":"5"}` {
+	if got := string(rc.Added()[0].State); got != `{"lo":"5"}` {
 		t.Errorf("the new split: %s", got)
 	}
 }
@@ -1053,9 +936,9 @@ func TestResplitAnIncrementalRead(t *testing.T) {
 	e.exec("INSERT INTO $schema.t SELECT i, (i * 37) % 100, i FROM generate_series(1, 400) i")
 	s := e.source(`, "chunkRows": 30`)
 	cs := source.ConfiguredStream{Name: "t", SyncMode: source.Incremental, Cursor: "seq"}
-	rc := &splitCapture{col: "n"}
+	rc := &splitCapture{Col: "n"}
 	var asked atomic.Int64
-	rc.onBatch = func(stream, split string) {
+	rc.OnBatch = func(stream, split string) {
 		if asked.Add(1) <= 6 {
 			if _, err := s.Resplit(t.Context(), stream, split); err != nil {
 				t.Error(err)
@@ -1063,17 +946,17 @@ func TestResplitAnIncrementalRead(t *testing.T) {
 		}
 	}
 	e.mustRead(s, 3, rc, cs)
-	sameValues(t, rc.values(), oneToN(400))
-	if len(rc.added()) == 0 {
+	sameValues(t, rc.Values(), oneToN(400))
+	if len(rc.Added()) == 0 {
 		t.Fatal("no split was added")
 	}
-	for _, a := range rc.added() {
+	for _, a := range rc.Added() {
 		st := parseState(t, string(a.State))
 		if st.Until == nil || *st.Until != "99" || st.Lo == nil || len(st.After) != 2 {
 			t.Errorf("the new split %q: %s", a.ID, a.State)
 		}
-		events := rc.of(a.ID)
-		if last := events[len(events)-1]; !last.complete || last.state != `{"since":"99"}` {
+		events := rc.Of(a.ID)
+		if last := events[len(events)-1]; !last.Complete || last.State != `{"since":"99"}` {
 			t.Errorf("the new split %q ended with %+v", a.ID, last)
 		}
 	}
@@ -1092,13 +975,11 @@ func TestResplitAtRandom(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			e := newSourceEnv(t)
-			e.exec("CREATE TABLE $schema.t (" + c.cols + ", n int NOT NULL, PRIMARY KEY (" + c.key + "))")
-			e.exec("INSERT INTO $schema.t SELECT " + c.row + ", i FROM generate_series(1, 3000) i")
-			e.exec("ANALYZE $schema.t")
+			e.keyTable(c.cols, c.key, c.row, 3000)
 			s := e.source(`, "chunkRows": 40`)
 			cs := source.ConfiguredStream{Name: "t"}
 			splits := e.mustSplits(s, cs, nil)
-			rc := &splitCapture{col: "n"}
+			rc := &splitCapture{Col: "n"}
 			rng := rand.New(rand.NewPCG(1, 2))
 			var mu sync.Mutex
 			known := map[string]bool{}
@@ -1106,7 +987,7 @@ func TestResplitAtRandom(t *testing.T) {
 				known[sp.ID] = true
 			}
 			var accepted atomic.Int64
-			rc.onBatch = func(stream, split string) {
+			rc.OnBatch = func(stream, split string) {
 				mu.Lock()
 				defer mu.Unlock()
 				known[split] = true
@@ -1119,8 +1000,8 @@ func TestResplitAtRandom(t *testing.T) {
 				}
 			}
 			e.mustRead(s, 4, rc, inSplits(cs, splits))
-			sameValues(t, rc.values(), oneToN(3000))
-			added := rc.added()
+			sameValues(t, rc.Values(), oneToN(3000))
+			added := rc.Added()
 			if len(added) == 0 || accepted.Load() == 0 {
 				t.Errorf("%d asks accepted, %d splits added", accepted.Load(), len(added))
 			}
@@ -1141,24 +1022,24 @@ func TestResplitAtRandom(t *testing.T) {
 			var before []string
 			var walk func(id string, state []byte)
 			walk = func(id string, state []byte) {
-				events := rc.of(id)
-				at := slices.IndexFunc(events, func(e splitEvent) bool { return e.resume })
+				events := rc.Of(id)
+				at := slices.IndexFunc(events, func(e splitEvent) bool { return e.Resume })
 				if at < 0 {
 					again = append(again, source.Split{ID: id, State: state})
 					return
 				}
-				before = append(before, valuesOf(events[:at])...)
-				again = append(again, source.Split{ID: id, State: []byte(events[at].state)})
-				for _, a := range events[at].added {
+				before = append(before, connectortest.ValuesOf(events[:at])...)
+				again = append(again, source.Split{ID: id, State: []byte(events[at].State)})
+				for _, a := range events[at].Added {
 					walk(a.ID, a.State)
 				}
 			}
 			for _, sp := range splits {
 				walk(sp.ID, sp.State)
 			}
-			rest := &splitCapture{col: "n"}
+			rest := &splitCapture{Col: "n"}
 			e.mustRead(s, 4, rest, inSplits(cs, again))
-			sameValues(t, append(before, rest.values()...), oneToN(3000))
+			sameValues(t, append(before, rest.Values()...), oneToN(3000))
 		})
 	}
 }
@@ -1172,11 +1053,11 @@ func TestSplitsStopOnAFailure(t *testing.T) {
 	s := e.source(`, "chunkRows": 20`)
 	bad := source.Split{ID: "bad", State: []byte(`{"after":["1","2","3"]}`)}
 	good := source.Split{ID: "good", State: []byte(`{"lo":"100"}`)}
-	err := s.Read(t.Context(), source.ReadRequest{Streams: []source.ConfiguredStream{{Name: "t", Splits: []source.Split{good, bad}}}, Lanes: 2}, &splitCapture{col: "n"})
+	err := s.Read(t.Context(), source.ReadRequest{Streams: []source.ConfiguredStream{{Name: "t", Splits: []source.Split{good, bad}}}, Lanes: 2}, &splitCapture{Col: "n"})
 	if err == nil || !strings.Contains(err.Error(), "3 key columns") {
 		t.Errorf("read with a bad state: %v", err)
 	}
-	if err := s.Read(context.Background(), source.ReadRequest{Streams: []source.ConfiguredStream{{Name: "missing"}}}, &splitCapture{col: "n"}); err == nil {
+	if err := s.Read(context.Background(), source.ReadRequest{Streams: []source.ConfiguredStream{{Name: "missing"}}}, &splitCapture{Col: "n"}); err == nil {
 		t.Error("read a missing table")
 	}
 }
@@ -1208,7 +1089,7 @@ func TestSourceServesSplits(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(splits.GetSplits()) != maxKeyRanges {
+	if len(splits.GetSplits()) != keysplit.MaxRanges {
 		t.Fatalf("%d splits", len(splits.GetSplits()))
 	}
 	cs.Splits = splits.GetSplits()
@@ -1256,7 +1137,11 @@ func TestSourceServesSplits(t *testing.T) {
 	if !asked {
 		t.Error("no ask to split was accepted")
 	}
-	if len(ended) != maxKeyRanges+len(added) {
+	if len(ended) != keysplit.MaxRanges+len(added) {
 		t.Errorf("%d splits ended, with %d added", len(ended), len(added))
 	}
+}
+
+func sameBound(a, b *string) bool {
+	return a == nil && b == nil || a != nil && b != nil && *a == *b
 }
