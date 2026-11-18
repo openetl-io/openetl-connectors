@@ -851,6 +851,10 @@ checks_iceberg() {
     --unreachable "$work/iceberg-closed.json"
 }
 
+# Redshift has no local server, so its package isn't checked here; its
+# conformance test runs against a cluster given OPENETL_TEST_REDSHIFT_*.
+checks_redshift() { echo "::notice::redshift: no checks ran, there's no Redshift to check against"; }
+
 for name in "${names[@]}"; do
   if declare -F "checks_$name" >/dev/null; then
     "checks_$name"
