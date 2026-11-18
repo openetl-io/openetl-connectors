@@ -90,19 +90,33 @@ func TestChecksItemByItem(t *testing.T) {
 		"db.connect": "passed", "schema.create": "failed privilege_missing",
 	})
 	e.exec("GRANT CREATE ON SCHEMA $schema TO " + role)
+	// CREATE without USAGE: the writer couldn't reach the tables it creates.
+	e.exec("REVOKE USAGE ON SCHEMA $schema FROM " + role)
+	r := check.Run(t.Context(), d.Checks())
+	connectortest.ExpectItems(t, "CREATE without USAGE", r, map[string]string{"schema.create": "failed privilege_missing"})
+	if it := r.Items[len(r.Items)-1].Rendered(); !strings.Contains(it.Message, "USAGE") {
+		t.Errorf("CREATE without USAGE: %s", it.Message)
+	}
+	e.exec("GRANT USAGE ON SCHEMA $schema TO " + role)
 	e.exec("GRANT INSERT ON $schema.b TO " + role)
 	// wider writes to b, with a column b lacks, which only b's owner can add.
 	md := arrow.NewMetadata([]string{sqlstage.TableKey}, []string{"b"})
 	wider := arrow.NewSchema([]arrow.Field{{Name: "id", Type: arrow.PrimitiveTypes.Int32}, {Name: "extra", Type: arrow.BinaryTypes.String}}, &md)
 	dpf := check.Run(t.Context(), d.Preflight(destination.PreflightRequest{Streams: []destination.Stream{
 		{Name: "b", Mode: destination.Append}, {Name: "b", Mode: destination.Merge, PrimaryKey: []string{"id"}}, {Name: "new"}, {Name: "wider"},
+		{Name: "b", Mode: destination.Append, Dedupe: destination.DedupeTarget},
 	}, Schemas: map[string]*arrow.Schema{"wider": wider}}))
 	connectortest.ExpectItems(t, "the destination's preflight", dpf, map[string]string{
 		"schema.create": "passed", "stream.b.write": "warning table_not_owned",
 		"stream.b.write-2": "failed privilege_missing", "stream.new.write": "passed", "stream.wider.write": "failed table_not_owned",
+		"stream.b.write-3": "failed privilege_missing",
 	})
-	if it := dpf.Items[3].Rendered(); !strings.Contains(it.Message, "UPDATE, DELETE") {
+	// A merge and a deduped append read the target's rows.
+	if it := dpf.Items[3].Rendered(); !strings.Contains(it.Message, "SELECT, UPDATE, DELETE") {
 		t.Errorf("the merge's failure: %s", it.Message)
+	}
+	if it := dpf.Items[6].Rendered(); !strings.Contains(it.Message, "SELECT") {
+		t.Errorf("the deduped append's failure: %s", it.Message)
 	}
 
 	// A schema that doesn't exist yet: it's created, with CREATE on the

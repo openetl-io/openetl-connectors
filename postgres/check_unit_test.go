@@ -4,6 +4,8 @@ import (
 	"slices"
 	"testing"
 
+	"github.com/apache/arrow-go/v18/arrow"
+
 	"github.com/openetl-io/openetl-connectors/connectortest"
 	"github.com/openetl-io/openetl/sdk/go/check"
 	"github.com/openetl-io/openetl/sdk/go/destination"
@@ -68,5 +70,56 @@ func TestCheckLists(t *testing.T) {
 	}
 	if got, want := connectortest.ItemNames(dpf), []string{"db.connect", "schema.create", "stream.a-b.write", "stream.a-b.write-2"}; !slices.Equal(got, want) {
 		t.Errorf("destination preflight %v, want %v", got, want)
+	}
+}
+
+// A merge whose schema lacks its key fails its write item, as the writer
+// would refuse its batches, before the item looks at the table.
+func TestPreflightMergeKey(t *testing.T) {
+	d, err := NewDestination([]byte(`{"dsn": "postgres://u:p@127.0.0.1:1/app?sslmode=disable&connect_timeout=5"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	value := arrow.NewSchema([]arrow.Field{{Name: "value", Type: arrow.BinaryTypes.String}}, nil)
+	keyed := arrow.NewSchema([]arrow.Field{{Name: "id", Type: arrow.PrimitiveTypes.Int64}, {Name: "value", Type: arrow.BinaryTypes.String}}, nil)
+	pf := d.Preflight(destination.PreflightRequest{
+		Streams: []destination.Stream{{Name: "a", Mode: destination.Merge, PrimaryKey: []string{"id"}}, {Name: "b", Mode: destination.Merge, PrimaryKey: []string{"id"}}},
+		Schemas: map[string]*arrow.Schema{"a": value, "b": keyed},
+	})
+	if err := check.Validate(pf); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []struct {
+		item, reason string
+	}{{"stream.a.write", "config_invalid"}, {"stream.b.write", "connection_refused"}} {
+		i := slices.IndexFunc(pf, func(ch check.Check) bool { return ch.Name == c.item })
+		if got := check.Classify(pf[i].Run(t.Context(), &check.Probe{})); got == nil || got.Reason != c.reason {
+			t.Errorf("%s: %v, want %s", c.item, got, c.reason)
+		}
+	}
+}
+
+// Of a dsn with several hosts, the first is only advised on: an unreachable
+// one leaves db.connect to try the others, where one host's fails the check
+// first.
+func TestCheckSeveralHosts(t *testing.T) {
+	for dsn, want := range map[string]map[string]check.Status{
+		"postgres://u:p@127.0.0.1:1/app?sslmode=disable":             {"net.connect": check.Failed, "db.connect": check.Skipped},
+		"postgres://u:p@127.0.0.1:1,127.0.0.1:2/app?sslmode=disable": {"net.connect": check.Warning, "db.connect": check.Failed},
+		"postgres://u:p@127.0.0.1:1,127.0.0.1:2/app?sslmode=require": {"net.connect": check.Warning, "db.tls": check.Warning, "db.connect": check.Failed},
+	} {
+		s, err := NewSource([]byte(`{"dsn": "` + dsn + `&connect_timeout=5"}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := map[string]check.Status{}
+		for _, it := range check.Run(t.Context(), s.Checks()).Items {
+			got[it.Name] = it.Status
+		}
+		for name, st := range want {
+			if got[name] != st {
+				t.Errorf("%s: %s is %v, want %v", dsn, name, got[name], st)
+			}
+		}
 	}
 }

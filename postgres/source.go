@@ -239,9 +239,13 @@ func (s *Source) tables(ctx context.Context, conn *pgx.Conn) ([]table, error) {
 
 // orders sets each table's read order: its primary key, or else the unique
 // index with the fewest columns, then the first by name, among those with
-// neither a predicate nor expressions whose columns are all NOT NULL, which
-// no two rows share. An index being built or that failed to build may hold
-// duplicates, so it isn't one.
+// neither a predicate nor expressions whose columns are all NOT NULL and
+// each in its column's collation, which no two rows share as the read
+// compares them. An index in another collation, such as "C" on a
+// case-insensitive column, can hold keys the read finds equal. An index
+// being built or that failed to build may hold duplicates, so it isn't one,
+// and nor is one on a table other tables inherit from: the read reads their
+// rows too, which its index doesn't cover.
 func (s *Source) orders(ctx context.Context, conn *pgx.Conn, tables []table) error {
 	rows, err := conn.Query(ctx, `SELECT DISTINCT ON (c.relname) c.relname,
 			(SELECT array_agg(a.attname ORDER BY k.ord) FROM unnest(i.indkey::int2[]) WITH ORDINALITY AS k(attnum, ord)
@@ -252,7 +256,9 @@ func (s *Source) orders(ctx context.Context, conn *pgx.Conn, tables []table) err
 		JOIN pg_class ic ON ic.oid = i.indexrelid
 		WHERE n.nspname = $1 AND i.indisunique AND i.indisvalid AND i.indpred IS NULL AND i.indexprs IS NULL
 			AND NOT EXISTS (SELECT FROM unnest(i.indkey::int2[]) WITH ORDINALITY AS k(attnum, ord)
-				JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = k.attnum WHERE k.ord <= i.indnkeyatts AND NOT a.attnotnull)
+				JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = k.attnum
+				WHERE k.ord <= i.indnkeyatts AND (NOT a.attnotnull OR i.indcollation[(k.ord - 1)::int] <> a.attcollation))
+			AND NOT (c.relkind = 'r' AND EXISTS (SELECT FROM pg_inherits h WHERE h.inhparent = c.oid))
 		ORDER BY c.relname, i.indisprimary DESC, i.indnkeyatts, ic.relname`, s.cfg.Schema)
 	if err != nil {
 		return classify(fmt.Errorf("postgres: list indexes: %w", err))
@@ -302,9 +308,10 @@ func (t table) orderKey() []string {
 }
 
 // sameOrder fails a read resumed in another order than the one its state
-// was read in, which only a read from the start carries on from.
+// was read in, which only a read from the start carries on from. A split's
+// range is of its order's first column, so it holds before its first row.
 func sameOrder(t table, st sourceState) error {
-	if st.After != nil && !slices.Equal(st.Key, t.orderKey()) {
+	if (st.After != nil || st.Lo != nil || st.Hi != nil) && !slices.Equal(st.Key, t.orderKey()) {
 		return positionLost("postgres: %s was read in the order of columns %v, and is now read in another; it's read again from the start", t.name, st.Key)
 	}
 	return nil

@@ -106,7 +106,9 @@ func newKit(cc *pgx.ConnConfig) *sqlcheck.Kit {
 
 // connectionChecks reach the server, agree on TLS as the dsn and tlsCa,
 // tlsCert and tlsKey say, and sign in: net.dns, net.connect, db.tls and
-// db.connect. A Unix socket has only db.connect.
+// db.connect. A Unix socket has only db.connect. Of a dsn with several
+// hosts, the first is reached and agreed with, which only advises: the
+// connection goes to the first host that takes it, as db.connect's does.
 func connectionChecks(cc *pgx.ConnConfig, k *sqlcheck.Kit, t TLS) []check.Check {
 	connect := k.Connect()
 	connect.Kind = check.Authentication
@@ -116,11 +118,9 @@ func connectionChecks(cc *pgx.ConnConfig, k *sqlcheck.Kit, t TLS) []check.Check 
 	if strings.HasPrefix(cc.Host, "/") {
 		return []check.Check{connect}
 	}
+	several := slices.ContainsFunc(cc.Fallbacks, func(f *pgconn.FallbackConfig) bool { return f.Host != cc.Host || f.Port != cc.Port })
 	addr := net.JoinHostPort(cc.Host, strconv.Itoa(int(cc.Port)))
 	checks := netcheck.Reach(addr)
-	for i := range checks {
-		checks[i].Field = "dsn"
-	}
 	connect.Needs = []string{"net.connect"}
 	if cc.TLSConfig != nil {
 		field := "dsn"
@@ -129,6 +129,12 @@ func connectionChecks(cc *pgx.ConnConfig, k *sqlcheck.Kit, t TLS) []check.Check 
 		}
 		checks = append(checks, tlsCheck(cc, addr, field))
 		connect.Needs = []string{"db.tls"}
+	}
+	for i := range checks {
+		checks[i].Advisory = several
+		if checks[i].Field == "" {
+			checks[i].Field = "dsn"
+		}
 	}
 	return append(checks, connect)
 }
@@ -151,6 +157,8 @@ func tlsCheck(cc *pgx.ConnConfig, addr, field string) check.Check {
 				return noTLS.Fail()
 			case err != nil && ctx.Err() != nil:
 				return check.TimedOut.Wrap(err)
+			case isDial(err):
+				return check.Classify(err).With("address", addr)
 			case err != nil:
 				f := check.TLSFailed.Wrap(err)
 				f.Fix = "Check that tlsCa, or the dsn's sslrootcert, holds the authority that signs the server's certificate, and under sslmode=verify-full that the certificate names the dsn's host."
@@ -177,6 +185,12 @@ func tlsCheck(cc *pgx.ConnConfig, addr, field string) check.Check {
 }
 
 var errNoTLS = errors.New("the server doesn't take TLS")
+
+// isDial says err is a failure to reach the server, before any TLS.
+func isDial(err error) bool {
+	oe, ok := errors.AsType[*net.OpError](err)
+	return ok && oe.Op == "dial"
+}
 
 // handshake asks the server at addr for TLS, as pgconn does, and makes the
 // handshake with cc's TLS config.
@@ -529,7 +543,9 @@ func (d *Destination) schemaCheck(k *sqlcheck.Kit, schema string) check.Check {
 	user := d.pool.ConnConfig.User
 	c := k.Check("schema.create", check.Permission, "Create tables in {schema}", func(ctx context.Context, p *check.Probe, db *sql.DB) error {
 		var create bool
-		err := db.QueryRowContext(ctx, `SELECT has_schema_privilege(oid, 'CREATE') FROM pg_namespace WHERE nspname = $1`, schema).Scan(&create)
+		var lacks sql.NullString
+		err := db.QueryRowContext(ctx, `SELECT (SELECT string_agg(p, ', ') FROM unnest(ARRAY['USAGE', 'CREATE']) p WHERE NOT has_schema_privilege(n.oid, p))
+			FROM pg_namespace n WHERE nspname = $1`, schema).Scan(&lacks)
 		switch {
 		case errors.Is(err, sql.ErrNoRows):
 			var database string
@@ -545,8 +561,8 @@ func (d *Destination) schemaCheck(k *sqlcheck.Kit, schema string) check.Check {
 			return nil
 		case err != nil:
 			return k.Failure(err)
-		case !create:
-			return check.PrivilegeMissing.Fail("principal", user, "privilege", "CREATE", "object", "schema "+schema)
+		case lacks.Valid:
+			return check.PrivilegeMissing.Fail("principal", user, "privilege", lacks.String, "object", "schema "+schema)
 		}
 		return nil
 	})
@@ -569,27 +585,40 @@ func (d *Destination) Preflight(req destination.PreflightRequest) []check.Check 
 	for _, st := range req.Streams {
 		table, key := sqlstage.TableName(st.Name), st.PrimaryKey
 		var fields []string
+		// The schema's lack of the key, which fails a merge's writes.
+		var keyErr error
 		if sch := req.Schemas[st.Name]; sch != nil {
 			table = sqlstage.TargetTable(sch, st.Name)
 			if k, err := sqlstage.KeyColumns(sch, st.PrimaryKey); err == nil {
 				key = k
+			} else {
+				keyErr = err
 			}
 			for _, f := range sch.Fields() {
 				fields = append(fields, f.Name)
 			}
 		}
+		// SELECT where an apply reads the target's rows: a merge's upsert and
+		// delete, and an append's skip of the IDs the target has.
 		privileges := []string{"INSERT"}
-		switch st.Mode {
-		case destination.Merge:
-			privileges = append(privileges, "UPDATE", "DELETE")
-		case destination.Overwrite:
+		switch {
+		case st.Mode == destination.Merge:
+			privileges = append(privileges, "SELECT", "UPDATE", "DELETE")
+		case st.Mode == destination.Overwrite:
 			privileges = append(privileges, "DELETE")
+		case st.Dedupe == destination.DedupeTarget:
+			privileges = append(privileges, "SELECT")
 		}
 		ident := pgx.Identifier{schema, table}.Sanitize()
 		c := k.Check(n.name("stream", st.Name, "write"), check.Permission, "Write {stream} to {table}", func(ctx context.Context, p *check.Probe, db *sql.DB) error {
 			if st.Mode == destination.Merge && len(st.PrimaryKey) == 0 {
 				f := check.ConfigInvalid.Fail()
 				f.Message, f.Fix = "{stream} merges, and has no primary key.", "Give the stream a primary key, or write it with append or overwrite."
+				return f
+			}
+			if st.Mode == destination.Merge && keyErr != nil {
+				f := check.ConfigInvalid.Wrap(keyErr)
+				f.Message, f.Fix = "{stream} merges on a primary key that isn't among its columns.", "Give the stream a primary key of its columns, or write it with append or overwrite."
 				return f
 			}
 			// What the table lacks of the privileges and the stream's columns,

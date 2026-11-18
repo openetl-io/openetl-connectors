@@ -3,8 +3,10 @@
 package connectortest
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
+	"slices"
 	"sync"
 
 	"github.com/apache/arrow-go/v18/arrow"
@@ -37,11 +39,22 @@ type Emitted struct {
 	Added            []source.Split
 }
 
+// add keeps e with copies of its state and added splits, which an emitter's
+// caller may reuse once the call returns.
 func (r *Recorder) add(e Emitted) error {
+	e.State, e.Added = bytes.Clone(e.State), cloneSplits(e.Added)
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.events = append(r.events, e)
 	return nil
+}
+
+func cloneSplits(splits []source.Split) []source.Split {
+	out := slices.Clone(splits)
+	for i, s := range out {
+		out[i].State, out[i].Until, out[i].CompleteAt = bytes.Clone(s.State), bytes.Clone(s.Until), bytes.Clone(s.CompleteAt)
+	}
+	return out
 }
 
 // Snapshot is what's emitted so far.

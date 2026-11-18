@@ -120,9 +120,13 @@ func (r *Reading) IntMid(low, high *big.Int, extent func() (least, most *big.Int
 	}
 	if low == nil || high == nil {
 		least, most, err := extent()
-		if err != nil || least == nil {
-			r.Over.Store(least == nil)
+		if err != nil {
 			return nil, err
+		}
+		if least == nil {
+			// The table is empty.
+			r.Over.Store(true)
+			return nil, nil
 		}
 		low, high = cmp.Or(low, least), cmp.Or(high, most)
 	}

@@ -90,6 +90,81 @@ func TestSourceReadsInAUniqueIndexsOrder(t *testing.T) {
 	}
 }
 
+// A table's splits hold the order they were cut in from the start: once
+// another index takes its place, a split not yet read fails with
+// POSITION_LOST rather than read its range of another column.
+func TestSplitsKeepTheirOrder(t *testing.T) {
+	e := newSourceEnv(t)
+	e.exec("CREATE TABLE $schema.t (a int NOT NULL, b int NOT NULL)")
+	e.exec("INSERT INTO $schema.t SELECT i, 2001 - i FROM generate_series(1, 2000) i")
+	e.exec("CREATE UNIQUE INDEX t_a ON $schema.t (a)")
+	e.exec("ANALYZE $schema.t")
+	s := e.source(`, "chunkRows": 200`)
+	splits, err := s.Splits(t.Context(), source.ConfiguredStream{Name: "t", SyncMode: source.FullRefresh}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(splits) < 2 {
+		t.Fatalf("%d splits", len(splits))
+	}
+	for _, sp := range splits {
+		if !strings.Contains(string(sp.State), `"key":["a"]`) {
+			t.Errorf("split %s: %s", sp.ID, sp.State)
+		}
+	}
+	e.exec("DROP INDEX $schema.t_a")
+	e.exec("CREATE UNIQUE INDEX t_b ON $schema.t (b)")
+	cs := source.ConfiguredStream{Name: "t", Splits: splits[1:2]}
+	err = s.Read(t.Context(), source.ReadRequest{Streams: []source.ConfiguredStream{cs}}, &splitCapture{Col: "a"})
+	if code := codeOf(err); code.String() != "ERROR_CODE_POSITION_LOST" {
+		t.Errorf("a split read in another order: %v (%v)", err, code)
+	}
+}
+
+// A unique index in another collation than its column's isn't a read order:
+// the read compares in the column's, in which two of its keys can be equal.
+func TestSourceReadOrderKeepsTheColumnsCollation(t *testing.T) {
+	e := newSourceEnv(t)
+	e.exec("CREATE TABLE $schema.t (k text NOT NULL)")
+	e.exec("INSERT INTO $schema.t SELECT 'k' || i FROM generate_series(1, 6) i")
+	e.exec(`CREATE UNIQUE INDEX t_c ON $schema.t (k COLLATE "C")`)
+	s := e.source(`, "chunkRows": 4`)
+	c := read(t, s, map[string]string{"t": ""})
+	if want := []string{"t:6 rows", `t@{"done":true}`, "t complete"}; !slices.Equal(c.log, want) {
+		t.Errorf("emitted %q, want %q", c.log, want)
+	}
+	e.exec("CREATE UNIQUE INDEX t_k ON $schema.t (k)")
+	c = read(t, s, map[string]string{"t": ""})
+	if !strings.Contains(strings.Join(c.log, " "), `"key":["k"]`) {
+		t.Errorf("read in %q, want the order of t_k", c.log)
+	}
+}
+
+// A unique index of a table others inherit from isn't a read order: the
+// read reads their rows too, whose keys the index doesn't cover. A
+// partitioned table's is, as it covers every partition.
+func TestSourceReadOrderOfAnInheritedTable(t *testing.T) {
+	e := newSourceEnv(t)
+	e.exec("CREATE TABLE $schema.p (id int NOT NULL, v text)")
+	e.exec("CREATE UNIQUE INDEX ON $schema.p (id)")
+	e.exec("CREATE TABLE $schema.c () INHERITS ($schema.p)")
+	e.exec("INSERT INTO $schema.p VALUES (1, 'parent')")
+	e.exec("INSERT INTO $schema.c VALUES (1, 'child')")
+	e.exec("CREATE TABLE $schema.parts (id int NOT NULL, v text) PARTITION BY RANGE (id)")
+	e.exec("CREATE TABLE $schema.parts_1 PARTITION OF $schema.parts FOR VALUES FROM (0) TO (10)")
+	e.exec("CREATE UNIQUE INDEX ON $schema.parts (id)")
+	e.exec("INSERT INTO $schema.parts VALUES (1, 'a'), (2, 'b')")
+	s := e.source(`, "chunkRows": 1`)
+	c := read(t, s, map[string]string{"p": ""})
+	if want := []string{"p:2 rows", `p@{"done":true}`, "p complete"}; !slices.Equal(c.log, want) {
+		t.Errorf("emitted %q, want %q", c.log, want)
+	}
+	c = read(t, s, map[string]string{"parts": ""})
+	if got := c.column("parts", "id"); !slices.Equal(got, []string{"1", "2"}) || !strings.Contains(strings.Join(c.log, " "), `"key":["id"]`) {
+		t.Errorf("parts: %v, %q", got, c.log)
+	}
+}
+
 // Views are read in one query, and incrementally. A materialized view's
 // columns are never NOT NULL, so even one with a unique index has no read
 // order.
