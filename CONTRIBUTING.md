@@ -74,7 +74,7 @@ The `openetl` CLI is openetl's `main`, copied out of the image `ghcr.io/openetl-
 Each package directory has an `openetl-connector.yaml`: its name, metadata, and how each role is built. The `openetl` CLI does the rest, so nothing here is specific to this repository:
 
 ```sh
-openetl connector validate --require author,logo,description,license postgres mysql redshift kafka kinesis iceberg s3
+openetl connector validate --require author,logo,description,license postgres mysql sqlserver oracle clickhouse mongodb dynamodb redshift kafka kinesis iceberg s3 gcs azureblob
 openetl connector package --tag postgres/v0.2.0
 ```
 
@@ -108,9 +108,16 @@ Each package directory holds its `openetl-connector.yaml`, its config schemas an
 
 - `postgres/`: the Postgres source and destination.
 - `mysql/`: the MySQL source and destination, which work against MariaDB too.
+- `sqlserver/`: the SQL Server source and destination.
+- `oracle/`: the Oracle Database source and destination.
+- `clickhouse/`: the ClickHouse source and destination.
+- `mongodb/`: the MongoDB source and destination.
+- `dynamodb/`: the DynamoDB source and destination.
 - `redshift/`: the Amazon Redshift destination.
 - `iceberg/`: the Iceberg destination.
 - `s3/`: files on Amazon S3, S3-compatible stores or a local disk: a source of Parquet, Avro, CSV and JSON Lines, and a destination that writes Parquet, CSV and JSON Lines.
+- `gcs/`: the same files source and destination, on Google Cloud Storage.
+- `azureblob/`: the same files source and destination, on Azure Blob Storage.
 - `kafka/`: the Kafka source and destination.
 - `kinesis/`: the Kinesis source and destination.
 - `records/`: the record layout and formats Kafka and Kinesis share: JSON, and Avro and Protobuf with a schema registry.

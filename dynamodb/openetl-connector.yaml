@@ -1,0 +1,14 @@
+name: dynamodb
+title: Amazon DynamoDB
+description: Amazon DynamoDB tables, in full, incrementally or by DynamoDB Streams, and DynamoDB as a destination
+license: Apache-2.0
+repository: https://github.com/openetl-io/openetl-connectors
+docs: https://github.com/openetl-io/openetl-connectors/blob/main/dynamodb/README.md
+logo: https://raw.githubusercontent.com/awslabs/aws-icons-for-plantuml/v23.1/dist/Database/DynamoDB.png
+tags: [database, aws, cdc]
+author: OpenETL
+roles:
+  source:
+    build: { go: ../cmd/source-dynamodb }
+  destination:
+    build: { go: ../cmd/destination-dynamodb }

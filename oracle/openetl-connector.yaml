@@ -1,0 +1,14 @@
+name: oracle
+title: Oracle Database
+description: Oracle Database tables, in full, incrementally or by CDC through LogMiner, and Oracle as a destination
+license: Apache-2.0
+repository: https://github.com/openetl-io/openetl-connectors
+docs: https://github.com/openetl-io/openetl-connectors/blob/main/oracle/README.md
+logo: https://upload.wikimedia.org/wikipedia/commons/5/50/Oracle_logo.svg
+tags: [database, cdc, logminer]
+author: OpenETL
+roles:
+  source:
+    build: { go: ../cmd/source-oracle }
+  destination:
+    build: { go: ../cmd/destination-oracle }

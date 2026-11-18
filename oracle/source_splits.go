@@ -1,0 +1,254 @@
+package oracle
+
+import (
+	"context"
+	"database/sql"
+	"fmt"
+	"math/big"
+	"strings"
+
+	"github.com/openetl-io/openetl-connectors/keysplit"
+	"github.com/openetl-io/openetl/sdk/go/source"
+)
+
+var (
+	_ source.Splitter   = (*Source)(nil)
+	_ source.Resplitter = (*Source)(nil)
+)
+
+// keyRange is a range of a NUMBER key's first column, its bounds integers
+// spelled as decimal text: above Lo, up to and including Hi. Nil is no
+// bound.
+type keyRange struct {
+	Lo *string `json:"lo,omitempty"`
+	Hi *string `json:"hi,omitempty"`
+}
+
+// where adds the conditions on c, the key's first column, of being in the
+// range.
+func (k keyRange) where(c column, w *where) error {
+	if k.Lo != nil {
+		if err := w.add(c, ">", *k.Lo); err != nil {
+			return err
+		}
+	}
+	if k.Hi != nil {
+		return w.add(c, "<=", *k.Hi)
+	}
+	return nil
+}
+
+// splittable says a table is read in key ranges: its key orders as it
+// compares, and its first column is a NUMBER, of any scale, which ranges
+// with integer bounds divide.
+func splittable(t table) bool { return chunked(t) && bindOf(t.cols[t.key[0]]) == bindNumber }
+
+// Splits divides a table read in full or incrementally whose key starts with
+// a NUMBER column into ranges of that column, evenly between its least and
+// greatest values, as many as the table's rows fill at chunkRows each, by
+// its statistics or else a count. Small tables are read whole. An
+// incremental read's ranges share the highest cursor value it reads and its
+// floor, where the last read's splits all ended.
+func (s *Source) Splits(ctx context.Context, cs source.ConfiguredStream, ended []source.Split) ([]source.Split, error) {
+	if cs.SyncMode == source.CDC {
+		// A state from a read in splits starts the table again, as one from a
+		// full refresh does.
+		return keysplit.Whole(ended, nil), nil
+	}
+	db, err := open(ctx, s.cfg.DSN.Reveal(), 1)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = db.Close() }()
+	tables, schema, err := s.tables(ctx, db)
+	if err != nil {
+		return nil, err
+	}
+	t, ok := findTable(tables, cs.Name)
+	if !ok {
+		return nil, configInvalid("oracle: there's no table %s.%s the user can read", schema, cs.Name)
+	}
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return nil, classify(err)
+	}
+	defer func() { _ = conn.Close() }()
+	var st sourceState
+	ci := -1
+	if cs.SyncMode == source.Incremental {
+		if ci, err = cursorColumn(t, cs.Cursor); err != nil {
+			return nil, err
+		}
+		if st.Since, err = keysplit.Floor("oracle", cs.Name, ended); err != nil {
+			return nil, err
+		}
+	}
+	ranges, err := keyRanges(ctx, conn, schema, t, s.cfg.ChunkRows)
+	if err != nil {
+		return nil, err
+	}
+	if len(ranges) > 0 && ci >= 0 {
+		if st.Until, err = maxCursor(ctx, conn, schema, t, ci); err != nil {
+			return nil, err
+		}
+		if st.Until == nil {
+			ranges = nil
+		}
+	}
+	return keysplit.Of(ended, len(ranges), func(i int) any {
+		if i >= 0 {
+			st.keyRange = ranges[i]
+		}
+		return st
+	})
+}
+
+// keyRanges divides a table into contiguous ranges of its key's first
+// column of about rows rows each, none if it's smaller or can't be split.
+// The first has no lower bound and the last no upper, so together they
+// cover every key.
+func keyRanges(ctx context.Context, conn *sql.Conn, schema string, t table, rows int) ([]keyRange, error) {
+	if !splittable(t) {
+		return nil, nil
+	}
+	est, err := estimate(ctx, conn, schema, t)
+	if err != nil {
+		return nil, err
+	}
+	n := min((est+int64(rows)-1)/int64(rows), keysplit.MaxRanges)
+	if n < 2 {
+		return nil, nil
+	}
+	low, high, err := extent(ctx, conn, schema, t)
+	if err != nil || low == nil {
+		return nil, err
+	}
+	return cutRanges(low, high, int(n)), nil
+}
+
+// cutRanges cuts [low, high] into n ranges of about as many values, fewer if
+// it holds fewer.
+func cutRanges(low, high *big.Int, n int) []keyRange {
+	return keysplit.Between(keysplit.CutInts(low, high, n), func(lo, hi *string) keyRange { return keyRange{lo, hi} })
+}
+
+// estimate is a table's rows by its statistics, ALL_TABLES.NUM_ROWS, or a
+// count where it has none.
+func estimate(ctx context.Context, conn *sql.Conn, schema string, t table) (int64, error) {
+	var n sql.NullInt64
+	err := conn.QueryRowContext(ctx, `SELECT num_rows FROM all_tables WHERE owner = :1 AND table_name = :2`, schema, t.name).Scan(&n)
+	if err != nil {
+		return 0, classify(err)
+	}
+	if n.Valid {
+		return n.Int64, nil
+	}
+	err = conn.QueryRowContext(ctx, "SELECT COUNT(*) FROM "+quoteIdent(schema)+"."+quoteIdent(t.name)).Scan(&n)
+	return n.Int64, classify(err)
+}
+
+// extent is the least and greatest values of a NUMBER key's first column,
+// rounded down and up to integers; nil for an empty table.
+func extent(ctx context.Context, conn *sql.Conn, schema string, t table) (low, high *big.Int, err error) {
+	col := colRef(t.cols[t.key[0]])
+	var lo, hi sql.NullString
+	err = conn.QueryRowContext(ctx, "SELECT MIN("+col+"), MAX("+col+") FROM "+quoteIdent(schema)+"."+quoteIdent(t.name)+" t").Scan(&lo, &hi)
+	if err != nil || !lo.Valid {
+		return nil, nil, classify(err)
+	}
+	if low, _, err = parseNum(lo.String, false); err != nil {
+		return nil, nil, err
+	}
+	high, _, err = parseNum(hi.String, true)
+	return low, high, err
+}
+
+// position is where a key-ordered read has reached in the key's first column,
+// nil before its first row.
+func (st sourceState) position() *string {
+	if len(st.After) == 0 {
+		return nil
+	}
+	return &st.After[0]
+}
+
+// resplit runs at each resume point of a keyed split, after the chunk that
+// reached st. If it was asked, it divides the remainder at its midpoint, so
+// what any chunk read before it stays below: st keeps the lower part, and the
+// split to add takes the upper. pos is st's position, if it says how far the
+// key has been read; keep has the new split keep st's position, where rows of
+// any key can follow it. ended: the chunk was its last.
+func (s *Source) resplit(ctx context.Context, conn *sql.Conn, schema string, t table, r *keysplit.Reading, st *sourceState, ended bool, pos *string, keep bool) ([]source.Split, error) {
+	if ended || !splittable(t) {
+		r.Over.Store(true)
+		return nil, nil
+	}
+	low, high, err := remainder(st.keyRange, pos, len(t.key) == 1)
+	if err != nil {
+		return nil, err
+	}
+	mid, err := r.IntMid(low, high, func() (*big.Int, *big.Int, error) { return extent(ctx, conn, schema, t) })
+	if mid == nil || err != nil {
+		return nil, err
+	}
+	upper := *st
+	upper.Lo = mid
+	if !keep {
+		upper.After = nil
+	}
+	splits, err := keysplit.Upper(*mid, upper)
+	if err == nil {
+		st.Hi = mid
+	}
+	return splits, err
+}
+
+// remainder is the least and most integer a NUMBER key's first column can
+// hold in what's left of a range, nil where only the table can say: an
+// upper part split off above the midpoint between them holds no row read.
+// A position in a key of one column is that key read; in a longer one, its
+// value has more keys to come.
+func remainder(r keyRange, pos *string, single bool) (low, high *big.Int, err error) {
+	switch {
+	case pos != nil:
+		var exact bool
+		if low, exact, err = parseNum(*pos, true); err != nil {
+			return nil, nil, err
+		}
+		if single && exact {
+			low.Add(low, big.NewInt(1))
+		}
+	case r.Lo != nil:
+		if low, _, err = parseNum(*r.Lo, false); err != nil {
+			return nil, nil, err
+		}
+		low.Add(low, big.NewInt(1))
+	}
+	if r.Hi != nil {
+		if high, _, err = parseNum(*r.Hi, false); err != nil {
+			return nil, nil, err
+		}
+	}
+	return low, high, nil
+}
+
+// parseNum is a NUMBER's text rounded to an integer, down, or up if up;
+// exact says it was one.
+func parseNum(s string, up bool) (n *big.Int, exact bool, err error) {
+	r, ok := new(big.Rat).SetString(strings.TrimSpace(s))
+	if !ok {
+		return nil, false, fmt.Errorf("oracle: %q as a key's number", s)
+	}
+	q, m := new(big.Int).QuoRem(r.Num(), r.Denom(), new(big.Int))
+	switch {
+	case m.Sign() == 0:
+		return q, true, nil
+	case r.Sign() < 0 && !up:
+		q.Sub(q, big.NewInt(1))
+	case r.Sign() > 0 && up:
+		q.Add(q, big.NewInt(1))
+	}
+	return q, false, nil
+}
+
+type connPool = keysplit.Conns
