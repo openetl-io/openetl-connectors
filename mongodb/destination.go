@@ -41,7 +41,8 @@ type DestinationConfig struct {
 // in collections of their own and applying them in Commit, with writes that
 // apply alike however often they run: merge upserts and deletes keyed on
 // the primary key and guarded by _openetl_seq, append inserts keyed on
-// _openetl_id or on an ObjectId staging gave the row. A stream's apply ends
+// _openetl_id where they're deduped against the target, or on an ObjectId
+// staging gave the row. A stream's apply ends
 // in its marker, which a single-document update of the pipeline's fence
 // writes, refused once a newer generation has raised the fence. A crash
 // before the marker leaves the staging, which Recover applies again.
@@ -315,8 +316,10 @@ func seqConverter(t arrow.DataType) convert {
 }
 
 // rows are a batch's rows as staged documents. A document's _id is its key
-// where its stream is keyed, its _openetl_id where its stream is deduped,
-// and an ObjectId otherwise, given here so that applying it again finds it.
+// where its stream is keyed, its _openetl_id where its stream is deduped
+// against the target, and an ObjectId otherwise, given here so that
+// applying it again finds it: deduped within each epoch only, a later
+// epoch's row of the same _openetl_id lands beside it.
 // A null is no field; a held column's field is null, unless its target value
 // is kept.
 func (w *writer) rows(cfg destination.Stream, batch arrow.RecordBatch) ([]any, error) {
@@ -359,7 +362,7 @@ func (w *writer) rows(cfg destination.Stream, batch arrow.RecordBatch) ([]any, e
 			if err != nil {
 				return nil, err
 			}
-		case cfg.Dedupe != destination.DedupeNone:
+		case cfg.Dedupe == destination.DedupeTarget:
 			doc[0].Value, _ = convs[idCol](batch.Column(idCol), i)
 		default:
 			doc[0].Value = bson.NewObjectID()
@@ -671,32 +674,22 @@ func (w *writer) Commit(ctx context.Context, e destination.Epoch, committables [
 	return docstore.Settle(ctx, w, w.cfg.Scope, e, streams)
 }
 
-// Swap puts an ended overwrite read's collection, which apply created, in
-// its target's place, with the target's indexes, and then clears the
+// Swap puts an ended overwrite read's collection, which apply created and
+// gave the target's indexes, in its target's place, and then clears the
 // marker's Swap. A read's collection that isn't there has taken its place
-// already.
+// already. Swap only renames, since any other command on the read would
+// create it again, empty, once another swap had renamed it.
 func (w *writer) Swap(ctx context.Context, m marker) error {
 	if m.Swap == "" {
 		return nil
 	}
-	names, err := w.db.ListCollectionNames(ctx, bson.D{{Key: "name", Value: m.Swap}})
-	if err != nil {
-		return classify(fmt.Errorf("mongodb: list collections of %s: %w", w.db.Name(), err))
-	}
-	if len(names) > 0 {
-		if err := w.copyIndexes(ctx, m.Target, m.Swap); err != nil {
-			return err
-		}
-		err := w.client.Database("admin").RunCommand(ctx, bson.D{
-			{Key: "renameCollection", Value: w.db.Name() + "." + m.Swap},
-			{Key: "to", Value: w.db.Name() + "." + m.Target},
-			{Key: "dropTarget", Value: true},
-		}).Err()
-		if se, ok := errors.AsType[mongo.ServerError](err); !ok || !se.HasErrorCode(codeNamespaceNotFound) {
-			if err != nil {
-				return classify(fmt.Errorf("mongodb: put %s in %s's place: %w", m.Swap, m.Target, err))
-			}
-		}
+	err := w.client.Database("admin").RunCommand(ctx, bson.D{
+		{Key: "renameCollection", Value: w.db.Name() + "." + m.Swap},
+		{Key: "to", Value: w.db.Name() + "." + m.Target},
+		{Key: "dropTarget", Value: true},
+	}).Err()
+	if se, ok := errors.AsType[mongo.ServerError](err); err != nil && (!ok || !se.HasErrorCode(codeNamespaceNotFound)) {
+		return classify(fmt.Errorf("mongodb: put %s in %s's place: %w", m.Swap, m.Target, err))
 	}
 	m.Swap = ""
 	return w.SetMarkers(ctx, []marker{m})
@@ -752,14 +745,20 @@ func (w *writer) copyIndexes(ctx context.Context, target, read string) error {
 	return classify(w.db.RunCommand(ctx, bson.D{{Key: "createIndexes", Value: read}, {Key: "indexes", Value: keep}}).Err())
 }
 
-// Apply writes a stream's staged rows of every lane, and then its patches.
-// collapsed: the rows dedupe skipped.
+// Apply writes a stream's staged rows of every lane, and then its patches;
+// an overwrite read that ended gets its target's indexes too, before its
+// marker names it for the swap. collapsed: the rows dedupe skipped.
 func (w *writer) Apply(ctx context.Context, s stagedStream) (collapsed uint64, err error) {
 	cfg := s.config()
 	coll := w.db.Collection(s.into())
 	if s.Mode == destination.Overwrite {
 		if err := w.ensureRead(ctx, s.Read, s.Target); err != nil {
 			return 0, err
+		}
+		if s.Ended {
+			if err := w.copyIndexes(ctx, s.Target, s.Read); err != nil {
+				return 0, err
+			}
 		}
 	}
 	var patches []stagedRow
@@ -771,7 +770,8 @@ func (w *writer) Apply(ctx context.Context, s stagedStream) (collapsed uint64, e
 		}
 		n, err := w.bulk(ctx, coll, ops, !keyed(cfg))
 		ops = ops[:0]
-		if cfg.Dedupe != destination.DedupeNone {
+		// Other inserts' _ids the collection has are an earlier apply's.
+		if cfg.Dedupe == destination.DedupeTarget {
 			collapsed += n
 		}
 		return err
@@ -862,7 +862,8 @@ func onID(we mongo.WriteError) bool {
 // rowModel is the write that applies a staged row: an insert, or for a keyed
 // stream, an upsert or delete that leaves a document with a higher
 // _openetl_seq as it is. A soft delete keeps the document's other fields,
-// held ones too, and updates its metadata.
+// held ones too, and updates its metadata. A merged row's kept columns keep
+// the document's values and holds.
 func rowModel(cfg destination.Stream, r stagedRow) mongo.WriteModel {
 	if !keyed(cfg) {
 		return mongo.NewInsertOneModel().SetDocument(r.Doc)
@@ -912,17 +913,33 @@ func rowModel(cfg destination.Stream, r stagedRow) mongo.WriteModel {
 		return upsert(bson.D{{Key: "$literal", Value: r.Doc}})
 	}
 	rest := bson.D{}
+	var held any = bson.D{}
 	elems, _ := r.Doc.Elements()
 	for _, e := range elems {
-		if !slices.Contains(r.Keep, e.Key()) {
+		switch {
+		case e.Key() == heldColumn:
+			held = e.Value()
+		case !slices.Contains(r.Keep, e.Key()):
 			rest = append(rest, bson.E{Key: e.Key(), Value: e.Value()})
 		}
 	}
-	kept := bson.D{{Key: "$arrayToObject", Value: bson.D{{Key: "$filter", Value: bson.D{
-		{Key: "input", Value: bson.D{{Key: "$objectToArray", Value: "$$ROOT"}}},
-		{Key: "cond", Value: bson.D{{Key: "$in", Value: bson.A{"$$this.k", bson.D{{Key: "$literal", Value: r.Keep}}}}}},
-	}}}}}
-	return upsert(bson.D{{Key: "$mergeObjects", Value: bson.A{bson.D{{Key: "$literal", Value: rest}}, kept}}})
+	// The target's fields of the kept columns, and its holds on them, which
+	// the row's own holds override, so that a held version's patch still
+	// finds its hold on a column the row didn't send.
+	keptOf := func(doc any) bson.D {
+		return bson.D{{Key: "$arrayToObject", Value: bson.D{{Key: "$filter", Value: bson.D{
+			{Key: "input", Value: bson.D{{Key: "$objectToArray", Value: doc}}},
+			{Key: "cond", Value: bson.D{{Key: "$in", Value: bson.A{"$$this.k", bson.D{{Key: "$literal", Value: r.Keep}}}}}},
+		}}}}}
+	}
+	holds := bson.D{{Key: "$mergeObjects", Value: bson.A{keptOf(bson.D{{Key: "$ifNull", Value: bson.A{"$" + heldColumn, bson.D{}}}}), bson.D{{Key: "$literal", Value: held}}}}}
+	heldField := bson.D{{Key: "$let", Value: bson.D{
+		{Key: "vars", Value: bson.D{{Key: "h", Value: holds}}},
+		{Key: "in", Value: bson.D{{Key: "$cond", Value: bson.A{bson.D{{Key: "$eq", Value: bson.A{"$$h", bson.D{{Key: "$literal", Value: bson.D{}}}}}}, "$$REMOVE", "$$h"}}}},
+	}}}
+	return upsert(bson.D{{Key: "$mergeObjects", Value: bson.A{
+		bson.D{{Key: "$literal", Value: rest}}, keptOf("$$ROOT"), bson.D{{Key: heldColumn, Value: heldField}},
+	}}})
 }
 
 // patchModel fills each column a patch has, in the document its key, or its

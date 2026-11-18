@@ -410,9 +410,9 @@ func (s *Source) readSplit(ctx context.Context, db *mongo.Database, cs source.Co
 	return out.Complete(next)
 }
 
-// endAt finishes a read that stops at an until: the document with its last
-// _id, if it's still there, then a resume point and the completion with
-// until's state.
+// endAt finishes a read that stops at an until: the rows b holds and the
+// document with its last _id, if it's still there, then a resume point and
+// the completion with until's state.
 func (s *Source) endAt(ctx context.Context, coll *mongo.Collection, filter bson.D, after *value, state []byte, b *batcher, op string, q seq, out source.SplitEmitter) error {
 	if after != nil {
 		doc, err := coll.FindOne(ctx, append(bson.D{{Key: "_id", Value: after.RawValue}}, filter...)).Raw()
@@ -424,10 +424,10 @@ func (s *Source) endAt(ctx context.Context, coll *mongo.Collection, filter bson.
 			if err := b.add(doc, op, q); err != nil {
 				return err
 			}
-			if err := b.Flush(out); err != nil {
-				return err
-			}
 		}
+	}
+	if err := b.Flush(out); err != nil {
+		return err
 	}
 	if err := out.ResumePoint(state); err != nil {
 		return err
@@ -576,6 +576,10 @@ type batcher struct {
 	gone func(field string) (bool, error)
 }
 
+// controlNames are the names of a cdc batch's control columns, which the
+// run's columns can have too.
+var controlNames = []string{source.OpField().Name, source.SeqField(seqType).Name}
+
 // newBatcher makes a batcher of columns, which are the run's where cs has
 // them.
 func (s *Source) newBatcher(cs source.ConfiguredStream, columns []string, changes bool) *batcher {
@@ -583,7 +587,7 @@ func (s *Source) newBatcher(cs source.ConfiguredStream, columns []string, change
 	b.Batch = docstore.NewBatch(changes)
 	b.Column("_id")
 	for _, c := range columns {
-		if !strings.HasPrefix(c, "openetl.") {
+		if !changes || !slices.Contains(controlNames, c) {
 			b.Column(c)
 		}
 	}

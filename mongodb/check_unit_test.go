@@ -2,11 +2,22 @@ package mongodb
 
 import (
 	"context"
+	"errors"
+	"io"
+	"net"
 	"slices"
+	"syscall"
 	"testing"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/mongo"
+	"go.mongodb.org/mongo-driver/v2/mongo/address"
+	"go.mongodb.org/mongo-driver/v2/x/mongo/driver"
+	"go.mongodb.org/mongo-driver/v2/x/mongo/driver/auth"
+	"go.mongodb.org/mongo-driver/v2/x/mongo/driver/description"
+	"go.mongodb.org/mongo-driver/v2/x/mongo/driver/mnet"
+	"go.mongodb.org/mongo-driver/v2/x/mongo/driver/topology"
 
 	"github.com/openetl-io/openetl-connectors/connectortest"
 	"github.com/openetl-io/openetl/sdk/go/check"
@@ -210,5 +221,68 @@ func TestSRVLookupFails(t *testing.T) {
 	}
 	if f := check.Classify(err); f.Reason != check.DNSFailed.Name {
 		t.Errorf("classified as %s", f.Reason)
+	}
+}
+
+// fakeConn is a connection signing in, as the handshake sees it.
+type fakeConn struct{}
+
+func (fakeConn) Read(context.Context) ([]byte, error) { return nil, io.EOF }
+func (fakeConn) Write(context.Context, []byte) error  { return io.EOF }
+func (fakeConn) Close() error                         { return nil }
+func (fakeConn) Description() description.Server {
+	return description.Server{Kind: description.ServerKindStandalone}
+}
+func (fakeConn) ID() string                 { return "fake" }
+func (fakeConn) ServerConnectionID() *int64 { return nil }
+func (fakeConn) DriverConnectionID() int64  { return 1 }
+func (fakeConn) Address() address.Address   { return "db.internal:27017" }
+func (fakeConn) Stale() bool                { return false }
+func (fakeConn) OIDCTokenGenID() uint64     { return 0 }
+func (fakeConn) SetOIDCTokenGenID(uint64)   {}
+
+// fakeAuth signs in with err.
+type fakeAuth struct{ err error }
+
+func (a fakeAuth) Auth(context.Context, *driver.AuthConfig) error   { return a.err }
+func (a fakeAuth) Reauth(context.Context, *driver.AuthConfig) error { return a.err }
+
+// A sign-in that the network or a deadline cuts short is transient, though
+// the driver wraps it as an authentication error; a server's or the
+// client's refusal of the credentials is a rejection.
+func TestSignInFailures(t *testing.T) {
+	signIn := func(inner error) error {
+		h := auth.Handshaker(nil, &auth.HandshakeOptions{Authenticator: fakeAuth{inner}})
+		err := h.FinishHandshake(t.Context(), &mnet.Connection{ReadWriteCloser: fakeConn{}, Describer: fakeConn{}})
+		if _, ok := errors.AsType[*auth.Error](err); !ok {
+			t.Fatalf("the handshake's error %v", err)
+		}
+		// As the pool and then the client wrap it.
+		err = topology.ConnectionError{ConnectionID: "fake", Wrapped: err}
+		if de, ok := errors.AsType[driver.Error](err); ok {
+			err = mongo.CommandError{Code: de.Code, Message: de.Message, Labels: de.Labels, Name: de.Name, Wrapped: err}
+		}
+		return err
+	}
+	reset := &net.OpError{Op: "read", Net: "tcp", Err: syscall.ECONNRESET}
+	for name, c := range map[string]struct {
+		inner  error
+		code   protocolv1.ErrorCode
+		reason string
+	}{
+		"rejected":   {driver.Error{Code: codeAuthenticationFailed, Name: "AuthenticationFailed", Message: "Authentication failed."}, protocolv1.ErrorCode_ERROR_CODE_AUTH_INVALID, "credentials_rejected"},
+		"no key":     {errors.New("no AWS credentials"), protocolv1.ErrorCode_ERROR_CODE_AUTH_INVALID, "credentials_rejected"},
+		"reset":      {driver.Error{Message: reset.Error(), Labels: []string{driver.NetworkError}, Wrapped: reset}, protocolv1.ErrorCode_ERROR_CODE_TRANSIENT, ""},
+		"bare reset": {reset, protocolv1.ErrorCode_ERROR_CODE_TRANSIENT, ""},
+		"deadline":   {context.DeadlineExceeded, protocolv1.ErrorCode_ERROR_CODE_TRANSIENT, ""},
+	} {
+		err := signIn(c.inner)
+		if got := connectortest.CodeOf(classify(err)); got != c.code {
+			t.Errorf("%s: classify is %s, want %s", name, got, c.code)
+		}
+		f, _ := errors.AsType[*check.Failure](failure(err))
+		if f == nil || f.Code != c.code || c.reason != "" && f.Reason != c.reason || c.reason == "" && f.Reason == "credentials_rejected" {
+			t.Errorf("%s: failure is %+v, want %s %s", name, f, c.code, c.reason)
+		}
 	}
 }

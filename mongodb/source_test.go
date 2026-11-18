@@ -280,3 +280,25 @@ func TestSourceCheck(t *testing.T) {
 		t.Errorf("Check with a bad password: %s: %v", connectortest.CodeOf(err), err)
 	}
 }
+
+// A range's bounds are values: a string _id that starts with $ isn't a
+// field path, which would make every _id fall inside the range.
+func TestSampleIDsLiteralBounds(t *testing.T) {
+	db := testDB(t)
+	coll := db.Collection("c")
+	for _, id := range []string{"$a", "$b", "$c", "$d", "$e"} {
+		insert(t, coll, bson.D{{Key: "_id", Value: id}, {Key: "c", Value: ""}})
+	}
+	lo, hi := &value{raw(t, "$a")}, &value{raw(t, "$e")}
+	ids, err := sampleIDs(t.Context(), coll, 10, lo, hi)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, id := range ids {
+		got = append(got, id.StringValue())
+	}
+	if fmt.Sprint(got) != "[$b $c $d]" {
+		t.Errorf("sampled %v between $a and $e", got)
+	}
+}

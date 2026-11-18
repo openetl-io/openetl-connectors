@@ -136,6 +136,9 @@ func decimalValue(unscaled *big.Int, scale int32) (any, error) {
 			return d, nil
 		}
 	}
+	if scale < 0 {
+		return new(big.Int).Mul(unscaled, new(big.Int).Exp(big.NewInt(10), big.NewInt(-int64(scale)), nil)).String(), nil
+	}
 	r := new(big.Rat).SetFrac(unscaled, new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(scale)), nil))
 	return r.FloatString(int(scale)), nil
 }

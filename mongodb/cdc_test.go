@@ -334,3 +334,30 @@ func TestCDCTransactionSeq(t *testing.T) {
 		t.Errorf("restarted, rows %v, want seqs %v", rows, seqs[1:])
 	}
 }
+
+// A field whose name has a dot is the name it is, not a path: a document
+// that has it fails the read, so that discovery declares it, rather than
+// the field being taken for one no document has.
+func TestCDCDottedField(t *testing.T) {
+	db := testDB(t)
+	ctx := t.Context()
+	coll := db.Collection("c")
+	insert(t, coll, bson.D{{Key: "_id", Value: 1}, {Key: "a", Value: 1}})
+	s := newTestSource(t, db, "")
+	columns := []string{"_id", "a", "openetl.op", "openetl.seq"}
+	rec := &connectortest.Recorder{}
+	if err := s.Read(ctx, source.ReadRequest{Streams: []source.ConfiguredStream{{Name: "c", SyncMode: source.CDC, Columns: columns}}}, rec); err != nil {
+		t.Fatal(err)
+	}
+	state, _ := rec.Last("c")
+	insert(t, coll, bson.D{{Key: "_id", Value: 2}, {Key: "a.b", Value: 1}})
+	_, done := follow(t, s, "c", state, columns)
+	select {
+	case err := <-done:
+		if connectortest.CodeOf(err) != protocolv1.ErrorCode_ERROR_CODE_TRANSIENT || !strings.Contains(err.Error(), `new field "a.b"`) {
+			t.Errorf("a new dotted field: %s: %v", connectortest.CodeOf(err), err)
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("a new dotted field didn't end the read")
+	}
+}

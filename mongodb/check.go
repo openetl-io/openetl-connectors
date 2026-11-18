@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"slices"
 	"strconv"
@@ -301,7 +302,7 @@ func (c *conn) refused(err error, privilege, object, role, db string) error {
 // by the server's codes, before check.Classify, which would see the network
 // error a refused handshake is wrapped in.
 func failure(err error) error {
-	if _, ok := errors.AsType[*auth.Error](err); ok {
+	if rejected(err) {
 		return check.CredentialsRejected.Wrap(err)
 	}
 	if se, ok := errors.AsType[mongo.ServerError](err); ok {
@@ -730,11 +731,11 @@ func writable(p *check.Probe, c *conn, v *jsonSchema, st destination.Stream, sch
 		if strings.HasPrefix(f.Name, "_openetl_") || f.Name == "_id" {
 			continue
 		}
-		_, to, err := converter(f)
+		ts, err := bsonTypes(f)
 		if err != nil {
 			return err
 		}
-		if from := v.kinds(f.Name); to != "" && from != nil && !accepts(from, to) {
+		if len(v.missing(f.Name, ts)) > 0 {
 			held = append(held, f.Name)
 		}
 	}
@@ -812,7 +813,10 @@ func classify(err error) error {
 		return nil
 	}
 	code := func(c protocolv1.ErrorCode) error { return sdk.WithCode(c, err) }
-	if _, ok := errors.AsType[*auth.Error](err); ok {
+	if ae, ok := errors.AsType[*auth.Error](err); ok {
+		if signInFault(ae) {
+			return code(protocolv1.ErrorCode_ERROR_CODE_TRANSIENT)
+		}
 		return code(protocolv1.ErrorCode_ERROR_CODE_AUTH_INVALID)
 	}
 	if se, ok := errors.AsType[mongo.ServerError](err); ok {
@@ -833,4 +837,24 @@ func classify(err error) error {
 		return code(protocolv1.ErrorCode_ERROR_CODE_TRANSIENT)
 	}
 	return err
+}
+
+// rejected reports whether err is the server's or the client's refusal of
+// the credentials: an authentication error that the network or a deadline
+// didn't cause.
+func rejected(err error) bool {
+	ae, ok := errors.AsType[*auth.Error](err)
+	return ok && !signInFault(ae)
+}
+
+// signInFault reports whether an authentication error is the network's or a
+// deadline's, such as a connection reset while signing in, which the driver
+// wraps as it does a refusal.
+func signInFault(ae *auth.Error) bool {
+	inner := ae.Unwrap()
+	if inner == nil {
+		return false
+	}
+	_, isNet := errors.AsType[net.Error](inner)
+	return isNet || mongo.IsNetworkError(inner) || mongo.IsTimeout(inner) || errors.Is(inner, io.EOF) || errors.Is(inner, io.ErrUnexpectedEOF)
 }

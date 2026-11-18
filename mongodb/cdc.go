@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
@@ -212,8 +213,8 @@ func (r *cdcReader) complete() error {
 // follow reads the change stream: inserts, updates and replaces as their
 // documents after the change, deletes as their keys, or the documents before
 // them where the collection keeps pre-images. Updates take the post-image
-// where the collection keeps them, or else the document as it is when read,
-// skipped if it's since been deleted. A drop or rename ends the stream: the
+// where the collection keeps them, or else the document as the majority
+// has it when read, skipped if it's since been deleted. A drop or rename ends the stream: the
 // position is lost, and only a new snapshot reads the collection again.
 func (r *cdcReader) follow(ctx context.Context) error {
 	images, err := r.images(ctx)
@@ -274,7 +275,9 @@ func (r *cdcReader) follow(ctx context.Context) error {
 			if r.until != nil && tokenCompare(tok, r.until.Token) == 0 {
 				return r.stopAtUntil()
 			}
-			if r.b.Rows >= r.s.cfg.ChunkDocuments {
+			// A backlog can keep TryNext reading across the server's
+			// batches, so the batch is bounded by its text too.
+			if r.b.Rows >= r.s.cfg.ChunkDocuments || r.b.Size >= batchBytes {
 				if err := r.resume(); err != nil {
 					return err
 				}
@@ -338,8 +341,17 @@ func (r *cdcReader) fieldGone(ctx context.Context) func(string) (bool, error) {
 		if err != nil {
 			return false, err
 		}
+		filter := bson.D{{Key: field, Value: bson.D{{Key: "$exists", Value: true}}}}
+		if strings.Contains(field, ".") || strings.HasPrefix(field, "$") {
+			// A query takes such a name for a path or an operator, and
+			// $getField takes it as the name it is.
+			filter = bson.D{{Key: "$expr", Value: bson.D{{Key: "$ne", Value: bson.A{
+				bson.D{{Key: "$type", Value: bson.D{{Key: "$getField", Value: bson.D{{Key: "field", Value: bson.D{{Key: "$literal", Value: field}}}, {Key: "input", Value: "$$ROOT"}}}}}},
+				"missing",
+			}}}}}
+		}
 		err = atLeast(ctx, r.coll, t, func(ctx context.Context, coll *mongo.Collection) error {
-			return coll.FindOne(ctx, bson.D{{Key: field, Value: bson.D{{Key: "$exists", Value: true}}}}, options.FindOne().SetProjection(bson.D{{Key: "_id", Value: 1}})).Err()
+			return coll.FindOne(ctx, filter, options.FindOne().SetProjection(bson.D{{Key: "_id", Value: 1}})).Err()
 		})
 		switch {
 		case err == nil:
@@ -370,9 +382,14 @@ func (r *cdcReader) change(ctx context.Context, ev bson.Raw, q seq) error {
 	case "insert", "update", "replace":
 		doc, ok := ev.Lookup("fullDocument").DocumentOK()
 		if !ok {
+			// A majority read, so that the document isn't a write the
+			// change stream would never have, as one rolled back is.
 			key := ev.Lookup("documentKey", "_id")
-			var err error
-			doc, err = r.coll.FindOne(ctx, bson.D{{Key: "_id", Value: key}}).Raw()
+			err := atLeast(ctx, r.coll, r.at, func(ctx context.Context, coll *mongo.Collection) error {
+				var err error
+				doc, err = coll.FindOne(ctx, bson.D{{Key: "_id", Value: key}}).Raw()
+				return err
+			})
 			if errors.Is(err, mongo.ErrNoDocuments) {
 				// Deleted since: its delete follows.
 				return nil

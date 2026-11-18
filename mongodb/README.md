@@ -30,7 +30,7 @@ A CDC read takes the deployment's cluster time when it starts, reads the collect
 | Change | Arrives as |
 |---|---|
 | insert | `insert`, with the document |
-| update, replace | `update`, with the whole document: its post-image where the collection keeps pre- and post-images, or else the document as it is when the change is read. An update of a document since deleted is skipped then, and its delete follows. |
+| update, replace | `update`, with the whole document: its post-image where the collection keeps pre- and post-images, or else the document as it is when the change is read, by a majority read, so never a write that may be rolled back. An update of a document since deleted is skipped then, and its delete follows. |
 | delete | `delete`, with the `_id`, or with the deleted document's fields where the collection keeps pre-images |
 | drop, rename, dropDatabase, invalidate | an error, `POSITION_LOST`, that names what happened; reading the collection again takes a new snapshot |
 
@@ -42,7 +42,7 @@ db.runCommand({collMod: "orders", changeStreamPreAndPostImages: {enabled: true}}
 
 A record's seq, `openetl.seq`, is a `decimal(38, 0)`: the change's cluster time, its seconds and increment, times 2^32, plus its place among the changes of that cluster time, as a transaction's changes share one. The snapshot's documents take the read's starting time with place 0.
 
-The state is the change stream's resume token. A read sends a resume point after every `chunkDocuments` changes and whenever it has read all the changes there are; a continuous read of a quiet collection moves its resume point to where the change stream has looked every 10 seconds, so its position doesn't fall out of the oplog.
+The state is the change stream's resume token. A read sends a resume point after every `chunkDocuments` changes, or sooner once their documents come to about 4 MB of text, and whenever it has read all the changes there are; a continuous read of a quiet collection moves its resume point to where the change stream has looked every 10 seconds, so its position doesn't fall out of the oplog.
 
 The oplog keeps changes for as long as its size, or `oplogMinRetentionHours`, lets it. A pipeline stopped for longer, or a snapshot that takes longer, loses its position: the read fails with `POSITION_LOST`, which OpenETL doesn't retry, and reading the collection again takes a new snapshot. OpenETL asks the source how close each CDC stream is to that: it answers with how far the stream's position is behind the oplog's newest entry, and the time between its position and the oplog's oldest entry, which is about how long the oplog keeps it at the pace it's been written. It answers only for a user who can read `local.oplog.rs`.
 
@@ -78,7 +78,7 @@ Canonical Extended JSON never spells 24 bare hexadecimal digits, so an ObjectId 
 
 Each value is sent as text, and OpenETL parses it into the column's declared type. A value that doesn't fit is quarantined: a date before year 1 or after 9999, and a decimal that's `NaN` or infinite, or that `decimal(38, 9)` doesn't hold exactly, with more than 9 digits after the point or 29 before it. A long in a field with doubles loses the digits a double doesn't keep. Nested documents and arrays keep every type through Extended JSON, numbers and dates included.
 
-A document with a field the run didn't declare fails the read with a retryable error that names the field, and the next attempt's discovery declares it. A CDC read leaves out such a field when no document of the collection has it any more, as a change from before the field was removed can, since discovery wouldn't declare it.
+A document with a field the run didn't declare fails the read with a retryable error that names the field, and the next attempt's discovery declares it. A CDC read leaves out such a field when no document of the collection has it any more, as a change from before the field was removed can, since discovery wouldn't declare it. For a field whose name has a `.` or starts with `$`, it asks with `$getField`, which takes the name as it is, and which needs MongoDB 5.0 or later.
 
 With `sampleSize`, the next discovery can miss the field again, and the read fails again, until a sample has a document with it. Nothing carries the field from the failed read to the next discovery: OpenETL gives discovery the config alone, the source keeps nothing between calls, and it only reads from MongoDB. The error says so: set `sampleSize` to 0, or read the collection `packed`.
 
@@ -176,8 +176,8 @@ Each stream becomes a collection in the database the pipeline's `destination.nam
 Each row is a document, and a null is a field the document doesn't have. A document's `_id` is:
 
 - its key, where the stream is merged or overwritten with a primary key: the key's value for a key of one column, or else a document of the key's columns, in order;
-- its `_openetl_id`, where the stream is appended and deduplicated;
-- else an ObjectId the destination gives it.
+- its `_openetl_id`, where the stream is appended and deduplicated against the collection, so a row whose `_openetl_id` the collection has is skipped;
+- else an ObjectId the destination gives it. A stream deduplicated within each epoch only, as one with no primary key that the pipeline requires only `at_least_once` of, skips a row whose `_openetl_id` an earlier row of the epoch has, and a later epoch's row of that `_openetl_id` lands beside it.
 
 A column named `_id` isn't written in the last two cases: rename it in the pipeline to keep it.
 
@@ -186,7 +186,7 @@ From the MongoDB source, whose `_id` is a string that spells its BSON type, set 
 All three write modes work:
 
 - **Append** inserts each epoch's rows.
-- **Overwrite** writes a read's rows to a collection of its own, `_openetl_read_…`, with the target's validator and collation. When the read ends, it takes the target's indexes and replaces the target, by `renameCollection`, so the target keeps its old documents until then.
+- **Overwrite** writes a read's rows to a collection of its own, `_openetl_read_…`, with the target's validator and collation. When the read ends, its last epoch's apply gives it the target's indexes, and it then replaces the target, by `renameCollection`, so the target keeps its old documents until then.
 - **Merge** upserts each key's latest version, ordered by `_openetl_seq`: an update guarded by it leaves a document with a higher `_openetl_seq` as it is. Deletes are soft unless the pipeline sets `destination.deletes: hard`: the document keeps its fields, with `_openetl_deleted` true and the delete's metadata.
 
 ### Commits
@@ -196,7 +196,10 @@ Each epoch is staged into collections of its own, `_openetl_stage_…`, then app
 The apply isn't one transaction, which MongoDB limits in size and time:
 
 - Readers of a collection can see part of an epoch while it's applied, and after a crash, until the next attempt applies the rest.
+- With the pipeline's commit scope, the default, the streams' markers are written together, but not their writes: a commit that fails on one stream leaves the streams it applied before it visible, and the next attempt applies the rest.
 - A replaced attempt that's already applying finishes the writes it started. They're the same writes the next attempt makes, except for a stream appended without deduplication, whose rows the next attempt stages again, and which can then land twice.
+- An overwrite's `renameCollection` can't be fenced, since MongoDB runs no rename in a transaction. A replaced attempt still applying an overwrite's last epoch after the next attempt has swapped its read in writes its last rows to a new `_openetl_read_…` collection, which stays until the stream's next overwrite read starts. If the next attempt crashed between the swap and its marker, the attempt after it swaps that collection in again, and the target then holds only those rows until the stream is read again.
+- With `destination.deletes: hard`, nothing is kept of a deleted document, so a version of its key older than the delete that lands after it, as a source that repeats rows can send, brings the document back.
 
 Up to 16 writer lanes write at once. A continuous pipeline commits every 10 seconds unless it sets its own `delivery.commit.interval`.
 
@@ -257,13 +260,13 @@ spec:
 A collection has no column types: a new column is a new field, and a widened column's new values land beside the old ones, whatever their types. Only a collection's `$jsonSchema` validator, which the user gives it, says what a field takes:
 
 - A field its `required` lists takes no null, so OpenETL holds no cell there.
-- A column whose BSON type the field's `bsonType` or `type` doesn't take is refused, and the stream holds it. The refusal gives the command that adds the type to the validator:
+- A column whose BSON type the field's `bsonType` or `type` doesn't take is refused, and the stream holds it. A decimal of more than 34 digits, such as the MongoDB source's `decimal(38, 9)`, lands as `decimal`, or as `string` where a value has more digits than Decimal128 holds, so the field must take both: a validator that takes only `decimal` refuses it. The refusal gives the command that adds the types to the validator:
 
   ```js
   db.runCommand({"collMod": "orders", "validator": {"$jsonSchema": {"properties": {"amount": {"bsonType": ["int", "long"]}}}}})
   ```
 
-  Run it, then release the hold. Or let the destination run it itself with the pipeline's `destination.typeChanges: allow`.
+  Run it, then release the hold. Since `collMod` replaces the whole validator, the refusals of a stream's columns all give one command, which adds every one's types. Or let the destination run it itself with the pipeline's `destination.typeChanges: allow`.
 
 A validator whose `validationAction` is `warn`, or whose `validationLevel` is `off`, says nothing of what a field takes, nor does one that isn't a `$jsonSchema`. A document a validator rejects, such as one with a field that `additionalProperties: false` doesn't allow, fails the commit with `DATA_INVALID`, which says why.
 

@@ -162,6 +162,13 @@ func TestAppendKeepsDuplicates(t *testing.T) {
 	if n, err := db.Collection("d").CountDocuments(t.Context(), bson.D{}); err != nil || n != 1 {
 		t.Errorf("append deduped at apply has %d documents: %v", n, err)
 	}
+	// Deduped within each epoch only, a version lands once an epoch.
+	w = openWriter(t, db, 3, destination.Stream{Name: "e", Mode: destination.Append, Dedupe: destination.DedupeEpoch})
+	commit(t, w, 1, "e", rowsBatch(t, row{1, "a", "insert", 1}, row{1, "a", "insert", 1}))
+	commit(t, w, 2, "e", rowsBatch(t, row{1, "a", "insert", 1}))
+	if n, err := db.Collection("e").CountDocuments(t.Context(), bson.D{}); err != nil || n != 2 {
+		t.Errorf("append deduped within each epoch has %d documents: %v", n, err)
+	}
 }
 
 // An overwrite's swap, run again after a crash between the rename and the
@@ -204,6 +211,25 @@ func TestOverwriteSwapAgain(t *testing.T) {
 	specs, err := db.Collection("s").Indexes().ListSpecifications(t.Context())
 	if err != nil || len(specs) != 2 {
 		t.Errorf("the target's indexes after the swap: %v, %v", specs, err)
+	}
+}
+
+// An ended read has its target's indexes once applied, before its marker
+// names it, so that the swap is only a rename.
+func TestOverwriteIndexesAtApply(t *testing.T) {
+	db := testDB(t)
+	w := openWriter(t, db, 1, destination.Stream{Name: "s", Mode: destination.Overwrite})
+	insert(t, db.Collection("s"), bson.D{{Key: "id", Value: int64(99)}})
+	if _, err := db.Collection("s").Indexes().CreateOne(t.Context(), mongo.IndexModel{Keys: bson.D{{Key: "v", Value: 1}}}); err != nil {
+		t.Fatal(err)
+	}
+	read := readName("p", "s", time.Now())
+	if _, err := w.Apply(t.Context(), stagedStream{Name: "s", Mode: destination.Overwrite, Target: "s", Read: read, Ended: true}); err != nil {
+		t.Fatal(err)
+	}
+	specs, err := db.Collection(read).Indexes().ListSpecifications(t.Context())
+	if err != nil || len(specs) != 2 {
+		t.Errorf("the read's indexes once applied: %v, %v", specs, err)
 	}
 }
 
@@ -365,5 +391,69 @@ func TestUniqueIndex(t *testing.T) {
 				t.Errorf("a row the unique index refuses: %s: %v", connectortest.CodeOf(err), err)
 			}
 		})
+	}
+}
+
+// A merged row that doesn't send a held column keeps the document's value
+// and its hold, so that the held version's patch still fills it.
+func TestUnchangedKeepsHold(t *testing.T) {
+	db := testDB(t)
+	w := openWriter(t, db, 1, destination.Stream{Name: "s", Mode: destination.Merge, PrimaryKey: []string{"id"}})
+	list := arrow.ListOf(arrow.BinaryTypes.String)
+	schema := arrow.NewSchema([]arrow.Field{
+		{Name: "id", Type: arrow.PrimitiveTypes.Int64},
+		{Name: "v", Type: arrow.BinaryTypes.String, Nullable: true},
+		{Name: idColumn, Type: arrow.BinaryTypes.String},
+		{Name: seqColumn, Type: arrow.PrimitiveTypes.Int64},
+		{Name: heldColumn, Type: list, Nullable: true},
+		{Name: unchangedColumn, Type: list, Nullable: true},
+	}, nil)
+	// batch is a row of id 1 whose v, held, and unchanged columns are as
+	// given; nil is null.
+	batch := func(v *string, version string, seq int64, held, unchanged []string) arrow.RecordBatch {
+		b := array.NewRecordBuilder(memory.DefaultAllocator, schema)
+		defer b.Release()
+		b.Field(0).(*array.Int64Builder).Append(1)
+		if v == nil {
+			b.Field(1).AppendNull()
+		} else {
+			b.Field(1).(*array.StringBuilder).Append(*v)
+		}
+		b.Field(2).(*array.StringBuilder).Append(version)
+		b.Field(3).(*array.Int64Builder).Append(seq)
+		for i, l := range [][]string{held, unchanged} {
+			lb := b.Field(4 + i).(*array.ListBuilder)
+			if l == nil {
+				lb.AppendNull()
+				continue
+			}
+			lb.Append(true)
+			for _, s := range l {
+				lb.ValueBuilder().(*array.StringBuilder).Append(s)
+			}
+		}
+		return b.NewRecordBatch()
+	}
+	commit(t, w, 1, "s", batch(nil, "1-10", 10, []string{"v"}, nil))
+	commit(t, w, 2, "s", batch(nil, "1-20", 20, nil, []string{"v"}))
+	if n, err := db.Collection("s").CountDocuments(t.Context(), bson.D{{Key: heldColumn + ".v", Value: "1-10"}}); err != nil || n != 1 {
+		t.Errorf("after a row that didn't send v, %d documents hold it for 1-10: %v", n, err)
+	}
+	e := destination.Epoch{Generation: 1, N: 3}
+	filled := "filled"
+	p := batch(&filled, "1-10", 10, []string{"v"}, nil)
+	if err := w.Patch(t.Context(), e, "s", p); err != nil {
+		t.Fatal(err)
+	}
+	p.Release()
+	staged, err := w.PreCommit(t.Context(), e)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Commit(t.Context(), e, []destination.Staged{staged}); err != nil {
+		t.Fatal(err)
+	}
+	if d := docs(t, db.Collection("s"))[1]; d["v"] != "filled" || d[heldColumn] != nil {
+		t.Errorf("after the held version's patch: %v", d)
 	}
 }

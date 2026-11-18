@@ -109,12 +109,13 @@ func (s *Source) Splits(ctx context.Context, cs source.ConfiguredStream, ended [
 // sampled from the collection's sample, which is cheap, or where that has
 // fewer than two of its _ids, from all of them.
 func sampleIDs(ctx context.Context, coll *mongo.Collection, n int, lo, hi *value) ([]*value, error) {
+	// $literal, so that a bound such as the string "$a" isn't a field path.
 	var in bson.A
 	if lo != nil {
-		in = append(in, bson.D{{Key: "$gt", Value: bson.A{"$_id", lo.RawValue}}})
+		in = append(in, bson.D{{Key: "$gt", Value: bson.A{"$_id", bson.D{{Key: "$literal", Value: lo.RawValue}}}}})
 	}
 	if hi != nil {
-		in = append(in, bson.D{{Key: "$lt", Value: bson.A{"$_id", hi.RawValue}}})
+		in = append(in, bson.D{{Key: "$lt", Value: bson.A{"$_id", bson.D{{Key: "$literal", Value: hi.RawValue}}}}})
 	}
 	sample := bson.D{{Key: "$sample", Value: bson.D{{Key: "size", Value: n}}}}
 	if len(in) == 0 {

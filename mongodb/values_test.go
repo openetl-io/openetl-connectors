@@ -10,11 +10,14 @@ import (
 	"time"
 
 	"github.com/apache/arrow-go/v18/arrow"
+	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/extensions"
+	"github.com/apache/arrow-go/v18/arrow/memory"
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 
 	"github.com/openetl-io/openetl-connectors/connectortest"
+	"github.com/openetl-io/openetl/sdk/go/destination"
 	protocolv1 "github.com/openetl-io/openetl/sdk/go/protocol/v1"
 	"github.com/openetl-io/openetl/sdk/go/source"
 )
@@ -234,6 +237,11 @@ func TestDecimalValue(t *testing.T) {
 	if s, ok := v.(string); err != nil || !ok || s != "99999999999999999999999999999.999999999" {
 		t.Errorf("decimalValue of 38 digits = %v, %v", v, err)
 	}
+	// A negative scale multiplies by its power of ten.
+	v, err = decimalValue(large, -2)
+	if s, ok := v.(string); err != nil || !ok || s != "9999999999999999999999999999999999999900" {
+		t.Errorf("decimalValue of 38 digits at scale -2 = %v, %v", v, err)
+	}
 }
 
 func TestParseJSON(t *testing.T) {
@@ -408,5 +416,117 @@ func TestPositionLost(t *testing.T) {
 	var c interface{ ErrorCode() protocolv1.ErrorCode }
 	if !errors.As(err, &c) || c.ErrorCode() != protocolv1.ErrorCode_ERROR_CODE_PERMISSION_DENIED {
 		t.Errorf("code 13: %v", err)
+	}
+}
+
+// A read that stops at its until emits the rows it holds before it
+// completes, whether or not the until's document is still there.
+func TestEndAtFlushes(t *testing.T) {
+	rec := &connectortest.Recorder{}
+	s := &Source{}
+	b := s.newBatcher(source.ConfiguredStream{Name: "s"}, nil, false)
+	defer b.Release()
+	d, err := bson.Marshal(bson.D{{Key: "_id", Value: 1}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := b.add(d, "", seq{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.endAt(t.Context(), nil, nil, nil, []byte(`{}`), b, "", seq{}, rec.Split("s", source.WholeStream)); err != nil {
+		t.Fatal(err)
+	}
+	got := rec.Snapshot()
+	if len(got) != 3 || len(got[0].Rows) != 1 || !got[1].Resume || !got[2].Complete {
+		t.Errorf("emitted %+v", got)
+	}
+}
+
+// Of the run's columns, a batcher leaves out only the control columns it
+// adds itself, not a field whose name starts as theirs do.
+func TestBatcherControlNames(t *testing.T) {
+	cols := []string{"_id", "openetl.note", "openetl.op", "openetl.seq"}
+	b := (&Source{}).newBatcher(source.ConfiguredStream{Name: "s", Columns: cols}, cols, true)
+	defer b.Release()
+	d, err := bson.Marshal(bson.D{{Key: "_id", Value: 1}, {Key: "openetl.note", Value: "x"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := b.add(d, source.OpInsert, seq{}); err != nil {
+		t.Fatalf("a declared field named openetl.note: %v", err)
+	}
+	if _, ok := b.Index["openetl.op"]; ok {
+		t.Errorf("the batch has openetl.op as a field too: %v", b.Names)
+	}
+	rec := &connectortest.Recorder{}
+	if err := b.Flush(rec.Split("s", source.WholeStream)); err != nil {
+		t.Fatal(err)
+	}
+	if rows := rec.RowsOf("s"); len(rows) != 1 || rows[0]["openetl.note"] != "x" {
+		t.Errorf("rows = %v", rows)
+	}
+}
+
+// An append deduped against the collection is keyed on its _openetl_id, so
+// a later epoch's row of that ID finds it; deduped within each epoch only,
+// it's keyed on an ObjectId, so that a later epoch's lands beside it.
+func TestDedupeIDs(t *testing.T) {
+	schema := arrow.NewSchema([]arrow.Field{{Name: "v", Type: arrow.BinaryTypes.String}, {Name: idColumn, Type: arrow.BinaryTypes.String}}, nil)
+	rb := array.NewRecordBuilder(memory.DefaultAllocator, schema)
+	defer rb.Release()
+	rb.Field(0).(*array.StringBuilder).Append("a")
+	rb.Field(1).(*array.StringBuilder).Append("id-1")
+	batch := rb.NewRecordBatch()
+	defer batch.Release()
+	for dedupe, want := range map[destination.Dedupe]bson.Type{destination.DedupeTarget: bson.TypeString, destination.DedupeEpoch: bson.TypeObjectID} {
+		rows, err := (&writer{}).rows(destination.Stream{Name: "s", Mode: destination.Append, Dedupe: dedupe}, batch)
+		if err != nil {
+			t.Fatal(err)
+		}
+		doc := rows[0].(stagedRow).Doc
+		if id := doc.Lookup("_id"); id.Type != want || doc.Lookup(idColumn).StringValue() != "id-1" {
+			t.Errorf("dedupe %d: staged %s", dedupe, doc)
+		}
+	}
+}
+
+// The columns a validator refuses share one fix, which takes every one's
+// types, since each collMod replaces the whole validator; a decimal of more
+// digits than Decimal128 has lands as a string too.
+func TestWidening(t *testing.T) {
+	b, _ := bson.Marshal(bson.D{{Key: "$jsonSchema", Value: bson.D{{Key: "properties", Value: bson.D{
+		{Key: "a", Value: bson.D{{Key: "bsonType", Value: "int"}}},
+		{Key: "d", Value: bson.D{{Key: "bsonType", Value: "decimal"}}},
+		{Key: "n", Value: bson.D{{Key: "bsonType", Value: "decimal"}}},
+	}}}}})
+	v := &jsonSchema{b}
+	sch := arrow.NewSchema([]arrow.Field{
+		{Name: "a", Type: arrow.PrimitiveTypes.Int64},
+		{Name: "d", Type: &arrow.Decimal128Type{Precision: 38, Scale: 9}},
+		{Name: "n", Type: &arrow.Decimal128Type{Precision: 18, Scale: 2}},
+	}, nil)
+	cmd, refused, err := widening(v, "orders", "s", sch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(refused) != 2 || refused[0].Column != "a" || refused[1].Column != "d" || refused[1].ToType != "decimal|string" || refused[0].Fix != refused[1].Fix {
+		t.Fatalf("refused %+v", refused)
+	}
+	got := &jsonSchema{cmd[1].Value.(bson.Raw)}
+	if !accepts(got.kinds("a"), "long") || !accepts(got.kinds("d"), "string") || !accepts(got.kinds("d"), "decimal") {
+		t.Errorf("the fix's validator: %s", got.raw)
+	}
+	// One column's fix is the collMod of that column's widening.
+	cmd, refused, err = widening(v, "orders", "s", arrow.NewSchema(sch.Fields()[:1], nil))
+	if err != nil || len(refused) != 1 {
+		t.Fatalf("refused %+v: %v", refused, err)
+	}
+	fix, _ := v.widen("a", "long")
+	text, _ := bson.MarshalExtJSON(bson.D{{Key: "collMod", Value: "orders"}, {Key: "validator", Value: fix}}, false, false)
+	if refused[0].Fix != "db.runCommand("+string(text)+")" {
+		t.Errorf("fix %s, want db.runCommand(%s)", refused[0].Fix, text)
+	}
+	if cmd, refused, _ := widening(nil, "orders", "s", sch); cmd != nil || refused != nil {
+		t.Errorf("without a validator: %v, %v", cmd, refused)
 	}
 }
