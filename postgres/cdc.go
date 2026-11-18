@@ -51,6 +51,12 @@ const (
 	// How often the read reports its progress, and logs it.
 	progressEvery = 10 * time.Second
 	logLagEvery   = time.Minute
+	// How long a read waits for the connection holding its slot to let it
+	// go: polling first after slotPollFirst, then twice as long each time,
+	// up to slotPollMax apart.
+	slotHeldFor   = 10 * time.Second
+	slotPollFirst = 10 * time.Millisecond
+	slotPollMax   = 500 * time.Millisecond
 )
 
 // A record version's _openetl_seq: its transaction's commit LSN, then its
@@ -67,6 +73,10 @@ func seqOf(commit pglogrepl.LSN, n uint64) decimal128.Num {
 // afterChunkSnapshot, if set, runs between a chunk's snapshot and its WAL
 // position: for tests.
 var afterChunkSnapshot func()
+
+// beforeStartReplication, if set, runs once a read has checked its slot's
+// position, before it takes the slot: for tests.
+var beforeStartReplication func()
 
 // cdcState is a CDC stream's state.
 type cdcState struct {
@@ -297,30 +307,13 @@ func (s *Source) readCDC(ctx context.Context, conns *connPool, req source.ReadRe
 	if err != nil {
 		return err
 	}
-	r.confirmed = confirmed
-	// The slot can't stream the log before its confirmed position, so a read
-	// from before it would skip changes: a stream acknowledged past while it
-	// wasn't read, or a redo from a position acknowledged since.
-	for _, st := range r.streams {
-		if st.from != 0 && st.from < confirmed {
-			return positionLost("postgres: %s resumes from %s, and replication slot %q was acknowledged up to %s and streams nothing before it, so the changes between can't be read again; its table needs a snapshot again", st.t.name, st.from, r.slot, confirmed)
-		}
+	if err := r.startAt(confirmed); err != nil {
+		return err
 	}
 	if !r.continuous {
 		if r.target, err = r.end(ctx); err != nil {
 			return err
 		}
-	}
-	// From the earliest stream's position, or the slot's if a stream has
-	// none.
-	start := r.streams[0].from
-	for _, st := range r.streams {
-		start = min(start, st.from)
-	}
-	start = max(start, confirmed)
-	r.pos = start
-	for _, st := range r.streams {
-		st.resumed = max(st.from, start)
 	}
 
 	rc := s.conn.Config.Copy()
@@ -329,7 +322,10 @@ func (s *Source) readCDC(ctx context.Context, conns *connPool, req source.ReadRe
 		return classify(fmt.Errorf("postgres: replication connection: %w", err))
 	}
 	defer func() { _ = r.repl.Close(context.WithoutCancel(ctx)) }()
-	err = pglogrepl.StartReplication(ctx, r.repl, r.slot, start, pglogrepl.StartReplicationOptions{
+	if beforeStartReplication != nil {
+		beforeStartReplication()
+	}
+	err = pglogrepl.StartReplication(ctx, r.repl, r.slot, r.pos, pglogrepl.StartReplicationOptions{
 		PluginArgs: []string{"proto_version '1'", "publication_names " + quoteLiteral(pgx.Identifier{r.pub}.Sanitize())},
 	})
 	if err != nil {
@@ -338,9 +334,51 @@ func (s *Source) readCDC(ctx context.Context, conns *connPool, req source.ReadRe
 		}
 		return classify(fmt.Errorf("postgres: start replication: %w", err))
 	}
-	s.setReader(r)
-	defer s.setReader(nil)
+	unset := s.setReader(r)
+	defer unset()
+	// The slot may have been advanced since ensureSlot, by Committed without
+	// a read, or by another process; it streams from where it was advanced
+	// to. Now that the read holds it, only the read's own status moves it.
+	if confirmed, err = r.slotConfirmed(ctx); err != nil {
+		return err
+	}
+	if err := r.startAt(confirmed); err != nil {
+		return err
+	}
 	return r.run(ctx)
+}
+
+// startAt checks that the slot, confirmed up to confirmed, can stream every
+// stream's changes, and sets where the read starts: the earliest stream's
+// position, or the slot's if it's later or a stream has none.
+func (r *cdcReader) startAt(confirmed pglogrepl.LSN) error {
+	// The slot can't stream the log before its confirmed position, so a read
+	// from before it would skip changes: a stream acknowledged past while it
+	// wasn't read, or a redo from a position acknowledged since.
+	for _, st := range r.streams {
+		if st.from != 0 && st.from < confirmed {
+			return positionLost("postgres: %s resumes from %s, and replication slot %q was acknowledged up to %s and streams nothing before it, so the changes between can't be read again; its table needs a snapshot again", st.t.name, st.from, r.slot, confirmed)
+		}
+	}
+	start := r.streams[0].from
+	for _, st := range r.streams {
+		start = min(start, st.from)
+	}
+	start = max(start, confirmed)
+	r.confirmed, r.pos = confirmed, start
+	for _, st := range r.streams {
+		st.resumed = max(st.from, start)
+	}
+	return nil
+}
+
+// slotConfirmed is the slot's confirmed position.
+func (r *cdcReader) slotConfirmed(ctx context.Context) (pglogrepl.LSN, error) {
+	var at string
+	if err := r.conn.QueryRow(ctx, "SELECT confirmed_flush_lsn::text FROM pg_replication_slots WHERE slot_name = $1", r.slot).Scan(&at); err != nil {
+		return 0, classify(fmt.Errorf("postgres: replication slot %q: %w", r.slot, err))
+	}
+	return pglogrepl.ParseLSN(at)
 }
 
 // stopAt sets where a bounded read of the stream stops: its until, or its
@@ -478,6 +516,7 @@ func (r *cdcReader) ensureSlot(ctx context.Context) (pglogrepl.LSN, error) {
 	if r.version >= 170000 {
 		invalidated += " OR invalidation_reason IS NOT NULL"
 	}
+	giveUp, wait := time.Now().Add(slotHeldFor), slotPollFirst
 	for attempt := 0; ; attempt++ {
 		var active, invalid bool
 		var pid *int32
@@ -524,14 +563,15 @@ func (r *cdcReader) ensureSlot(ctx context.Context) (pglogrepl.LSN, error) {
 				slog.Warn("can't end the connection holding the replication slot; waiting for it to time out", "slot", r.slot, "pid", *pid, "err", err)
 			}
 		}
-		if attempt >= 20 {
+		if time.Now().After(giveUp) {
 			return 0, sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_TRANSIENT, fmt.Errorf("postgres: replication slot %q is held by PID %v", r.slot, deref(pid)))
 		}
 		select {
-		case <-time.After(500 * time.Millisecond):
+		case <-time.After(wait):
 		case <-ctx.Done():
 			return 0, ctx.Err()
 		}
+		wait = min(2*wait, slotPollMax)
 	}
 }
 
@@ -1285,10 +1325,24 @@ func (r *cdcReader) ack(at pglogrepl.LSN) {
 	}
 }
 
-func (s *Source) setReader(r *cdcReader) {
+// setReader makes r the read Committed acknowledges on, with what the read
+// it replaces was acknowledged if that read the same slot, and returns what
+// unsets it. That unsets r alone, so a read that ends after the next one
+// started leaves the next one's in place.
+func (s *Source) setReader(r *cdcReader) (unset func()) {
 	s.mu.Lock()
+	defer s.mu.Unlock()
+	if old := s.reader; old != nil && old.slot == r.slot {
+		r.ack(pglogrepl.LSN(old.acked.Load()))
+	}
 	s.reader = r
-	s.mu.Unlock()
+	return func() {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if s.reader == r {
+			s.reader = nil
+		}
+	}
 }
 
 // Committed lets the slot discard the log before the streams' positions.
@@ -1308,13 +1362,16 @@ func (s *Source) Committed(ctx context.Context, states map[string][]byte, _ map[
 	if low == 0 {
 		return nil
 	}
+	// Under the lock, so a read that replaces this one takes the
+	// acknowledgement with it.
 	s.mu.Lock()
 	r := s.reader
-	s.mu.Unlock()
 	if r != nil && r.slot == slot {
 		r.ack(low)
+		s.mu.Unlock()
 		return nil
 	}
+	s.mu.Unlock()
 	conn, err := pgx.ConnectConfig(ctx, s.conn)
 	if err != nil {
 		return classify(err)

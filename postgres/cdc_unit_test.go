@@ -228,3 +228,47 @@ func TestCDCStopsAtAPosition(t *testing.T) {
 		t.Error("a broken until")
 	}
 }
+
+// A read of the slot that ends after the next one started, as a read's end
+// can when the next read took the slot from it, leaves the next read the
+// one Committed acknowledges on; and the next read takes what the one it
+// replaced was acknowledged.
+func TestALateReadEndLeavesTheNextReadsReader(t *testing.T) {
+	s := &Source{}
+	committed := func(at string) {
+		t.Helper()
+		if err := s.Committed(t.Context(), map[string][]byte{"users": []byte(`{"slot":"s","lsn":"` + at + `"}`)}, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	old, next := &cdcReader{slot: "s"}, &cdcReader{slot: "s"}
+	unsetOld := s.setReader(old)
+	committed("0/10")
+	unsetNext := s.setReader(next)
+	if got := pglogrepl.LSN(next.acked.Load()); got != 0x10 {
+		t.Errorf("the next read starts acknowledged up to %s, want 0/10", got)
+	}
+	unsetOld()
+	if s.reader != next {
+		t.Fatalf("the earlier read's end unset the next read's reader: %p, want %p", s.reader, next)
+	}
+	committed("0/20")
+	if got := pglogrepl.LSN(next.acked.Load()); got != 0x20 {
+		t.Errorf("the next read was acknowledged up to %s, want 0/20", got)
+	}
+	if got := pglogrepl.LSN(old.acked.Load()); got != 0x10 {
+		t.Errorf("the earlier read was acknowledged up to %s after it was replaced", got)
+	}
+	unsetNext()
+	if s.reader != nil {
+		t.Errorf("a read's end left its reader: %p", s.reader)
+	}
+
+	// A read of another slot takes nothing from the one it replaces.
+	other := &cdcReader{slot: "t"}
+	s.setReader(next)
+	s.setReader(other)
+	if got := other.acked.Load(); got != 0 {
+		t.Errorf("a read of another slot took %s", pglogrepl.LSN(got))
+	}
+}

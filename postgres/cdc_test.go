@@ -580,6 +580,46 @@ func TestCDCSlotTakeoverAndLoss(t *testing.T) {
 	}
 }
 
+// A slot advanced after the read checked its position, and before the read
+// took it, as Committed advances a slot no read holds, fails a stream that
+// resumes from before where it was advanced to, rather than skip the changes
+// between.
+func TestCDCFailsASlotAdvancedBeforeItsStart(t *testing.T) {
+	e := newSourceEnv(t)
+	e.exec("CREATE TABLE $schema.users (id int PRIMARY KEY, name text)")
+	s, pipeline := e.cdcSource("")
+	from := readCDC(t, s, pipeline, map[string]string{"users": ""}).last("users")
+	e.exec("INSERT INTO $schema.users VALUES (1, 'a')")
+	later := readCDC(t, s, pipeline, map[string]string{"users": from}).last("users")
+	var to cdcState
+	if err := json.Unmarshal([]byte(later), &to); err != nil {
+		t.Fatal(err)
+	}
+
+	var once sync.Once
+	beforeStartReplication = func() {
+		once.Do(func() {
+			if err := s.Committed(context.Background(), map[string][]byte{"users": []byte(later)}, nil); err != nil {
+				t.Error(err)
+			}
+		})
+	}
+	t.Cleanup(func() { beforeStartReplication = nil })
+	c := &capture{}
+	t.Cleanup(c.release)
+	err := s.Read(t.Context(), cdcRequest(pipeline, false, map[string]string{"users": from}), c)
+	if code := codeOf(err); code != protocolv1.ErrorCode_ERROR_CODE_POSITION_LOST {
+		t.Errorf("a read from %s of a slot advanced to %s before it started: %v (%v), read %v", from, pglogrepl.LSN(to.LSN), err, code, c.column("users", "id"))
+	}
+	var at string
+	if err := e.conn.QueryRow(t.Context(), "SELECT confirmed_flush_lsn::text FROM pg_replication_slots WHERE slot_name = $1", s.slotName(pipeline)).Scan(&at); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := pglogrepl.ParseLSN(at); got != pglogrepl.LSN(to.LSN) {
+		t.Errorf("the slot was confirmed up to %s, not advanced to %s", got, pglogrepl.LSN(to.LSN))
+	}
+}
+
 // A new column fails the read, so the next declares it; a truncate is
 // only logged.
 func TestCDCNewColumnsAndTruncates(t *testing.T) {
