@@ -1,0 +1,11 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "SQL Server destination",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["dsn"],
+  "properties": {
+    "dsn": {"type": "string", "title": "Connection string", "x-secret": true, "examples": ["sqlserver://user:password@host:1433?database=warehouse"], "description": "A sqlserver:// URL, or an ADO or ODBC connection string, naming the database to write, such as sqlserver://user:password@host:1433?database=warehouse."},
+    "schema": {"type": "string", "title": "Schema", "default": "dbo", "description": "The schema to write to when the pipeline names no namespace. It's created if it's missing."}
+  }
+}
