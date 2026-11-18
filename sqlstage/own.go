@@ -49,9 +49,17 @@ func (o *Own) LockFence(ctx context.Context, tx *sql.Tx, lock string) error {
 
 // Fenced runs fn, which may run DDL on other connections, while a
 // transaction holds the fence row by lock, so that a newer generation's
-// Recover waits for it and a fenced writer can't run it.
+// Recover waits for it and a fenced writer can't run it. The transaction
+// ends only once fn has returned, even if ctx ends first.
 func (o *Own) Fenced(ctx context.Context, lock string, fn func() error) error {
-	tx, err := o.DB.BeginTx(ctx, nil)
+	conn, err := o.DB.Conn(ctx)
+	if err != nil {
+		return o.Classify(err)
+	}
+	defer func() { _ = conn.Close() }()
+	// Not ctx: database/sql rolls a transaction back once its context ends,
+	// which would let the fence go while fn's statements still run.
+	tx, err := conn.BeginTx(context.WithoutCancel(ctx), nil)
 	if err != nil {
 		return o.Classify(err)
 	}

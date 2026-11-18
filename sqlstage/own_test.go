@@ -8,6 +8,7 @@ import (
 	"maps"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // fakeDB is a database whose every query returns one row of 0: a fence of
@@ -67,5 +68,25 @@ func TestApplyTxCountsNoCollapsedRowsOfAMerge(t *testing.T) {
 	}
 	if want := map[string]uint64{"appended": 2}; !maps.Equal(collapsed, want) {
 		t.Errorf("collapsed %v, want %v", collapsed, want)
+	}
+}
+
+func TestFencedHoldsTheFenceUntilFnReturns(t *testing.T) {
+	d := &fakeDB{}
+	ctx, cancel := context.WithCancel(t.Context())
+	err := fakeOwn(d).Fenced(ctx, "", func() error {
+		cancel()
+		// database/sql rolls a transaction back soon after its context ends.
+		time.Sleep(100 * time.Millisecond)
+		if d.rolledBack.Load() > 0 {
+			t.Error("the fence's transaction ended while fn ran")
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.committed.Load() != 1 {
+		t.Error("the fence's transaction didn't commit once fn returned")
 	}
 }
