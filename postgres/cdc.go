@@ -51,6 +51,12 @@ const (
 	// How often the read reports its progress, and logs it.
 	progressEvery = 10 * time.Second
 	logLagEvery   = time.Minute
+	// How long a read waits for the connection holding its slot to let it
+	// go: polling first after slotPollFirst, then twice as long each time,
+	// up to slotPollMax apart.
+	slotHeldFor   = 10 * time.Second
+	slotPollFirst = 10 * time.Millisecond
+	slotPollMax   = 500 * time.Millisecond
 )
 
 // A record version's _openetl_seq: its transaction's commit LSN, then its
@@ -338,8 +344,8 @@ func (s *Source) readCDC(ctx context.Context, conns *connPool, req source.ReadRe
 		}
 		return classify(fmt.Errorf("postgres: start replication: %w", err))
 	}
-	s.setReader(r)
-	defer s.setReader(nil)
+	unset := s.setReader(r)
+	defer unset()
 	return r.run(ctx)
 }
 
@@ -478,6 +484,7 @@ func (r *cdcReader) ensureSlot(ctx context.Context) (pglogrepl.LSN, error) {
 	if r.version >= 170000 {
 		invalidated += " OR invalidation_reason IS NOT NULL"
 	}
+	giveUp, wait := time.Now().Add(slotHeldFor), slotPollFirst
 	for attempt := 0; ; attempt++ {
 		var active, invalid bool
 		var pid *int32
@@ -524,14 +531,15 @@ func (r *cdcReader) ensureSlot(ctx context.Context) (pglogrepl.LSN, error) {
 				slog.Warn("can't end the connection holding the replication slot; waiting for it to time out", "slot", r.slot, "pid", *pid, "err", err)
 			}
 		}
-		if attempt >= 20 {
+		if time.Now().After(giveUp) {
 			return 0, sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_TRANSIENT, fmt.Errorf("postgres: replication slot %q is held by PID %v", r.slot, deref(pid)))
 		}
 		select {
-		case <-time.After(500 * time.Millisecond):
+		case <-time.After(wait):
 		case <-ctx.Done():
 			return 0, ctx.Err()
 		}
+		wait = min(2*wait, slotPollMax)
 	}
 }
 
@@ -1285,10 +1293,24 @@ func (r *cdcReader) ack(at pglogrepl.LSN) {
 	}
 }
 
-func (s *Source) setReader(r *cdcReader) {
+// setReader makes r the read Committed acknowledges on, with what the read
+// it replaces was acknowledged if that read the same slot, and returns what
+// unsets it. That unsets r alone, so a read that ends after the next one
+// started leaves the next one's in place.
+func (s *Source) setReader(r *cdcReader) (unset func()) {
 	s.mu.Lock()
+	defer s.mu.Unlock()
+	if old := s.reader; old != nil && old.slot == r.slot {
+		r.ack(pglogrepl.LSN(old.acked.Load()))
+	}
 	s.reader = r
-	s.mu.Unlock()
+	return func() {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if s.reader == r {
+			s.reader = nil
+		}
+	}
 }
 
 // Committed lets the slot discard the log before the streams' positions.
@@ -1308,13 +1330,16 @@ func (s *Source) Committed(ctx context.Context, states map[string][]byte, _ map[
 	if low == 0 {
 		return nil
 	}
+	// Under the lock, so a read that replaces this one takes the
+	// acknowledgement with it.
 	s.mu.Lock()
 	r := s.reader
-	s.mu.Unlock()
 	if r != nil && r.slot == slot {
 		r.ack(low)
+		s.mu.Unlock()
 		return nil
 	}
+	s.mu.Unlock()
 	conn, err := pgx.ConnectConfig(ctx, s.conn)
 	if err != nil {
 		return classify(err)
