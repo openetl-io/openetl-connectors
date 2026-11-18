@@ -1,7 +1,12 @@
 package connectortest
 
 import (
+	"slices"
 	"testing"
+
+	"github.com/apache/arrow-go/v18/arrow"
+	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/memory"
 
 	"github.com/openetl-io/openetl/sdk/go/source"
 )
@@ -47,5 +52,21 @@ func TestRecordersCopyWhatTheyAreGiven(t *testing.T) {
 	_ = none.Complete("s", nil)
 	if got, done := none.Last("s"); got != nil || !done {
 		t.Errorf("a full refresh's completion recorded %q", got)
+	}
+}
+
+// A batch's column may hold more values than the batch has rows.
+func TestSplitCaptureKeepsTheBatchsRows(t *testing.T) {
+	b := array.NewInt64Builder(memory.DefaultAllocator)
+	b.AppendValues([]int64{1, 2}, nil)
+	col := b.NewArray()
+	defer col.Release()
+	schema := arrow.NewSchema([]arrow.Field{{Name: "id", Type: arrow.PrimitiveTypes.Int64}}, nil)
+	c := SplitCapture{Col: "id"}
+	if err := c.Records("s", array.NewRecordBatch(schema, []arrow.Array{col}, 1)); err != nil {
+		t.Fatal(err)
+	}
+	if got := c.Values(); !slices.Equal(got, []string{"1"}) {
+		t.Errorf("captured %v, want [1]", got)
 	}
 }

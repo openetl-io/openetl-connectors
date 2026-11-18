@@ -77,7 +77,8 @@ func (s splitSink) Records(b arrow.RecordBatch) error {
 		s.c.OnBatch(s.stream, s.id)
 	}
 	col := b.Column(b.Schema().FieldIndices(s.c.Col)[0])
-	rows := make([]string, col.Len())
+	// A column may hold more values than the batch has rows.
+	rows := make([]string, b.NumRows())
 	for i := range rows {
 		rows[i] = col.ValueStr(i)
 	}
