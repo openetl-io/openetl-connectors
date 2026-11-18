@@ -1,8 +1,9 @@
-// Command destination-s3 serves the Parquet on S3 destination as an external
-// connector.
+// Command destination-s3 serves the files destination of Amazon S3, S3-compatible stores and local files, as an
+// external connector.
 package main
 
 import (
+	"github.com/openetl-io/openetl-connectors/objstore"
 	"github.com/openetl-io/openetl-connectors/s3"
 	sdk "github.com/openetl-io/openetl/sdk/go"
 	"github.com/openetl-io/openetl/sdk/go/destination"
@@ -15,6 +16,6 @@ func main() {
 		ConfigSchema: s3.DestinationConfigSchema,
 		Egress:       sdk.Egress{Tier: sdk.EgressRaw},
 		Destination:  func(c []byte, _ host.Host) (destination.Destination, error) { return s3.NewDestination(c) },
-		Capabilities: s3.DestinationCapabilities,
+		Capabilities: objstore.DestinationCapabilities,
 	})
 }
