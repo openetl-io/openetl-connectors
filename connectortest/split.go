@@ -53,7 +53,10 @@ func (c *SplitCapture) Split(stream, id string) source.SplitEmitter {
 	return splitSink{c, stream, id}
 }
 
+// add keeps e with a copy of its added splits, which an emitter's caller may
+// reuse once the call returns.
 func (c *SplitCapture) add(e SplitEvent) {
+	e.Added = cloneSplits(e.Added)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.events = append(c.events, e)
