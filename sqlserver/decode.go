@@ -64,10 +64,12 @@ func (c sourceColumn) selectExpr(alias string) string {
 		return "CONVERT(nvarchar(max), " + q + ".ToString())"
 	case "sql_variant":
 		// A variant's varchar holds up to 8000 characters, and its binary as
-		// hex twice as many.
+		// hex twice as many. A variant converted to nvarchar(max) directly
+		// keeps only 4000 characters, so a varchar goes through its own type.
 		return "CASE WHEN SQL_VARIANT_PROPERTY(" + q + ", 'BaseType') IN ('datetime', 'smalldatetime', 'datetime2', 'date', 'time', 'datetimeoffset') " +
 			"THEN CONVERT(nvarchar(4000), " + q + ", 126) " +
 			"WHEN SQL_VARIANT_PROPERTY(" + q + ", 'BaseType') IN ('binary', 'varbinary', 'timestamp') THEN CONVERT(nvarchar(max), CONVERT(varbinary(8000), " + q + "), 1) " +
+			"WHEN SQL_VARIANT_PROPERTY(" + q + ", 'BaseType') IN ('varchar', 'char') THEN CONVERT(nvarchar(max), CONVERT(varchar(8000), " + q + ")) " +
 			"WHEN SQL_VARIANT_PROPERTY(" + q + ", 'BaseType') IN ('float', 'real') THEN CONVERT(nvarchar(4000), CONVERT(float, " + q + "), 3) " +
 			"ELSE CONVERT(nvarchar(max), " + q + ") END"
 	}

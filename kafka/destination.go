@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/http"
 	"strconv"
 	"sync"
 	"time"
@@ -17,6 +18,7 @@ import (
 	"github.com/twmb/franz-go/pkg/kgo"
 	"github.com/twmb/franz-go/pkg/kmsg"
 	"github.com/twmb/franz-go/pkg/sr"
+	"golang.org/x/oauth2"
 
 	"github.com/openetl-io/openetl-connectors/records"
 	sdk "github.com/openetl-io/openetl/sdk/go"
@@ -63,8 +65,6 @@ type Destination struct {
 	cfg DestinationConfig
 }
 
-var _ destination.Checker = (*Destination)(nil)
-
 func NewDestination(config []byte) (*Destination, error) {
 	cfg := DestinationConfig{MarkerTopic: defaultMarkerTopic, TransactionalIDPrefix: "openetl-"}
 	if err := decodeConfig(config, &cfg); err != nil {
@@ -87,30 +87,6 @@ func decodeConfig(config []byte, v any) error {
 
 func (d *Destination) Capabilities() destination.Capabilities { return DestinationCapabilities }
 
-// Check reaches the brokers and, if there is one, the schema registry.
-func (d *Destination) Check(ctx context.Context) error {
-	return check(ctx, &d.cfg.Connection)
-}
-
-func check(ctx context.Context, c *Connection) error {
-	cl, err := c.client()
-	if err != nil {
-		return err
-	}
-	defer cl.Close()
-	if _, err := kadm.NewClient(cl).ListBrokers(ctx); err != nil {
-		return classify(fmt.Errorf("kafka: list brokers: %w", err))
-	}
-	reg, err := c.Registry()
-	if err != nil || reg == nil {
-		return err
-	}
-	if _, err := reg.Subjects(ctx); err != nil {
-		return fmt.Errorf("kafka: schema registry: %w", err)
-	}
-	return nil
-}
-
 // classify gives Kafka's errors their taxonomy codes.
 func classify(err error) error {
 	var ke *kerr.Error
@@ -128,6 +104,14 @@ func classify(err error) error {
 		return sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_TRANSIENT, err)
 	case unreachable(err):
 		return sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_TRANSIENT, err)
+	}
+	if re, ok := errors.AsType[*oauth2.RetrieveError](err); ok && re.Response != nil {
+		switch s := re.Response.StatusCode; {
+		case s == http.StatusBadRequest || s == http.StatusUnauthorized || s == http.StatusForbidden:
+			return sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_AUTH_INVALID, err)
+		case s >= http.StatusInternalServerError || s == http.StatusTooManyRequests:
+			return sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_TRANSIENT, err)
+		}
 	}
 	return err
 }

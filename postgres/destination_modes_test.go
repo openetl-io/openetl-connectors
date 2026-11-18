@@ -13,6 +13,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 
+	"github.com/openetl-io/openetl-connectors/sqlstage"
 	"github.com/openetl-io/openetl/sdk/go/destination"
 )
 
@@ -281,7 +282,7 @@ func TestOverwrite(t *testing.T) {
 	if got := env.text(users); got != "9:old" {
 		t.Errorf("before the read ended: %s", got)
 	}
-	read := readName("p1", "users", time.UnixMicro(1000))
+	read := sqlstage.ReadName("p1", "users", time.UnixMicro(1000))
 	if n := env.count("SELECT count(*) FROM $schema." + read); n != 2 {
 		t.Errorf("the read's table has %d rows, want 2", n)
 	}
@@ -374,7 +375,7 @@ func TestOverwriteDropsAbandonedReads(t *testing.T) {
 	e1 := destination.Epoch{Generation: 1, N: 1}
 	write(t, w1, e1, "users", batch(t, fields, `[{"id": 1}]`))
 	st1, _ := commit(t, w1, e1)
-	first, second := readName("p1", "users", time.UnixMicro(1000)), readName("p1", "users", time.UnixMicro(2000))
+	first, second := sqlstage.ReadName("p1", "users", time.UnixMicro(1000)), sqlstage.ReadName("p1", "users", time.UnixMicro(2000))
 	exists := func(table string) bool {
 		return env.count("SELECT count(*) FROM pg_tables WHERE schemaname = '"+env.schema+"' AND tablename = '"+table+"'") == 1
 	}

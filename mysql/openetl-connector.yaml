@@ -1,0 +1,14 @@
+name: mysql
+title: MySQL
+description: MySQL and MariaDB tables, in full, incrementally or by CDC from the binlog, and MySQL or MariaDB as a destination
+license: Apache-2.0
+repository: https://github.com/openetl-io/openetl-connectors
+docs: https://github.com/openetl-io/openetl-connectors/blob/main/mysql/README.md
+logo: https://upload.wikimedia.org/wikipedia/en/d/dd/MySQL_logo.svg
+tags: [database, cdc, mariadb]
+author: OpenETL
+roles:
+  source:
+    build: { go: ../cmd/source-mysql }
+  destination:
+    build: { go: ../cmd/destination-mysql }
