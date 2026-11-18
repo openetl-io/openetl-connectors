@@ -103,7 +103,7 @@ func (o *Own) Unapplied(ctx context.Context, desc Staged, streams []Stream) ([]S
 
 // ApplyTx applies streams in one transaction, which holds the fence row by
 // lock: each that has no marker yet, by apply, and its marker. It adds the
-// rows each deduped stream skipped to collapsed.
+// rows each deduped append or overwrite stream skipped to collapsed.
 func (o *Own) ApplyTx(ctx context.Context, opts *sql.TxOptions, lock string, desc Staged, streams []Stream, apply func(*sql.Tx, Stream) (uint64, error), collapsed map[string]uint64) error {
 	skipped := map[string]uint64{}
 	tx, err := o.DB.BeginTx(ctx, opts)
@@ -126,7 +126,9 @@ func (o *Own) ApplyTx(ctx context.Context, opts *sql.TxOptions, lock string, des
 		if err != nil {
 			return o.Classify(fmt.Errorf("%s: apply %s: %w", o.Name, s.Name, err))
 		}
-		if s.Deduped() && s.Rows > n {
+		// Dedupe skips append and overwrite rows; a merge's apply counts
+		// none of the rows it applies.
+		if s.Deduped() && s.Mode != ModeMerge && s.Rows > n {
 			skipped[s.Name] = s.Rows - n
 		}
 		if _, err := tx.ExecContext(ctx, o.Mark, o.Pipeline, s.Name, desc.Generation, desc.Epoch); err != nil {
