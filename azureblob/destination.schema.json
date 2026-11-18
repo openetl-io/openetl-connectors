@@ -6,6 +6,30 @@
   "required": [
     "url"
   ],
+  "if": {
+    "properties": {
+      "format": {
+        "enum": [
+          "csv",
+          "jsonl"
+        ]
+      }
+    },
+    "required": [
+      "format"
+    ]
+  },
+  "then": {
+    "properties": {
+      "compression": {
+        "enum": [
+          "gzip",
+          "zstd",
+          "none"
+        ]
+      }
+    }
+  },
   "properties": {
     "url": {
       "type": "string",
@@ -16,7 +40,7 @@
     "endpoint": {
       "type": "string",
       "title": "Endpoint",
-      "description": "The blob service's URL, for one other than https://ACCOUNT.blob.core.windows.net, such as Azurite's http://127.0.0.1:10000/devstoreaccount1.",
+      "description": "The blob service's URL, for one other than https://ACCOUNT.blob.core.windows.net, such as Azurite's http://127.0.0.1:10000/devstoreaccount1. Not with connectionString, which names its own. With sasToken, it needs https.",
       "x-group": "location",
       "x-format": "uri",
       "x-advanced": true
@@ -38,14 +62,14 @@
       "type": "string",
       "x-secret": true,
       "title": "SAS token",
-      "description": "A shared access signature for the container, the query string it is.",
+      "description": "A shared access signature for the container, the query string it is. It goes in each request's URL, so it needs an https endpoint.",
       "x-group": "azure"
     },
     "connectionString": {
       "type": "string",
       "x-secret": true,
       "title": "Connection string",
-      "description": "The account's connection string, which names the account and its key or a SAS.",
+      "description": "The account's connection string, which names the account and its key or a SAS, and the endpoint, so it doesn't go with endpoint. With a SAS, its endpoint needs https.",
       "x-group": "azure"
     },
     "format": {

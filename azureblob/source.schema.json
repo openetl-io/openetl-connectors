@@ -17,7 +17,7 @@
     "endpoint": {
       "type": "string",
       "title": "Endpoint",
-      "description": "The blob service's URL, for one other than https://ACCOUNT.blob.core.windows.net, such as Azurite's http://127.0.0.1:10000/devstoreaccount1.",
+      "description": "The blob service's URL, for one other than https://ACCOUNT.blob.core.windows.net, such as Azurite's http://127.0.0.1:10000/devstoreaccount1. Not with connectionString, which names its own. With sasToken, it needs https.",
       "x-group": "location",
       "x-format": "uri",
       "x-advanced": true
@@ -39,14 +39,14 @@
       "type": "string",
       "x-secret": true,
       "title": "SAS token",
-      "description": "A shared access signature for the container, the query string it is.",
+      "description": "A shared access signature for the container, the query string it is. It goes in each request's URL, so it needs an https endpoint.",
       "x-group": "azure"
     },
     "connectionString": {
       "type": "string",
       "x-secret": true,
       "title": "Connection string",
-      "description": "The account's connection string, which names the account and its key or a SAS.",
+      "description": "The account's connection string, which names the account and its key or a SAS, and the endpoint, so it doesn't go with endpoint. With a SAS, its endpoint needs https.",
       "x-group": "azure"
     },
     "streams": {
@@ -116,7 +116,8 @@
                 "items": {
                   "type": "string"
                 },
-                "description": "The columns of files without a header, in order. Without them, f0, f1 and so on.",
+                "uniqueItems": true,
+                "description": "The columns of files without a header, in order, each named once. Without them, f0, f1 and so on.",
                 "title": "Column names"
               },
               "skipRows": {
@@ -148,11 +149,20 @@
           },
           "columns": {
             "type": "object",
+            "propertyNames": {
+              "not": {
+                "enum": [
+                  "_file",
+                  "_line",
+                  "_modified"
+                ]
+              }
+            },
             "additionalProperties": {
               "type": "string",
               "pattern": "^(string|integer|number|boolean|date|time|timestamp|timestamp_tz|json|binary|decimal\\(\\d+, ?\\d+\\))$"
             },
-            "description": "Columns' types, by name, over the ones discovery finds: string, integer, number, boolean, date, time, timestamp (without a time zone), timestamp_tz, json, binary or decimal(P,S). A column of CSV or JSON Lines that discovery's sample doesn't show must be named here. A Parquet or Avro column named here is sent as text, which OpenETL parses to the type, quarantining a value that doesn't fit.",
+            "description": "Columns' types, by name, over the ones discovery finds: string, integer, number, boolean, date, time, timestamp (without a time zone), timestamp_tz, json, binary or decimal(P,S). A column of CSV or JSON Lines that discovery's sample doesn't show must be named here. A Parquet or Avro column named here is sent as text, which OpenETL parses to the type, quarantining a value that doesn't fit. Not _file, _line or _modified, which the source adds.",
             "title": "Column types"
           },
           "primaryKey": {
