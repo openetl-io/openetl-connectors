@@ -102,6 +102,13 @@ func TestFailure(t *testing.T) {
 	}
 }
 
+// A GRANT's ON takes one object, so each table gets a privilege of its own.
+func TestGrantsOn(t *testing.T) {
+	if got, want := grantsOn("SELECT", []string{"`db`.`a`", "`db`.`b`"}), "SELECT ON `db`.`a`, SELECT ON `db`.`b`"; got != want {
+		t.Errorf("%s, want %s", got, want)
+	}
+}
+
 func TestOlder(t *testing.T) {
 	for v, want := range map[string]bool{"26.8.37.168": false, "26.7.1.1": true, "25.12.1": true, "27.1.1": false, "head": false} {
 		if got := older(v, [2]int{26, 8}); got != want {

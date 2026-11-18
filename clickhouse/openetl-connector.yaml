@@ -1,6 +1,6 @@
 name: clickhouse
 title: ClickHouse
-description: ClickHouse tables, in full or incrementally, and ClickHouse as a destination with atomic, exactly-once epochs
+description: ClickHouse tables, in full or incrementally, and ClickHouse as a destination that applies each epoch exactly once
 license: Apache-2.0
 repository: https://github.com/openetl-io/openetl-connectors
 docs: https://github.com/openetl-io/openetl-connectors/blob/main/clickhouse/README.md

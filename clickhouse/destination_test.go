@@ -4,6 +4,7 @@ package clickhouse
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
@@ -13,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	ch "github.com/ClickHouse/clickhouse-go/v2"
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/decimal128"
@@ -826,4 +828,41 @@ func TestDestinationHeldTypeChange(t *testing.T) {
 		t.Fatal(err)
 	}
 	wantRows(t, "m after patches at the new type", k.rows("m", "id", "n", "n__v2", heldColumn), "1|1099511627776|NULL|{}", "2|NULL|7|{}")
+}
+
+// A failed patch kills its own mutation, which names its Join table, and
+// leaves the table's others, such as a user's, which aren't the
+// destination's to kill.
+func TestKillPatch(t *testing.T) {
+	k := newKit(t)
+	conn := testConn(t)
+	if err := conn.Exec(t.Context(), "CREATE TABLE "+qualified(k.db, "t")+" (id Int64, v String) ENGINE = MergeTree ORDER BY id"); err != nil {
+		t.Fatal(err)
+	}
+	if err := conn.Exec(t.Context(), "INSERT INTO "+qualified(k.db, "t")+" VALUES (1, 'a')"); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = conn.Exec(context.Background(), "KILL MUTATION WHERE database = ?", k.db) })
+	// Mutations that fail on their first row, and stay until they're killed.
+	async := ch.Context(t.Context(), ch.WithSettings(ch.Settings{"mutations_sync": 0}))
+	for _, name := range []string{"_openetl_stage_mine", "_openetl_stage_theirs"} {
+		if err := conn.Exec(async, "ALTER TABLE "+qualified(k.db, "t")+" UPDATE v = if(throwIf(id > 0, "+literal(name)+") = 0, v, v) WHERE 1"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := conn.Exec(t.Context(), killPatch, k.db, "t", "_openetl_stage_mine"); err != nil {
+		t.Fatal(err)
+	}
+	left := func() []string {
+		return k.query("SELECT command FROM system.mutations WHERE database = '" + k.db + "' AND table = 't' AND NOT is_done ORDER BY create_time")
+	}
+	for range 50 {
+		if got := left(); len(got) == 1 {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if got := left(); len(got) != 1 || !strings.Contains(got[0], "_openetl_stage_theirs") {
+		t.Errorf("mutations left: %q, not only theirs", got)
+	}
 }

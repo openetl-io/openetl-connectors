@@ -284,11 +284,15 @@ func (s *Source) Read(ctx context.Context, req source.ReadRequest, out source.Em
 		return err
 	}
 	for _, cs := range req.Streams {
+		i := slices.IndexFunc(tables, func(t table) bool { return t.name == cs.Name })
 		switch {
-		case !slices.ContainsFunc(tables, func(t table) bool { return t.name == cs.Name }):
+		case i < 0:
 			return fmt.Errorf("clickhouse: unknown stream %q", cs.Name)
 		case cs.SyncMode == source.CDC || cs.SyncMode == source.Stream:
 			return sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_CONFIG_INVALID, fmt.Errorf("clickhouse: %s can only be read in full or incrementally: ClickHouse keeps no change log", cs.Name))
+		}
+		if err := undeclaredText(tables[i], cs.Columns); err != nil {
+			return err
 		}
 	}
 	return source.ReadSplits(ctx, source.ReadRequest{Streams: req.Streams, Lanes: limit}, out, func(ctx context.Context, cs source.ConfiguredStream, sp source.Split, e source.SplitEmitter) error {
@@ -317,6 +321,23 @@ func (s *Source) Read(ctx context.Context, req source.ReadRequest, out source.Em
 	})
 }
 
+// undeclaredText fails a read, retryably, if columns, those the run
+// declared, leave out one of t's that can come as text for the engine to
+// parse: a DateTime64 of more than 6 digits, and a time of day, whose values
+// past a day do. Undeclared, its text would be taken for a string. The next
+// attempt discovers and declares it. No columns: the request doesn't say.
+func undeclaredText(t table, columns []string) error {
+	if len(columns) == 0 {
+		return nil
+	}
+	for _, c := range t.cols {
+		if (c.text || canBePast(c.dt)) && !slices.Contains(columns, c.name) {
+			return sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_TRANSIENT, fmt.Errorf("clickhouse: %s has a column %q the read didn't declare, which can come as text; the read starts again to declare it", t.name, c.name))
+		}
+	}
+	return nil
+}
+
 // tableRead is one split's read.
 type tableRead struct {
 	s    *Source
@@ -329,30 +350,57 @@ type tableRead struct {
 	untilState []byte
 }
 
-func (r *tableRead) from() string {
-	q := qualified(r.s.cfg.Database, r.t.name)
-	if r.t.final {
+func (r *tableRead) from() string { return r.s.from(r.t) }
+
+// from is what a read of t selects from: t, with FINAL where its engine
+// merges rows by key, so that the read sees them merged.
+func (s *Source) from(t table) string {
+	q := qualified(s.cfg.Database, t.name)
+	if t.final {
 		q += " FINAL"
 	}
 	return q
+}
+
+// untilQuery selects the highest value of the cursor c in from, as a state
+// keeps it; NULL if it has none. from is a read's, so that the value is of
+// the rows the read sees.
+func untilQuery(from string, c sourceColumn) string {
+	return "SELECT if(count() > 0, " + stateText(c, "max("+ident(c.name)+")") + ", NULL) FROM " + from + " WHERE " + ident(c.name) + " IS NOT NULL"
 }
 
 func (r *tableRead) selectList() string {
 	sel := make([]string, len(r.t.cols))
 	for i, c := range r.t.cols {
 		sel[i] = ident(c.name)
-		switch t, _ := parseType(c.typ).unwrap(); {
+		switch m := micros(parseType(c.typ), ident(c.name), 0); {
 		case c.opaque:
 			sel[i] = "toJSONString(" + ident(c.name) + ")"
 		case c.text:
 			sel[i] = "concat(toString(" + ident(c.name) + ", 'UTC'), 'Z')"
-		case t.name == "DateTime64":
-			// The driver's time.Time is wrong past 2262, as it counts in
-			// nanoseconds.
-			sel[i] = "toUnixTimestamp64Micro(" + ident(c.name) + ")"
+		case m != "":
+			sel[i] = m
 		}
 	}
 	return strings.Join(sel, ", ")
+}
+
+// micros is expr, a value of t, with each DateTime64 in it, alone or in
+// arrays, as its microseconds since 1970: the driver's time.Time is wrong
+// past 2262, as it counts in nanoseconds. Empty if t has none. depth numbers
+// an array's lambda's variable.
+func micros(t chType, expr string, depth int) string {
+	t, _ = t.unwrap()
+	switch t.name {
+	case "DateTime64":
+		return "toUnixTimestamp64Micro(" + expr + ")"
+	case "Array":
+		x := "x" + strconv.Itoa(depth)
+		if m := micros(t.arg(0), x, depth+1); m != "" {
+			return "arrayMap(" + x + " -> " + m + ", " + expr + ")"
+		}
+	}
+	return ""
 }
 
 // castBack is a state's value, as a SQL expression of the column's type,
@@ -531,8 +579,7 @@ func (r *tableRead) incremental(ctx context.Context, cursor string, st sourceSta
 	c := r.t.cols[ci]
 	if st.Until == nil {
 		var until *string
-		q := "SELECT if(count() > 0, " + stateText(c, "max("+ident(c.name)+")") + ", NULL) FROM " + r.from() + " WHERE " + ident(c.name) + " IS NOT NULL"
-		if err := r.conn.QueryRow(ctx, q).Scan(&until); err != nil {
+		if err := r.conn.QueryRow(ctx, untilQuery(r.from(), c)).Scan(&until); err != nil {
 			return classify(fmt.Errorf("clickhouse: read %s: %w", r.t.name, err))
 		}
 		if until == nil {
@@ -614,7 +661,11 @@ func (r *tableRead) query(ctx context.Context, q string, keyCols int) (int, []st
 		if keyCols > 0 {
 			last = last[:0]
 			for _, v := range dest[len(r.t.cols):] {
-				last = append(last, *v.(*string))
+				s, ok := scannedString(v)
+				if !ok {
+					return n, nil, fmt.Errorf("clickhouse: read %s: a row's order column is NULL", r.t.name)
+				}
+				last = append(last, s)
 			}
 		}
 	}
@@ -622,6 +673,17 @@ func (r *tableRead) query(ctx context.Context, q string, keyCols int) (int, []st
 		return n, nil, classify(fmt.Errorf("clickhouse: read %s: %w", r.t.name, err))
 	}
 	return n, slices.Clone(last), b.flush(r.out)
+}
+
+// scannedString is the String the driver scanned into v: a *string, or a
+// **string for a Nullable one, as a Nullable cursor's text is; false for a
+// null.
+func scannedString(v any) (string, bool) {
+	s := deref(reflect.ValueOf(v))
+	if !s.IsValid() || s.Kind() != reflect.String {
+		return "", false
+	}
+	return s.String(), true
 }
 
 // batcher builds one table's Arrow batches.

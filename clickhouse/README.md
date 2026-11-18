@@ -3,7 +3,7 @@ title: ClickHouse
 description: Read ClickHouse tables in full or by a cursor column, in sorting-key order, and write into ClickHouse by appending, overwriting or merging, each epoch exactly once.
 ---
 
-The `clickhouse` package has a source and a destination, both over ClickHouse's native protocol. The source reads the tables of one database, whole or from where a cursor column last got to. The destination writes each stream into a table of its own and makes each epoch visible at once, exactly once.
+The `clickhouse` package has a source and a destination, both over ClickHouse's native protocol. The source reads the tables of one database, whole or from where a cursor column last got to. The destination writes each stream into a table of its own and applies each epoch exactly once, in steps that readers can see one at a time: see [How a commit works](#how-a-commit-works).
 
 Both are tested against a single ClickHouse 26.8 server. Nothing was tested on a cluster: see [Clusters](#clusters).
 
@@ -103,6 +103,8 @@ spec:
 
 In that JSON, such as a `Map`'s, a `Tuple`'s or a `DateTime` array's, a date and time is wall-clock text in the column's time zone, or the server's if it has none, with no UTC offset: `"2026-11-03 10:00:00.123456789"`.
 
+As a `DateTime64(7)` to `(9)` column, and a `Time` or `Time64` one, can arrive as text, a read whose run didn't declare such a column, as one added to the table since, fails before it reads a row, with an error the platform retries, and the next attempt declares it.
+
 ### Delivery
 
 Full refresh streams replay exactly: a read resumed from a checkpoint yields the same rows. OpenETL counts incremental streams as ones that may repeat rows, because of the rows at the cursor's last value, and the destination's capabilities decide what guarantee that leaves.
@@ -138,10 +140,11 @@ ClickHouse has no transactions across statements, so a commit is built from step
 
 1. Each writer lane inserts its rows into staging tables of its own, `_openetl_stage_…`, in column batches straight from Arrow.
 2. The commit builds the stream's part of the epoch, as the target will hold it, into a new table, and renames it `_openetl_ready_…` once it's whole.
-3. It moves that table's partitions into the target with `ALTER TABLE … MOVE PARTITION`. A partition moves at once; one moved already isn't there to move again.
-4. It writes the stream's marker in `_openetl_loads`, and drops the staging and ready tables.
+3. It moves that table's partitions into the target with `ALTER TABLE … MOVE PARTITION`. A partition moves at once; one moved already isn't there to move again. A table the destination creates has one partition, so its part of the epoch moves at once; a table its user made with `PARTITION BY` takes it partition by partition.
+4. It applies the epoch's patches, if the stream has any, in one `ALTER TABLE … UPDATE` ([Holds](#holds)).
+5. It writes the stream's marker in `_openetl_loads`, and drops the staging and ready tables.
 
-A fence in `_openetl_fence`, the pipeline's highest generation, stops a replaced attempt from committing. If a commit is cut off anywhere, the next attempt finishes it from the step it reached, so each epoch lands exactly once. Each stream's part of an epoch becomes visible on its own, not together with the other streams'. Leave `_openetl_fence` and `_openetl_loads` in place; tables named `_openetl_stage_…`, `_openetl_ready_…` and `_openetl_read_…` are the destination's, and a later attempt drops the ones left behind.
+A fence in `_openetl_fence`, the pipeline's highest generation, stops a replaced attempt from committing. If a commit is cut off anywhere, the next attempt finishes it from the step it reached, so each epoch lands exactly once. These steps aren't one transaction: readers can see a stream's rows before its patches, and each stream's part of an epoch becomes visible on its own, not together with the other streams'. Leave `_openetl_fence` and `_openetl_loads` in place; tables named `_openetl_stage_…`, `_openetl_ready_…` and `_openetl_read_…` are the destination's, and a later attempt drops the ones left behind.
 
 A continuous pipeline commits every 10 seconds unless it sets its own `delivery.commit.interval`.
 
@@ -187,7 +190,7 @@ spec:
 | boolean | `Bool` |
 | integers | `Int8` to `Int64`, `UInt8` to `UInt64` |
 | 16- and 32-bit floats, 64-bit floats | `Float32`, `Float64` |
-| decimal(p, s), up to 76 digits | `Decimal(p, s)` |
+| decimal(p, s), up to 76 digits | `Decimal(p, s)`; with a negative scale, whose values are multiples of a power of ten, `Decimal(p - s, 0)`, and with a scale past p, `Decimal(s, s)` |
 | string, binary | `String` |
 | fixed-size binary | `FixedString(n)` |
 | date | `Date32`, clamped to its range, 1900-01-01 to 2299-12-31 |
@@ -238,7 +241,7 @@ Only a single server was tested. The destination creates plain `MergeTree` and `
 
 - A patch rewrites the table's parts that hold a patched row, as any `ALTER TABLE … UPDATE` does.
 - The database's name can't have a `.` in it on a stream that takes patches, as `joinGet` takes its table as `database.table`.
-- Each stream's part of an epoch becomes visible on its own, as nothing in ClickHouse moves several tables' rows at once.
+- An epoch isn't visible all at once: each stream's part becomes visible on its own, its rows before its patches, and in a table partitioned by its user, partition by partition, as nothing in ClickHouse moves several tables' or partitions' rows, or changes them, at once.
 - JSON lands as a `String`, not ClickHouse's `JSON` type.
 - A timestamp outside 1900 to 2262-04-11 and a date outside 1900 to 2299 are clamped to the range; a null interval or list isn't kept as null.
 - Table and column names can be up to 160 bytes. ClickHouse takes a table name of up to 213 bytes less its database's name, so this leaves 53 for that.

@@ -12,6 +12,7 @@ import (
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/openetl-io/openetl-connectors/connectortest"
+	"github.com/openetl-io/openetl/sdk/go/check"
 	"github.com/openetl-io/openetl/sdk/go/destination"
 	"github.com/openetl-io/openetl/sdk/go/source"
 )
@@ -85,6 +86,25 @@ func TestSourceCheckItems(t *testing.T) {
 		map[string]string{"stream.items.read": "failed privilege_missing", "stream.items.order": "skipped"})
 	connectortest.ExpectStatuses(t, connectortest.Items(t, s.Preflight(source.PreflightRequest{Streams: []source.ConfiguredStream{{Name: "v", SyncMode: source.FullRefresh}}})),
 		map[string]string{"stream.v.read": "failed not_found", "stream.v.order": "skipped"})
+	// Two tables it sees and can't read: the fix grants SELECT on each, in a
+	// GRANT the server takes.
+	user = testUser(t, db, "", "INSERT ON $db.items", "INSERT ON $db.nokey")
+	s, err = NewSource(userConfig(user, db))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fix string
+	for _, it := range check.Run(t.Context(), s.Checks()).Items {
+		if it.Name == "tables.read" && it.Failure != nil {
+			fix = it.Rendered().Failure.Fix
+		}
+	}
+	grant, ok := strings.CutPrefix(strings.TrimSuffix(fix, ";"), "Run ")
+	if !ok || strings.Count(grant, "SELECT ON") != 2 {
+		t.Fatalf("tables.read's fix: %q", fix)
+	}
+	e.exec(grant)
+	connectortest.ExpectStatuses(t, connectortest.Items(t, s.Checks()), nil)
 	// A readonly profile's user reads, as the source sets no setting.
 	e.exec("INSERT INTO $db.items (id, at) VALUES (1, now()), (2, now())")
 	s, err = NewSource(userConfig(testUser(t, db, "readonly = 1", "SELECT ON $db.*"), db))

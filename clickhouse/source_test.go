@@ -407,3 +407,73 @@ func TestSourceViewsAndText(t *testing.T) {
 		t.Errorf("base's s: %q, not %q", got, want)
 	}
 }
+
+// An incremental read by a Nullable cursor reads in chunks, resuming after
+// each, and leaves out the rows whose cursor is NULL.
+func TestSourceNullableCursor(t *testing.T) {
+	db := newDatabase(t)
+	e := sourceEnv{t: t, db: db, conn: testConn(t)}
+	e.exec("CREATE TABLE $db.n (id Int64, at Nullable(Int64)) ENGINE = MergeTree ORDER BY id")
+	e.exec("INSERT INTO $db.n SELECT number + 1, if(number % 10 = 9, NULL, intDiv(number, 3)) FROM numbers(100)")
+	s := newTestSource(t, db, `, "chunkRows": 7`)
+	c := newCollector()
+	if err := s.Read(t.Context(), source.ReadRequest{Streams: []source.ConfiguredStream{{Name: "n", SyncMode: source.Incremental, Cursor: "at"}}}, c); err != nil {
+		t.Fatal(err)
+	}
+	var want []int64
+	for id := int64(1); id <= 100; id++ {
+		if id%10 != 0 {
+			want = append(want, id)
+		}
+	}
+	if got := c.ids("n"); !slices.Equal(got, want) {
+		t.Errorf("read ids %v, not those whose cursor isn't NULL, once", got)
+	}
+	if len(c.resumes["n"]) < 2 {
+		t.Errorf("read with %d resume points, not one a chunk", len(c.resumes["n"]))
+	}
+}
+
+// A SummingMergeTree's incremental splits read up to the highest cursor of
+// the rows FINAL gives, so a key whose unmerged parts sum past each of
+// theirs is read.
+func TestSourceFinalSplitsCursor(t *testing.T) {
+	db := newDatabase(t)
+	e := sourceEnv{t: t, db: db, conn: testConn(t)}
+	e.exec("CREATE TABLE $db.s (id UInt32, at Int64) ENGINE = SummingMergeTree ORDER BY id SETTINGS index_granularity = 32")
+	e.exec("SYSTEM STOP MERGES $db.s")
+	e.exec("INSERT INTO $db.s SELECT number + 1, 10 FROM numbers(1000)")
+	e.exec("INSERT INTO $db.s SELECT number + 1, 20 FROM numbers(1000)")
+	s := newTestSource(t, db, `, "chunkRows": 100`)
+	cs := source.ConfiguredStream{Name: "s", SyncMode: source.Incremental, Cursor: "at"}
+	var err error
+	if cs.Splits, err = s.Splits(t.Context(), cs, nil); err != nil || len(cs.Splits) < 2 {
+		t.Fatalf("splits: %d, %v", len(cs.Splits), err)
+	}
+	c := newCollector()
+	readEnded(t, s, cs, c)
+	if got := c.ids("s"); !slices.Equal(got, span(1, 1000)) {
+		t.Errorf("read %d rows, not ids 1 to 1000 once", len(got))
+	}
+}
+
+// A DateTime64 in an array arrives as its instant, past 2262 too, as a
+// column's does.
+func TestSourceDateTimeArrays(t *testing.T) {
+	db := newDatabase(t)
+	e := sourceEnv{t: t, db: db, conn: testConn(t)}
+	e.exec("CREATE TABLE $db.ad (id Int64, a Array(DateTime64(6, 'UTC')), an Array(Array(Nullable(DateTime64(3, 'Asia/Tokyo'))))) ENGINE = MergeTree ORDER BY id")
+	e.exec("INSERT INTO $db.ad VALUES (1, ['2290-01-01 00:00:00.123456', '1900-01-01 00:00:00'], [[NULL, '2299-12-31 23:59:59.999']])")
+	s := newTestSource(t, db, "")
+	c := newCollector()
+	if err := s.Read(t.Context(), source.ReadRequest{Streams: []source.ConfiguredStream{{Name: "ad", SyncMode: source.FullRefresh}}}, c); err != nil {
+		t.Fatal(err)
+	}
+	if len(c.rows["ad"]) != 1 {
+		t.Fatalf("read %d rows", len(c.rows["ad"]))
+	}
+	b, _ := json.Marshal(c.rows["ad"][0])
+	if want := `{"a":["2290-01-01T00:00:00.123456Z","1900-01-01T00:00:00Z"],"an":[[null,"2299-12-31T14:59:59.999Z"]],"id":1}`; string(b) != want {
+		t.Errorf("read %s, not %s", b, want)
+	}
+}

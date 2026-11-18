@@ -297,17 +297,22 @@ func (w *writer) add(ctx context.Context, e destination.Epoch, ls *laneStaging, 
 	}
 	batch.Retain()
 	ls.pending = append(ls.pending, batch)
-	for _, c := range batch.Columns() {
-		for _, b := range c.Data().Buffers() {
-			if b != nil {
-				ls.pendingBytes += int64(b.Len())
-			}
-		}
-	}
+	ls.pendingBytes += batchBytes(batch)
 	if ls.pendingBytes >= flushBytes {
 		return w.flush(ctx, e, ls)
 	}
 	return nil
+}
+
+// batchBytes is the size of a batch's buffers, with its columns' children
+// and dictionaries, where a list's, map's, struct's or dictionary's values
+// are; at most flushBytes, which is as far as add needs to count.
+func batchBytes(batch arrow.RecordBatch) int64 {
+	var n uint64
+	for _, c := range batch.Columns() {
+		n += c.Data().SizeInBytes()
+	}
+	return int64(min(n, flushBytes))
 }
 
 func (ls *laneStaging) release() {

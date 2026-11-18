@@ -265,7 +265,7 @@ func (s *Source) Checks() []check.Check {
 			}
 		}
 		if len(unreadable) > 0 {
-			return selectMissing(ctx, k, db, strings.Join(unreadable, ", "))
+			return selectMissing(ctx, k, db, unreadable...)
 		}
 		if len(ts) == 0 {
 			f := check.NotFound.Fail()
@@ -280,15 +280,25 @@ func (s *Source) Checks() []check.Check {
 	return append(checks, read)
 }
 
-// selectMissing is the failure of a user without SELECT on object.
-func selectMissing(ctx context.Context, k *sqlcheck.Kit, db *sql.DB, object string) error {
+// selectMissing is the failure of a user without SELECT on objects.
+func selectMissing(ctx context.Context, k *sqlcheck.Kit, db *sql.DB, objects ...string) error {
 	who, err := principal(ctx, db)
 	if err != nil {
 		return k.Failure(err)
 	}
-	f := check.PrivilegeMissing.Fail("principal", who, "privilege", "SELECT", "object", object)
-	f.Fix = "Run GRANT {privilege} ON {object} TO {principal};"
+	f := check.PrivilegeMissing.Fail("principal", who, "privilege", "SELECT", "object", strings.Join(objects, ", "), "grants", grantsOn("SELECT", objects))
+	f.Fix = "Run GRANT {grants} TO {principal};"
 	return f
+}
+
+// grantsOn is privilege on each of objects, as one GRANT lists them:
+// SELECT ON a, SELECT ON b. A GRANT's ON takes one object.
+func grantsOn(privilege string, objects []string) string {
+	grants := make([]string, len(objects))
+	for i, o := range objects {
+		grants[i] = privilege + " ON " + o
+	}
+	return strings.Join(grants, ", ")
 }
 
 // tablesOf lists the tables the source offers, as tables does.
@@ -490,11 +500,7 @@ func databaseChecks(k *sqlcheck.Kit, database, user, field string) []check.Check
 		if err != nil {
 			return k.Failure(err)
 		}
-		grants := make([]string, len(missing))
-		for i, t := range missing {
-			grants[i] = "SELECT ON " + t
-		}
-		f := check.PrivilegeMissing.Fail("principal", who, "privilege", "SELECT", "object", strings.Join(missing, ", "), "grants", strings.Join(grants, ", "))
+		f := check.PrivilegeMissing.Fail("principal", who, "privilege", "SELECT", "object", strings.Join(missing, ", "), "grants", grantsOn("SELECT", missing))
 		f.Fix = "Run GRANT {grants} TO {principal};"
 		return f
 	})

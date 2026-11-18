@@ -42,8 +42,8 @@ type mapped struct {
 	value    func(a arrow.Array, i int) any
 	// The value a null takes in a column that can't hold one.
 	zero any
-	// A null's value in a Nullable column, where the driver needs it typed;
-	// nil otherwise.
+	// A null's value where Nullable wraps the type, in a column, an array,
+	// a map or a tuple, where the driver needs it typed; nil otherwise.
 	null any
 }
 
@@ -241,16 +241,13 @@ func mapType(dt arrow.DataType, ext string) (mapped, error) {
 		// dictionary's type.
 		zero := inner.zero
 		if inner.nullable {
-			zero = nil
+			zero = inner.null
 		}
 		return mapped{typ: "LowCardinality(" + typ + ")", zero: zero, value: func(a arrow.Array, i int) any {
 			d := storage(a).(*array.Dictionary)
 			j := d.GetValueIndex(i)
 			if d.Dictionary().IsNull(j) {
-				if inner.nullable {
-					return nil
-				}
-				return inner.zero
+				return zero
 			}
 			return inner.value(d.Dictionary(), j)
 		}}, nil
@@ -266,11 +263,16 @@ func precision(u arrow.TimeUnit) int {
 	return [...]int{0, 3, 6, 9}[u]
 }
 
+// decimalType is the Decimal that holds Arrow's decimal(p, s). ClickHouse's
+// scale is 0 to its precision: a negative scale, of values in multiples of
+// a power of ten, takes as many more digits at scale 0, so decimal(5, -3)
+// is Decimal(8, 0), and a scale past p takes that many digits.
 func decimalType(p, s int32, v func(a arrow.Array, i int) *big.Int) (mapped, error) {
-	if p > 76 {
+	cp, cs := max(p-min(s, 0), s), max(s, 0)
+	if cp > 76 {
 		return mapped{}, fmt.Errorf("decimal(%d, %d) has more digits than ClickHouse's 76", p, s)
 	}
-	return mapped{typ: fmt.Sprintf("Decimal(%d, %d)", p, s), nullable: true, zero: decimal.Zero, value: func(a arrow.Array, i int) any {
+	return mapped{typ: fmt.Sprintf("Decimal(%d, %d)", cp, cs), nullable: true, zero: decimal.Zero, value: func(a arrow.Array, i int) any {
 		return decimal.NewFromBigInt(v(a, i), -s)
 	}}, nil
 }
@@ -301,7 +303,7 @@ func listType(t arrow.ListLikeType) (mapped, error) {
 			case !vals.IsNull(j):
 				out = append(out, elem.value(vals, j))
 			case elem.nullable:
-				out = append(out, nil)
+				out = append(out, elem.null)
 			default:
 				out = append(out, elem.zero)
 			}
@@ -333,7 +335,7 @@ func mapOf(t *arrow.MapType) (mapped, error) {
 		keys, items := m.Keys(), m.Items()
 		out := &orderedMap{}
 		for j := int(start); j < int(end); j++ {
-			var v any
+			v := item.null
 			switch {
 			case !items.IsNull(j):
 				v = item.value(items, j)
@@ -365,6 +367,7 @@ func structType(t *arrow.StructType) (mapped, error) {
 	}
 	zero := make([]any, len(fields))
 	for i, m := range fields {
+		zero[i] = m.null
 		if !m.nullable {
 			zero[i] = m.zero
 		}
@@ -377,7 +380,9 @@ func structType(t *arrow.StructType) (mapped, error) {
 			switch {
 			case !f.IsNull(i):
 				out[j] = m.value(f, i)
-			case !m.nullable:
+			case m.nullable:
+				out[j] = m.null
+			default:
 				out[j] = m.zero
 			}
 		}

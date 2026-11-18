@@ -73,8 +73,7 @@ func (s *Source) Splits(ctx context.Context, cs source.ConfiguredStream, ended [
 	}
 	if len(ranges) > 0 && ci >= 0 {
 		c := t.cols[ci]
-		q := "SELECT if(count() > 0, " + stateText(c, "max("+ident(c.name)+")") + ", NULL) FROM " + qualified(s.cfg.Database, t.name) + " WHERE " + ident(c.name) + " IS NOT NULL"
-		if err := conn.QueryRow(ctx, q).Scan(&st.Until); err != nil {
+		if err := conn.QueryRow(ctx, untilQuery(s.from(t), c)).Scan(&st.Until); err != nil {
 			return nil, classify(fmt.Errorf("clickhouse: read %s: %w", t.name, err))
 		}
 		if st.Until == nil {

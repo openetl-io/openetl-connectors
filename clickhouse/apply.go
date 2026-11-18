@@ -448,11 +448,18 @@ func (w *writer) patch(ctx context.Context, desc staged, s stagedStream) error {
 	mctx := ch.Context(ctx, ch.WithSettings(ch.Settings{"mutations_sync": 2}))
 	err = w.exec(mctx, "ALTER TABLE "+w.q(s.Table)+" UPDATE "+strings.Join(set, ", ")+" WHERE notEmpty("+h+") AND "+where)
 	if err != nil {
-		// A failed mutation stays, and is retried, until it's killed.
-		_ = w.conn.Exec(context.WithoutCancel(ctx), "KILL MUTATION WHERE database = ? AND table = ? AND NOT is_done", w.db, s.Table)
+		// A failed mutation stays, and is retried, until it's killed. This
+		// patch's is the one whose command names its Join table; the table's
+		// other mutations aren't the destination's to kill.
+		_ = w.conn.Exec(context.WithoutCancel(ctx), killPatch, w.db, s.Table, join)
 	}
 	return err
 }
+
+// killPatch kills a patch's mutation if it's unfinished. Its arguments are
+// the database, the table, and the patch's Join table, which only that
+// mutation's command names.
+const killPatch = "KILL MUTATION WHERE database = ? AND table = ? AND NOT is_done AND position(command, ?) > 0"
 
 // strings runs a query of one String column.
 func (w *writer) strings(ctx context.Context, q string) ([]string, error) {
