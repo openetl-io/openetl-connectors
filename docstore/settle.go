@@ -44,6 +44,7 @@ type Store[S any] interface {
 	Apply(ctx context.Context, s S) (uint64, error)
 	// Swap makes m's read, if it has one, its target.
 	Swap(ctx context.Context, m Marker) error
+	// DropStaging drops s's staging; what's gone already isn't an error.
 	DropStaging(ctx context.Context, s S) error
 	// Staging counts s's staging that's there, and that's gone.
 	Staging(ctx context.Context, s S) (present, missing int, err error)
@@ -61,7 +62,12 @@ func Settle[S any](ctx context.Context, st Store[S], scope destination.Scope, e 
 	var todo []S
 	for _, s := range streams {
 		if m, ok := markers[st.Mark(s, e).Stream]; ok && m.Is(e) {
+			// Applied by an earlier call, which may have stopped before
+			// its swap or its staging's drop.
 			if err := st.Swap(ctx, m); err != nil {
+				return done, err
+			}
+			if err := st.DropStaging(ctx, s); err != nil {
 				return done, err
 			}
 			continue
