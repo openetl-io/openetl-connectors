@@ -53,7 +53,10 @@ func (c *SplitCapture) Split(stream, id string) source.SplitEmitter {
 	return splitSink{c, stream, id}
 }
 
+// add keeps e with a copy of its added splits, which an emitter's caller may
+// reuse once the call returns.
 func (c *SplitCapture) add(e SplitEvent) {
+	e.Added = cloneSplits(e.Added)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.events = append(c.events, e)
@@ -74,7 +77,8 @@ func (s splitSink) Records(b arrow.RecordBatch) error {
 		s.c.OnBatch(s.stream, s.id)
 	}
 	col := b.Column(b.Schema().FieldIndices(s.c.Col)[0])
-	rows := make([]string, col.Len())
+	// A column may hold more values than the batch has rows.
+	rows := make([]string, b.NumRows())
 	for i := range rows {
 		rows[i] = col.ValueStr(i)
 	}

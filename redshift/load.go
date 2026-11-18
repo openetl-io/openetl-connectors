@@ -163,7 +163,7 @@ func (w *writer) stage(tables map[uint64]map[string]*stagingTable, name string, 
 		}
 		st.parts = append(st.parts, p)
 	}
-	if err := st.parts[len(st.parts)-1].write(batch); err != nil {
+	if err := st.parts[len(st.parts)-1].write(batch, cols); err != nil {
 		return nil, sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_DATA_INVALID, fmt.Errorf("redshift: stage %s: %w", stream, err))
 	}
 	st.Rows += uint64(batch.NumRows())
@@ -197,7 +197,9 @@ func newPart(dir, name string, cols []column) (*part, error) {
 }
 
 // write appends a batch with the part's columns to its file, as a row group.
-func (p *part) write(batch arrow.RecordBatch) error {
+// cols are the batch's, which convert its arrays: a part's columns take
+// batches of different Arrow types, such as int8 and int16 for smallint.
+func (p *part) write(batch arrow.RecordBatch, cols []column) error {
 	n := int(batch.NumRows())
 	b := array.NewRecordBuilder(memory.DefaultAllocator, p.schema)
 	defer b.Release()
@@ -205,7 +207,7 @@ func (p *part) write(batch arrow.RecordBatch) error {
 	if i := batch.Schema().FieldIndices(idColumn); len(i) > 0 {
 		ids = batch.Column(i[0])
 	}
-	for j, c := range p.cols {
+	for j, c := range cols {
 		a, fb := batch.Column(j), b.Field(j)
 		fb.Reserve(n)
 		for i := range n {

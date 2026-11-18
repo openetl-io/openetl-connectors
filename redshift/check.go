@@ -49,10 +49,13 @@ var (
 		Message: "{address} doesn't take TLS, and the dsn's sslmode needs it.",
 		Fix:     "Check that the dsn names the cluster's endpoint, or set sslmode=disable in the dsn.",
 	}
+	// Redshift has no function that tells whether a user may alter a table
+	// it doesn't own: ALTER on the table, or the ALTER TABLE permission,
+	// granted to the user or through a role.
 	notOwned = check.Reason{
 		Name: "table_not_owned", Code: protocolv1.ErrorCode_ERROR_CODE_PERMISSION_DENIED,
-		Message: "{principal} doesn't own {table}, so a column the stream gains can't be added to it.",
-		Fix:     "Run ALTER TABLE {table} OWNER TO {principal};",
+		Message: "{principal} doesn't own {table} and isn't a superuser, so adding a column the stream gains needs ALTER on it, granted to it or through a role, which the preflight can't see.",
+		Fix:     "Run ALTER TABLE {table} OWNER TO {principal}; or GRANT ALTER ON {table} TO {principal};",
 	}
 	tooWide = check.Reason{
 		Name: "too_many_columns", Code: protocolv1.ErrorCode_ERROR_CODE_SCHEMA_DRIFT,
@@ -268,8 +271,9 @@ func handshake(ctx context.Context, cc *pgx.ConnConfig, addr string) (*tls.Conne
 func (d *Destination) schemaCheck(k *sqlcheck.Kit, schema string) check.Check {
 	user := d.pool.ConnConfig.User
 	c := k.Check("schema.create", check.Permission, "Create tables in {schema}", func(ctx context.Context, p *check.Probe, db *sql.DB) error {
-		var create bool
-		err := db.QueryRowContext(ctx, `SELECT has_schema_privilege(nspname, 'CREATE') FROM pg_namespace WHERE nspname = $1`, schema).Scan(&create)
+		// USAGE too: without it, the tables in the schema can't be reached.
+		var create, usage bool
+		err := db.QueryRowContext(ctx, `SELECT has_schema_privilege(nspname, 'CREATE'), has_schema_privilege(nspname, 'USAGE') FROM pg_namespace WHERE nspname = $1`, schema).Scan(&create, &usage)
 		switch {
 		case errors.Is(err, sql.ErrNoRows):
 			var database string
@@ -285,8 +289,15 @@ func (d *Destination) schemaCheck(k *sqlcheck.Kit, schema string) check.Check {
 			return nil
 		case err != nil:
 			return k.Failure(err)
-		case !create:
-			return check.PrivilegeMissing.Fail("principal", user, "privilege", "CREATE", "object", "schema "+schema)
+		case !create || !usage:
+			var lacks []string
+			if !create {
+				lacks = append(lacks, "CREATE")
+			}
+			if !usage {
+				lacks = append(lacks, "USAGE")
+			}
+			return check.PrivilegeMissing.Fail("principal", user, "privilege", strings.Join(lacks, ", "), "object", "schema "+schema)
 		}
 		return nil
 	})
@@ -310,10 +321,11 @@ func (n checkNames) name(parts ...string) string {
 
 // Preflight looks at the pipeline's schema, and at each stream's table: one
 // that exists takes what the stream's write mode, and a hold's release, do
-// to it; if the user doesn't own it, it has the stream's columns; it has
-// room for them; and the types it has are ones the stream's take, or
-// widens to when the pipeline allows it. A type it would refuse to change
-// only warns, as the stream holds the column.
+// to it; it has room for the stream's columns; and the types it has are
+// ones the stream's take, or widens to when the pipeline allows it. A type
+// it would refuse to change only warns, as the stream holds the column, and
+// so does a table the user doesn't own, as adding a column may then need
+// ALTER, which it can't see.
 func (d *Destination) Preflight(req destination.PreflightRequest) []check.Check {
 	cc := d.pool.ConnConfig
 	k := newKit(cc)
@@ -351,6 +363,9 @@ func (d *Destination) Preflight(req destination.PreflightRequest) []check.Check 
 			err := db.QueryRowContext(ctx, `SELECT pg_get_userbyid(c.relowner) = current_user OR (SELECT usesuper FROM pg_user WHERE usename = current_user)
 				FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = $1 AND c.relname = $2 AND c.relkind = 'r'`, schema, table).Scan(&owner)
 			switch {
+			case errors.Is(err, sql.ErrNoRows) && len(want) > maxColumns:
+				p.Param("columns", len(want))
+				return tooWide.Fail()
 			case errors.Is(err, sql.ErrNoRows):
 				p.Found("{table} doesn't exist, and the first write creates it.")
 				return nil
@@ -397,8 +412,8 @@ func (d *Destination) Preflight(req destination.PreflightRequest) []check.Check 
 			case !owner && len(gains) > 0:
 				p.Param("columns", strings.Join(gains, ", "))
 				f := notOwned.Fail()
-				f.Message = "{principal} doesn't own {table}, so the columns it lacks, {columns}, can't be added to it."
-				return f
+				f.Message = "{principal} doesn't own {table} and isn't a superuser, so adding the columns it lacks, {columns}, needs ALTER on it, granted to it or through a role, which the preflight can't see."
+				return check.Warn(f)
 			case len(changes) > 0:
 				p.Param("changes", strings.Join(changes, ", "))
 				return check.Warn(refusedType.Fail())

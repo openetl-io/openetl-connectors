@@ -90,14 +90,21 @@ fi
 
 failed=()
 # check NAME PACKAGE FLAGS... runs the kit on PACKAGE's target with FLAGS.
+# With ROLE_OPTIONAL set, a released target that has no such role, as one
+# from before the role was added, is skipped rather than failed; one packaged
+# here always fails.
 check() {
   local name=$1 at
   at=$(target "$2")
   shift 2
   [ -n "$at" ] || return 0
   echo "::group::$name"
-  if ! "$openetl" connector test -q "$@" "$at"; then
-    failed+=("$name")
+  if ! "$openetl" connector test -q "$@" "$at" 2>&1 | tee "$work/check.log"; then
+    if [[ -n ${ROLE_OPTIONAL:-} && $at != "$dist"/* ]] && grep -q "has no [a-z]* role" "$work/check.log"; then
+      echo "::notice::$name: $at has no such role, so it isn't checked"
+    else
+      failed+=("$name")
+    fi
   fi
   echo "::endgroup::"
 }
@@ -796,10 +803,6 @@ SH
   closed="\"endpoint\": \"$closed\"${creds:+, $creds}"
   creds="\"endpoint\": \"$endpoint\"${creds:+, $creds}"
   "$work/put" "$store" || exit 1
-  for i in 1 2 3; do
-    "$work/put" "$store" "$run/people/$i.csv.gz" "$work/people-$i.csv.gz" &&
-      "$work/put" "$store" "$run/logs/$i.jsonl" "$work/logs-$i.jsonl" || exit 1
-  done
   streams='"streams": [{"name": "people", "glob": "people/*.csv.gz", "format": "csv", "columns": {"born": "date"}}, {"name": "logs", "glob": "logs/**", "format": "jsonl"}]'
   config "$store-source" "{\"url\": \"$url/\", $creds, $streams}"
   config "$store-source-closed" "{\"url\": \"$url/\", $closed, $streams}"
@@ -816,11 +819,19 @@ SH
     dest_bad=(--bad-credentials "$work/azure-dest-bad.json")
   fi
   export STORE=$store
-  check "source-$pkg" "$pkg" --role source \
-    --config "$work/$store-source.json" \
-    --unreachable "$work/$store-source-closed.json" ${source_bad[@]+"${source_bad[@]}"} \
-    --stream people:incremental --stream logs:incremental --add-records-command "$work/files-add" \
-    --stops-at-until
+  # The source is checked where the tested artifact has one: a package built
+  # here has one if this checkout does, and a release says when it hasn't.
+  if [[ $(target "$pkg") != "$dist"/* || -d cmd/source-$pkg ]]; then
+    for i in 1 2 3; do
+      "$work/put" "$store" "$run/people/$i.csv.gz" "$work/people-$i.csv.gz" &&
+        "$work/put" "$store" "$run/logs/$i.jsonl" "$work/logs-$i.jsonl" || exit 1
+    done
+    ROLE_OPTIONAL=1 check "source-$pkg" "$pkg" --role source \
+      --config "$work/$store-source.json" \
+      --unreachable "$work/$store-source-closed.json" ${source_bad[@]+"${source_bad[@]}"} \
+      --stream people:incremental --stream logs:incremental --add-records-command "$work/files-add" \
+      --stops-at-until
+  fi
   check "destination-$pkg" "$pkg" --role destination \
     --config "$work/$store-dest.json" \
     --unreachable "$work/$store-dest-closed.json" ${dest_bad[@]+"${dest_bad[@]}"}
@@ -839,6 +850,10 @@ checks_iceberg() {
     --config "$work/iceberg.json" \
     --unreachable "$work/iceberg-closed.json"
 }
+
+# Redshift has no local server, so its package isn't checked here; its
+# conformance test runs against a cluster given OPENETL_TEST_REDSHIFT_*.
+checks_redshift() { echo "::notice::redshift: no checks ran, there's no Redshift to check against"; }
 
 for name in "${names[@]}"; do
   if declare -F "checks_$name" >/dev/null; then

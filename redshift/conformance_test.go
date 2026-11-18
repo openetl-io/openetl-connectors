@@ -9,6 +9,7 @@ import (
 	"errors"
 	"net/url"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/jackc/pgx/v5"
@@ -38,11 +39,17 @@ func TestDestinationConformance(t *testing.T) {
 		}
 		return b
 	}
-	u, err := url.Parse(dsn)
-	if err != nil {
-		t.Fatal(err)
+	// A keyword/value dsn's last password is the one pgx takes; a URL's is
+	// in its user info, as pgx tells the two apart.
+	bad := dsn + " password=not-the-password"
+	if strings.HasPrefix(dsn, "postgres://") || strings.HasPrefix(dsn, "postgresql://") {
+		u, err := url.Parse(dsn)
+		if err != nil {
+			t.Fatal(err)
+		}
+		u.User = url.UserPassword(u.User.Username(), "not-the-password")
+		bad = u.String()
 	}
-	u.User = url.UserPassword(u.User.Username(), "not-the-password")
 	pc, err := pgxpool.ParseConfig(dsn)
 	if err != nil {
 		t.Fatal(err)
@@ -57,7 +64,7 @@ func TestDestinationConformance(t *testing.T) {
 	conformance.DestinationSuite{
 		Launch:         conformance.Exec(conformance.Build(t, "../cmd/destination-redshift")),
 		Config:         cfg(dsn),
-		BadCredentials: cfg(u.String()),
+		BadCredentials: cfg(bad),
 		Unreachable:    cfg("postgres://openetl:openetl@127.0.0.1:1/dev?connect_timeout=2"),
 		LossyTypes: map[string]string{
 			"timestamp_ns": "Redshift's TIMESTAMP keeps microseconds",

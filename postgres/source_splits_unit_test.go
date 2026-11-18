@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/jackc/pglogrepl"
+	"github.com/openetl-io/openetl-connectors/keysplit"
 )
 
 func TestCutRanges(t *testing.T) {
@@ -54,8 +55,8 @@ func TestCutRanges(t *testing.T) {
 			t.Errorf("%s: cuts %q, want %q", c.name, got, c.want)
 		}
 	}
-	if got := cutRanges(bounds, 1e12, 100); len(got) != maxKeyRanges {
-		t.Errorf("%d ranges at most, want %d", len(got), maxKeyRanges)
+	if got := cutRanges(bounds, 1e12, 100); len(got) != keysplit.MaxRanges {
+		t.Errorf("%d ranges at most, want %d", len(got), keysplit.MaxRanges)
 	}
 }
 
@@ -194,5 +195,35 @@ func TestSnapshotFullIDs(t *testing.T) {
 	}
 	if got := (pgSnapshot{xmax: 5<<32 - 2}).full(3); got != 5<<32+3 {
 		t.Errorf("an ID ahead of xmax in the next epoch: %d", got)
+	}
+}
+
+// A state with a range or a position holds only in the order it was made
+// in, a split not yet started included.
+func TestSameOrder(t *testing.T) {
+	lo := "50"
+	cols := []sourceColumn{{name: "a"}, {name: "b"}}
+	byB := table{name: "t", cols: cols, order: []int{1}}
+	byKey := table{name: "t", cols: cols, key: []int{0}, order: []int{0}}
+	for _, c := range []struct {
+		t    table
+		st   sourceState
+		lost bool
+	}{
+		{byB, sourceState{}, false},
+		{byB, sourceState{Key: []string{"a"}}, false},
+		{byB, sourceState{keyRange: keyRange{Lo: &lo}, Key: []string{"b"}}, false},
+		{byB, sourceState{After: []string{"1"}, Key: []string{"b"}}, false},
+		{byB, sourceState{keyRange: keyRange{Lo: &lo}}, true},
+		{byB, sourceState{keyRange: keyRange{Hi: &lo}, Key: []string{"a"}}, true},
+		{byB, sourceState{After: []string{"1"}, Key: []string{"a"}}, true},
+		{byKey, sourceState{keyRange: keyRange{Lo: &lo}}, false},
+		{byKey, sourceState{keyRange: keyRange{Lo: &lo}, Key: []string{"b"}}, true},
+		{table{name: "t", cols: cols}, sourceState{keyRange: keyRange{Lo: &lo}, Key: []string{"b"}}, true},
+	} {
+		if err := sameOrder(c.t, c.st); (err != nil) != c.lost {
+			b, _ := json.Marshal(c.st)
+			t.Errorf("order %v, state %s: %v", c.t.orderKey(), b, err)
+		}
 	}
 }

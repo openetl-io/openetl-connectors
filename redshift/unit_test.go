@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"regexp"
+	"slices"
 	"strings"
 	"testing"
 
@@ -306,5 +307,93 @@ func TestStage(t *testing.T) {
 	}
 	for _, p := range w.Staging[1]["s"].parts {
 		p.discard()
+	}
+}
+
+// Batches whose Arrow types differ but stage as the same columns share a
+// file, each converted from its own types.
+func TestStageMixedSources(t *testing.T) {
+	first, _, err := array.RecordFromJSON(memory.DefaultAllocator, arrow.NewSchema([]arrow.Field{
+		{Name: "i", Type: arrow.PrimitiveTypes.Int8, Nullable: true},
+		{Name: "s", Type: arrow.Null, Nullable: true},
+		{Name: "ts", Type: &arrow.TimestampType{Unit: arrow.Millisecond}, Nullable: true},
+	}, nil), strings.NewReader(`[{"i": -8, "s": null, "ts": 1767323045500}]`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Release()
+	second, _, err := array.RecordFromJSON(memory.DefaultAllocator, arrow.NewSchema([]arrow.Field{
+		{Name: "i", Type: arrow.PrimitiveTypes.Int16, Nullable: true},
+		{Name: "s", Type: arrow.BinaryTypes.String, Nullable: true},
+		{Name: "ts", Type: &arrow.TimestampType{Unit: arrow.Nanosecond}, Nullable: true},
+	}, nil), strings.NewReader(`[{"i": 300, "s": "x", "ts": 1767323045123456789}]`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Release()
+
+	w := &writer{dir: t.TempDir(), Epochs: sqlstage.NewEpochs[*stagingTable]()}
+	e := destination.Epoch{N: 1}
+	var st *stagingTable
+	for _, b := range []arrow.RecordBatch{first, second} {
+		if st, err = w.stage(w.Staging, "stg", e, "s", "t", nil, b); err != nil {
+			t.Fatal(err)
+		}
+	}
+	defer func() {
+		for _, p := range st.parts {
+			p.discard()
+		}
+	}()
+	if len(st.parts) != 1 {
+		t.Fatalf("%d files", len(st.parts))
+	}
+	p := st.parts[0]
+	if err := p.close(); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.Open(p.file.Name())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = f.Close() }()
+	tbl, err := pqarrow.ReadTable(t.Context(), f, nil, pqarrow.ArrowReadProperties{}, memory.DefaultAllocator)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tbl.Release()
+	for i, want := range [][]string{{"-8", "300"}, {"(null)", "x"}, {"2026-01-02T03:04:05.5", "2026-01-02T03:04:05.123456"}} {
+		var got []string
+		for _, ch := range tbl.Column(i).Data().Chunks() {
+			for r := range ch.Len() {
+				got = append(got, ch.ValueStr(r))
+			}
+		}
+		if len(got) != 2 || !strings.HasPrefix(got[0], want[0]) || !strings.HasPrefix(got[1], want[1]) {
+			t.Errorf("%s: %q, want %q", p.cols[i].name, got, want)
+		}
+	}
+}
+
+// A merge's unchanged column comes only from a version that isn't older
+// than the target's row, which mergePicks joins; without a seq, from any.
+func TestMergePicks(t *testing.T) {
+	w := &writer{schema: "s"}
+	cols := []column{{name: "id", typ: "bigint"}, {name: "name", typ: varcharMax}, {name: seqColumn, typ: "decimal(38,0)"}, {name: unchangedColumn, typ: varcharMax}}
+	s := stagedStream{Name: "users", Table: "users", Key: []string{"id"}, Mode: modeMerge}
+	picks := func(cols []column) string {
+		for _, q := range w.merge(s, prepared{cols: cols, rows: `"s"."stg"`, unchanged: []string{"name"}, everUnchanged: []string{"name"}}) {
+			if strings.Contains(q, `TEMP TABLE "`+mergePicks+`"`) {
+				return q
+			}
+		}
+		return ""
+	}
+	q := picks(cols)
+	if !strings.Contains(q, `LEFT JOIN "s"."users" cur ON cur."id" = x."id"`) || !strings.Contains(q, `NOT coalesce(cur."_openetl_seq" > x."_openetl_seq", false) THEN`) {
+		t.Errorf("with a seq: %s", q)
+	}
+	if q := picks(slices.Delete(slices.Clone(cols), 2, 3)); q == "" || strings.Contains(q, "cur") {
+		t.Errorf("without a seq: %s", q)
 	}
 }

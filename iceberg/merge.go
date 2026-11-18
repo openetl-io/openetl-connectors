@@ -169,7 +169,11 @@ func (m *merge) patch(ctx context.Context, tbl *table.Table, fs iceio.IO, s stag
 		skip[keyOf(dels, keyIdx, r)] = true
 	}
 	filter := func(rs []int) ice.BooleanExpression { return keyFilter(m.sc, ps, m.key, rs) }
-	target, err := patchTarget(ctx, tbl, m.sc, p, filter, have, skip)
+	// The key, which the deletes take, is the same before a patch.
+	target, before, err := patchTarget(ctx, tbl, m.sc, p, filter, have, skip)
+	if before != nil {
+		before.Release()
+	}
 	if err != nil || target == nil || target.NumRows() == 0 {
 		if target != nil {
 			target.Release()

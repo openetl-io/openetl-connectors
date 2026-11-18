@@ -106,6 +106,7 @@ jobs:
             clickhouse: clickhouse
             mongodb: mongodb
             dynamodb: dynamodb
+            redshift:
             kafka: kafka registry kafka-sasl
             kinesis: kinesis kafka registry
             iceberg: s3 iceberg glue

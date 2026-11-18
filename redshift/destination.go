@@ -403,7 +403,8 @@ type prepared struct {
 }
 
 // apply applies each stream that has no marker yet, then drops its staging.
-// It adds the rows each deduped stream skipped to collapsed.
+// It adds the rows each deduped append or overwrite stream skipped to
+// collapsed.
 func (w *writer) apply(ctx context.Context, desc staged, streams []stagedStream, collapsed map[string]uint64) error {
 	todo, err := w.unapplied(ctx, desc, streams)
 	if err != nil {
@@ -528,7 +529,9 @@ func (w *writer) applyTx(ctx context.Context, desc staged, streams []stagedStrea
 			if err != nil {
 				return classify(fmt.Errorf("redshift: apply %s: %w", s.Name, err))
 			}
-			if s.Deduped() && s.Rows > n {
+			// Dedupe skips append and overwrite rows; a merge's apply counts
+			// none of the rows it applies.
+			if s.Deduped() && s.Mode != modeMerge && s.Rows > n {
 				skipped[s.Name] = s.Rows - n
 			}
 			if _, err := tx.Exec(ctx, "INSERT INTO "+w.ident(loadsTable)+" (pipeline, stream, generation, epoch, loaded_at) VALUES ($1, $2, $3, $4, GETDATE())",
@@ -750,7 +753,8 @@ func pick(i int) string { return "_openetl_pick_" + strconv.Itoa(i) }
 // other columns as they were, with its metadata columns updated, or with
 // hard deletes removes the row. A column in unchanged that the latest
 // version didn't send takes its value from the key's latest staged version
-// that did, or else keeps the target's.
+// that did, unless the target's row is newer than that version, or else
+// keeps the target's.
 //
 // Each row's values are worked out against the target's row, joined as cur,
 // into a temporary table that the update, insert and delete then take them
@@ -841,20 +845,28 @@ func (w *writer) merge(s stagedStream, p prepared) []string {
 
 // latest is merge's relation of each key's latest staged version, from its
 // versions, ranked by latestFirst. With unchanged columns, each comes from
-// the key's latest version that sent it, if any, which mergePicks finds;
-// its _openetl_unchanged then leaves it out. It adds the statements that
+// the key's latest version that sent it and isn't older than the target's
+// row, if any, which mergePicks finds; its _openetl_unchanged then leaves it
+// out. It adds the statements that
 // make mergePicks to stmts.
 func (w *writer) latest(s stagedStream, p prepared, stmts *[]string) string {
 	cols := names(p.cols)
 	q := quoteIdent
 	from := q(mergeVersions) + " l"
 	if len(p.unchanged) > 0 {
+		// A version older than the target's row doesn't give a column: the
+		// target's value is newer. A missing seq doesn't stop it, as in merge.
+		versions, newer := q(mergeVersions)+" x", ""
+		if slices.Contains(cols, seqColumn) {
+			versions += " LEFT JOIN " + w.ident(s.Table) + " cur ON " + keyEq("cur", "x", s.Key, p.cols)
+			newer = " AND NOT coalesce(cur." + q(seqColumn) + " > x." + q(seqColumn) + ", false)"
+		}
 		picks := make([]string, len(p.unchanged))
 		for i, c := range p.unchanged {
-			picks[i] = "MIN(CASE WHEN NOT " + w.listHas("x."+q(unchangedColumn), c) + " THEN x." + rnColumn + " END) AS " + pick(i)
+			picks[i] = "MIN(CASE WHEN NOT " + w.listHas("x."+q(unchangedColumn), c) + newer + " THEN x." + rnColumn + " END) AS " + pick(i)
 		}
 		*stmts = append(*stmts, "CREATE TEMP TABLE "+q(mergePicks)+" AS SELECT "+selectList("x", s.Key)+", "+strings.Join(picks, ", ")+
-			" FROM "+q(mergeVersions)+" x GROUP BY "+keyParts("x", s.Key, p.cols))
+			" FROM "+versions+" GROUP BY "+keyParts("x", s.Key, p.cols))
 		from += " JOIN " + q(mergePicks) + " k ON " + keyEq("k", "l", s.Key, p.cols)
 		for i := range p.unchanged {
 			e := "e" + strconv.Itoa(i)
@@ -1181,7 +1193,8 @@ func (w *writer) ensureRead(ctx context.Context, s stagedStream, cols []column) 
 		}
 		return nil
 	}
-	for _, c := range have.cols {
+	// A copy: retype moves the column it changes to the end of have.cols.
+	for _, c := range slices.Clone(have.cols) {
 		if t := targetType(c.column); t.typ != c.typ {
 			if err := w.retype(ctx, s.Read, have, c, t.typ); err != nil {
 				return fmt.Errorf("redshift: column %q of the read table for %s, as its target has it: %w", c.name, s.Name, err)
@@ -1519,34 +1532,8 @@ func (w *writer) Recover(ctx context.Context, gen uint64, e destination.Epoch, c
 			return 0, fmt.Errorf("redshift: prepare %s: %w", w.schema, err)
 		}
 	}
-	// Waits for applies that hold the fence.
-	var raised *int64
-	err := w.inTx(ctx, func(tx pgx.Tx) error {
-		if _, err := tx.Exec(ctx, "LOCK "+w.ident(fenceTable)); err != nil {
-			return err
-		}
-		tag, err := tx.Exec(ctx, "UPDATE "+w.ident(fenceTable)+" SET generation = $2 WHERE pipeline = $1 AND generation <= $2", w.cfg.Pipeline, gen)
-		if err != nil {
-			return err
-		}
-		if tag.RowsAffected() == 0 {
-			var n int64
-			if err := tx.QueryRow(ctx, "SELECT COUNT(*) FROM "+w.ident(fenceTable)+" WHERE pipeline = $1", w.cfg.Pipeline).Scan(&n); err != nil {
-				return err
-			}
-			if n == 0 {
-				if _, err := tx.Exec(ctx, "INSERT INTO "+w.ident(fenceTable)+" (pipeline, generation) VALUES ($1, $2)", w.cfg.Pipeline, gen); err != nil {
-					return err
-				}
-			}
-		}
-		return tx.QueryRow(ctx, "SELECT MAX(generation) FROM "+w.ident(fenceTable)+" WHERE pipeline = $1", w.cfg.Pipeline).Scan(&raised)
-	})
-	if err != nil {
-		return 0, fmt.Errorf("redshift: raise fence: %w", err)
-	}
-	if raised == nil || *raised < 0 || uint64(*raised) != gen {
-		return 0, fmt.Errorf("%w: recovering as generation %d, and the fence is %v", destination.ErrFenced, gen, raised)
+	if err := w.raise(ctx, gen); err != nil {
+		return 0, err
 	}
 	if e.IsZero() {
 		w.dropRemovedReads(ctx)
@@ -1582,7 +1569,12 @@ func (w *writer) Recover(ctx context.Context, gen uint64, e destination.Epoch, c
 		}
 		r = destination.Redone
 	case len(missing) == len(desc.Streams):
-		// Nothing of it is visible, and some lane's staging is gone.
+		// Nothing of it is visible, and some lane's staging is gone, unless
+		// a newer generation has raised the fence since, applied the epoch
+		// and dropped its staging.
+		if err := w.raise(ctx, gen); err != nil {
+			return 0, err
+		}
 		r = destination.Lost
 	default:
 		return 0, fmt.Errorf("redshift: epoch %d-g%d is partly applied and the staging for the rest is gone", desc.Epoch, desc.Generation)
@@ -1593,6 +1585,41 @@ func (w *writer) Recover(ctx context.Context, gen uint64, e destination.Epoch, c
 	w.dropStale(ctx, gen)
 	w.dropRemovedReads(ctx)
 	return r, nil
+}
+
+// raise raises the pipeline's fence to gen, once applies that hold it are
+// done, and fails with ErrFenced if a newer generation has raised it. Run
+// again with the same gen, it changes nothing.
+func (w *writer) raise(ctx context.Context, gen uint64) error {
+	var raised *int64
+	err := w.inTx(ctx, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, "LOCK "+w.ident(fenceTable)); err != nil {
+			return err
+		}
+		tag, err := tx.Exec(ctx, "UPDATE "+w.ident(fenceTable)+" SET generation = $2 WHERE pipeline = $1 AND generation <= $2", w.cfg.Pipeline, gen)
+		if err != nil {
+			return err
+		}
+		if tag.RowsAffected() == 0 {
+			var n int64
+			if err := tx.QueryRow(ctx, "SELECT COUNT(*) FROM "+w.ident(fenceTable)+" WHERE pipeline = $1", w.cfg.Pipeline).Scan(&n); err != nil {
+				return err
+			}
+			if n == 0 {
+				if _, err := tx.Exec(ctx, "INSERT INTO "+w.ident(fenceTable)+" (pipeline, generation) VALUES ($1, $2)", w.cfg.Pipeline, gen); err != nil {
+					return err
+				}
+			}
+		}
+		return tx.QueryRow(ctx, "SELECT MAX(generation) FROM "+w.ident(fenceTable)+" WHERE pipeline = $1", w.cfg.Pipeline).Scan(&raised)
+	})
+	if err != nil {
+		return fmt.Errorf("redshift: raise fence: %w", err)
+	}
+	if raised == nil || *raised < 0 || uint64(*raised) != gen {
+		return fmt.Errorf("%w: recovering as generation %d, and the fence is %v", destination.ErrFenced, gen, raised)
+	}
+	return nil
 }
 
 // trimMarkers deletes the pipeline's markers below an applied epoch. Recovery
