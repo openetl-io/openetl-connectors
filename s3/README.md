@@ -163,7 +163,7 @@ CSV and JSON Lines files are compressed whole with `compression`: `gzip` (adding
 
 A file closes at `fileSize` bytes, 256 MiB by default, and the next one starts.
 
-The destination keeps what it needs besides the tables under `URL/_openetl/`: files being staged, a marker per stream and epoch, and a record of each table's columns. Leave it in place, and point readers at the table directories.
+The destination keeps what it needs besides the tables under `URL/_openetl/`: files being staged, a marker per stream and epoch, and a record of each table's columns. Leave it in place, and point readers at the table directories, or at an overwritten table's manifest, as [Write modes](#write-modes) says.
 
 ```yaml
 apiVersion: openetl.io/v1alpha1
@@ -184,12 +184,22 @@ The [config schema](./destination.schema.json) has every setting.
 ### Write modes
 
 - **Append** adds each epoch's files to the table. Deletes from a CDC source arrive as rows whose `_openetl_op` is `delete`, and a reader that wants the latest version of each row picks it by `_openetl_seq`.
-- **Overwrite**, from 0.2.0, replaces the table's contents with each full read. A read's files go to `TABLE/_reads/START/`, named for when the read started. When the read ends, the destination writes `TABLE/_symlink_format_manifest/manifest`, which lists the read's files, one URL per line, and then deletes the files of older reads. The manifest is written with the store's conditional write, so an attempt that a newer one replaced can't put an older read back. A read that ends with no rows writes an empty manifest.
+- **Overwrite**, from 0.2.0, replaces the table's contents with each full read. A read's files go to `TABLE/_reads/START/`, named for when the read started. When the read ends, the destination writes `TABLE/_symlink_format_manifest/manifest`, which lists the read's files, one URL per line, and then deletes the files of older reads under `_reads/`. The manifest is written with the store's conditional write, so an attempt that a newer one replaced can't put an older read back. A read that ends with no rows writes an empty manifest.
+
+OpenETL picks each stream's mode. From 0.2.0, without the pipeline's `destination.write`, a stream read with `full_refresh` is overwritten, and a stream read with `incremental`, `cdc` or `stream` is appended to. `destination.write: append` appends to every stream, so each full read adds all its rows again. `destination.write: overwrite` overwrites every stream, and the plan refuses it if a stream is read with `incremental`, `cdc` or `stream`. [Pipeline settings](https://github.com/openetl-io/openetl/blob/main/docs/pipelines/settings.md#destination) has the field. In a pipeline on more than one worker, each attempt reads an overwritten stream on one of them, and the plan warns so.
 
 > [!IMPORTANT]
 > An overwrite is atomic only for readers that read the files the manifest lists, as a table defined with Hive's `SymlinkTextInputFormat` does. A reader that lists the table's directory instead sees the files of every read not yet deleted, under `_reads/`. Readers that skip names starting with `_`, as Hadoop's do, see none of them. Between the manifest's write and the deletion of the older read's files, the older files are still there but listed by no manifest.
 >
 > The older read's files are deleted just after the manifest is replaced, so a reader that read the manifest before then can find its files gone and fail. Run such readers between overwrites, or have them try again.
+
+### Upgrading from 0.1.0-alpha
+
+The 0.1.0-alpha package appends to every stream, as it has no overwrite. From 0.2.0, a stream read with `full_refresh` is overwritten unless the pipeline sets `destination.write`, so a pipeline that appended its full reads overwrites them once the package is upgraded, with no change to its spec. To keep appending, set `destination.write: append` in the pipeline before its first sync with 0.2.0.
+
+An overwrite deletes only older reads under `_reads/`, so the files appended before the upgrade stay at the top of the table's directory, listed by no manifest. A reader that reads the manifest sees only the latest read. A reader that lists the directory sees the appended files and the latest read's, both. A reader that skips names starting with `_` sees only the appended files, and never a read. Point readers at the manifest, then delete the table's files outside `_reads/` and `_symlink_format_manifest/` once the first overwrite has committed: the destination doesn't use them again.
+
+The same holds the other way: a table overwritten and then appended to keeps its manifest and its last read, and the manifest doesn't list the appended files. Point its readers at the directory, and delete `_reads/` and `_symlink_format_manifest/`.
 
 ### Exactly once
 
