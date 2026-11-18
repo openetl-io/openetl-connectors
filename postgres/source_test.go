@@ -17,6 +17,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/jackc/pgx/v5"
 
+	protocolv1 "github.com/openetl-io/openetl/sdk/go/protocol/v1"
 	"github.com/openetl-io/openetl/sdk/go/source"
 )
 
@@ -175,6 +176,8 @@ func TestSourceDiscovers(t *testing.T) {
 	e.exec("CREATE TABLE $schema.parted (id int PRIMARY KEY) PARTITION BY RANGE (id)")
 	e.exec("CREATE TABLE $schema.parted_1 PARTITION OF $schema.parted FOR VALUES FROM (0) TO (100)")
 	e.exec("CREATE VIEW $schema.view AS SELECT 1 AS x")
+	e.exec("CREATE MATERIALIZED VIEW $schema.matview AS SELECT 1 AS x, 'a' AS y")
+	e.exec("CREATE UNIQUE INDEX ON $schema.matview (x)")
 
 	cat, err := e.source("").Discover(t.Context())
 	if err != nil {
@@ -184,8 +187,22 @@ func TestSourceDiscovers(t *testing.T) {
 	for _, s := range cat.Streams {
 		got[s.Name] = s
 	}
-	if len(got) != 3 {
-		t.Errorf("streams %v, want keyed, loose and parted", cat.Streams)
+	if len(got) != 5 {
+		t.Errorf("streams %v, want keyed, loose, parted, view and matview", cat.Streams)
+	}
+	// Nothing in the catalog says a column orders new and changed rows, as an
+	// incremental read needs: a pipeline names its cursor.
+	for _, s := range got {
+		if s.CursorField != "" {
+			t.Errorf("%s has a default cursor %q", s.Name, s.CursorField)
+		}
+	}
+	// Views are read in full or incrementally, never with cdc.
+	for _, name := range []string{"view", "matview"} {
+		s := got[name]
+		if len(s.PrimaryKey) != 0 || s.SplitsByKey || !slices.Equal(s.SyncModes, []source.SyncMode{source.FullRefresh, source.Incremental}) {
+			t.Errorf("%s: %+v", name, s)
+		}
 	}
 	if s := got["keyed"]; !slices.Equal(s.PrimaryKey, []string{"a", "b"}) || s.Replay != source.Exact {
 		t.Errorf("keyed: %+v", s)
@@ -252,7 +269,7 @@ func TestSourceReadsTypes(t *testing.T) {
 		"name": "utf8", "code": "utf8", "label": "utf8", "raw": "binary", "day": "date32", "at_time": "time64[us]",
 		"ts": "timestamp[us]", "tstz": "timestamp[us, tz=UTC]", "uid": "extension<arrow.uuid>",
 		"doc": `extension<arrow.json[storage_type=utf8]>`, "docb": `extension<arrow.json[storage_type=utf8]>`,
-		"amount": "utf8", "any_num": "utf8", "span": "utf8", "tags": "utf8",
+		"amount": "utf8", "any_num": "utf8", "span": "month_day_nano_interval", "tags": "list<item: utf8, nullable>",
 	}
 	for name, typ := range want {
 		if types[name] != typ {
@@ -276,7 +293,7 @@ func TestSourceReadsTypes(t *testing.T) {
 		"code": "ab", "label": "xy", "day": "2026-10-31", "at_time": "12:34:56.789000",
 		"ts": "2026-10-31T12:00:00.123456", "tstz": "2026-10-31T06:30:00Z",
 		"uid": "0b0e1f2a-3c4d-4e5f-8a9b-0c1d2e3f4a5b", "doc": `{"a": [1, 2]}`, "docb": `{"b": true}`,
-		"amount": "-12345.67", "any_num": "1.000000000000000000000000000000000000001", "span": "P1DT2H", "tags": "{x,y}",
+		"amount": "-12345.67", "any_num": "1.000000000000000000000000000000000000001", "span": `{"months":0,"days":1,"nanoseconds":7200000000000}`, "tags": `["x","y"]`,
 	} {
 		if row[name] != v {
 			t.Errorf("%s = %q, want %q", name, row[name], v)
@@ -402,5 +419,101 @@ func TestSourceSplitsBatchesByBytes(t *testing.T) {
 	}
 	if got := len(c.column("t", "id")); got != 50 {
 		t.Errorf("%d rows", got)
+	}
+}
+
+// Intervals arrive as intervals, and one-dimensional arrays of booleans,
+// integers, floats and strings as lists, in full, incrementally and with
+// cdc; arrays declared with more dimensions, and of other types, as text.
+func TestSourceReadsArraysAndIntervals(t *testing.T) {
+	e := newSourceEnv(t)
+	e.exec(`CREATE TABLE $schema.a (id int PRIMARY KEY, iv interval, b bool[], i2 int2[], i4 int[], i8 bigint[],
+		f4 real[], f8 float8[], tx text[], vc varchar(5)[], ch char(3)[], grid int[][], nums numeric[], days date[])`)
+	e.exec(`INSERT INTO $schema.a VALUES
+		(1, '1 year 2 mons -3 days 04:05:06.789', '{t,f,NULL}', '{-32768,32767}', '{1,NULL,3}', '{9223372036854775807}',
+		 '{1.5,NaN}', '{-Infinity,1e300,0.1}', '{"a,b","q\"u","NULL",NULL,"","back\\slash"," sp "}', '{xy}', '{ab}',
+		 '{{1,2},{3,4}}', '{1.5}', '{2026-01-01}'),
+		(2, '-00:00:00.000001', '{}', '[0:1]={5,6}', NULL, '{}', NULL, NULL, '{}', NULL, NULL, NULL, NULL, NULL),
+		(3, '0', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL)`)
+	want := map[string][]string{
+		"iv": {`{"months":14,"days":-3,"nanoseconds":14706789000000}`, `{"months":0,"days":0,"nanoseconds":-1000}`, `{"months":0,"days":0,"nanoseconds":0}`},
+		"b":  {`[true,false,null]`, `[]`, array.NullValueStr},
+		"i2": {`[-32768,32767]`, `[5,6]`, array.NullValueStr},
+		"i4": {`[1,null,3]`, array.NullValueStr, array.NullValueStr},
+		"i8": {`[9223372036854775807]`, `[]`, array.NullValueStr},
+		"f4": {`[1.5,"NaN"]`, array.NullValueStr, array.NullValueStr},
+		"f8": {`["-Inf",1e+300,0.1]`, array.NullValueStr, array.NullValueStr},
+		"tx": {`["a,b","q\"u","NULL",null,"","back\\slash"," sp "]`, `[]`, array.NullValueStr},
+		"vc": {`["xy"]`, array.NullValueStr, array.NullValueStr},
+		"ch": {`["ab"]`, array.NullValueStr, array.NullValueStr},
+		// As Postgres spells them.
+		"grid": {"{{1,2},{3,4}}", array.NullValueStr, array.NullValueStr},
+		"nums": {"{1.5}", array.NullValueStr, array.NullValueStr},
+		"days": {"{2026-01-01}", array.NullValueStr, array.NullValueStr},
+	}
+	check := func(t *testing.T, what string, col func(name string) []string) {
+		t.Helper()
+		for name, w := range want {
+			if got := col(name); !slices.Equal(got, w) {
+				t.Errorf("%s: %s = %q, want %q", what, name, got, w)
+			}
+		}
+	}
+	s := e.source("")
+	cat, err := s.Discover(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	declared := map[string]string{}
+	for _, f := range cat.Streams[0].Schema.Fields() {
+		declared[f.Name] = f.Type.String()
+	}
+	for name, typ := range map[string]string{"iv": "month_day_nano_interval", "i4": "list<item: int32, nullable>", "f4": "list<item: float32, nullable>", "tx": "list<item: utf8, nullable>", "grid": "utf8", "nums": "utf8"} {
+		if declared[name] != typ {
+			t.Errorf("%s is declared %s, want %s", name, declared[name], typ)
+		}
+	}
+	c := read(t, s, map[string]string{"a": ""})
+	check(t, "full", func(name string) []string { return c.column("a", name) })
+	c, err = readIncremental(t, s, "a", "id", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	check(t, "incremental", func(name string) []string { return c.column("a", name) })
+
+	cs, pipeline := e.cdcSource("")
+	c = readCDC(t, cs, pipeline, map[string]string{"a": ""})
+	check(t, "cdc snapshot", func(name string) []string { return c.column("a", name) })
+	state := c.last("a")
+	e.exec("UPDATE $schema.a SET id = id + 10")
+	c = readCDC(t, cs, pipeline, map[string]string{"a": state})
+	check(t, "cdc", func(name string) []string {
+		var out []string
+		for i, v := range c.column("a", name) {
+			// After each key's delete.
+			if i%2 == 1 {
+				out = append(out, v)
+			}
+		}
+		return out
+	})
+}
+
+// A value with nowhere to go in its column's type fails the read, saying
+// what it is: an array of more dimensions than a list holds, and an interval
+// past the engine's.
+func TestSourceRefusesArraysAndIntervalsItCantHold(t *testing.T) {
+	for value, column := range map[string]string{
+		"'{{1,2},{3,4}}'::int[]":      "int[]",
+		"'100000000 hours'::interval": "interval",
+		"'infinity'::interval":        "interval",
+	} {
+		e := newSourceEnv(t)
+		e.exec("CREATE TABLE $schema.t (id int PRIMARY KEY, v " + column + ")")
+		e.exec("INSERT INTO $schema.t VALUES (1, " + value + ")")
+		err := e.source("").Read(t.Context(), source.ReadRequest{Streams: []source.ConfiguredStream{{Name: "t"}}}, &capture{})
+		if code := codeOf(err); code != protocolv1.ErrorCode_ERROR_CODE_DATA_INVALID || !strings.Contains(err.Error(), `"v"`) {
+			t.Errorf("%s: %v (%v)", value, err, code)
+		}
 	}
 }

@@ -453,7 +453,11 @@ func TestUnchangedKeepsHold(t *testing.T) {
 	if _, err := w.Commit(t.Context(), e, []destination.Staged{staged}); err != nil {
 		t.Fatal(err)
 	}
-	if d := docs(t, db.Collection("s"))[1]; d["v"] != "filled" || d[heldColumn] != nil {
+	// The patch removes the hold's entry; the held map it leaves may be empty.
+	if d := docs(t, db.Collection("s"))[1]; d["v"] != "filled" {
 		t.Errorf("after the held version's patch: %v", d)
+	}
+	if n, err := db.Collection("s").CountDocuments(t.Context(), bson.D{{Key: heldColumn + ".v", Value: bson.D{{Key: "$exists", Value: true}}}}); err != nil || n != 0 {
+		t.Errorf("after the held version's patch, %d documents still hold v (%v)", n, err)
 	}
 }

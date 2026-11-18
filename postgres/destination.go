@@ -11,10 +11,7 @@ package postgres
 
 import (
 	"bytes"
-	"cmp"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -22,7 +19,6 @@ import (
 	"slices"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/apache/arrow-go/v18/arrow"
@@ -30,6 +26,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/openetl-io/openetl-connectors/sqlstage"
 	sdk "github.com/openetl-io/openetl/sdk/go"
 	"github.com/openetl-io/openetl/sdk/go/destination"
 	protocolv1 "github.com/openetl-io/openetl/sdk/go/protocol/v1"
@@ -40,6 +37,7 @@ type DestinationConfig struct {
 	DSN sdk.Secret `json:"dsn"`
 	// Used when the pipeline names no namespace. Default "public".
 	Schema string `json:"schema"`
+	TLS
 }
 
 type Destination struct {
@@ -67,6 +65,9 @@ func NewDestination(config []byte) (*Destination, error) {
 	pc, err := pgxpool.ParseConfig(cfg.DSN.Reveal())
 	if err != nil {
 		return nil, fmt.Errorf("postgres: dsn: %w", err)
+	}
+	if err := cfg.TLS.apply(&pc.ConnConfig.Config); err != nil {
+		return nil, err
 	}
 	pc.MaxConns = 4
 	// COPY encodes values for the column types a statement description
@@ -101,11 +102,8 @@ func (d *Destination) Open(ctx context.Context, cfg destination.OpenConfig) (des
 		pool:    pool,
 		cfg:     cfg,
 		schema:  cfg.Namespace,
-		staging: map[uint64]map[string]*stagingTable{},
-		patches: map[uint64]map[string]*stagingTable{},
-		ended:   map[uint64][]string{},
+		Epochs:  sqlstage.NewEpochs[*stagingTable](),
 		streams: map[string]destination.Stream{},
-		tables:  map[string]string{},
 		indexed: map[string]bool{},
 	}
 	if w.schema == "" {
@@ -114,6 +112,8 @@ func (d *Destination) Open(ctx context.Context, cfg destination.OpenConfig) (des
 	for _, s := range cfg.Streams {
 		w.streams[s.Name] = s
 	}
+	w.Dialect = sqlstage.Dialect[*stagingTable]{Name: "postgres", Open: cfg, Streams: w.streams,
+		StagingName: sqlstage.StagingName, ReadName: sqlstage.ReadName, TargetTable: sqlstage.TargetTable, SQL: w}
 	return w, nil
 }
 
@@ -122,98 +122,26 @@ type writer struct {
 	cfg     destination.OpenConfig
 	schema  string
 	streams map[string]destination.Stream
-	// Only Write, Patch, StartReads, EndRead and PreCommit use these.
-	staging map[uint64]map[string]*stagingTable
-	patches map[uint64]map[string]*stagingTable
-	starts  map[string]time.Time
-	ended   map[uint64][]string // streams whose read ends in each epoch
-	// Each stream's target, from its batches and schemas.
-	mu     sync.Mutex
-	tables map[string]string
+	sqlstage.Epochs[*stagingTable]
 	// Only Commit and Recover use it: tables with an _openetl_id index, or
 	// one on their key.
 	indexed map[string]bool
 }
 
 type stagingTable struct {
-	name   string
-	target string
-	cols   []column
-	rows   uint64
-	// Merge: the key's columns.
-	key []string
-	// Columns whose held cells keep the target's value.
-	last []string
-	// Patches: columns that fill another held column, by that column.
-	fills map[string]string
-	// Tables of the epoch before name, each narrower than the next: a batch
-	// wider than a table starts the next one, as no table's column is ever
-	// changed to a wider type.
-	earlier []string
+	sqlstage.Table
+	cols []column
 }
 
-// all are the staging's tables, in order.
-func (st *stagingTable) all() []string { return append(slices.Clone(st.earlier), st.name) }
-
-// staged is the descriptor PreCommit returns.
-type staged struct {
-	Generation uint64         `json:"generation"`
-	Epoch      uint64         `json:"epoch"`
-	Streams    []stagedStream `json:"streams"`
-}
-
-const (
-	modeOverwrite = "overwrite"
-	modeMerge     = "merge"
+type (
+	staged       = sqlstage.Staged
+	stagedStream = sqlstage.Stream
 )
 
-type stagedStream struct {
-	Name  string `json:"name"`
-	Table string `json:"table"`
-	// Empty when an overwrite read ended in the epoch without rows in it.
-	Staging string `json:"staging"`
-	// The lane's later staging tables of the epoch, each taking batches
-	// wider than the one before.
-	Wider []string `json:"wider,omitempty"`
-	// One row per _openetl_id in the epoch, and only IDs the target doesn't
-	// have yet.
-	Dedupe bool `json:"dedupe,omitempty"`
-	// One row per _openetl_id in the epoch.
-	DedupeEpoch bool `json:"dedupe_epoch,omitempty"`
-	// Staged rows, to count those the apply skips; 0 in descriptors from
-	// before it was counted.
-	Rows uint64 `json:"rows,omitempty"`
-	// Empty for append.
-	Mode string `json:"mode,omitempty"`
-	// Merge: the key's columns, and whether a delete removes the row.
-	Key         []string `json:"key,omitempty"`
-	HardDeletes bool     `json:"hard_deletes,omitempty"`
-	// Overwrite: the read's table, which takes the epoch's rows and, once
-	// the read has ended in it, replaces the target's.
-	Read  string `json:"read,omitempty"`
-	Ended bool   `json:"ended,omitempty"`
-	// Merge: columns whose held cells keep the target's value.
-	Last []string `json:"last,omitempty"`
-	// The epoch's patches' staging, and the columns in it that fill
-	// another held column.
-	Patch string            `json:"patch,omitempty"`
-	Fills map[string]string `json:"fills,omitempty"`
-	// As Wider, for Patch.
-	WiderPatches []string `json:"wider_patches,omitempty"`
-	// Staging and Patch, of every lane that has them, once mergeLanes has
-	// merged the lanes' descriptors.
-	stagings, patches []string
-}
-
-func (s stagedStream) deduped() bool { return s.Dedupe || s.DedupeEpoch }
-
-// into is where the epoch's rows go: the read's table for overwrite.
-func (s stagedStream) into() string {
-	if s.Mode == modeOverwrite {
-		return s.Read
-	}
-	return s.Table
-}
+const (
+	modeOverwrite = sqlstage.ModeOverwrite
+	modeMerge     = sqlstage.ModeMerge
+)
 
 func (w *writer) ident(name string) string { return pgx.Identifier{w.schema, name}.Sanitize() }
 
@@ -236,133 +164,9 @@ const (
 
 var metadataColumns = []string{idColumn, opColumn, seqColumn, syncedColumn, deletedColumn, unchangedColumn, heldColumn}
 
-func indexName(table string) string {
-	h := sha256.Sum256([]byte(table))
-	return "_openetl_id_" + hex.EncodeToString(h[:12])
-}
-
-func keyIndexName(table string) string {
-	h := sha256.Sum256([]byte(table))
-	return "_openetl_key_" + hex.EncodeToString(h[:12])
-}
-
-func stagingName(pipeline, stream string, e destination.Epoch, lane int) string {
-	name := pipeline + "\x00" + stream + "\x00" + strconv.FormatUint(e.Generation, 10) + "\x00" + strconv.FormatUint(e.N, 10)
-	if lane > 0 {
-		name += "\x00" + strconv.Itoa(lane)
-	}
-	h := sha256.Sum256([]byte(name))
-	return "_openetl_stage_" + hex.EncodeToString(h[:12])
-}
-
-func patchName(pipeline, stream string, e destination.Epoch, lane int) string {
-	return stagingName(pipeline, stream+"\x00patch", e, lane)
-}
-
-func readName(pipeline, stream string, start time.Time) string {
-	h := sha256.Sum256([]byte(pipeline + "\x00" + stream + "\x00" + strconv.FormatInt(start.UnixMicro(), 10)))
-	return "_openetl_read_" + hex.EncodeToString(h[:12])
-}
-
-func (w *writer) StartReads(_ context.Context, starts map[string]time.Time) error {
-	w.starts = starts
-	return nil
-}
-
-func (w *writer) EndRead(_ context.Context, e destination.Epoch, stream string) error {
-	w.ended[e.N] = append(w.ended[e.N], stream)
-	return nil
-}
-
-func (w *writer) setTable(stream, table string) {
-	w.mu.Lock()
-	w.tables[stream] = table
-	w.mu.Unlock()
-}
-
-func (w *writer) table(stream string) string {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	return w.tables[stream]
-}
-
-func (w *writer) Write(ctx context.Context, e destination.Epoch, stream string, batch arrow.RecordBatch) error {
-	cfg, ok := w.streams[stream]
-	if !ok {
-		return fmt.Errorf("postgres: unknown stream %q", stream)
-	}
-	if batch.NumRows() == 0 {
-		return nil
-	}
-	if cfg.Dedupe != destination.DedupeNone && len(batch.Schema().FieldIndices(idColumn)) == 0 {
-		return fmt.Errorf("postgres: stream %q is deduped at apply, but its batches have no %s", stream, idColumn)
-	}
-	if _, ok := w.starts[stream]; cfg.Mode == destination.Overwrite && !ok {
-		return fmt.Errorf("postgres: stream %q overwrites, but its read has no start", stream)
-	}
-	var key []string
-	if cfg.Mode == destination.Merge {
-		var err error
-		if key, err = keyColumns(batch.Schema(), cfg.PrimaryKey); err != nil {
-			return fmt.Errorf("postgres: stream %q: %w", stream, err)
-		}
-	}
-	st, err := w.stage(ctx, w.staging, stagingName(w.cfg.Pipeline, stream, e, w.cfg.Lane), e, stream, targetTable(batch.Schema(), stream), key, batch)
-	if err != nil {
-		return err
-	}
-	w.setTable(stream, st.target)
-	for _, f := range batch.Schema().Fields() {
-		if v, _ := f.Metadata.GetValue(destination.HeldKey); v == "last" && !slices.Contains(st.last, f.Name) {
-			st.last = append(st.last, f.Name)
-		}
-	}
-	return nil
-}
-
-// Patch stages patches in a table of their own, which Commit applies after
-// the epoch's rows, in the same transaction and under the same marker.
-func (w *writer) Patch(ctx context.Context, e destination.Epoch, stream string, batch arrow.RecordBatch) error {
-	cfg, ok := w.streams[stream]
-	switch {
-	case !ok:
-		return fmt.Errorf("postgres: unknown stream %q", stream)
-	case cfg.Mode != destination.Merge && cfg.Mode != destination.Append:
-		return fmt.Errorf("postgres: stream %q overwrites, and takes no patches", stream)
-	case batch.NumRows() == 0:
-		return nil
-	case len(batch.Schema().FieldIndices(idColumn)) == 0 || len(batch.Schema().FieldIndices(heldColumn)) == 0:
-		return fmt.Errorf("postgres: patches for %q need %s and %s", stream, idColumn, heldColumn)
-	}
-	var key []string
-	if cfg.Mode == destination.Merge {
-		var err error
-		if key, err = keyColumns(batch.Schema(), cfg.PrimaryKey); err != nil {
-			return fmt.Errorf("postgres: patches for %q: %w", stream, err)
-		}
-	}
-	target := w.table(stream)
-	if target == "" {
-		target = targetTable(batch.Schema(), stream)
-	}
-	st, err := w.stage(ctx, w.patches, patchName(w.cfg.Pipeline, stream, e, w.cfg.Lane), e, stream, target, key, batch)
-	if err != nil {
-		return err
-	}
-	for _, f := range batch.Schema().Fields() {
-		if held, ok := f.Metadata.GetValue(destination.FillsKey); ok {
-			if st.fills == nil {
-				st.fills = map[string]string{}
-			}
-			st.fills[f.Name] = held
-		}
-	}
-	return nil
-}
-
-// stage copies a batch into the stream's staging table for epoch e in
+// Stage copies a batch into the stream's staging table for epoch e in
 // tables, which it creates, labelled, or widens.
-func (w *writer) stage(ctx context.Context, tables map[uint64]map[string]*stagingTable, name string, e destination.Epoch, stream, target string, key []string, batch arrow.RecordBatch) (*stagingTable, error) {
+func (w *writer) Stage(ctx context.Context, tables map[uint64]map[string]*stagingTable, name string, e destination.Epoch, stream, target string, key []string, batch arrow.RecordBatch) (*stagingTable, error) {
 	cols, err := columnsOf(batch.Schema())
 	if err != nil {
 		return nil, err
@@ -374,9 +178,9 @@ func (w *writer) stage(ctx context.Context, tables map[uint64]map[string]*stagin
 	}
 	st := byStream[stream]
 	if st == nil {
-		st = &stagingTable{name: name, target: target, key: key}
-		label := stagingLabel{Pipeline: w.cfg.Pipeline, Generation: e.Generation, Epoch: e.N}
-		if err := w.createLabelled(ctx, st.name, label, cols); err != nil {
+		st = &stagingTable{Table: sqlstage.Table{Name: name, Target: target, Key: key}}
+		label := sqlstage.StagingLabel{Pipeline: w.cfg.Pipeline, Generation: e.Generation, Epoch: e.N}
+		if err := w.createLabelled(ctx, st.Name, label, cols); err != nil {
 			return nil, fmt.Errorf("postgres: create staging for %s: %w", stream, err)
 		}
 		st.cols = cols
@@ -384,10 +188,10 @@ func (w *writer) stage(ctx context.Context, tables map[uint64]map[string]*stagin
 	} else if wider, err := w.addColumns(ctx, st, cols); err != nil {
 		return nil, err
 	} else if wider != nil {
-		st.earlier = append(st.earlier, st.name)
-		st.name = name + "_" + strconv.Itoa(len(st.earlier)+1)
-		label := stagingLabel{Pipeline: w.cfg.Pipeline, Generation: e.Generation, Epoch: e.N}
-		if err := w.createLabelled(ctx, st.name, label, wider); err != nil {
+		st.Earlier = append(st.Earlier, st.Name)
+		st.Name = name + "_" + strconv.Itoa(len(st.Earlier)+1)
+		label := sqlstage.StagingLabel{Pipeline: w.cfg.Pipeline, Generation: e.Generation, Epoch: e.N}
+		if err := w.createLabelled(ctx, st.Name, label, wider); err != nil {
 			return nil, fmt.Errorf("postgres: create staging for %s: %w", stream, err)
 		}
 		st.cols = wider
@@ -395,11 +199,11 @@ func (w *writer) stage(ctx context.Context, tables map[uint64]map[string]*stagin
 
 	n := int(batch.NumRows())
 	if len(cols) == 0 {
-		if _, err := w.pool.Exec(ctx, "INSERT INTO "+w.ident(st.name)+" SELECT FROM generate_series(1, $1)", n); err != nil {
+		if _, err := w.pool.Exec(ctx, "INSERT INTO "+w.ident(st.Name)+" SELECT FROM generate_series(1, $1)", n); err != nil {
 			return nil, err
 		}
 		if n > 0 {
-			st.rows += uint64(n)
+			st.Rows += uint64(n)
 		}
 		return st, nil
 	}
@@ -422,57 +226,15 @@ func (w *writer) stage(ctx context.Context, tables map[uint64]map[string]*stagin
 	if st.narrower(cols) {
 		err = w.copyCast(ctx, st, cols, src)
 	} else {
-		_, err = w.pool.CopyFrom(ctx, pgx.Identifier{w.schema, st.name}, names(cols), src)
+		_, err = w.pool.CopyFrom(ctx, pgx.Identifier{w.schema, st.Name}, names(cols), src)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("postgres: stage %s: %w", stream, err)
 	}
 	if n > 0 {
-		st.rows += uint64(n)
+		st.Rows += uint64(n)
 	}
 	return st, nil
-}
-
-// keyColumns returns the destination names of a stream's primary key, which
-// the catalog gives by source name.
-func keyColumns(schema *arrow.Schema, key []string) ([]string, error) {
-	renamed := map[string]string{}
-	if v, ok := schema.Metadata().GetValue(sourceNamesKey); ok {
-		var names map[string]string
-		if err := json.Unmarshal([]byte(v), &names); err != nil {
-			return nil, fmt.Errorf("its %s metadata: %w", sourceNamesKey, err)
-		}
-		for dst, src := range names {
-			renamed[src] = dst
-		}
-	}
-	out := make([]string, len(key))
-	for i, k := range key {
-		out[i] = k
-		if dst, ok := renamed[k]; ok {
-			out[i] = dst
-		}
-		if len(schema.FieldIndices(out[i])) == 0 {
-			return nil, fmt.Errorf("it merges on %q, which its batches don't have", k)
-		}
-	}
-	return out, nil
-}
-
-// stagingLabel is each staging table's comment, so that Recover can find
-// what earlier generations of the pipeline staged.
-type stagingLabel struct {
-	Pipeline   string `json:"pipeline"`
-	Generation uint64 `json:"generation"`
-	Epoch      uint64 `json:"epoch"`
-}
-
-// readLabel is each read table's comment, so that applies and Recover can
-// find reads that were abandoned.
-type readLabel struct {
-	Pipeline string `json:"pipeline"`
-	Stream   string `json:"stream"`
-	Table    string `json:"table"`
 }
 
 func (w *writer) createLabelled(ctx context.Context, name string, label any, cols []column) error {
@@ -511,7 +273,7 @@ func (st *stagingTable) narrower(cols []column) bool {
 // copyCast copies a batch narrower than the staging through a table of its
 // own types, and casts its columns as widening the staging would have.
 func (w *writer) copyCast(ctx context.Context, st *stagingTable, cols []column, src pgx.CopyFromSource) error {
-	tmp := st.name + "_older"
+	tmp := st.Name + "_older"
 	sel := make([]string, len(cols))
 	for i, c := range cols {
 		q := pgx.Identifier{c.name}.Sanitize()
@@ -527,7 +289,7 @@ func (w *writer) copyCast(ctx context.Context, st *stagingTable, cols []column, 
 		if _, err := tx.CopyFrom(ctx, pgx.Identifier{w.schema, tmp}, names(cols), src); err != nil {
 			return err
 		}
-		if _, err := tx.Exec(ctx, "INSERT INTO "+w.ident(st.name)+" ("+quoteAll(names(cols))+") SELECT "+strings.Join(sel, ", ")+" FROM "+w.ident(tmp)); err != nil {
+		if _, err := tx.Exec(ctx, "INSERT INTO "+w.ident(st.Name)+" ("+quoteAll(names(cols))+") SELECT "+strings.Join(sel, ", ")+" FROM "+w.ident(tmp)); err != nil {
 			return err
 		}
 		_, err := tx.Exec(ctx, "DROP TABLE "+w.ident(tmp))
@@ -546,7 +308,7 @@ func (w *writer) addColumns(ctx context.Context, st *stagingTable, cols []column
 		i := slices.IndexFunc(st.cols, func(x column) bool { return x.name == c.name })
 		switch {
 		case i < 0:
-			if _, err := w.pool.Exec(ctx, "ALTER TABLE "+w.ident(st.name)+" ADD COLUMN IF NOT EXISTS "+columnDef(c)); err != nil {
+			if _, err := w.pool.Exec(ctx, "ALTER TABLE "+w.ident(st.Name)+" ADD COLUMN IF NOT EXISTS "+columnDef(c)); err != nil {
 				return nil, fmt.Errorf("postgres: add column %q to staging: %w", c.name, err)
 			}
 			st.cols = append(st.cols, c)
@@ -580,115 +342,6 @@ func columnDefs(cols []column) string {
 		defs[i] = columnDef(c)
 	}
 	return strings.Join(defs, ", ")
-}
-
-// PreCommit has nothing to flush: every Write committed its rows to staging.
-func (w *writer) PreCommit(_ context.Context, e destination.Epoch) (destination.Staged, error) {
-	desc := staged{Generation: e.Generation, Epoch: e.N}
-	byStream, patches := w.staging[e.N], w.patches[e.N]
-	for _, s := range w.cfg.Streams {
-		st, pt := byStream[s.Name], patches[s.Name]
-		ended := s.Mode == destination.Overwrite && slices.Contains(w.ended[e.N], s.Name)
-		if st == nil && pt == nil && !ended {
-			continue
-		}
-		ss := stagedStream{
-			Name: s.Name, Table: w.table(s.Name),
-			Dedupe: s.Dedupe == destination.DedupeTarget, DedupeEpoch: s.Dedupe == destination.DedupeEpoch,
-		}
-		key := []string(nil)
-		if pt != nil {
-			tables := pt.all()
-			ss.Table, ss.Patch, ss.WiderPatches, ss.Fills, key = pt.target, tables[0], tables[1:], pt.fills, pt.key
-		}
-		if st != nil {
-			tables := st.all()
-			ss.Table, ss.Staging, ss.Wider, ss.Rows, ss.Last, key = st.target, tables[0], tables[1:], st.rows, st.last, st.key
-		}
-		switch s.Mode {
-		case destination.Overwrite:
-			// A read that ends without rows in the epoch still replaces the
-			// target's.
-			ss.Mode, ss.Read, ss.Ended = modeOverwrite, readName(w.cfg.Pipeline, s.Name, w.starts[s.Name]), ended
-		case destination.Merge:
-			ss.Mode, ss.Key, ss.HardDeletes = modeMerge, key, s.Deletes == destination.HardDelete
-		}
-		desc.Streams = append(desc.Streams, ss)
-	}
-	delete(w.staging, e.N)
-	delete(w.patches, e.N)
-	delete(w.ended, e.N)
-	return json.Marshal(desc)
-}
-
-func (w *writer) Commit(ctx context.Context, _ destination.Epoch, committables []destination.Staged) (destination.Committed, error) {
-	desc, err := w.mergeLanes(committables)
-	if err != nil {
-		return destination.Committed{}, err
-	}
-	c := destination.Committed{Collapsed: map[string]uint64{}}
-	return c, w.apply(ctx, desc, desc.Streams, c.Collapsed)
-}
-
-// mergeLanes merges the epoch's descriptors, one per lane of the attempt
-// that staged it, by stream. A lane that didn't know a read ended, or had no
-// rows of a stream, says less: its table can come from the schemas.
-func (w *writer) mergeLanes(committables []destination.Staged) (staged, error) {
-	var out staged
-	at := map[string]int{}
-	if len(committables) == 0 {
-		return out, errors.New("postgres: no staged descriptor")
-	}
-	for i, c := range committables {
-		var desc staged
-		if err := json.Unmarshal(c, &desc); err != nil {
-			return out, fmt.Errorf("postgres: staged descriptor: %w", err)
-		}
-		if i == 0 {
-			out.Generation, out.Epoch = desc.Generation, desc.Epoch
-		} else if desc.Generation != out.Generation || desc.Epoch != out.Epoch {
-			return out, fmt.Errorf("postgres: staged descriptors of epochs %d-g%d and %d-g%d", out.Epoch, out.Generation, desc.Epoch, desc.Generation)
-		}
-		for _, s := range desc.Streams {
-			j, ok := at[s.Name]
-			if !ok {
-				j = len(out.Streams)
-				at[s.Name] = j
-				out.Streams = append(out.Streams, stagedStream{
-					Name: s.Name, Dedupe: s.Dedupe, DedupeEpoch: s.DedupeEpoch, Mode: s.Mode, HardDeletes: s.HardDeletes, Read: s.Read,
-				})
-			}
-			m := &out.Streams[j]
-			if m.Read != s.Read {
-				return out, fmt.Errorf("postgres: two reads of %s in epoch %d-g%d", s.Name, out.Epoch, out.Generation)
-			}
-			m.Table, m.Rows, m.Ended = cmp.Or(m.Table, s.Table), m.Rows+s.Rows, m.Ended || s.Ended
-			if len(m.Key) == 0 {
-				m.Key = s.Key
-			}
-			for _, c := range s.Last {
-				if !slices.Contains(m.Last, c) {
-					m.Last = append(m.Last, c)
-				}
-			}
-			if len(s.Fills) > 0 && m.Fills == nil {
-				m.Fills = map[string]string{}
-			}
-			maps.Copy(m.Fills, s.Fills)
-			if s.Staging != "" {
-				m.stagings = append(append(m.stagings, s.Staging), s.Wider...)
-			}
-			if s.Patch != "" {
-				m.patches = append(append(m.patches, s.Patch), s.WiderPatches...)
-			}
-		}
-	}
-	for i := range out.Streams {
-		if s := &out.Streams[i]; s.Table == "" {
-			s.Table = w.table(s.Name)
-		}
-	}
-	return out, nil
 }
 
 // prepared is what a stream's apply reads before its transaction.
@@ -732,10 +385,10 @@ func (r lanesRows) latestFirst(rel string) string {
 	return rel + ".ctid DESC"
 }
 
-// apply applies each stream that has no marker yet, then drops its staging.
+// Apply applies each stream that has no marker yet, then drops its staging.
 // It adds the rows each deduped stream skipped to collapsed.
-func (w *writer) apply(ctx context.Context, desc staged, streams []stagedStream, collapsed map[string]uint64) error {
-	todo, err := w.unapplied(ctx, desc, streams)
+func (w *writer) Apply(ctx context.Context, desc staged, streams []stagedStream, collapsed map[string]uint64) error {
+	todo, err := w.Unapplied(ctx, desc, streams)
 	if err != nil || len(todo) == 0 {
 		return err
 	}
@@ -754,7 +407,7 @@ func (w *writer) apply(ctx context.Context, desc staged, streams []stagedStream,
 	} else if err := w.applyTx(ctx, desc, todo, prep, "FOR UPDATE", collapsed); err != nil {
 		return err
 	}
-	w.dropStaging(ctx, todo)
+	w.DropStaging(ctx, todo)
 	return nil
 }
 
@@ -785,7 +438,7 @@ func (w *writer) applyTx(ctx context.Context, desc staged, streams []stagedStrea
 			if err != nil {
 				return fmt.Errorf("postgres: apply %s: %w", s.Name, err)
 			}
-			if s.deduped() && s.Rows > n {
+			if s.Deduped() && s.Rows > n {
 				skipped[s.Name] = s.Rows - n
 			}
 			if _, err := tx.Exec(ctx, "INSERT INTO "+w.ident("_openetl_loads")+" (pipeline, stream, generation, epoch) VALUES ($1, $2, $3, $4)",
@@ -820,7 +473,7 @@ func (w *writer) applyStream(ctx context.Context, tx pgx.Tx, s stagedStream, p p
 
 func (w *writer) applyRows(ctx context.Context, tx pgx.Tx, s stagedStream, p prepared) (uint64, error) {
 	if s.Mode == modeMerge {
-		if len(s.stagings) == 0 {
+		if len(s.Stagings) == 0 {
 			return 0, nil
 		}
 		for _, q := range w.merge(s, p) {
@@ -832,11 +485,11 @@ func (w *writer) applyRows(ctx context.Context, tx pgx.Tx, s stagedStream, p pre
 	}
 	var n uint64
 	if s.Mode == modeOverwrite {
-		if err := w.dropAbandonedReads(ctx, tx, func(l readLabel, table string) bool { return l.Stream == s.Name && table != s.Read }); err != nil {
+		if err := w.dropAbandonedReads(ctx, tx, func(l sqlstage.ReadLabel, table string) bool { return l.Stream == s.Name && table != s.Read }); err != nil {
 			return 0, err
 		}
 	}
-	if len(s.stagings) > 0 {
+	if len(s.Stagings) > 0 {
 		tag, err := tx.Exec(ctx, w.insert(s, p))
 		if err != nil {
 			return 0, err
@@ -858,12 +511,12 @@ func (w *writer) applyRows(ctx context.Context, tx pgx.Tx, s stagedStream, p pre
 // the target doesn't have.
 func (w *writer) insert(s stagedStream, p prepared) string {
 	list, sel := quoteAll(p.cols), selectList(p.cols, "s")
-	into := "INSERT INTO " + w.ident(s.into()) + " (" + list + ") "
+	into := "INSERT INTO " + w.ident(s.Into()) + " (" + list + ") "
 	id := pgx.Identifier{idColumn}.Sanitize()
 	switch {
 	case s.Dedupe:
 		return into + "SELECT DISTINCT ON (s." + id + ") " + sel + " FROM " + p.rows.rel +
-			" s WHERE NOT EXISTS (SELECT 1 FROM " + w.ident(s.into()) + " t WHERE t." + id + " = s." + id + ")"
+			" s WHERE NOT EXISTS (SELECT 1 FROM " + w.ident(s.Into()) + " t WHERE t." + id + " = s." + id + ")"
 	case s.DedupeEpoch:
 		return into + "SELECT DISTINCT ON (s." + id + ") " + sel + " FROM " + p.rows.rel + " s"
 	default:
@@ -1102,9 +755,9 @@ func names(cols []column) []string {
 func (w *writer) prepare(ctx context.Context, desc staged, s stagedStream) (prepared, error) {
 	var p prepared
 	var cols []column
-	if len(s.stagings) > 0 {
+	if len(s.Stagings) > 0 {
 		var err error
-		if cols, p.rows, err = w.acrossLanes(ctx, s.stagings); err != nil {
+		if cols, p.rows, err = w.acrossLanes(ctx, s.Stagings); err != nil {
 			return p, err
 		}
 		if len(cols) == 0 {
@@ -1139,15 +792,15 @@ func (w *writer) prepare(ctx context.Context, desc staged, s stagedStream) (prep
 			return p, err
 		}
 	}
-	if len(s.patches) > 0 {
+	if len(s.Patches) > 0 {
 		var err error
 		if p.patch, p.patches, err = w.preparePatch(ctx, desc, s); err != nil {
 			return p, err
 		}
 	}
 	if s.Dedupe && cols != nil {
-		if err := w.ensureIndex(ctx, s.into(), indexName(s.into()), false, []string{idColumn}); err != nil {
-			return p, fmt.Errorf("postgres: index %s on %s: %w", idColumn, s.into(), err)
+		if err := w.ensureIndex(ctx, s.Into(), sqlstage.IndexName(s.Into()), false, []string{idColumn}); err != nil {
+			return p, fmt.Errorf("postgres: index %s on %s: %w", idColumn, s.Into(), err)
 		}
 	}
 	if s.Mode == modeMerge && (cols != nil || p.patch != nil) {
@@ -1169,7 +822,7 @@ func (w *writer) prepare(ctx context.Context, desc staged, s stagedStream) (prep
 	// The apply joins the staging with the target, and the planner knows
 	// nothing of a table just copied into.
 	if s.Dedupe || s.Mode == modeMerge {
-		for _, t := range s.stagings {
+		for _, t := range s.Stagings {
 			if _, err := w.pool.Exec(ctx, "ANALYZE "+w.ident(t)); err != nil {
 				return p, fmt.Errorf("postgres: analyze the staging of %s: %w", s.Name, err)
 			}
@@ -1241,7 +894,7 @@ func laneColumn(c column, have []column) string {
 // gives an append target the _openetl_id index
 // patches match on.
 func (w *writer) preparePatch(ctx context.Context, desc staged, s stagedStream) ([]string, lanesRows, error) {
-	cols, rows, err := w.acrossLanes(ctx, s.patches)
+	cols, rows, err := w.acrossLanes(ctx, s.Patches)
 	if err != nil {
 		return nil, rows, err
 	}
@@ -1253,11 +906,11 @@ func (w *writer) preparePatch(ctx context.Context, desc staged, s stagedStream) 
 		return nil, rows, err
 	}
 	if s.Mode != modeMerge {
-		if err := w.ensureIndex(ctx, s.Table, indexName(s.Table), false, []string{idColumn}); err != nil {
+		if err := w.ensureIndex(ctx, s.Table, sqlstage.IndexName(s.Table), false, []string{idColumn}); err != nil {
 			return nil, rows, fmt.Errorf("postgres: index %s on %s: %w", idColumn, s.Table, err)
 		}
 	}
-	for _, t := range s.patches {
+	for _, t := range s.Patches {
 		if _, err := w.pool.Exec(ctx, "ANALYZE "+w.ident(t)); err != nil {
 			return nil, rows, fmt.Errorf("postgres: analyze the patches of %s: %w", s.Name, err)
 		}
@@ -1296,7 +949,7 @@ func (w *writer) ensureRead(ctx context.Context, s stagedStream, cols []column) 
 		for i, c := range cols {
 			want[i] = targetType(c)
 		}
-		label := readLabel{Pipeline: w.cfg.Pipeline, Stream: s.Name, Table: s.Table}
+		label := sqlstage.ReadLabel{Pipeline: w.cfg.Pipeline, Stream: s.Name, Table: s.Table}
 		if err := w.createLabelled(ctx, s.Read, label, want); err != nil {
 			return fmt.Errorf("postgres: create the read table for %s: %w", s.Name, err)
 		}
@@ -1356,7 +1009,7 @@ func (w *writer) dropIndex(ctx context.Context, name string) error {
 // ensureKey gives a merge target a unique index on its key, unless it has
 // one, for ON CONFLICT.
 func (w *writer) ensureKey(ctx context.Context, table string, key []string) error {
-	name := keyIndexName(table)
+	name := sqlstage.KeyIndexName(table)
 	if w.indexed[name] {
 		return nil
 	}
@@ -1399,7 +1052,7 @@ func (w *writer) ApplySchema(ctx context.Context, streams []destination.StreamSc
 		if err != nil {
 			return out, err
 		}
-		tables[i], want[i] = targetTable(s.Schema, s.Name), cols
+		tables[i], want[i] = sqlstage.TargetTable(s.Schema, s.Name), cols
 	}
 	have, err := w.catalog(ctx, tables)
 	if err != nil {
@@ -1420,7 +1073,7 @@ func (w *writer) ApplySchema(ctx context.Context, streams []destination.StreamSc
 			t = &tableInfo{attrs: len(want[i])}
 		}
 		out.Limits[s.Name] = t.limits()
-		w.setTable(s.Name, tables[i])
+		w.SetTable(s.Name, tables[i])
 	}
 	return out, nil
 }
@@ -1659,7 +1312,7 @@ func (w *writer) columnTypes(ctx context.Context, table string) ([]column, error
 	return cols, nil
 }
 
-func (w *writer) unapplied(ctx context.Context, desc staged, streams []stagedStream) ([]stagedStream, error) {
+func (w *writer) Unapplied(ctx context.Context, desc staged, streams []stagedStream) ([]stagedStream, error) {
 	var todo []stagedStream
 	for _, s := range streams {
 		var done bool
@@ -1674,11 +1327,11 @@ func (w *writer) unapplied(ctx context.Context, desc staged, streams []stagedStr
 	return todo, nil
 }
 
-// dropStaging is best effort: staging left behind is never applied twice,
+// DropStaging is best effort: staging left behind is never applied twice,
 // because its marker exists.
-func (w *writer) dropStaging(ctx context.Context, streams []stagedStream) {
+func (w *writer) DropStaging(ctx context.Context, streams []stagedStream) {
 	for _, s := range streams {
-		for _, t := range slices.Concat(s.stagings, s.patches) {
+		for _, t := range slices.Concat(s.Stagings, s.Patches) {
 			_, _ = w.pool.Exec(ctx, "DROP TABLE IF EXISTS "+w.ident(t))
 		}
 	}
@@ -1701,9 +1354,11 @@ func (w *writer) ensureSchema(ctx context.Context) error {
 	return nil
 }
 
-func (w *writer) Recover(ctx context.Context, gen uint64, e destination.Epoch, committables []destination.Staged) (destination.Recovery, error) {
+// Fence makes the schema and the fence and marker tables, and raises the
+// fence to gen.
+func (w *writer) Fence(ctx context.Context, gen uint64) error {
 	if err := w.ensureSchema(ctx); err != nil {
-		return 0, err
+		return err
 	}
 	for _, q := range []string{
 		"CREATE TABLE IF NOT EXISTS " + w.ident("_openetl_fence") + " (pipeline text PRIMARY KEY, generation bigint NOT NULL)",
@@ -1712,7 +1367,7 @@ func (w *writer) Recover(ctx context.Context, gen uint64, e destination.Epoch, c
 			PRIMARY KEY (pipeline, stream, generation, epoch))`,
 	} {
 		if _, err := w.pool.Exec(ctx, q); err != nil {
-			return 0, fmt.Errorf("postgres: prepare %s: %w", w.schema, err)
+			return fmt.Errorf("postgres: prepare %s: %w", w.schema, err)
 		}
 	}
 	// Waits for applies that hold the fence row.
@@ -1721,68 +1376,27 @@ func (w *writer) Recover(ctx context.Context, gen uint64, e destination.Epoch, c
 		ON CONFLICT (pipeline) DO UPDATE SET generation = EXCLUDED.generation WHERE f.generation <= EXCLUDED.generation
 		RETURNING generation`, w.cfg.Pipeline, gen).Scan(&raised)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return 0, fmt.Errorf("%w: recovering as generation %d", destination.ErrFenced, gen)
+		return fmt.Errorf("%w: recovering as generation %d", destination.ErrFenced, gen)
 	}
 	if err != nil {
-		return 0, fmt.Errorf("postgres: raise fence: %w", err)
+		return fmt.Errorf("postgres: raise fence: %w", err)
 	}
-	if e.IsZero() {
-		w.dropRemovedReads(ctx)
-		return destination.Applied, nil
-	}
-
-	desc, err := w.mergeLanes(committables)
-	if err != nil {
-		return 0, err
-	}
-	missing, err := w.unapplied(ctx, desc, desc.Streams)
-	if err != nil {
-		return 0, err
-	}
-	// An overwrite read that ended without rows in the epoch needs no
-	// staging.
-	needs, present := 0, 0
-	for _, m := range missing {
-		for _, t := range slices.Concat(m.stagings, m.patches) {
-			needs++
-			var ok bool
-			if err := w.pool.QueryRow(ctx, "SELECT to_regclass($1) IS NOT NULL", w.ident(t)).Scan(&ok); err != nil {
-				return 0, err
-			}
-			if ok {
-				present++
-			}
-		}
-	}
-	var r destination.Recovery
-	switch {
-	case len(missing) == 0:
-		w.dropStaging(ctx, desc.Streams)
-		r = destination.Applied
-	case present == needs:
-		if err := w.apply(ctx, desc, missing, map[string]uint64{}); err != nil {
-			return 0, err
-		}
-		r = destination.Redone
-	case len(missing) == len(desc.Streams):
-		// Nothing of it is visible, and some lane's staging is gone.
-		r = destination.Lost
-	default:
-		return 0, fmt.Errorf("postgres: epoch %d-g%d is partly applied and the staging for the rest is gone", desc.Epoch, desc.Generation)
-	}
-	if r != destination.Lost {
-		w.trimMarkers(ctx, desc.Epoch)
-	}
-	w.dropStale(ctx, gen)
-	w.dropRemovedReads(ctx)
-	return r, nil
+	return nil
 }
 
-// trimMarkers deletes the pipeline's markers below an applied epoch. Recovery
+func (w *writer) Exists(ctx context.Context, table string) (bool, error) {
+	var ok bool
+	if err := w.pool.QueryRow(ctx, "SELECT to_regclass($1) IS NOT NULL", w.ident(table)).Scan(&ok); err != nil {
+		return false, err
+	}
+	return ok, nil
+}
+
+// TrimMarkers deletes the pipeline's markers below an applied epoch. Recovery
 // checks only HEAD's, and HEAD never moves back past an applied epoch; a lost
 // one moves it back to the previous record, whose markers it then checks.
 // Best effort, like dropStaging.
-func (w *writer) trimMarkers(ctx context.Context, applied uint64) {
+func (w *writer) TrimMarkers(ctx context.Context, applied uint64) {
 	_, _ = w.pool.Exec(ctx, "DELETE FROM "+w.ident("_openetl_loads")+" WHERE pipeline = $1 AND epoch < $2", w.cfg.Pipeline, applied)
 }
 
@@ -1807,16 +1421,16 @@ func (w *writer) labelled(ctx context.Context, q querier, prefix string) ([][2]s
 	})
 }
 
-// dropStale drops what earlier generations of the pipeline staged. None of
+// DropStale drops what earlier generations of the pipeline staged. None of
 // it can be applied once HEAD's epoch is recovered: the fence stops their
 // commits. Best effort, like dropStaging.
-func (w *writer) dropStale(ctx context.Context, gen uint64) {
+func (w *writer) DropStale(ctx context.Context, gen uint64) {
 	labelled, err := w.labelled(ctx, w.pool, "_openetl_stage_")
 	if err != nil {
 		return
 	}
 	for _, t := range labelled {
-		var l stagingLabel
+		var l sqlstage.StagingLabel
 		if json.Unmarshal([]byte(t[1]), &l) == nil && l.Pipeline == w.cfg.Pipeline && l.Generation < gen {
 			_, _ = w.pool.Exec(ctx, "DROP TABLE IF EXISTS "+w.ident(t[0]))
 		}
@@ -1826,13 +1440,13 @@ func (w *writer) dropStale(ctx context.Context, gen uint64) {
 // dropAbandonedReads drops the pipeline's read tables that drop says were
 // abandoned, in q: an apply's transaction, which holds the fence, so a
 // zombie can't drop a read that continues.
-func (w *writer) dropAbandonedReads(ctx context.Context, q querier, drop func(l readLabel, table string) bool) error {
+func (w *writer) dropAbandonedReads(ctx context.Context, q querier, drop func(l sqlstage.ReadLabel, table string) bool) error {
 	labelled, err := w.labelled(ctx, q, "_openetl_read_")
 	if err != nil {
 		return fmt.Errorf("postgres: find abandoned reads: %w", err)
 	}
 	for _, t := range labelled {
-		var l readLabel
+		var l sqlstage.ReadLabel
 		if json.Unmarshal([]byte(t[1]), &l) == nil && l.Pipeline == w.cfg.Pipeline && drop(l, t[0]) {
 			if _, err := q.Exec(ctx, "DROP TABLE IF EXISTS "+w.ident(t[0])); err != nil {
 				return fmt.Errorf("postgres: drop an abandoned read of %s: %w", l.Stream, err)
@@ -1842,11 +1456,11 @@ func (w *writer) dropAbandonedReads(ctx context.Context, q querier, drop func(l 
 	return nil
 }
 
-// dropRemovedReads drops the read tables of streams that no longer
+// DropRemovedReads drops the read tables of streams that no longer
 // overwrite, once Recover has raised the fence. Best effort, like
 // dropStaging.
-func (w *writer) dropRemovedReads(ctx context.Context) {
-	_ = w.dropAbandonedReads(ctx, w.pool, func(l readLabel, _ string) bool {
+func (w *writer) DropRemovedReads(ctx context.Context) {
+	_ = w.dropAbandonedReads(ctx, w.pool, func(l sqlstage.ReadLabel, _ string) bool {
 		return w.streams[l.Stream].Mode != destination.Overwrite
 	})
 }
