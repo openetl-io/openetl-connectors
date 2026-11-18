@@ -87,3 +87,20 @@ func TestSettleDropsTheStagingOfAStreamAppliedBefore(t *testing.T) {
 		}
 	}
 }
+
+func TestSettleRecordedIsLostOnlyWhenNothingApplied(t *testing.T) {
+	st := newStore()
+	st.gone["a"], st.gone["b"] = true, true
+	if r, err := SettleRecorded(t.Context(), "db", st, destination.ScopeStream, epoch, []string{"a", "b"}); err != nil || r != destination.Lost {
+		t.Errorf("with every stream's staging gone, recovery is %v, %v; want lost", r, err)
+	}
+	st = newStore()
+	st.markers["a"] = st.Mark("a", epoch)
+	st.gone["b"] = true
+	if r, err := SettleRecorded(t.Context(), "db", st, destination.ScopeStream, epoch, []string{"a", "b"}); err == nil {
+		t.Errorf("with a applied and b's staging gone, recovery is %v", r)
+	}
+	if len(st.applied) > 0 {
+		t.Errorf("applied %v", st.applied)
+	}
+}

@@ -119,9 +119,10 @@ func SettleRecorded[S any](ctx context.Context, name string, st Store[S], scope 
 	if err != nil {
 		return 0, err
 	}
-	present, missing, swaps := 0, 0, false
+	present, missing, applied, swaps := 0, 0, 0, false
 	for _, s := range streams {
 		if m, ok := markers[st.Mark(s, e).Stream]; ok && m.Is(e) {
+			applied++
 			swaps = swaps || m.Swap != ""
 			continue
 		}
@@ -147,8 +148,12 @@ func SettleRecorded[S any](ctx context.Context, name string, st Store[S], scope 
 	case missing == 0:
 		_, err := Settle(ctx, st, scope, e, streams)
 		return destination.Redone, err
-	case present == 0:
+	case present == 0 && applied == 0:
 		return destination.Lost, nil
+	case present == 0:
+		// With ScopeStream, some streams applied before the rest's
+		// staging went: the epoch can't be read again, nor finished.
+		return 0, fmt.Errorf("%s: epoch %d.%d is partly applied, and the staging for the rest is gone", name, e.Generation, e.N)
 	}
 	return 0, fmt.Errorf("%s: epoch %d.%d's staging is partly gone, %d of %d parts", name, e.Generation, e.N, missing, present+missing)
 }
