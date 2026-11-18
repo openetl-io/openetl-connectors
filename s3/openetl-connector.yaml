@@ -1,12 +1,14 @@
 name: s3
 title: Amazon S3
-description: Parquet files on S3, or on a local filesystem
+description: Parquet, Avro, CSV and JSON Lines files on Amazon S3, S3-compatible stores such as MinIO and Cloudflare R2, or a local filesystem, read, and Parquet, CSV and JSON Lines written
 license: Apache-2.0
 repository: https://github.com/openetl-io/openetl-connectors
 docs: https://github.com/openetl-io/openetl-connectors/blob/main/s3/README.md
 logo: https://raw.githubusercontent.com/awslabs/aws-icons-for-plantuml/v23.1/dist/Storage/SimpleStorageService.png
-tags: [files, aws]
+tags: [files, aws, s3-compatible]
 author: OpenETL
 roles:
+  source:
+    build: { go: ../cmd/source-s3 }
   destination:
     build: { go: ../cmd/destination-s3 }

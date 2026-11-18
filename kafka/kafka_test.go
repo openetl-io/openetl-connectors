@@ -28,6 +28,7 @@ import (
 	"github.com/twmb/franz-go/pkg/kgo"
 
 	"github.com/openetl-io/openetl-connectors/records"
+	"github.com/openetl-io/openetl/sdk/go/check"
 	"github.com/openetl-io/openetl/sdk/go/destination"
 	protocolv1 "github.com/openetl-io/openetl/sdk/go/protocol/v1"
 	"github.com/openetl-io/openetl/sdk/go/source"
@@ -61,8 +62,8 @@ func newDest(t *testing.T, extra map[string]any) *Destination {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := d.Check(t.Context()); err != nil {
-		t.Fatalf("check (is the broker running? make deps-up): %v", err)
+	if r := check.Run(t.Context(), d.Checks()); !r.OK() {
+		t.Fatalf("check (is the broker running?): %v", r.Err())
 	}
 	return d
 }

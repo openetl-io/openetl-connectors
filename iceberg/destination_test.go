@@ -55,7 +55,9 @@ func newEnv(t *testing.T) *env {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := d.Check(t.Context()); err != nil {
+	if c, err := d.catalog(t.Context()); err != nil {
+		t.Fatalf("catalog (is the Iceberg catalog running? make deps-up): %v", err)
+	} else if _, err := c.ListNamespaces(t.Context(), nil); err != nil {
 		t.Fatalf("check (is the Iceberg catalog running? make deps-up): %v", err)
 	}
 	return &env{t: t, d: d, ns: ns}

@@ -1,16 +1,119 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "Parquet on S3 destination",
+  "title": "Files on Amazon S3 or a local disk: destination",
   "type": "object",
   "additionalProperties": false,
-  "required": ["url"],
+  "required": [
+    "url"
+  ],
+  "if": {
+    "properties": {
+      "format": {
+        "enum": [
+          "csv",
+          "jsonl"
+        ]
+      }
+    },
+    "required": [
+      "format"
+    ]
+  },
+  "then": {
+    "properties": {
+      "compression": {
+        "enum": [
+          "gzip",
+          "zstd",
+          "none"
+        ]
+      }
+    }
+  },
   "properties": {
-    "url": {"type": "string", "description": "Where the tables go: s3://bucket/prefix, or file:// and an absolute path. Each stream's table is a directory of Parquet files under it."},
-    "region": {"type": "string", "description": "The bucket's AWS region."},
-    "endpoint": {"type": "string", "description": "An S3-compatible endpoint, for stores other than AWS. Uses path-style addressing."},
-    "accessKeyId": {"type": "string", "x-secret": true, "description": "An AWS access key. Without one, the AWS default credentials."},
-    "secretAccessKey": {"type": "string", "x-secret": true, "description": "The access key's secret."},
-    "compression": {"type": "string", "enum": ["zstd", "snappy", "gzip", "none"], "default": "zstd", "description": "The Parquet files' compression."},
-    "fileSize": {"type": "integer", "minimum": 1048576, "default": 268435456, "description": "Bytes a file reaches before the next one starts."}
-  }
+    "url": {
+      "type": "string",
+      "title": "URL",
+      "description": "Where the tables go: s3://bucket/prefix, or file:// and an absolute path. Each stream's table is a directory of files under it.",
+      "x-group": "location"
+    },
+    "endpoint": {
+      "type": "string",
+      "title": "Endpoint",
+      "description": "An S3-compatible store's endpoint, such as MinIO's, Cloudflare R2's or SeaweedFS's, with path-style addressing. Empty for Amazon S3. Not for file:// URLs.",
+      "x-group": "location",
+      "x-format": "uri",
+      "x-advanced": true
+    },
+    "region": {
+      "type": "string",
+      "title": "Region",
+      "description": "The bucket's AWS region.",
+      "x-group": "s3"
+    },
+    "accessKeyId": {
+      "type": "string",
+      "x-secret": true,
+      "title": "Access key ID",
+      "description": "An AWS access key. Without one, the AWS default credentials.",
+      "x-group": "s3"
+    },
+    "secretAccessKey": {
+      "type": "string",
+      "x-secret": true,
+      "title": "Secret access key",
+      "description": "The access key's secret.",
+      "x-group": "s3"
+    },
+    "format": {
+      "type": "string",
+      "enum": [
+        "parquet",
+        "csv",
+        "jsonl"
+      ],
+      "default": "parquet",
+      "title": "Format",
+      "description": "The files' format: Parquet, CSV with a header line, or JSON Lines. From 0.2.0.",
+      "x-group": "files"
+    },
+    "compression": {
+      "type": "string",
+      "enum": [
+        "zstd",
+        "snappy",
+        "gzip",
+        "none"
+      ],
+      "title": "Compression",
+      "description": "Parquet: zstd (the default), snappy, gzip or none, inside the file. CSV and JSON Lines, from 0.2.0: gzip, zstd or none (the default), the whole file, which gets the extension .gz or .zst.",
+      "x-group": "files"
+    },
+    "fileSize": {
+      "type": "integer",
+      "minimum": 1048576,
+      "default": 268435456,
+      "title": "File size",
+      "description": "Bytes a file reaches, compressed, before the next one starts.",
+      "x-group": "files",
+      "x-advanced": true
+    }
+  },
+  "x-groups": [
+    {
+      "id": "location",
+      "title": "Location",
+      "description": "Where the files are, and the address of the store's API."
+    },
+    {
+      "id": "s3",
+      "title": "Amazon S3",
+      "description": "The region and keys."
+    },
+    {
+      "id": "files",
+      "title": "Files",
+      "description": "How each table's files are written."
+    }
+  ]
 }

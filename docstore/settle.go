@@ -33,7 +33,8 @@ func Mark(e destination.Epoch, stream string, ended bool, read, target string) M
 // Store is how a destination applies an epoch's staged streams, S, and
 // keeps their markers.
 type Store[S any] interface {
-	// Markers are the pipeline's, by stream.
+	// Markers are the pipeline's, by stream: destination.ErrFenced once a
+	// newer generation than the writer's has raised the fence.
 	Markers(ctx context.Context) (map[string]Marker, error)
 	// SetMarkers replaces the streams' markers, all or none, unless a newer
 	// generation has raised the fence.
@@ -44,6 +45,7 @@ type Store[S any] interface {
 	Apply(ctx context.Context, s S) (uint64, error)
 	// Swap makes m's read, if it has one, its target.
 	Swap(ctx context.Context, m Marker) error
+	// DropStaging drops s's staging; what's gone already isn't an error.
 	DropStaging(ctx context.Context, s S) error
 	// Staging counts s's staging that's there, and that's gone.
 	Staging(ctx context.Context, s S) (present, missing int, err error)
@@ -61,7 +63,12 @@ func Settle[S any](ctx context.Context, st Store[S], scope destination.Scope, e 
 	var todo []S
 	for _, s := range streams {
 		if m, ok := markers[st.Mark(s, e).Stream]; ok && m.Is(e) {
+			// Applied by an earlier call, which may have stopped before
+			// its swap or its staging's drop.
 			if err := st.Swap(ctx, m); err != nil {
+				return done, err
+			}
+			if err := st.DropStaging(ctx, s); err != nil {
 				return done, err
 			}
 			continue
@@ -113,9 +120,10 @@ func SettleRecorded[S any](ctx context.Context, name string, st Store[S], scope 
 	if err != nil {
 		return 0, err
 	}
-	present, missing, swaps := 0, 0, false
+	present, missing, applied, swaps := 0, 0, 0, false
 	for _, s := range streams {
 		if m, ok := markers[st.Mark(s, e).Stream]; ok && m.Is(e) {
+			applied++
 			swaps = swaps || m.Swap != ""
 			continue
 		}
@@ -141,8 +149,17 @@ func SettleRecorded[S any](ctx context.Context, name string, st Store[S], scope 
 	case missing == 0:
 		_, err := Settle(ctx, st, scope, e, streams)
 		return destination.Redone, err
-	case present == 0:
+	case present == 0 && applied == 0:
+		// Unless a newer generation has raised the fence since, applied
+		// the epoch and dropped its staging, which Markers then refuses.
+		if _, err := st.Markers(ctx); err != nil {
+			return 0, err
+		}
 		return destination.Lost, nil
+	case present == 0:
+		// With ScopeStream, some streams applied before the rest's
+		// staging went: the epoch can't be read again, nor finished.
+		return 0, fmt.Errorf("%s: epoch %d.%d is partly applied, and the staging for the rest is gone", name, e.Generation, e.N)
 	}
 	return 0, fmt.Errorf("%s: epoch %d.%d's staging is partly gone, %d of %d parts", name, e.Generation, e.N, missing, present+missing)
 }

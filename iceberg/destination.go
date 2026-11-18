@@ -15,14 +15,12 @@
 package iceberg
 
 import (
-	"bytes"
 	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"maps"
-	"net"
 	"slices"
 	"strconv"
 	"strings"
@@ -34,14 +32,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/array"
 	ice "github.com/apache/iceberg-go"
 	"github.com/apache/iceberg-go/catalog"
-	"github.com/apache/iceberg-go/catalog/glue"
-	"github.com/apache/iceberg-go/catalog/rest"
-	iceio "github.com/apache/iceberg-go/io"
-	_ "github.com/apache/iceberg-go/io/gocloud"
 	"github.com/apache/iceberg-go/table"
-	"github.com/aws/aws-sdk-go-v2/aws"
-	awsconfig "github.com/aws/aws-sdk-go-v2/config"
-	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/google/uuid"
 	"golang.org/x/sync/errgroup"
 
@@ -51,136 +42,36 @@ import (
 )
 
 type DestinationConfig struct {
-	// rest or glue. Default rest.
-	Catalog string `json:"catalog"`
-	// The REST catalog's URI.
-	URI string `json:"uri"`
-	// The REST catalog's warehouse, or Glue's location for new tables.
-	Warehouse string `json:"warehouse"`
-	// Used when the pipeline names no namespace. Default "default".
-	Namespace string `json:"namespace"`
-	// REST: a bearer token, or OAuth2 client credentials as id:secret.
-	Token      sdk.Secret `json:"token"`
-	Credential sdk.Secret `json:"credential"`
-	// AWS, for Glue and S3. Without a key, the AWS default credentials.
-	Region          string     `json:"region"`
-	AccessKeyID     sdk.Secret `json:"accessKeyId"`
-	SecretAccessKey sdk.Secret `json:"secretAccessKey"`
-	S3Endpoint      string     `json:"s3Endpoint"`
-	// More catalog and file IO properties.
-	Properties map[string]string `json:"properties"`
+	CatalogConfig
 }
 
 type Destination struct {
-	cfg   DestinationConfig
-	props ice.Properties
+	cfg DestinationConfig
+	*conn
 }
 
 var (
 	_ destination.Destination   = (*Destination)(nil)
-	_ destination.Checker       = (*Destination)(nil)
 	_ destination.SchemaApplier = (*writer)(nil)
 	_ destination.ReadTracker   = (*writer)(nil)
 	_ destination.Patcher       = (*writer)(nil)
 )
 
 func NewDestination(config []byte) (*Destination, error) {
-	cfg := DestinationConfig{Catalog: "rest", Namespace: "default"}
-	dec := json.NewDecoder(bytes.NewReader(config))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&cfg); err != nil {
-		return nil, fmt.Errorf("iceberg: config: %w", err)
+	cfg := DestinationConfig{CatalogConfig: defaultCatalogConfig()}
+	if err := decodeConfig(config, &cfg); err != nil {
+		return nil, err
 	}
-	switch cfg.Catalog {
-	case "rest":
-		if cfg.URI == "" {
-			return nil, errors.New("iceberg: a REST catalog needs a uri")
-		}
-	case "glue":
-	default:
-		return nil, fmt.Errorf("iceberg: catalog %q is neither rest nor glue", cfg.Catalog)
+	c, err := newConn(cfg.CatalogConfig)
+	if err != nil {
+		return nil, err
 	}
-	if cfg.AccessKeyID.IsZero() != cfg.SecretAccessKey.IsZero() {
-		return nil, errors.New("iceberg: accessKeyId and secretAccessKey go together")
-	}
-	props := ice.Properties{}
-	for k, v := range cfg.Properties {
-		props[k] = v
-	}
-	if cfg.S3Endpoint != "" {
-		props[iceio.S3EndpointURL] = cfg.S3Endpoint
-	}
-	if cfg.Region != "" {
-		props[iceio.S3Region] = cfg.Region
-	}
-	if !cfg.AccessKeyID.IsZero() {
-		props[iceio.S3AccessKeyID] = cfg.AccessKeyID.Reveal()
-		props[iceio.S3SecretAccessKey] = cfg.SecretAccessKey.Reveal()
-	}
-	return &Destination{cfg: cfg, props: props}, nil
+	return &Destination{cfg: cfg, conn: c}, nil
 }
 
 func (d *Destination) Capabilities() destination.Capabilities { return DestinationCapabilities }
 
-func (d *Destination) catalog(ctx context.Context) (catalog.Catalog, error) {
-	if d.cfg.Catalog == "glue" {
-		var opts []func(*awsconfig.LoadOptions) error
-		if d.cfg.Region != "" {
-			opts = append(opts, awsconfig.WithRegion(d.cfg.Region))
-		}
-		if !d.cfg.AccessKeyID.IsZero() {
-			opts = append(opts, awsconfig.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(d.cfg.AccessKeyID.Reveal(), d.cfg.SecretAccessKey.Reveal(), "")))
-		}
-		ac, err := awsconfig.LoadDefaultConfig(ctx, opts...)
-		if err != nil {
-			return nil, fmt.Errorf("iceberg: AWS config: %w", err)
-		}
-		if ep := d.props["glue.endpoint"]; ep != "" {
-			ac.BaseEndpoint = aws.String(ep)
-		}
-		c, err := glue.NewCatalog(glue.WithAwsConfig(ac), glue.WithAwsProperties(glue.AwsProperties(d.props)))
-		if err != nil {
-			return nil, fmt.Errorf("iceberg: glue: %w", err)
-		}
-		return c, nil
-	}
-	opts := []rest.Option{rest.WithAdditionalProps(d.props)}
-	if d.cfg.Warehouse != "" {
-		opts = append(opts, rest.WithWarehouseLocation(d.cfg.Warehouse))
-	}
-	if !d.cfg.Token.IsZero() {
-		opts = append(opts, rest.WithOAuthToken(d.cfg.Token.Reveal()))
-	}
-	if !d.cfg.Credential.IsZero() {
-		opts = append(opts, rest.WithCredential(d.cfg.Credential.Reveal()))
-	}
-	c, err := rest.NewCatalog(ctx, "openetl", d.cfg.URI, opts...)
-	if err != nil {
-		return nil, unavailable(fmt.Errorf("iceberg: catalog %s: %w", d.cfg.URI, err))
-	}
-	return c, nil
-}
-
-// unavailable classifies an error reaching the catalog or the store as the
-// destination being unavailable.
-func unavailable(err error) error {
-	if _, ok := errors.AsType[net.Error](err); ok && !errors.Is(err, context.Canceled) {
-		return sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_DESTINATION_UNAVAILABLE, err)
-	}
-	return err
-}
-
-// Check confirms the catalog answers and lists namespaces.
-func (d *Destination) Check(ctx context.Context) error {
-	c, err := d.catalog(ctx)
-	if err != nil {
-		return err
-	}
-	if _, err := c.ListNamespaces(ctx, nil); err != nil {
-		return unavailable(fmt.Errorf("iceberg: list namespaces: %w", err))
-	}
-	return nil
-}
+func (d *Destination) catalog(ctx context.Context) (catalog.Catalog, error) { return d.open(ctx) }
 
 func (d *Destination) Open(ctx context.Context, cfg destination.OpenConfig) (destination.Writer, error) {
 	for _, s := range cfg.Streams {
@@ -198,13 +89,9 @@ func (d *Destination) Open(ctx context.Context, cfg destination.OpenConfig) (des
 	if err != nil {
 		return nil, err
 	}
-	ns := cfg.Namespace
-	if ns == "" {
-		ns = d.cfg.Namespace
-	}
 	wctx, cancel := context.WithCancel(context.WithoutCancel(ctx))
 	w := &writer{
-		d: d, cat: c, cfg: cfg, ns: strings.Split(ns, "."),
+		d: d, cat: c, cfg: cfg, ns: d.namespace(cfg.Namespace),
 		ctx: wctx, cancel: cancel,
 		streams: map[string]destination.Stream{},
 		tables:  map[string]*table.Table{},
@@ -305,6 +192,9 @@ type stagedStream struct {
 	// that column.
 	Patches []string          `json:"patches,omitempty"`
 	Fills   map[string]string `json:"fills,omitempty"`
+	// Append and overwrite: which staged rows the commit skips by
+	// _openetl_id, as dedupeOf names it; empty for none.
+	Dedupe string `json:"dedupe,omitempty"`
 }
 
 // applies reports whether committing the stream changes its table, and
@@ -420,6 +310,9 @@ func (w *writer) ensure(ctx context.Context, stream string, sc *arrow.Schema) (*
 		if err != nil {
 			return nil, nil, fmt.Errorf("iceberg: load %s: %w", strings.Join(ident, "."), err)
 		}
+		if err := w.checkTable(ctx, tbl, stream, sc); err != nil {
+			return nil, nil, err
+		}
 		refused, add, promote := compareSchemas(ident, tbl.Schema(), want, w.streams[stream].AllowTypeChanges)
 		tx := tbl.NewTransaction()
 		u := tx.UpdateSchema(true, false).UnionByNameWith(add)
@@ -499,6 +392,34 @@ func limits(tbl *table.Table) destination.TableLimits {
 		}
 	}
 	return l
+}
+
+// checkTable fails a stream that merges into a table it can't delete the
+// rows of: one of format 1, one partitioned by a column outside the key,
+// since a merge's equality deletes are partitioned by the key alone, or one
+// with files of an earlier partitioning.
+func (w *writer) checkTable(ctx context.Context, tbl *table.Table, stream string, sc *arrow.Schema) error {
+	s := w.streams[stream]
+	if s.Mode != destination.Merge {
+		return nil
+	}
+	if tbl.Metadata().Version() < 2 {
+		return configInvalid(fmt.Errorf("iceberg: %s is format 1, which has no deletes, and stream %q merges into it", strings.Join(tbl.Identifier(), "."), stream))
+	}
+	key, err := keyColumns(sc, s.PrimaryKey)
+	if err != nil {
+		return configInvalid(fmt.Errorf("iceberg: stream %q: %w", stream, err))
+	}
+	for _, c := range partitionColumns(tbl) {
+		if !slices.Contains(key, c) {
+			return configInvalid(fmt.Errorf("iceberg: %s is partitioned by %s, and stream %q merges on %s: a merge needs every partition column in the key", strings.Join(tbl.Identifier(), "."), c, stream, strings.Join(key, ", ")))
+		}
+	}
+	return olderSpecs(ctx, tbl)
+}
+
+func configInvalid(err error) error {
+	return sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_CONFIG_INVALID, err)
 }
 
 // createMu keeps a job's lanes from racing to create a namespace or a table.
@@ -846,7 +767,7 @@ func (w *writer) PreCommit(ctx context.Context, e destination.Epoch) (destinatio
 		if len(files) == 0 && len(patched) == 0 && !isEnd && r == nil {
 			continue
 		}
-		ss := stagedStream{Name: s.Name, Table: w.name(s.Name), Files: files, Patches: patched}
+		ss := stagedStream{Name: s.Name, Table: w.name(s.Name), Files: files, Patches: patched, Dedupe: dedupeOf(s.Dedupe)}
 		if pf != nil {
 			ss.Fills = pf.fills
 		}
@@ -906,7 +827,8 @@ func (w *writer) Commit(ctx context.Context, _ destination.Epoch, committables [
 	if err != nil {
 		return destination.Committed{}, err
 	}
-	return destination.Committed{}, w.apply(ctx, desc, desc.Streams)
+	c := destination.Committed{Collapsed: map[string]uint64{}}
+	return c, w.apply(ctx, desc, desc.Streams, c.Collapsed)
 }
 
 // mergeLanes merges the epoch's descriptors, one per lane of the attempt
@@ -933,13 +855,13 @@ func (w *writer) mergeLanes(committables []destination.Staged) (staged, error) {
 			if !ok {
 				j = len(out.Streams)
 				at[s.Name] = j
-				out.Streams = append(out.Streams, stagedStream{Name: s.Name, Mode: s.Mode, HardDeletes: s.HardDeletes, Read: s.Read})
+				out.Streams = append(out.Streams, stagedStream{Name: s.Name, Mode: s.Mode, HardDeletes: s.HardDeletes, Read: s.Read, Dedupe: s.Dedupe})
 			}
 			m := &out.Streams[j]
 			if m.Read != s.Read {
 				return out, fmt.Errorf("iceberg: two reads of %s in epoch %d-g%d", s.Name, out.Epoch, out.Generation)
 			}
-			m.Table, m.Ended = cmp.Or(m.Table, s.Table), m.Ended || s.Ended
+			m.Table, m.Ended, m.Dedupe = cmp.Or(m.Table, s.Table), m.Ended || s.Ended, cmp.Or(m.Dedupe, s.Dedupe)
 			m.Files = append(m.Files, s.Files...)
 			m.Patches = append(m.Patches, s.Patches...)
 			m.Manifests = append(m.Manifests, s.Manifests...)
@@ -970,11 +892,14 @@ func (w *writer) mergeLanes(committables []destination.Staged) (staged, error) {
 // snapshot holds unless it commits, and a merge's staged files, which it
 // makes unneeded once it does.
 type pending struct {
-	tx *table.Transaction
+	stream string
+	tx     *table.Transaction
 	// The table as it was checked, whose store holds the files.
 	tbl     *table.Table
 	written []string
 	staged  []string
+	// The staged rows it doesn't insert, by dedupe.
+	collapsed uint64
 	// Overwrite: the stream's reads' manifests, which it makes unneeded too.
 	readsDir string
 }
@@ -993,7 +918,8 @@ func (w *writer) committed(p pending) {
 // apply commits each stream that changes its table and has no marker yet:
 // all in one catalog transaction, or with stream scope one per table. A
 // conflict means another commit landed first, so it checks again.
-func (w *writer) apply(ctx context.Context, desc staged, streams []stagedStream) error {
+// It adds the rows each stream's commit collapsed to collapsed, if not nil.
+func (w *writer) apply(ctx context.Context, desc staged, streams []stagedStream, collapsed map[string]uint64) error {
 	for attempt := 0; ; attempt++ {
 		txs, err := w.prepare(ctx, desc, streams)
 		if err != nil || len(txs) == 0 {
@@ -1002,7 +928,7 @@ func (w *writer) apply(ctx context.Context, desc staged, streams []stagedStream)
 		if testHookBeforeCommit != nil {
 			testHookBeforeCommit(w)
 		}
-		err = w.commit(ctx, txs)
+		err = w.commit(ctx, txs, collapsed)
 		if err == nil {
 			return nil
 		}
@@ -1030,7 +956,16 @@ var testHookBeforeCommit func(*writer)
 // each on its own, parallelism at a time, sending none once one has failed.
 // It drops the files of those the catalog refused or that it never sent, but
 // not of one whose outcome it doesn't know.
-func (w *writer) commit(ctx context.Context, txs []pending) error {
+func (w *writer) commit(ctx context.Context, txs []pending, collapsed map[string]uint64) error {
+	var mu sync.Mutex
+	landed := func(p pending) {
+		w.committed(p)
+		if collapsed != nil && p.collapsed > 0 {
+			mu.Lock()
+			collapsed[p.stream] += p.collapsed
+			mu.Unlock()
+		}
+	}
 	if w.cfg.Scope == destination.ScopePipeline && len(txs) > 1 {
 		m, err := catalog.NewMultiTableTransaction(w.cat)
 		if err != nil {
@@ -1050,7 +985,7 @@ func (w *writer) commit(ctx context.Context, txs []pending) error {
 			return err
 		}
 		for _, p := range txs {
-			w.committed(p)
+			landed(p)
 		}
 		return nil
 	}
@@ -1070,7 +1005,7 @@ func (w *writer) commit(ctx context.Context, txs []pending) error {
 				}
 				return err
 			}
-			w.committed(p)
+			landed(p)
 			return nil
 		})
 	}
@@ -1147,12 +1082,12 @@ func (w *writer) prepareStream(ctx context.Context, desc staged, s stagedStream,
 		reading.Lock()
 		defer reading.Unlock()
 	}
-	tx, written, err := w.transaction(ctx, tbl, desc, s, paths)
+	tx, res, err := w.transaction(ctx, tbl, desc, s, paths)
 	if err != nil {
-		w.removeFiles(tbl, written)
+		w.removeFiles(tbl, res.written)
 		return nil, fmt.Errorf("iceberg: %s: %w", strings.Join(ident, "."), err)
 	}
-	p := &pending{tx: tx, tbl: tbl, written: written, staged: s.Patches}
+	p := &pending{stream: s.Name, tx: tx, tbl: tbl, written: res.written, staged: append(slices.Clone(s.Patches), res.replaced...), collapsed: res.collapsed}
 	switch s.Mode {
 	case modeMerge:
 		p.staged = append(slices.Clone(s.Files), s.Patches...)
@@ -1162,71 +1097,87 @@ func (w *writer) prepareStream(ctx context.Context, desc staged, s stagedStream,
 	return p, nil
 }
 
+// staging is what a transaction did besides itself: the files it wrote,
+// which no snapshot holds unless it commits, the staged files it replaced
+// with them, which none does once it has, and the staged rows it left out.
+type staging struct {
+	written, replaced []string
+	collapsed         uint64
+}
+
 // transaction stages the stream's epoch in a transaction on tbl. It returns
 // the files it wrote, also on failure.
-func (w *writer) transaction(ctx context.Context, tbl *table.Table, desc staged, s stagedStream, paths []string) (*table.Transaction, []string, error) {
+func (w *writer) transaction(ctx context.Context, tbl *table.Table, desc staged, s stagedStream, paths []string) (*table.Transaction, staging, error) {
 	// Without it, a table that sets commit.retry.num-retries has iceberg-go
 	// replay the commit on top of a conflicting one.
 	tx := tbl.NewTransaction()
 	if err := tx.AssertRefSnapshotID(""); err != nil {
-		return nil, nil, err
+		return nil, staging{}, err
 	}
 	marker := ice.Properties{
 		pipelineKey: w.cfg.Pipeline, streamKey: s.Name,
 		generationKey: strconv.FormatUint(desc.Generation, 10), epochKey: strconv.FormatUint(desc.Epoch, 10),
 	}
-	var written []string
+	var res staging
+	// The table may have changed since the epoch's writes.
+	if s.Mode == modeMerge || len(s.Patches) > 0 {
+		if err := olderSpecs(ctx, tbl); err != nil {
+			return nil, res, err
+		}
+	}
 	var err error
 	if s.Mode == modeMerge {
-		written, err = w.mergeInto(ctx, tx, tbl, s, marker)
+		res.written, err = w.mergeInto(ctx, tx, tbl, s, marker)
 	} else {
-		written, err = w.addFiles(ctx, tx, tbl, s, paths, marker)
+		res, err = w.addFiles(ctx, tx, tbl, s, paths, marker)
 	}
 	if err != nil {
-		return nil, written, err
+		return nil, res, err
 	}
 	props := ice.Properties{loadedKey(w.cfg.Pipeline): fmt.Sprintf("%d:%d", desc.Epoch, desc.Generation)}
 	if s.Mode == modeOverwrite {
 		props[readKey(w.cfg.Pipeline)] = strconv.FormatInt(s.Read, 10)
 	}
 	if err := tx.SetProperties(props); err != nil {
-		return nil, written, err
+		return nil, res, err
 	}
-	return tx, written, nil
+	return tx, res, nil
 }
 
 // addFiles stages an append or an overwrite of the staged files in tx,
-// and an append's patches. It returns the files it wrote.
-func (w *writer) addFiles(ctx context.Context, tx *table.Transaction, tbl *table.Table, s stagedStream, paths []string, marker ice.Properties) ([]string, error) {
+// deduped as the stream says, and an append's patches.
+func (w *writer) addFiles(ctx context.Context, tx *table.Transaction, tbl *table.Table, s stagedStream, paths []string, marker ice.Properties) (staging, error) {
+	var res staging
 	fs, err := tbl.FS(ctx)
 	if err != nil {
-		return nil, err
+		return res, err
 	}
-	// Each reads the file's footer.
-	files := make([]ice.DataFile, len(paths))
-	g, gctx := errgroup.WithContext(ctx)
-	g.SetLimit(parallelism)
-	for i, p := range paths {
-		g.Go(func() error {
-			df, err := table.FileToDataFile(gctx, fs, p, tbl.Schema(), tbl.Spec(), 0, tbl.Properties())
-			if err != nil {
-				return fmt.Errorf("staged file %s: %w", p, err)
-			}
-			files[i] = df
-			return nil
-		})
+	if s.Dedupe != "" {
+		// An overwrite's target is its read, all of which it has.
+		d, err := dedupe(ctx, tbl, fs, paths, s.Dedupe == dedupeTarget && s.Mode == "")
+		res = staging{written: d.written, replaced: d.replaced, collapsed: d.dropped}
+		if err != nil {
+			return res, err
+		}
+		paths = d.paths
 	}
-	if err := g.Wait(); err != nil {
-		return nil, err
+	// A format 3 table's row delta gives the files it adds row IDs; the
+	// others take them as they are.
+	patched := s.Mode == "" && len(s.Patches) > 0
+	files, err := dataFiles(ctx, fs, tbl, paths, !patched, &res)
+	if err != nil {
+		return res, err
 	}
-	if s.Mode == "" && len(s.Patches) > 0 {
-		return w.appendPatched(ctx, tx, tbl, s, files, marker)
+	if patched {
+		written, err := w.appendPatched(ctx, tx, tbl, s, files, marker)
+		res.written = append(res.written, written...)
+		return res, err
 	}
 	var current []ice.DataFile
 	if s.Mode == modeOverwrite && tbl.CurrentSnapshot() != nil {
 		tasks, err := tbl.Scan().PlanFiles(ctx)
 		if err != nil {
-			return nil, fmt.Errorf("plan its files: %w", err)
+			return res, fmt.Errorf("plan its files: %w", err)
 		}
 		for _, t := range tasks {
 			current = append(current, t.File)
@@ -1238,7 +1189,7 @@ func (w *writer) addFiles(ctx context.Context, tx *table.Transaction, tbl *table
 	case len(files) > 0:
 		err = tx.AddDataFiles(ctx, files, marker, table.WithoutAutoNameMapping())
 	}
-	return nil, err
+	return res, err
 }
 
 func (w *writer) checkFence(props ice.Properties, gen uint64) error {
@@ -1414,7 +1365,7 @@ func (w *writer) Recover(ctx context.Context, gen uint64, e destination.Epoch, c
 	case len(missing) == 0:
 		r = destination.Applied
 	case present == needs:
-		if err := w.apply(ctx, desc, missing); err != nil {
+		if err := w.apply(ctx, desc, missing, nil); err != nil {
 			return 0, err
 		}
 		r = destination.Redone
