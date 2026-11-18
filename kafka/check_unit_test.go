@@ -13,11 +13,17 @@ import (
 	"math/big"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/twmb/franz-go/pkg/kadm"
+	"github.com/twmb/franz-go/pkg/kerr"
+	"github.com/twmb/franz-go/pkg/kgo"
+	"github.com/twmb/franz-go/pkg/kmsg"
 
 	sdk "github.com/openetl-io/openetl/sdk/go"
 	"github.com/openetl-io/openetl/sdk/go/check"
@@ -173,6 +179,10 @@ func TestOAuthBearer(t *testing.T) {
 // AWS_MSK_IAM signs its challenge with the config's key, in the broker's
 // region.
 func TestMSKIAM(t *testing.T) {
+	// Static keys don't depend on the host's AWS config, even a broken one.
+	t.Setenv("AWS_PROFILE", "openetl-missing-profile")
+	t.Setenv("AWS_CONFIG_FILE", filepath.Join(t.TempDir(), "missing"))
+	t.Setenv("AWS_SHARED_CREDENTIALS_FILE", filepath.Join(t.TempDir(), "missing"))
 	c := Connection{Brokers: []string{"b-1.c.kafka.eu-west-2.amazonaws.com:9098"}, SASLMechanism: saslMSKIAM,
 		AWSAccessKeyID: secret("AKIATEST"), AWSSecretAccessKey: secret("shh")}
 	if err := c.validate("json"); err != nil {
@@ -225,4 +235,41 @@ func testCA(t *testing.T) string {
 		t.Fatal(err)
 	}
 	return string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}))
+}
+
+// transactionLimit reads the brokers' transaction.max.timeout.ms, is 0 only
+// where the credentials may not describe their configs, and fails on any
+// other error, rather than skipping the check.
+func TestTransactionLimit(t *testing.T) {
+	limit := func(code int16) (time.Duration, error) {
+		c := fakeCluster(t)
+		if code != 0 {
+			c.ControlKey(int16(kmsg.DescribeConfigs), func(kr kmsg.Request) (kmsg.Response, error, bool) {
+				c.KeepControl()
+				req := kr.(*kmsg.DescribeConfigsRequest)
+				resp := req.ResponseKind().(*kmsg.DescribeConfigsResponse)
+				for _, r := range req.Resources {
+					rr := kmsg.NewDescribeConfigsResponseResource()
+					rr.ResourceName, rr.ResourceType, rr.ErrorCode = r.ResourceName, r.ResourceType, code
+					resp.Resources = append(resp.Resources, rr)
+				}
+				return resp, nil, true
+			})
+		}
+		cl, err := kgo.NewClient(kgo.SeedBrokers(c.ListenAddrs()...))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer cl.Close()
+		return transactionLimit(t.Context(), kadm.NewClient(cl))
+	}
+	if got, err := limit(0); err != nil || got != 15*time.Minute {
+		t.Errorf("the brokers' limit = %v, %v", got, err)
+	}
+	if got, err := limit(kerr.ClusterAuthorizationFailed.Code); err != nil || got != 0 {
+		t.Errorf("without DESCRIBE_CONFIGS = %v, %v", got, err)
+	}
+	if _, err := limit(kerr.InvalidRequest.Code); !errors.Is(err, kerr.InvalidRequest) {
+		t.Errorf("a broker's error = %v", err)
+	}
 }

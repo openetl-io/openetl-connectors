@@ -673,15 +673,22 @@ func (d *Destination) Checks() []check.Check {
 }
 
 // transactionLimit is the brokers' transaction.max.timeout.ms; 0 if the
-// credentials may not describe the brokers' configs.
+// credentials may not describe the brokers' configs, or the brokers don't
+// say.
 func transactionLimit(ctx context.Context, adm *kadm.Client) (time.Duration, error) {
 	brokers, err := adm.ListBrokers(ctx)
 	if err != nil || len(brokers) == 0 {
 		return 0, err
 	}
 	rcs, err := adm.DescribeBrokerConfigs(ctx, brokers[0].NodeID)
-	if err != nil || len(rcs) == 0 || rcs[0].Err != nil {
+	if err == nil && len(rcs) > 0 {
+		err = rcs[0].Err
+	}
+	if errors.Is(err, kerr.ClusterAuthorizationFailed) || err == nil && len(rcs) == 0 {
 		return 0, nil
+	}
+	if err != nil {
+		return 0, err
 	}
 	for _, c := range rcs[0].Configs {
 		if c.Key != "transaction.max.timeout.ms" || c.Value == nil {

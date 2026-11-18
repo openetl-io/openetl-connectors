@@ -1,6 +1,7 @@
 package keysplit
 
 import (
+	"errors"
 	"math/big"
 	"slices"
 	"testing"
@@ -48,5 +49,16 @@ func TestIntMid(t *testing.T) {
 	r.Asked.Store(true)
 	if mid, _ := r.IntMid(big.NewInt(3), big.NewInt(3), extent); mid != nil || !r.Over.Load() {
 		t.Fatalf("nothing left: %v, over %v", mid, r.Over.Load())
+	}
+
+	var failed Reading
+	failed.Asked.Store(true)
+	if _, err := failed.IntMid(nil, nil, func() (*big.Int, *big.Int, error) { return nil, nil, errors.New("lookup failed") }); err == nil || failed.Over.Load() {
+		t.Fatalf("a failed lookup: %v, over %v", err, failed.Over.Load())
+	}
+	var empty Reading
+	empty.Asked.Store(true)
+	if mid, err := empty.IntMid(nil, nil, func() (*big.Int, *big.Int, error) { return nil, nil, nil }); mid != nil || err != nil || !empty.Over.Load() {
+		t.Fatalf("an empty table: %v, %v, over %v", mid, err, empty.Over.Load())
 	}
 }

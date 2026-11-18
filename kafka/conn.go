@@ -178,7 +178,7 @@ func (c *Connection) mechanism() sasl.Mechanism {
 
 // awsAuth signs MSK IAM's challenge with the config's key, or else the AWS
 // default credentials, loaded once and renewed as they expire. The region
-// is the broker's host's.
+// is the broker's host's, so the key needs no AWS config of the host's.
 func (c *Connection) awsAuth() func(context.Context) (saslaws.Auth, error) {
 	var (
 		mu    sync.Mutex
@@ -187,16 +187,16 @@ func (c *Connection) awsAuth() func(context.Context) (saslaws.Auth, error) {
 	return func(ctx context.Context) (saslaws.Auth, error) {
 		mu.Lock()
 		if creds == nil {
-			var opts []func(*awsconfig.LoadOptions) error
 			if !c.AWSAccessKeyID.IsZero() {
-				opts = append(opts, awsconfig.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(c.AWSAccessKeyID.Reveal(), c.AWSSecretAccessKey.Reveal(), "")))
+				creds = credentials.NewStaticCredentialsProvider(c.AWSAccessKeyID.Reveal(), c.AWSSecretAccessKey.Reveal(), "")
+			} else {
+				ac, err := awsconfig.LoadDefaultConfig(ctx)
+				if err != nil {
+					mu.Unlock()
+					return saslaws.Auth{}, fmt.Errorf("kafka: AWS config: %w", err)
+				}
+				creds = ac.Credentials
 			}
-			ac, err := awsconfig.LoadDefaultConfig(ctx, opts...)
-			if err != nil {
-				mu.Unlock()
-				return saslaws.Auth{}, fmt.Errorf("kafka: AWS config: %w", err)
-			}
-			creds = ac.Credentials
 		}
 		p := creds
 		mu.Unlock()

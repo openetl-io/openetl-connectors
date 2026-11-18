@@ -5,7 +5,7 @@ description: Read Kafka topics as streams, and write streams into topics in one 
 
 The `kafka` package has a source and a destination. The source reads each topic as a stream, from where the last read stopped. The destination writes each stream into a topic, a record per row, and commits each epoch in one Kafka transaction, so every row lands exactly once.
 
-Both are tested against Apache Kafka 4.3 and the Karapace schema registry: without TLS or SASL, and through a SASL_SSL listener with PLAIN, SCRAM-SHA-256, SCRAM-SHA-512 and OAUTHBEARER. The tests also show that the broker refuses a client certificate its CA didn't sign, but no test signs in with a client certificate the broker accepts. A registry's basic authentication and AWS MSK IAM are supported, but no test runs them against a server: MSK IAM's signed request is tested on its own.
+Both are tested against Apache Kafka 4.3 and the Karapace schema registry: without TLS or SASL, and through a SASL_SSL listener with PLAIN, SCRAM-SHA-256, SCRAM-SHA-512 and OAUTHBEARER (from 0.2.0). The tests also show that the broker refuses a client certificate its CA didn't sign, but no test signs in with a client certificate the broker accepts. A registry's basic authentication and AWS MSK IAM (from 0.2.0) are supported, but no test runs them against a server: MSK IAM's signed request is tested on its own.
 
 ## Connecting
 
@@ -122,7 +122,7 @@ Each epoch is one Kafka transaction across all its topics, on one of three trans
 
 Streams whose source replays exactly land exactly once. A stream that may repeat rows, such as a Postgres table read incrementally, gets at least once: the destination has no way to drop the rows sent again.
 
-A transaction must stay open for less than the brokers' `transaction.max.timeout.ms`, 15 minutes by default, so a pipeline's commit interval can be at most 7 minutes. The destination reads the brokers' setting in its check and when it opens, if the credentials may describe their configs. A continuous pipeline commits every 10 seconds unless it sets its own `delivery.commit.interval`.
+A transaction must stay open for less than the brokers' `transaction.max.timeout.ms`, 15 minutes by default, so a pipeline's commit interval can be at most 7 minutes. The destination reads the brokers' setting when it opens, and from 0.2.0 in its check too, if the credentials may describe their configs. A continuous pipeline commits every 10 seconds unless it sets its own `delivery.commit.interval`.
 
 ### Jobs on several workers
 
