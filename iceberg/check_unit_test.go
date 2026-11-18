@@ -1,8 +1,19 @@
 package iceberg
 
 import (
+	"context"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"slices"
 	"testing"
+
+	"github.com/apache/arrow-go/v18/arrow"
+	ice "github.com/apache/iceberg-go"
+	"github.com/apache/iceberg-go/catalog"
+	iceio "github.com/apache/iceberg-go/io"
+	"github.com/apache/iceberg-go/table"
 
 	"github.com/openetl-io/openetl-connectors/connectortest"
 	"github.com/openetl-io/openetl/sdk/go/check"
@@ -12,6 +23,9 @@ import (
 // The lists are valid for any config and request, streams whose names make
 // the same check name included, and hold what the config calls for.
 func TestCheckLists(t *testing.T) {
+	// Whatever proxy the environment names.
+	defer func(f func(*http.Request) (*url.URL, error)) { proxyFor = f }(proxyFor)
+	proxyFor = func(*http.Request) (*url.URL, error) { return nil, nil }
 	for config, want := range map[string][]string{
 		`{"uri": "https://catalog.example.com/api", "token": "t"}`: {"net.dns", "net.connect", "net.tls", "catalog.auth", "catalog.namespace", "catalog.create", "catalog.commit", "store.write", "store.delete"},
 		`{"uri": "http://catalog:8181", "s3Endpoint": "http://s3:8333"}`: {"net.dns", "net.connect", "catalog.auth", "catalog.namespace", "catalog.create", "catalog.commit",
@@ -49,5 +63,121 @@ func TestCheckLists(t *testing.T) {
 	}
 	if pf[0].Advisory {
 		t.Error("a named Glue endpoint's reach is advisory")
+	}
+}
+
+// Reaching the catalog or the store only advises where a proxy applies, as
+// the clients take it and a dial doesn't.
+func TestCheckThroughAProxy(t *testing.T) {
+	defer func(f func(*http.Request) (*url.URL, error)) { proxyFor = f }(proxyFor)
+	proxyFor = func(r *http.Request) (*url.URL, error) {
+		if r.URL.Hostname() == "catalog" {
+			return url.Parse("http://proxy:3128")
+		}
+		return nil, nil
+	}
+	d, err := NewDestination([]byte(`{"uri": "http://catalog:8181", "s3Endpoint": "http://s3:8333"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]bool{"net.dns": true, "net.connect": true, "store.dns": false, "store.connect": false}
+	for _, c := range d.Checks() {
+		if w, ok := want[c.Name]; ok && c.Advisory != w {
+			t.Errorf("%s: advisory %v", c.Name, c.Advisory)
+		}
+	}
+}
+
+type closingCatalog struct {
+	catalog.Catalog
+	closed *int
+}
+
+func (c closingCatalog) Close() error { *c.closed++; return nil }
+
+// A list's catalog is closed once, after the cleanups of the checks that
+// used it.
+func TestSessionCloses(t *testing.T) {
+	closed, opened := 0, 0
+	s := &session{open: func(context.Context) (catalog.Catalog, error) { opened++; return closingCatalog{closed: &closed}, nil }}
+	use := func(name string, needs ...string) check.Check {
+		return check.Check{Name: name, Kind: check.Resource, Title: name, Needs: needs, Run: func(ctx context.Context, p *check.Probe) error {
+			_, err := s.catalog(ctx, p)
+			p.Cleanup(func(context.Context) {
+				if closed > 0 {
+					t.Errorf("%s's cleanup ran after the catalog closed", name)
+				}
+			})
+			return err
+		}}
+	}
+	check.Run(t.Context(), []check.Check{use("a"), use("b", "a")})
+	if opened != 1 || closed != 1 {
+		t.Errorf("opened %d, closed %d", opened, closed)
+	}
+}
+
+// probeCatalog creates no table, failing with err, as Glue does when it
+// creates one and can't load it, and counts the drops.
+type probeCatalog struct {
+	catalog.Catalog
+	err     error
+	dropped *int
+}
+
+func (c probeCatalog) ListNamespaces(context.Context, table.Identifier) ([]table.Identifier, error) {
+	return nil, nil
+}
+func (c probeCatalog) CheckNamespaceExists(context.Context, table.Identifier) (bool, error) {
+	return true, nil
+}
+func (c probeCatalog) CreateTable(context.Context, table.Identifier, *ice.Schema, ...catalog.CreateTableOpt) (*table.Table, error) {
+	return nil, c.err
+}
+func (c probeCatalog) PurgeTable(context.Context, table.Identifier) error { *c.dropped++; return nil }
+
+// A check table whose creation failed is dropped all the same, as it may
+// exist, unless it existed before.
+func TestCheckTableDropped(t *testing.T) {
+	srv := httptest.NewServer(http.NotFoundHandler())
+	defer srv.Close()
+	d, err := NewDestination([]byte(`{"uri": "` + srv.URL + `"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for err, want := range map[error]int{errors.New("can't load it"): 1, catalog.ErrTableAlreadyExists: 0} {
+		dropped := 0
+		cat := probeCatalog{err: err, dropped: &dropped}
+		r := check.Run(t.Context(), d.checks(&session{open: func(context.Context) (catalog.Catalog, error) { return cat, nil }}))
+		if it := r.Items[slices.IndexFunc(r.Items, func(it check.Item) bool { return it.Name == "catalog.create" })]; it.Status != check.Failed {
+			t.Errorf("%v: catalog.create %v", err, it.Status)
+		}
+		if dropped != want {
+			t.Errorf("%v: dropped %d times, want %d", err, dropped, want)
+		}
+	}
+}
+
+// A merge's table check reports a manifest list it can't read as that, not
+// as files of an earlier partitioning.
+func TestTableTakesUnreadManifests(t *testing.T) {
+	dir := t.TempDir()
+	meta, err := table.ParseMetadataString(`{"format-version": 2, "table-uuid": "9c12d441-03fe-4693-9a96-a0705ddf69c1", "location": "file://` + dir + `",
+		"last-sequence-number": 1, "last-updated-ms": 1, "last-column-id": 1, "current-schema-id": 0,
+		"schemas": [{"type": "struct", "schema-id": 0, "fields": [{"id": 1, "name": "id", "required": false, "type": "long"}]}],
+		"default-spec-id": 0, "last-partition-id": 1000, "partition-specs": [{"spec-id": 0, "fields": [{"source-id": 1, "field-id": 1000, "name": "id", "transform": "identity"}]}],
+		"default-sort-order-id": 0, "sort-orders": [{"order-id": 0, "fields": []}],
+		"current-snapshot-id": 1, "snapshots": [{"snapshot-id": 1, "sequence-number": 1, "timestamp-ms": 1, "manifest-list": "file://` + dir + `/missing.avro", "summary": {"operation": "append"}, "schema-id": 0}]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tbl := table.New(table.Identifier{"n", "t"}, meta, dir+"/metadata.json", func(context.Context) (iceio.IO, error) { return iceio.LocalFS{}, nil }, nil)
+	sc := arrow.NewSchema([]arrow.Field{{Name: "id", Type: arrow.PrimitiveTypes.Int64, Nullable: true}}, nil)
+	err = tableTakes(t.Context(), tbl, tbl.Identifier(), sc, destination.Stream{Name: "t", Mode: destination.Merge, PrimaryKey: []string{"id"}})
+	if err == nil {
+		t.Fatal("a table whose manifest list is missing takes a merge")
+	}
+	if f := check.Classify(err); f != nil && f.Reason == "merge_unsupported" {
+		t.Errorf("a missing manifest list: %v", err)
 	}
 }

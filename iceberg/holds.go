@@ -214,9 +214,10 @@ func rewrite(ctx context.Context, rec arrow.RecordBatch, match func(arrow.Record
 
 // patchTarget reads the table's rows the patches match that rows doesn't
 // already have, patches them, and returns those the patches changed, all
-// the table's rows of what they match. skip is what no row may be read
-// for, such as keys the epoch deletes.
-func patchTarget(ctx context.Context, tbl *table.Table, sc *arrow.Schema, p *patcher, filter func([]int) ice.BooleanExpression, have, skip map[string]bool) (arrow.RecordBatch, error) {
+// the table's rows of what they match, and the same rows as they were
+// before. skip is what no row may be read for, such as keys the epoch
+// deletes.
+func patchTarget(ctx context.Context, tbl *table.Table, sc *arrow.Schema, p *patcher, filter func([]int) ice.BooleanExpression, have, skip map[string]bool) (patched, before arrow.RecordBatch, err error) {
 	var want []int
 	for _, r := range p.matches() {
 		if k := p.match(p.rec, r); !have[k] && !skip[k] {
@@ -224,7 +225,7 @@ func patchTarget(ctx context.Context, tbl *table.Table, sc *arrow.Schema, p *pat
 		}
 	}
 	if len(want) == 0 || tbl.CurrentSnapshot() == nil {
-		return nil, nil
+		return nil, nil, nil
 	}
 	f := filter(want)
 	if _, err := ice.BindExpr(tbl.Schema(), f, true); err != nil {
@@ -232,7 +233,7 @@ func patchTarget(ctx context.Context, tbl *table.Table, sc *arrow.Schema, p *pat
 	}
 	_, it, err := tbl.Scan(table.WithRowFilter(f)).ToArrowRecords(ctx)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	var batches []arrow.RecordBatch
 	defer func() {
@@ -242,36 +243,43 @@ func patchTarget(ctx context.Context, tbl *table.Table, sc *arrow.Schema, p *pat
 	}()
 	for b, err := range it {
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		c, err := conform(ctx, b, sc)
 		b.Release()
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		batches = append(batches, c)
 	}
 	target, err := concat(sc, batches)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer target.Release()
 	wanted := map[string]bool{}
 	for _, r := range want {
 		wanted[p.match(p.rec, r)] = true
 	}
-	patched, changed, err := p.apply(ctx, target)
+	all, changed, err := p.apply(ctx, target)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	defer patched.Release()
+	defer all.Release()
 	hit := map[string]bool{}
 	for r, c := range changed {
-		if k := p.match(patched, r); c && wanted[k] {
+		if k := p.match(all, r); c && wanted[k] {
 			hit[k] = true
 		}
 	}
-	return rewrite(ctx, patched, p.match, hit)
+	if patched, err = rewrite(ctx, all, p.match, hit); err != nil {
+		return nil, nil, err
+	}
+	if before, err = rewrite(ctx, target, p.match, hit); err != nil {
+		patched.Release()
+		return nil, nil, err
+	}
+	return patched, before, nil
 }
 
 // readPatches reads an epoch's patches back in sc.
@@ -310,9 +318,12 @@ func (w *writer) appendPatched(ctx context.Context, tx *table.Transaction, tbl *
 	match := func(rec arrow.RecordBatch, r int) string { return string(bytesAt(rec.Column(id), r)) }
 	p := newPatcher(sc, ps, s.Fills, match)
 	filter := func(rows []int) ice.BooleanExpression { return keyFilter(sc, ps, []int{id}, rows) }
-	rows, err := patchTarget(ctx, tbl, sc, p, filter, nil, nil)
+	rows, before, err := patchTarget(ctx, tbl, sc, p, filter, nil, nil)
 	if err != nil {
 		return nil, fmt.Errorf("patch its rows: %w", err)
+	}
+	if before != nil {
+		defer before.Release()
 	}
 	if rows == nil || rows.NumRows() == 0 {
 		if rows != nil {
@@ -324,14 +335,15 @@ func (w *writer) appendPatched(ctx context.Context, tx *table.Transaction, tbl *
 		return nil, tx.AddDataFiles(ctx, files, marker, table.WithoutAutoNameMapping())
 	}
 	// A partitioned table's deletes go to the partitions of the rows they
-	// delete, which a patch doesn't move.
+	// delete, as they were: a patch sets _openetl_synced_at, which the
+	// table may be partitioned by.
 	delCols := []int{id}
 	for _, c := range partitionColumns(tbl) {
 		if j := columnIndex(sc, c); j >= 0 && j != id {
 			delCols = append(delCols, j)
 		}
 	}
-	dels := keysOf(rows, delCols)
+	dels := keysOf(before, delCols)
 	defer dels.Release()
 	// WriteRecords releases rows.
 	written, data, err := writeData(ctx, tbl, sc, rows)

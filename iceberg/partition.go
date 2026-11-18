@@ -4,10 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"reflect"
 	"slices"
 	"strings"
-	"sync"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/memory"
@@ -34,9 +34,13 @@ func partitionColumns(tbl *table.Table) []string {
 	return out
 }
 
+// errOlderSpec is a table's files of an earlier partition spec.
+var errOlderSpec = errors.New("files of an earlier partitioning")
+
 // olderSpecs fails a partitioned table that holds data files of another
-// partition spec: a delete written in the current one's partitions doesn't
-// apply to them, so a merge or a patch would leave their rows in place.
+// partition spec, with errOlderSpec: a delete written in the current one's
+// partitions doesn't apply to them, so a merge or a patch would leave their
+// rows in place.
 func olderSpecs(ctx context.Context, tbl *table.Table) error {
 	spec, snap := tbl.Spec(), tbl.CurrentSnapshot()
 	if spec.IsUnpartitioned() || snap == nil {
@@ -51,12 +55,20 @@ func olderSpecs(ctx context.Context, tbl *table.Table) error {
 		return err
 	}
 	for _, m := range manifests {
-		if m.ManifestContent() == ice.ManifestContentData && int(m.PartitionSpecID()) != spec.ID() {
-			return configInvalid(fmt.Errorf("iceberg: %s holds files of an earlier partitioning, whose rows its deletes, partitioned by %s, can't reach: rewrite them into the current partitioning, as Spark's rewrite_data_files procedure does",
-				strings.Join(tbl.Identifier(), "."), strings.Join(partitionColumns(tbl), ", ")))
+		if olderData(m, spec.ID()) {
+			return configInvalid(fmt.Errorf("iceberg: %s holds %w, whose rows its deletes, partitioned by %s, can't reach: rewrite them into the current partitioning, as Spark's rewrite_data_files procedure does",
+				strings.Join(tbl.Identifier(), "."), errOlderSpec, strings.Join(partitionColumns(tbl), ", ")))
 		}
 	}
 	return nil
+}
+
+// olderData reports whether m lists live data files of a spec other than
+// spec: added or existing ones, or ones it doesn't count. A manifest of
+// only deleted files, as a rewrite into the current spec leaves in its
+// snapshot, lists none.
+func olderData(m ice.ManifestFile, spec int) bool {
+	return m.ManifestContent() == ice.ManifestContentData && int(m.PartitionSpecID()) != spec && (m.HasAddedFiles() || m.HasExistingFiles())
 }
 
 // fileDesc is a staged data file of a table, written with the table's
@@ -119,52 +131,75 @@ func (d fileDesc) dataFile(tbl *table.Table, firstRowID *int64) (ice.DataFile, e
 // table, with row IDs from the table's next one on. A file of more than one
 // partition, written before the table's partitioning changed, is written
 // again by partition into the files it adds to res.written, and to
-// res.replaced itself.
+// res.replaced itself. A file written so is described once more, and fails
+// if it's still of more than one partition, as another rewrite would write
+// it the same.
 func dataFiles(ctx context.Context, fs iceio.IO, tbl *table.Table, paths []string, rowIDs bool, res *staging) ([]ice.DataFile, error) {
-	var mixed []string
-	for {
-		descs := make([]fileDesc, len(paths))
-		var mu sync.Mutex
-		g, gctx := errgroup.WithContext(ctx)
-		g.SetLimit(parallelism)
-		for i, p := range paths {
-			g.Go(func() error {
-				d, err := describeFile(gctx, fs, p, tbl)
-				if errors.Is(err, errMixed) {
-					mu.Lock()
-					mixed = append(mixed, p)
-					mu.Unlock()
-					return nil
-				}
-				if err != nil {
-					return fmt.Errorf("staged file %s: %w", p, err)
-				}
-				descs[i] = d
-				return nil
-			})
-		}
-		if err := g.Wait(); err != nil {
-			return nil, err
-		}
-		if len(mixed) == 0 {
-			return describedFiles(tbl, descs, rowIDs)
-		}
-		sc, err := table.SchemaToArrowSchema(tbl.Schema(), nil, true, false)
-		if err != nil {
-			return nil, err
-		}
-		keep := slices.DeleteFunc(slices.Clone(paths), func(p string) bool { return slices.Contains(mixed, p) })
-		for _, p := range mixed {
-			written, err := rewriteKept(ctx, tbl, fs, p, sc, nil)
-			res.written = append(res.written, written...)
-			if err != nil {
-				return nil, fmt.Errorf("staged file %s: %w", p, err)
-			}
-			res.replaced = append(res.replaced, p)
-			keep = append(keep, written...)
-		}
-		paths, mixed = keep, nil
+	descs, mixed, err := describeFiles(ctx, fs, tbl, paths)
+	if err != nil {
+		return nil, err
 	}
+	if len(mixed) == 0 {
+		return describedFiles(tbl, descs, rowIDs)
+	}
+	sc, err := table.SchemaToArrowSchema(tbl.Schema(), nil, true, false)
+	if err != nil {
+		return nil, err
+	}
+	var rewritten []string
+	for _, p := range mixed {
+		written, err := rewriteKept(ctx, tbl, fs, p, sc, nil)
+		res.written = append(res.written, written...)
+		if err != nil {
+			return nil, fmt.Errorf("staged file %s: %w", p, err)
+		}
+		res.replaced = append(res.replaced, p)
+		rewritten = append(rewritten, written...)
+	}
+	more, still, err := describeFiles(ctx, fs, tbl, rewritten)
+	if err != nil {
+		return nil, err
+	}
+	if len(still) > 0 {
+		return nil, fmt.Errorf("files %s, written by partition, are still of more than one", strings.Join(still, ", "))
+	}
+	return describedFiles(tbl, append(descs, more...), rowIDs)
+}
+
+// describeFiles describes files of tbl, parallelism at a time: those of one
+// partition, in the order of paths, and the paths of those of more.
+func describeFiles(ctx context.Context, fs iceio.IO, tbl *table.Table, paths []string) ([]fileDesc, []string, error) {
+	descs := make([]fileDesc, len(paths))
+	mixed := make([]bool, len(paths))
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(parallelism)
+	for i, p := range paths {
+		g.Go(func() error {
+			d, err := describeFile(gctx, fs, p, tbl)
+			if errors.Is(err, errMixed) {
+				mixed[i] = true
+				return nil
+			}
+			if err != nil {
+				return fmt.Errorf("staged file %s: %w", p, err)
+			}
+			descs[i] = d
+			return nil
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return nil, nil, err
+	}
+	var one []fileDesc
+	var more []string
+	for i, p := range paths {
+		if mixed[i] {
+			more = append(more, p)
+		} else {
+			one = append(one, descs[i])
+		}
+	}
+	return one, more, nil
 }
 
 func describedFiles(tbl *table.Table, descs []fileDesc, rowIDs bool) ([]ice.DataFile, error) {
@@ -188,6 +223,21 @@ func describedFiles(tbl *table.Table, descs []fileDesc, rowIDs bool) ([]ice.Data
 // errMixed: a file's rows are of more than one partition of the table's
 // spec, which changed after the file was written.
 var errMixed = errors.New("rows of more than one partition")
+
+// samePartition reports whether a and b, partition values, are the same
+// partition's: as reflect.DeepEqual has them, but a NaN, which is equal to
+// nothing, is one partition with another NaN.
+func samePartition(a, b any) bool {
+	switch x := a.(type) {
+	case float32:
+		y, ok := b.(float32)
+		return ok && (x == y || math.IsNaN(float64(x)) && math.IsNaN(float64(y)))
+	case float64:
+		y, ok := b.(float64)
+		return ok && (x == y || math.IsNaN(x) && math.IsNaN(y))
+	}
+	return reflect.DeepEqual(a, b)
+}
 
 // partitionOf is the partition of a file of tbl, from its rows, each
 // partition field's value, and the Avro logical type of those that have
@@ -250,7 +300,7 @@ func partitionOf(ctx context.Context, fs iceio.IO, path string, tbl *table.Table
 				}
 				if first {
 					values[pf.FieldID], first = v, false
-				} else if !reflect.DeepEqual(v, values[pf.FieldID]) {
+				} else if !samePartition(v, values[pf.FieldID]) {
 					rr.Release()
 					return nil, nil, errMixed
 				}

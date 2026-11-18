@@ -348,3 +348,34 @@ func TestPatchAPartitionedTable(t *testing.T) {
 		t.Errorf("a patch of a table with files of an earlier partitioning: %v", err)
 	}
 }
+
+// A table partitioned by _openetl_synced_at, which a patch sets, has a
+// patched row's delete in the partition the row was in, so the row isn't
+// left there too.
+func TestPatchATablePartitionedBySyncedAt(t *testing.T) {
+	env := newEnv(t)
+	stream := destination.Stream{Name: "users", Mode: destination.Append, PrimaryKey: []string{"id"}}
+	w := env.writer(1, stream)
+	fields := []arrow.Field{idField, rowID, opField, seqField, syncedField, priceField, heldField}
+	if _, err := w.(destination.SchemaApplier).ApplySchema(t.Context(), []destination.StreamSchema{{Name: "users", Schema: arrow.NewSchema(fields, nil)}}); err != nil {
+		t.Fatal(err)
+	}
+	tx := env.table("users").NewTransaction()
+	if err := tx.UpdateSpec(true).AddField(syncedColumn, ice.DayTransform{}, "synced_day").Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Commit(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	synced := func(r string) string {
+		return strings.Replace(r, `{"id"`, `{"_openetl_synced_at": "2026-01-01T00:00:00Z", "id"`, 1)
+	}
+	writeRows(t, w, ep(1), "users", fields, list(synced(row(1, 1, "null", `["price"]`)), synced(row(2, 2, `"x"`, "null"))))
+	commitEpoch(t, w, ep(1))
+	// p's _openetl_synced_at is the next day's.
+	patch(t, w, ep(2), "users", batch(t, []arrow.Field{idField, rowID, seqField, syncedField, heldField, priceField}, list(p(1, 1, `"1"`))))
+	commitEpoch(t, w, ep(2))
+	if got := env.held("users", "id", "price"); got != "1:1:-,2:x:-" {
+		t.Errorf("after the patch: %s", got)
+	}
+}

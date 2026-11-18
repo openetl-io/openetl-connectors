@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/http"
 	"net/url"
 	"slices"
 	"strconv"
@@ -50,23 +51,33 @@ var (
 )
 
 // session is one list's catalog, opened by the first check that needs it
-// and shared by the rest.
+// and shared by the rest, and closed once the list's other cleanups, which
+// may use it, have run.
 type session struct {
-	c    *conn
+	open func(context.Context) (catalog.Catalog, error)
 	once sync.Once
 	cat  catalog.Catalog
 	err  error
 }
 
-func (s *session) catalog(ctx context.Context) (catalog.Catalog, error) {
-	s.once.Do(func() { s.cat, s.err = s.c.open(ctx) })
+// catalog is the session's catalog; p is the probe of the check that needs
+// it, which closes it if it's the first.
+func (s *session) catalog(ctx context.Context, p *check.Probe) (catalog.Catalog, error) {
+	s.once.Do(func() {
+		s.cat, s.err = s.open(ctx)
+		if c, ok := s.cat.(catalog.Closer); ok && s.err == nil {
+			p.Cleanup(func(context.Context) { _ = c.Close() })
+		}
+	})
 	return s.cat, s.err
 }
 
 // endpoint is the host and port the catalog answers at, whether it starts
-// with TLS, the config field that names it, and whether the config names
-// it at all, rather than AWS's own; empty if it can't tell.
-func (c *conn) endpoint() (addr string, tls bool, field string, named bool) {
+// with TLS, the config field that names it, and whether the client dials
+// it, as the checks do: the config names it, rather than AWS's own, which
+// may be reachable only through a proxy, and no proxy applies to it; empty
+// if it can't tell.
+func (c *conn) endpoint() (addr string, tls bool, field string, direct bool) {
 	raw, field, named := c.cfg.URI, "uri", true
 	if c.cfg.Catalog == "glue" {
 		raw, field = c.glueEndpoint(), "properties"
@@ -77,20 +88,27 @@ func (c *conn) endpoint() (addr string, tls bool, field string, named bool) {
 	return hostPort(raw, field, named)
 }
 
-// storeEndpoint is s3Endpoint's host and port, as endpoint gives them; empty
-// without one.
-func (c *conn) storeEndpoint() (addr string, tls bool) {
+// storeEndpoint is s3Endpoint's host and port, and whether it starts with
+// TLS and the client dials it, as endpoint gives them; empty without one.
+func (c *conn) storeEndpoint() (addr string, tls, direct bool) {
 	if c.cfg.S3Endpoint == "" {
-		return "", false
+		return "", false, false
 	}
-	addr, tls, _, _ = hostPort(c.cfg.S3Endpoint, "s3Endpoint", true)
-	return addr, tls
+	addr, tls, _, direct = hostPort(c.cfg.S3Endpoint, "s3Endpoint", true)
+	return addr, tls, direct
 }
+
+// proxyFor is the proxy an HTTP request takes, as the catalog's and the
+// store's clients find it; nil for none.
+var proxyFor = http.ProxyFromEnvironment
 
 func hostPort(raw, field string, named bool) (string, bool, string, bool) {
 	u, err := url.Parse(raw)
 	if err != nil || u.Host == "" {
 		return "", false, field, named
+	}
+	if proxy, err := proxyFor(&http.Request{URL: u}); err != nil || proxy != nil {
+		named = false
 	}
 	port := u.Port()
 	if port == "" {
@@ -121,7 +139,7 @@ func (c *conn) credentialField() string {
 // net.connect, net.tls for an HTTPS endpoint, and catalog.auth.
 func (c *conn) connectionChecks(s *session) []check.Check {
 	var checks []check.Check
-	addr, tls, field, named := c.endpoint()
+	addr, tls, field, direct := c.endpoint()
 	if addr != "" {
 		if tls {
 			checks = netcheck.ReachTLS(addr, nil)
@@ -130,9 +148,9 @@ func (c *conn) connectionChecks(s *session) []check.Check {
 		}
 		for i := range checks {
 			checks[i].Field = field
-			// AWS's own endpoint may be reachable only through a proxy,
-			// which the SDK takes and a dial doesn't.
-			checks[i].Advisory = !named
+			// A proxy, which the client takes and a dial doesn't, may be
+			// the only way there.
+			checks[i].Advisory = !direct
 		}
 	}
 	var needs []string
@@ -147,7 +165,7 @@ func (c *conn) connectionChecks(s *session) []check.Check {
 		Name: "catalog.auth", Kind: check.Authentication, Title: "Sign in to " + what, Field: c.credentialField(),
 		Params: check.Params{"uri": c.cfg.URI, "region": cmp.Or(c.cfg.Region, "the default region")}, Needs: needs,
 		Run: func(ctx context.Context, p *check.Probe) error {
-			cat, err := s.catalog(ctx)
+			cat, err := s.catalog(ctx, p)
 			if err != nil {
 				return err
 			}
@@ -174,7 +192,7 @@ func namespaceCheck(s *session, ns []string) check.Check {
 		Name: "catalog.namespace", Kind: check.Resource, Title: "Find the namespace {namespace}", Field: "namespace",
 		Params: check.Params{"namespace": strings.Join(ns, ".")}, Needs: []string{"catalog.auth"},
 		Run: func(ctx context.Context, p *check.Probe) error {
-			cat, err := s.catalog(ctx)
+			cat, err := s.catalog(ctx, p)
 			if err != nil {
 				return err
 			}
@@ -195,8 +213,9 @@ func namespaceCheck(s *session, ns []string) check.Check {
 // Checks reach the catalog and sign in, find the namespace, then create a
 // table there, commit to it, and write and delete a file in its location,
 // as writes do, and drop it.
-func (d *Destination) Checks() []check.Check {
-	s := &session{c: d.conn}
+func (d *Destination) Checks() []check.Check { return d.checks(&session{open: d.conn.open}) }
+
+func (d *Destination) checks(s *session) []check.Check {
 	ns := d.namespace("")
 	checks := append(d.connectionChecks(s), namespaceCheck(s, ns))
 
@@ -217,7 +236,7 @@ func (d *Destination) Checks() []check.Check {
 		Description: "The destination creates each stream's table, and its namespace if it's missing.", Params: params,
 		Needs: []string{"catalog.namespace"},
 		Run: func(ctx context.Context, p *check.Probe) error {
-			cat, err := s.catalog(ctx)
+			cat, err := s.catalog(ctx, p)
 			if err != nil {
 				return err
 			}
@@ -236,11 +255,15 @@ func (d *Destination) Checks() []check.Check {
 			createMu.Lock()
 			probe, err = cat.CreateTable(ctx, ident, sc, opts...)
 			createMu.Unlock()
+			// Glue may create the table and then fail to load it.
+			mayExist := !errors.Is(err, catalog.ErrTableAlreadyExists)
 			p.Cleanup(func(ctx context.Context) {
-				if probe != nil {
-					if fs, err := probe.FS(ctx); err == nil && probeFile != "" {
+				if probe != nil && probeFile != "" {
+					if fs, err := probe.FS(ctx); err == nil {
 						_ = fs.Remove(probeFile)
 					}
+				}
+				if mayExist {
 					// Purging takes its metadata files too.
 					if pc, ok := cat.(interface {
 						PurgeTable(context.Context, table.Identifier) error
@@ -273,7 +296,7 @@ func (d *Destination) Checks() []check.Check {
 			return classify(err)
 		},
 	})
-	if addr, tls := d.storeEndpoint(); addr != "" {
+	if addr, tls, direct := d.storeEndpoint(); addr != "" {
 		var reach []check.Check
 		if tls {
 			reach = netcheck.ReachTLS(addr, nil)
@@ -287,6 +310,7 @@ func (d *Destination) Checks() []check.Check {
 				reach[i].Needs[j] = strings.Replace(n, "net.", "store.", 1)
 			}
 			reach[i].Field = "s3Endpoint"
+			reach[i].Advisory = !direct
 		}
 		checks = append(checks, reach...)
 	}
@@ -360,7 +384,7 @@ func (n checkNames) name(parts ...string) string {
 // that it takes the stream's columns without a type change the stream
 // doesn't allow, and that a merge can delete its rows.
 func (d *Destination) Preflight(req destination.PreflightRequest) []check.Check {
-	s := &session{c: d.conn}
+	s := &session{open: d.conn.open}
 	ns := d.namespace(req.Namespace)
 	checks := append(d.connectionChecks(s), namespaceCheck(s, ns))
 	n := checkNames{}
@@ -396,7 +420,7 @@ func (d *Destination) Preflight(req destination.PreflightRequest) []check.Check 
 			Name: n.name("stream", st.Name, "table"), Kind: check.Compatibility, Title: "Write {stream} to {table}", Params: params,
 			Needs: []string{"catalog.namespace", mode},
 			Run: func(ctx context.Context, p *check.Probe) error {
-				cat, err := s.catalog(ctx)
+				cat, err := s.catalog(ctx, p)
 				if err != nil {
 					return err
 				}
@@ -455,9 +479,11 @@ func tableTakes(ctx context.Context, tbl *table.Table, ident table.Identifier, s
 				"Write the stream to a table partitioned by its key's columns or not at all, or write it with append.")
 		}
 	}
-	if err := olderSpecs(ctx, tbl); err != nil {
+	if err := olderSpecs(ctx, tbl); errors.Is(err, errOlderSpec) {
 		return cantMerge.Fail("why", "holds files of an earlier partitioning, which its deletes can't reach", "fix",
 			"Rewrite the table's files into its current partitioning, as Spark's rewrite_data_files procedure does.")
+	} else if err != nil {
+		return classify(err)
 	}
 	return nil
 }
