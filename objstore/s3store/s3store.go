@@ -6,9 +6,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
+	"net/http"
 	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/feature/s3/transfermanager"
@@ -74,16 +77,27 @@ func (s *Store) Open(ctx context.Context, bucket string) (*blob.Bucket, error) {
 }
 
 // credentialsSource codes its provider's failures AUTH_INVALID, so a
-// connector without AWS credentials isn't taken for one the store refuses.
+// connector without AWS credentials isn't taken for one the store refuses,
+// but for a provider that doesn't answer or fails, such as STS or the
+// runner's endpoint of a role's credentials: TRANSIENT.
 type credentialsSource struct{ aws.CredentialsProvider }
 
 func (c credentialsSource) Retrieve(ctx context.Context) (aws.Credentials, error) {
 	creds, err := c.CredentialsProvider.Retrieve(ctx)
+	if _, ok := errors.AsType[net.Error](err); ok || serverError(err) {
+		return creds, sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_TRANSIENT, fmt.Errorf("AWS credentials: %w", err))
+	}
 	if err != nil {
 		return creds, sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_AUTH_INVALID,
 			fmt.Errorf("no AWS credentials: set accessKeyId and secretAccessKey, or name a role in the connector's aws.role: %w", err))
 	}
 	return creds, nil
+}
+
+// serverError: an AWS service answered err with a server error.
+func serverError(err error) bool {
+	re, ok := errors.AsType[*awshttp.ResponseError](err)
+	return ok && re.HTTPStatusCode() >= http.StatusInternalServerError
 }
 
 func (s *Store) Endpoint() (endpoint, setting string) {
@@ -121,6 +135,9 @@ func (s *Store) Code(err error) protocolv1.ErrorCode {
 		case "InvalidAccessKeyId", "SignatureDoesNotMatch", "InvalidToken":
 			return protocolv1.ErrorCode_ERROR_CODE_AUTH_INVALID
 		}
+	}
+	if serverError(err) {
+		return protocolv1.ErrorCode_ERROR_CODE_TRANSIENT
 	}
 	return protocolv1.ErrorCode_ERROR_CODE_UNSPECIFIED
 }

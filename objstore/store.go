@@ -209,6 +209,10 @@ var errConflict = errors.New("objstore: the object changed since it was read")
 // if key moved.
 func (s *store) swap(ctx context.Context, b *blob.Bucket, key string, data []byte, md map[string]string, was *version, check func() (*version, error)) error {
 	if s.st == nil {
+		// fileblob escapes a key's .., which the lock's path doesn't.
+		if !filepath.IsLocal(filepath.FromSlash(key)) {
+			return fmt.Errorf("objstore: %s names a file outside %s", key, s.prefix)
+		}
 		unlock, err := lockFile(filepath.Join(s.prefix, filepath.FromSlash(key)) + ".lock")
 		if err != nil {
 			return err

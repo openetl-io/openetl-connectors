@@ -49,8 +49,26 @@ func New(cfg Config) (*Store, error) {
 		return nil, errors.New("azureblob: set one of accountKey, sasToken and connectionString")
 	case cfg.AccountName == "" && cfg.ConnectionString.IsZero() && cfg.Endpoint == "":
 		return nil, errors.New("azureblob: set accountName, a connectionString or an endpoint")
+	case cfg.Endpoint != "" && !cfg.ConnectionString.IsZero():
+		return nil, errors.New("azureblob: set endpoint or connectionString, not both: a connection string names its endpoint")
 	}
-	return &Store{cfg: cfg}, nil
+	s := &Store{cfg: cfg}
+	// A SAS goes in each request's URL, as it is; an account's key signs
+	// requests, and an emulator takes it over http.
+	if endpoint, _ := s.Endpoint(); s.sas() && endpoint != "" && !strings.HasPrefix(strings.ToLower(endpoint), "https://") {
+		return nil, errors.New("azureblob: a SAS needs an https endpoint")
+	}
+	return s, nil
+}
+
+// sas: the credentials are a shared access signature.
+func (s *Store) sas() bool {
+	if !s.cfg.ConnectionString.IsZero() {
+		kv := connection(s.cfg.ConnectionString.Reveal())
+		// As Azure's SDK reads it: an account's key before a SAS.
+		return kv["sharedaccesssignature"] != "" && (kv["accountname"] == "" || kv["accountkey"] == "")
+	}
+	return !s.cfg.SASToken.IsZero()
 }
 
 func (s *Store) Scheme() string    { return "azblob" }
@@ -100,33 +118,35 @@ func (s *Store) accountName() string {
 	return ""
 }
 
+// A connection string's endpoint is the store's own, but for a BlobEndpoint
+// it names.
 func (s *Store) Endpoint() (endpoint, setting string) {
-	if s.cfg.Endpoint != "" {
-		return s.cfg.Endpoint, "endpoint"
-	}
 	if !s.cfg.ConnectionString.IsZero() {
-		if e := connectionEndpoint(s.cfg.ConnectionString.Reveal()); e != "" {
+		kv := connection(s.cfg.ConnectionString.Reveal())
+		if e := kv["blobendpoint"]; e != "" {
 			return e, "connectionString"
 		}
+		if kv["accountname"] == "" {
+			return "", ""
+		}
+		return cmp.Or(kv["defaultendpointsprotocol"], "https") + "://" + kv["accountname"] + ".blob." + cmp.Or(kv["endpointsuffix"], "core.windows.net"), ""
+	}
+	if s.cfg.Endpoint != "" {
+		return s.cfg.Endpoint, "endpoint"
 	}
 	return "https://" + s.accountName() + ".blob.core.windows.net", ""
 }
 
-// connectionEndpoint is a connection string's blob endpoint.
-func connectionEndpoint(cs string) string {
+// connection is a connection string's settings, by their names in lower
+// case.
+func connection(cs string) map[string]string {
 	kv := map[string]string{}
 	for part := range strings.SplitSeq(cs, ";") {
 		if k, v, ok := strings.Cut(part, "="); ok {
 			kv[strings.ToLower(strings.TrimSpace(k))] = strings.TrimSpace(v)
 		}
 	}
-	if e := kv["blobendpoint"]; e != "" {
-		return e
-	}
-	if kv["accountname"] == "" {
-		return ""
-	}
-	return cmp.Or(kv["defaultendpointsprotocol"], "https") + "://" + kv["accountname"] + ".blob." + cmp.Or(kv["endpointsuffix"], "core.windows.net")
+	return kv
 }
 
 func (s *Store) Credential() string {

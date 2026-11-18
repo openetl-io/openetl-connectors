@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"math/big"
 	"slices"
 	"strings"
 	"sync"
@@ -13,6 +14,8 @@ import (
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/extensions"
+	"github.com/twmb/avro"
+	"github.com/twmb/avro/ocf"
 	"gocloud.dev/blob"
 
 	"github.com/openetl-io/openetl/sdk/go/check"
@@ -203,6 +206,74 @@ const (
 	jsonExt = "arrow.json"
 )
 
+// avroFile is an object container file of schema's records.
+func avroFile(t *testing.T, schema string, records ...any) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	w, err := ocf.NewWriter(&buf, avro.MustParse(schema))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range records {
+		if err := w.Encode(r); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
+}
+
+// A decimal within a record, an array or a union keeps its digits.
+func TestAvroNestedDecimal(t *testing.T) {
+	cfg := map[string]any{"url": "file://" + t.TempDir()}
+	tiny := new(big.Rat).SetFrac(big.NewInt(1), new(big.Int).Exp(big.NewInt(10), big.NewInt(20), nil))
+	half := big.NewRat(1, 2)
+	put(t, cfg, map[string][]byte{"d/a.avro": avroFile(t, `{"type": "record", "name": "R", "fields": [
+		{"name": "rec", "type": {"type": "record", "name": "In", "fields": [
+			{"name": "x", "type": {"type": "bytes", "logicalType": "decimal", "precision": 25, "scale": 20}}]}},
+		{"name": "arr", "type": {"type": "array", "items": {"type": "bytes", "logicalType": "decimal", "precision": 4, "scale": 1}}},
+		{"name": "either", "type": ["null", "boolean", {"type": "bytes", "logicalType": "decimal", "precision": 25, "scale": 20}]}
+	]}`, map[string]any{"rec": map[string]any{"x": tiny}, "arr": []any{half}, "either": tiny})})
+	s := newSource(t, cfg, map[string]any{"name": "d", "glob": "d/*", "format": "avro"})
+	r := mustRead(t, s, "d", source.FullRefresh, nil).rows["d/"]
+	for k, want := range map[string]string{"rec": `{"x":"0.00000000000000000001"}`, "arr": `["0.5"]`, "either": `"0.00000000000000000001"`} {
+		if got, _ := json.Marshal(r[0][k]); string(got) != want {
+			t.Errorf("%s: %s, want %s", k, got, want)
+		}
+	}
+}
+
+// A named type that fields name again maps as it does where it's defined.
+func TestAvroNamedTypes(t *testing.T) {
+	cfg := map[string]any{"url": "file://" + t.TempDir()}
+	id := [16]byte{0x6b, 0xa7, 0xb8, 0x10, 0x9d, 0xad, 0x11, 0xd1, 0x80, 0xb4, 0x00, 0xc0, 0x4f, 0xd4, 0x30, 0xc8}
+	put(t, cfg, map[string][]byte{"n/a.avro": avroFile(t, `{"type": "record", "name": "R", "fields": [
+		{"name": "a", "type": {"type": "fixed", "name": "U", "size": 16, "logicalType": "uuid"}},
+		{"name": "b", "type": "U"},
+		{"name": "c", "type": ["null", "U"]},
+		{"name": "list", "type": {"type": "record", "name": "L", "fields": [{"name": "next", "type": ["null", "L"]}]}}
+	]}`, map[string]any{"a": id, "b": id, "c": id, "list": map[string]any{"next": map[string]any{"next": nil}}})})
+	s := newSource(t, cfg, map[string]any{"name": "n", "glob": "n/*", "format": "avro"})
+	cat, err := s.Discover(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := mustRead(t, s, "n", source.FullRefresh, nil).rows["n/"]
+	for i, f := range cat.Streams[0].Schema.Fields()[:3] {
+		if extName(f) != uuidExt {
+			t.Errorf("%s: declared %s", f.Name, f.Type)
+		}
+		if got := values(r, f.Name); len(got) != 1 || got[0] != "6ba7b810-9dad-11d1-80b4-00c04fd430c8" {
+			t.Errorf("field %d, %s: %q", i, f.Name, got)
+		}
+	}
+	if got, _ := json.Marshal(r[0]["list"]); string(got) != `{"next":{"next":null}}` {
+		t.Errorf("a recursive record: %s", got)
+	}
+}
+
 // Resplit halves a running split's files left: every file is read once,
 // a read again up to a resume point past the halving stops there with the
 // first read's records, and the next read goes on from the splits it left.
@@ -262,11 +333,20 @@ func testResplit(t *testing.T, cfg map[string]any) {
 			if len(states) < 3 || json.Unmarshal(states[0], &first) != nil || json.Unmarshal(states[len(states)-1], &last) != nil || len(first.Gave) > 0 || len(last.Gave) == 0 {
 				continue
 			}
-			want := map[string]bool{}
-			for _, r := range e.rows[at] {
-				want[fmt.Sprint(r[fileColumn], ":", r[lineColumn])] = true
+			keys := func(rows []map[string]any) []string {
+				var out []string
+				for _, r := range rows {
+					out = append(out, fmt.Sprint(r[fileColumn], ":", r[lineColumn]))
+				}
+				return out
 			}
-			for _, until := range [][]byte{states[1], states[len(states)-1]} {
+			// Each file's one record, then its resume point.
+			sent := keys(e.rows[at])
+			if len(sent) != len(states) {
+				t.Fatalf("%v: %s sent %d records and %d resume points", mode, at, len(sent), len(states))
+			}
+			for _, i := range []int{1, len(states) - 1} {
+				until := states[i]
 				redo := cs
 				redo.Splits = []source.Split{{ID: strings.TrimPrefix(at, "q/"), State: states[0], Until: until}}
 				got, err := readStreams(t, s, redo)
@@ -276,15 +356,8 @@ func testResplit(t *testing.T, cfg map[string]any) {
 				if done := got.done[at]; !bytes.Equal(done, until) || !got.ended[at] {
 					t.Errorf("%v: %s read up to %s completed at %s", mode, at, until, done)
 				}
-				n := 0
-				for _, r := range got.rows[at] {
-					if k := fmt.Sprint(r[fileColumn], ":", r[lineColumn]); !want[k] {
-						t.Errorf("%v: %s read again %s, which it gave away", mode, at, k)
-					}
-					n++
-				}
-				if n == 0 {
-					t.Errorf("%v: %s read again nothing", mode, at)
+				if again := keys(got.rows[at]); !slices.Equal(again, sent[1:i+1]) {
+					t.Errorf("%v: %s read up to its resume point %d again %v, not %v", mode, at, i, again, sent[1:i+1])
 				}
 			}
 			redone++
@@ -350,12 +423,13 @@ func mustOpenBucket(t *testing.T, s *Source) *blob.Bucket {
 // Preflight reads a file of each stream as its format, warns of a stream
 // with none, and fails one whose file isn't of its format.
 func testSourcePreflight(t *testing.T, cfg map[string]any) {
-	put(t, cfg, map[string][]byte{"pf/a/1.jsonl": []byte("{\"id\":1}\n"), "pf/c/1.parquet": []byte("{\"id\":1}\n")})
+	put(t, cfg, map[string][]byte{"pf/a/1.jsonl": []byte("{\"id\":1}\n"), "pf/c/1.parquet": []byte("{\"id\":1}\n"), "pf/e/1.jsonl": nil})
 	s := newSource(t, cfg,
 		map[string]any{"name": "has", "glob": "pf/a/*.jsonl", "format": "jsonl"},
 		map[string]any{"name": "none", "glob": "pf/b/*.jsonl", "format": "jsonl"},
-		map[string]any{"name": "wrong", "glob": "pf/c/*", "format": "parquet"})
-	req := source.PreflightRequest{Pipeline: "p", Streams: []source.ConfiguredStream{{Name: "has"}, {Name: "none"}, {Name: "wrong"}}}
+		map[string]any{"name": "wrong", "glob": "pf/c/*", "format": "parquet"},
+		map[string]any{"name": "empty", "glob": "pf/e/*", "format": "jsonl"})
+	req := source.PreflightRequest{Pipeline: "p", Streams: []source.ConfiguredStream{{Name: "has"}, {Name: "none"}, {Name: "wrong"}, {Name: "empty"}}}
 	checks := s.Preflight(req)
 	if err := check.Validate(append(s.Checks(), checks...)); err != nil {
 		t.Fatal(err)
@@ -372,6 +446,7 @@ func testSourcePreflight(t *testing.T, cfg map[string]any) {
 		"stream.has.read": "passed", "stream.has.format": "passed",
 		"stream.none.read": "warning no_files", "stream.none.format": "skipped",
 		"stream.wrong.read": "passed", "stream.wrong.format": "failed file_unreadable",
+		"stream.empty.read": "passed", "stream.empty.format": "passed",
 	}
 	if !maps.Equal(got, want) {
 		t.Errorf("preflight: %v", got)

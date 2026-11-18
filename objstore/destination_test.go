@@ -22,6 +22,7 @@ import (
 	"github.com/apache/arrow-go/v18/parquet/file"
 	"github.com/apache/arrow-go/v18/parquet/pqarrow"
 	"gocloud.dev/blob"
+	"gocloud.dev/gcerrors"
 
 	"github.com/openetl-io/openetl/sdk/go/check"
 	"github.com/openetl-io/openetl/sdk/go/destination"
@@ -637,8 +638,11 @@ func testSwapRefusesStale(e *env) {
 	check := func(key string) func() (*version, error) {
 		return func() (*version, error) {
 			a, err := e.b.Attributes(ctx, key)
-			if err != nil {
+			if gcerrors.Code(err) == gcerrors.NotFound {
 				return nil, nil
+			}
+			if err != nil {
+				return nil, err
 			}
 			return st.version(a), nil
 		}

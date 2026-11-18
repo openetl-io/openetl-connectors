@@ -84,6 +84,8 @@ type emitted struct {
 	ended   map[string]bool
 	// Called after each resume point, without the lock.
 	onResume func(at string)
+	// What Complete returns.
+	completeErr error
 }
 
 func (e *emitted) Rows(stream string, rows []json.RawMessage) error {
@@ -156,7 +158,7 @@ func (s splitOut) Complete(next []byte, added ...source.Split) error {
 	s.e.mu.Lock()
 	defer s.e.mu.Unlock()
 	s.e.done[s.at], s.e.ended[s.at] = next, true
-	return nil
+	return s.e.completeErr
 }
 
 // read reads a stream whole, from state, and returns what it sent.
@@ -512,6 +514,9 @@ func TestStateBoundary(t *testing.T) {
 			t.Errorf("%s at %v: done %v", c.o.Key, c.o.Modified, got)
 		}
 	}
+	if (&readState{}).done(object{Key: "epoch", Modified: time.Unix(0, 0)}, true) {
+		t.Error("a fresh state has read a file of the Unix epoch")
+	}
 	var full readState
 	full.finish(object{Key: "m"}, false)
 	if !full.done(object{Key: "a"}, false) || full.done(object{Key: "n"}, false) {
@@ -564,6 +569,25 @@ func TestManyFiles(t *testing.T) {
 	}
 }
 
+// A read up to a resume point within a file fails when its completion
+// does.
+func TestUntilWithinFile(t *testing.T) {
+	cfg := map[string]any{"url": "file://" + t.TempDir()}
+	var data []byte
+	for i := range batchRecords + 1 {
+		data = fmt.Appendf(data, "{\"id\":%d}\n", i)
+	}
+	put(t, cfg, map[string][]byte{"u/a.jsonl": data})
+	s := newSource(t, cfg, map[string]any{"name": "u", "glob": "u/*", "format": "jsonl"})
+	within := mustRead(t, s, "u", source.FullRefresh, nil).resumes["u/"][0]
+	refused := errors.New("refused")
+	e := &emitted{completeErr: refused, rows: map[string][]map[string]any{}, batches: map[string][]arrow.RecordBatch{}, resumes: map[string][][]byte{}, done: map[string][]byte{}, ended: map[string]bool{}}
+	err := s.Read(t.Context(), source.ReadRequest{Streams: []source.ConfiguredStream{{Name: "u", SyncMode: source.FullRefresh, Until: within}}, Lanes: 1}, e)
+	if !errors.Is(err, refused) || !bytes.Equal(e.done["u/"], within) {
+		t.Fatalf("completed at %s: %v", e.done["u/"], err)
+	}
+}
+
 // A decimal OpenETL can't hold, of more than 38 digits or with a scale
 // outside 0 to its precision, is read as text.
 func TestDecimalBounds(t *testing.T) {
@@ -585,6 +609,19 @@ func TestDecimalBounds(t *testing.T) {
 	}
 }
 
+// A stream whose config can't be read as it says is refused.
+func TestStreamRefused(t *testing.T) {
+	for name, sc := range map[string]map[string]any{
+		"columnNames twice":        {"name": "s", "glob": "*", "format": "csv", "csv": map[string]any{"header": false, "columnNames": []string{"x", "y", "x"}}},
+		"a column the source adds": {"name": "s", "glob": "*", "format": "parquet", "columns": map[string]string{"_file": "string"}},
+	} {
+		b, _ := json.Marshal(map[string]any{"url": "file://" + t.TempDir(), "streams": []any{sc}})
+		if _, err := testSource(b); err == nil {
+			t.Errorf("%s: no error", name)
+		}
+	}
+}
+
 func TestGlob(t *testing.T) {
 	for _, c := range []struct {
 		glob, prefix string
@@ -595,6 +632,7 @@ func TestGlob(t *testing.T) {
 		{"logs/2026-??/{a,b}.jsonl", "logs/2026-", []string{"logs/2026-01/a.jsonl"}, []string{"logs/2026-01/c.jsonl"}},
 		{"x/[!.]*", "x/", []string{"x/a"}, []string{"x/.hidden"}},
 		{"a.b+c", "a.b+c", []string{"a.b+c"}, []string{"aXb+c"}},
+		{"café/*.csv", "café/", []string{"café/a.csv"}, []string{"cafe/a.csv"}},
 	} {
 		re, prefix, err := globRegexp(c.glob)
 		if err != nil || prefix != c.prefix {

@@ -222,7 +222,12 @@ func (s *Source) Preflight(req source.PreflightRequest) []check.Check {
 							continue
 						}
 						p.Param("file", s.store.location(obj.Key))
-						r, err := b.NewRangeReader(ctx, obj.Key, 0, 1, nil)
+						// S3 refuses a range of an empty file.
+						n := int64(1)
+						if obj.Size == 0 {
+							n = -1
+						}
+						r, err := b.NewRangeReader(ctx, obj.Key, 0, n, nil)
 						if err != nil {
 							return s.store.denied(fmt.Errorf("objstore: read %s: %w", obj.Key, err), "read", s.store.location(obj.Key))
 						}
@@ -311,8 +316,8 @@ func (d *Destination) Checks() []check.Check {
 
 // Preflight checks each stream's write mode, and that its columns keep the
 // types its table's files have, unless the stream may change them; and,
-// for a pipeline that overwrites, that the store refuses a conditional write
-// it should, which overwrite relies on.
+// for a pipeline that overwrites, that the store refuses the conditional
+// writes it should, if absent and if at a version, which overwrite relies on.
 func (d *Destination) Preflight(req destination.PreflightRequest) []check.Check {
 	var checks []check.Check
 	overwrites := false
@@ -388,7 +393,7 @@ func (d *Destination) Preflight(req destination.PreflightRequest) []check.Check 
 		return checks
 	}
 	return append(checks, check.Check{
-		Name: "store.conditional-write", Kind: check.Compatibility, Title: "Write a file under {url} only if it's absent", Field: "url",
+		Name: "store.conditional-write", Kind: check.Compatibility, Title: "Write a file under {url} only if it hasn't changed", Field: "url",
 		Params: check.Params{"url": d.cfg.URL}, Advisory: true,
 		Run: func(ctx context.Context, p *check.Probe) error {
 			b, err := d.bucket(ctx)
@@ -412,18 +417,38 @@ func (d *Destination) Preflight(req destination.PreflightRequest) []check.Check 
 				}
 				return d.store.version(a), nil
 			}
-			for i := range 2 {
-				err := d.store.swap(ctx, b, key, []byte{byte(i)}, nil, nil, now)
-				switch {
-				case i == 1 && errors.Is(err, errConflict):
-					return nil
-				case i == 1 && err == nil:
-					return unconditional.Fail()
-				case err != nil:
-					return d.store.denied(fmt.Errorf("objstore: write %s: %w", key, err), "write", d.cfg.URL)
-				}
+			// Each write is of another size, so its version differs where a
+			// version is the file's modification time and size.
+			write := func(size int, was *version) error {
+				return d.store.swap(ctx, b, key, make([]byte, size), nil, was, now)
 			}
-			return nil
+			failed := func(err error) error {
+				return d.store.denied(fmt.Errorf("objstore: write %s: %w", key, err), "write", d.cfg.URL)
+			}
+			if err := write(1, nil); err != nil {
+				return failed(err)
+			}
+			first, err := now()
+			if err != nil {
+				return d.store.denied(fmt.Errorf("objstore: read %s: %w", key, err), "read", d.cfg.URL)
+			}
+			// A write over a version the file isn't at: absent, or its first.
+			refused := func(err error) error {
+				switch {
+				case err == nil:
+					return unconditional.Fail()
+				case !errors.Is(err, errConflict):
+					return failed(err)
+				}
+				return nil
+			}
+			if err := refused(write(2, nil)); err != nil {
+				return err
+			}
+			if err := write(3, first); err != nil {
+				return failed(fmt.Errorf("over the version it has: %w", err))
+			}
+			return refused(write(4, first))
 		},
 	})
 }

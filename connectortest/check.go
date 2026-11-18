@@ -57,18 +57,37 @@ func Items(t *testing.T, checks []check.Check) map[string]string {
 	out := map[string]string{}
 	for _, it := range check.Run(t.Context(), checks).Items {
 		s := it.Status.String()
-		r := it.Rendered()
-		text := r.Title + " " + r.Message
-		if f := r.Failure; f != nil {
+		if f := it.Failure; f != nil {
 			s += " " + f.Reason
-			text += " " + f.Message + " " + f.Fix
 		}
-		if strings.ContainsAny(text, "{}") {
+		if text, ok := unfilled(it); ok {
 			t.Errorf("%s: a placeholder unfilled: %s", it.Name, text)
 		}
 		out[it.Name] = s
 	}
 	return out
+}
+
+// unfilled is it's text, rendered, and whether one of its templates has a
+// brace that isn't a placeholder its params fill. A param's value may have
+// braces of its own.
+func unfilled(it check.Item) (string, bool) {
+	r := it.Rendered()
+	blank := make(check.Params, len(r.Params))
+	for k := range r.Params {
+		blank[k] = ""
+	}
+	templates, text := []string{it.Title, it.Message}, r.Title+" "+r.Message
+	if f := it.Failure; f != nil {
+		templates = append(templates, f.Message, f.Fix)
+		text += " " + r.Failure.Message + " " + r.Failure.Fix
+	}
+	for _, tm := range templates {
+		if strings.ContainsAny(check.Render(tm, blank), "{}") {
+			return text, true
+		}
+	}
+	return text, false
 }
 
 // ExpectStatuses compares the items want names, of got, the statuses Items

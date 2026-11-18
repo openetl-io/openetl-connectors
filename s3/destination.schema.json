@@ -6,6 +6,30 @@
   "required": [
     "url"
   ],
+  "if": {
+    "properties": {
+      "format": {
+        "enum": [
+          "csv",
+          "jsonl"
+        ]
+      }
+    },
+    "required": [
+      "format"
+    ]
+  },
+  "then": {
+    "properties": {
+      "compression": {
+        "enum": [
+          "gzip",
+          "zstd",
+          "none"
+        ]
+      }
+    }
+  },
   "properties": {
     "url": {
       "type": "string",

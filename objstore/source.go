@@ -156,6 +156,11 @@ func parseStream(sc StreamConfig) (*streamSpec, error) {
 		if spec.csvHeader && len(sc.CSV.ColumnNames) > 0 {
 			return nil, fmt.Errorf("objstore: stream %q: columnNames are for CSV files without a header", sc.Name)
 		}
+		for i, n := range sc.CSV.ColumnNames {
+			if slices.Contains(sc.CSV.ColumnNames[:i], n) {
+				return nil, fmt.Errorf("objstore: stream %q: columnNames names %q twice", sc.Name, n)
+			}
+		}
 		spec.nulls = map[string]bool{}
 		for _, n := range cmpOr(sc.CSV.NullValues, []string{""}) {
 			spec.nulls[n] = true
@@ -169,6 +174,9 @@ func parseStream(sc StreamConfig) (*streamSpec, error) {
 		}
 	}
 	for _, name := range sortedKeys(sc.Columns) {
+		if name == fileColumn || name == lineColumn || name == modifiedColumn {
+			return nil, fmt.Errorf("objstore: stream %q: columns can't name %s, a column the source adds", sc.Name, name)
+		}
 		f, err := declaredField(name, sc.Columns[name])
 		if err != nil {
 			return nil, fmt.Errorf("objstore: stream %q: %w", sc.Name, err)
@@ -473,23 +481,33 @@ func (s *Source) readSplit(ctx context.Context, b *blob.Bucket, typed *typedColu
 		}
 		return false, out.ResumePoint(state, added...)
 	}
-	setLeft := func(from int) {
-		run.mu.Lock()
-		defer run.mu.Unlock()
-		run.left = run.left[:0]
-		for _, o := range files[from:] {
-			if r.has(o.Key) && !st.done(o, incremental) {
-				run.left = append(run.left, o.Key)
-			}
+	// The split's files yet to start, in the read's order, which Resplit
+	// sees once the first starts. Starting a file takes it from them, with
+	// any before it that a cut took from the split.
+	var left []string
+	for _, o := range files {
+		if r.has(o.Key) && !st.done(o, incremental) {
+			left = append(left, o.Key)
 		}
 	}
 	unmarked := 0
-	for i, o := range files {
+	for _, o := range files {
 		cutTo(o, false)
 		if !r.has(o.Key) || st.done(o, incremental) {
 			continue
 		}
-		setLeft(i + 1)
+		run.mu.Lock()
+		if left != nil {
+			run.left, left = left, nil
+		}
+		for len(run.left) > 0 {
+			k := run.left[0]
+			run.left = run.left[1:]
+			if k == o.Key {
+				break
+			}
+		}
+		run.mu.Unlock()
 		at := filePos{Key: o.Key, Modified: o.Modified.UnixNano(), Size: o.Size}
 		if st.At != nil && st.At.Key == o.Key && st.At.Modified == at.Modified && st.At.Size == o.Size {
 			at = *st.At
@@ -519,11 +537,11 @@ func (s *Source) readSplit(ctx context.Context, b *blob.Bucket, typed *typedColu
 		case formatJSONL:
 			err = s.readJSONL(ctx, b, spec, o, at, declared, sk)
 		}
+		if err != nil && !errors.Is(err, errStop) {
+			return err
+		}
 		if stop {
 			return nil
-		}
-		if err != nil {
-			return err
 		}
 		st.finish(o, incremental)
 		// A large state's resume points come every so many files, but for

@@ -534,6 +534,10 @@ func (w *writer) manifest(ctx context.Context, table string) (*version, manifest
 	return w.d.store.version(a), m, nil
 }
 
+// publishAttempts is how many times publish writes a manifest that keeps
+// changing, or that the store keeps refusing as changed.
+const publishAttempts = 5
+
 // publish makes the read's files the table's: it writes the manifest that
 // lists them, unless an epoch as late or later wrote it, then drops older
 // reads. The conditional write keeps a stale attempt from moving the
@@ -545,7 +549,7 @@ func (w *writer) publish(ctx context.Context, d staged, st stagedStream) error {
 	}
 	ours := manifestState{epoch: d.Epoch, generation: d.Generation, read: read}
 	key := st.Table + "/" + manifestPath
-	for {
+	for attempt := 1; ; attempt++ {
 		was, cur, err := w.manifest(ctx, st.Table)
 		if err != nil {
 			return fmt.Errorf("objstore: read %s: %w", key, err)
@@ -574,7 +578,14 @@ func (w *writer) publish(ctx context.Context, d staged, st stagedStream) error {
 			v, _, err := w.manifest(ctx, st.Table)
 			return v, err
 		})
-		if errors.Is(err, errConflict) {
+		// A store may refuse a write as it does a conflict for as long as
+		// something else, such as an Azure lease, holds the file.
+		if errors.Is(err, errConflict) && attempt < publishAttempts {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(time.Duration(attempt) * 100 * time.Millisecond):
+			}
 			continue
 		}
 		if err != nil {

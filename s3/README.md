@@ -15,8 +15,6 @@ The source reads the files that a glob matches as a stream, in Parquet, Avro, CS
 > [!NOTE]
 > 0.1.0-alpha has the destination's Parquet appends on S3 and local disks. The source, the destination's CSV and JSON Lines, and overwrite are from 0.2.0.
 
-Google Cloud Storage and Azure Blob Storage have packages of their own, which read and write files as this one does: [`gcs`](../gcs/README.md) and [`azureblob`](../azureblob/README.md).
-
 Both roles are tested on a local filesystem and against SeaweedFS's S3 API. The destination's Parquet appends have also run against Amazon S3. CI doesn't test Amazon S3 itself. See [Limits](#limits) for what SeaweedFS can't show.
 
 ## Connecting
@@ -60,11 +58,11 @@ A destination's preflight has these items:
 
 - `stream.NAME.mode` checks that the stream's write mode is append or overwrite. Merge fails as `setting_mismatch`.
 - `stream.NAME.types` checks that the stream's columns have the types that the table's record of its columns has. A change fails as `type_change_refused`, as the write would refuse it, unless the pipeline lets the stream change types. See [Schema changes](#schema-changes).
-- `store.conditional-write` runs only for a pipeline that overwrites. It writes a file under `URL/_openetl/` twice, the second time only if the file is absent, then deletes it. It warns as `conditional_writes_ignored` if the second write succeeds, which happens on a store that ignores `If-None-Match`. On such a store, a stale overwrite could put an older manifest back.
+- `store.conditional-write` runs only for a pipeline that overwrites. It writes a file under `URL/_openetl/`, then writes it three more times: only if it's absent, only if it's at the version it has, and only if it's at the version it had before that. Then it deletes the file. It warns as `conditional_writes_ignored` if the first or the last of the three succeeds, which happens on a store that ignores `If-None-Match` or `If-Match`. On such a store, a stale overwrite could put an older manifest back.
 
 ### Errors
 
-Credentials that the store refuses fail the check and the sync with `AUTH_INVALID`, `AUTH_EXPIRED` or `PERMISSION_DENIED`, and OpenETL retries only `AUTH_EXPIRED`. A store that doesn't answer, rate limits the connector or returns a server error fails with `TRANSIENT` or `RATE_LIMITED`, which OpenETL retries.
+Credentials that the store refuses fail the check and the sync with `AUTH_INVALID`, `AUTH_EXPIRED` or `PERMISSION_DENIED`, and OpenETL retries only `AUTH_EXPIRED`. A store that doesn't answer, rate limits the connector or returns a server error fails with `TRANSIENT` or `RATE_LIMITED`, which OpenETL retries. Without AWS credentials, the connector fails with `AUTH_INVALID`; when what gives it credentials, such as STS or the runner's endpoint of a role's, doesn't answer or returns a server error, with `TRANSIENT`.
 
 ## Source
 
@@ -122,7 +120,7 @@ The [config schema](./source.schema.json) has every setting.
 - **Full refresh** reads every matching file, in key order.
 - **Incremental** reads files that weren't read before, in the order of their `_modified`. A file that's written again after it was read is read again, whole.
 
-The state an incremental read leaves records each file it read since `lookback` (1 hour by default) before the newest file it read, with its modification time. The next read takes any file it doesn't list and that's no older than that, so files that share a modification time with ones already read, or that appear late, still get read. Files older than that, and not read, are skipped. S3 dates an object uploaded in parts from when the upload started, so an upload that takes longer than `lookback` can be missed. Raise `lookback` if your uploads run longer. The state lists at most 10,000 files; past that, the oldest ones drop out, and files no newer than them are treated as read.
+The state an incremental read leaves records each file it read since `lookback` (1 hour by default) before the newest file it read, with its modification time. The next read takes any file it doesn't list and that's no older than that, so files that share a modification time with ones already read, or that appear late, still get read. Files older than that, and not read, are skipped. S3 dates an object uploaded in parts from when the upload started, so an upload that takes longer than `lookback` can be missed. Raise `lookback` if your uploads run longer. The state lists at most 10,000 files; past that, the oldest ones drop out, and files no newer than them are treated as read. Files that share the oldest modification time the state keeps all stay in it, so when more than 10,000 files share one, the state lists every one of them.
 
 The source's replay is **superset**: a retried read may send records again, such as those of a file it was partway through, or of a file written again. A pipeline that needs exactly once has to drop repeats by the primary key, `_file` and `_line` by default.
 
@@ -140,7 +138,7 @@ Discovery lists each stream's files, and reads:
 
 A text column's type is inferred from those values: `boolean` if every value is `true` or `false`, then integer, number, date (`YYYY-MM-DD`), and a timestamp with or without a UTC offset (`YYYY-MM-DD[T ]HH:MM:SS[.fraction]`, then `Z`, `±HH`, `±HHMM` or `±HH:MM` for one with an offset). Anything else, or a mix, is text. A JSON Lines field whose values are all objects or arrays is JSON. A column with no values in the sample is text.
 
-`columns` overrides discovered types by name: `string`, `integer`, `number`, `boolean`, `date`, `time`, `timestamp` (without a time zone), `timestamp_tz`, `json`, `binary` (base64 text) or `decimal(P,S)`. Without a header, CSV columns are `f0`, `f1` and so on, unless `columnNames` names them. A Parquet or Avro column that `columns` names is sent as text, which OpenETL parses to the type, quarantining a value that doesn't fit.
+`columns` overrides discovered types by name: `string`, `integer`, `number`, `boolean`, `date`, `time`, `timestamp` (without a time zone), `timestamp_tz`, `json`, `binary` (base64 text) or `decimal(P,S)`. Without a header, CSV columns are `f0`, `f1` and so on, unless `columnNames` names them. A Parquet or Avro column that `columns` names is sent as text, which OpenETL parses to the type, quarantining a value that doesn't fit. `columns` can't name `_file`, `_line` or `_modified`, which the source adds.
 
 > [!NOTE]
 > A file with a column that the stream's declared columns don't include fails the read with `TRANSIENT`, and the retry's discovery declares it. A JSON Lines field that first appears past discovery's sample is never discovered, so the read keeps failing until `columns` names it.
@@ -190,6 +188,8 @@ The [config schema](./destination.schema.json) has every setting.
 
 > [!IMPORTANT]
 > An overwrite is atomic only for readers that read the files the manifest lists, as a table defined with Hive's `SymlinkTextInputFormat` does. A reader that lists the table's directory instead sees the files of every read not yet deleted, under `_reads/`. Readers that skip names starting with `_`, as Hadoop's do, see none of them. Between the manifest's write and the deletion of the older read's files, the older files are still there but listed by no manifest.
+>
+> The older read's files are deleted just after the manifest is replaced, so a reader that read the manifest before then can find its files gone and fail. Run such readers between overwrites, or have them try again.
 
 ### Exactly once
 
@@ -250,6 +250,8 @@ Avro types map as:
 | A union of null and one type | That type |
 | Other unions, records, arrays, maps, and duration | JSON |
 
+In a JSON column, a decimal is a string with the digits its value needs, such as `"0.5"` for a `decimal(4, 2)` of 0.50.
+
 CSV and JSON Lines values have the types [Discovery](#discovery) infers, or that `columns` declares.
 
 ### Destination
@@ -274,6 +276,7 @@ The destination adds new columns: later files have them, and earlier files don't
 
 - An Avro read that resumes within a file decodes the file from its start again, as the Avro library doesn't give blocks' offsets.
 - Each read, as well as discovery, reads every Parquet file's footer and Avro file's header, 16 at a time, so it takes longer to start with more files.
+- A read checks that a file is the one it listed by the file's size and its modification time to the second, as precise as some stores' reads give it. A file replaced while it's read, by one of the same size within the same second, isn't noticed, and a Parquet file's row groups could then come from both.
 - The source doesn't capture deleted files or deleted rows. A file written again is read again whole, as new records, if its modification time changed: a file rewritten within the store's time resolution, a second on S3, with the same time isn't read again.
 - Discovery reads every file's footer or header, so it takes longer with more files.
 - The destination doesn't merge or deduplicate.

@@ -247,7 +247,12 @@ func (p *Epochs[T]) Recover(ctx context.Context, gen uint64, e destination.Epoch
 		}
 		r = destination.Redone
 	case len(missing) == len(desc.Streams):
-		// Nothing of it is visible, and some lane's staging is gone.
+		// Nothing of it is visible, and some lane's staging is gone, unless
+		// a newer generation has raised the fence since, applied the epoch
+		// and dropped its staging.
+		if err := d.SQL.Fence(ctx, gen); err != nil {
+			return 0, err
+		}
 		r = destination.Lost
 	default:
 		return 0, fmt.Errorf("%s: epoch %d-g%d is partly applied and the staging for the rest is gone", d.Name, desc.Epoch, desc.Generation)

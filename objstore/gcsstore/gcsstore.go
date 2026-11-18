@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 
 	"cloud.google.com/go/storage"
@@ -24,13 +25,20 @@ type Config struct {
 	// The JSON API's endpoint, such as an emulator's; empty for Google's.
 	Endpoint string `json:"endpoint"`
 	// A service account's JSON key. Without one, Google's default
-	// credentials, or none with an endpoint.
+	// credentials, or none with an endpoint. With an endpoint, it needs
+	// https.
 	ServiceAccountKey sdk.Secret `json:"serviceAccountKey"`
 }
 
 type Store struct{ cfg Config }
 
-func New(cfg Config) (*Store, error) { return &Store{cfg: cfg}, nil }
+func New(cfg Config) (*Store, error) {
+	// The key's tokens go in each request's headers, as they are.
+	if u, err := url.Parse(cfg.Endpoint); cfg.Endpoint != "" && !cfg.ServiceAccountKey.IsZero() && (err != nil || u.Scheme != "https") {
+		return nil, errors.New("gcs: serviceAccountKey needs an https endpoint; an emulator's takes none")
+	}
+	return &Store{cfg: cfg}, nil
+}
 
 func (s *Store) Scheme() string    { return "gs" }
 func (s *Store) Container() string { return "bucket" }

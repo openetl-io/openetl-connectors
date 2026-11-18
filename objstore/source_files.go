@@ -66,10 +66,11 @@ func globRegexp(glob string) (re *regexp.Regexp, prefix string, err error) {
 			b.WriteString("[" + class + "]")
 			i += end
 		default:
+			// A byte at a time, so a character of several bytes stays whole.
 			if literal {
-				prefix += string(c)
+				prefix += glob[i : i+1]
 			}
-			b.WriteString(regexp.QuoteMeta(string(c)))
+			b.WriteString(regexp.QuoteMeta(glob[i : i+1]))
 		}
 	}
 	b.WriteString("$")
@@ -174,7 +175,8 @@ const maxRead = 10000
 // done reports whether the state has read the file whole.
 func (st *readState) done(o object, incremental bool) bool {
 	if incremental {
-		return o.Modified.UnixNano() < st.Floor || st.Read[o.Key] == o.Modified.UnixNano()
+		m, ok := st.Read[o.Key]
+		return o.Modified.UnixNano() < st.Floor || ok && m == o.Modified.UnixNano()
 	}
 	return st.Last != "" && o.Key <= st.Last
 }

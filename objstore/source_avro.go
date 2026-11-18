@@ -47,9 +47,10 @@ func openAvro(ctx context.Context, b *blob.Bucket, o object) (*ocf.Reader, func(
 }
 
 // avroRecord is the fields of an Avro file's records, which must be a
-// record.
+// record. A named type that a field names again is its definition there too,
+// but for a recursive one's reference to itself.
 func avroRecord(key string, s *avro.Schema) ([]avro.SchemaField, error) {
-	root := s.Root()
+	root := s.Root().ExpandReferences()
 	if root.Type != "record" {
 		return nil, fmt.Errorf("objstore: %s holds %s values, not records", key, root.Type)
 	}
@@ -223,6 +224,11 @@ func generic(v any) any {
 	case time.Duration:
 		return time.Time{}.Add(v).Format("15:04:05.000000")
 	case *big.Rat:
+		// A decimal where its scale isn't at hand, nested in a JSON value:
+		// a whole number over a power of ten, written exactly.
+		if n, exact := v.FloatPrec(); exact {
+			return v.FloatString(n)
+		}
 		return v.FloatString(18)
 	case []any:
 		out := make([]any, len(v))
