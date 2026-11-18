@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "SQL Server source",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["dsn"],
+  "x-groups": [
+    {"id": "connection", "title": "Connection", "description": "The database to read, and the login that reads it."},
+    {"id": "tables", "title": "Tables", "description": "Which tables and views are streams."},
+    {"id": "cdc", "title": "Change data", "description": "How a stream read with cdc gets its changes."},
+    {"id": "performance", "title": "Performance", "description": "How much a read takes at a time."}
+  ],
+  "properties": {
+    "dsn": {"type": "string", "title": "Connection string", "x-secret": true, "x-group": "connection", "examples": ["sqlserver://user:password@host:1433?database=shop"], "description": "A sqlserver:// URL, or an ADO or ODBC connection string, naming the database to read, such as sqlserver://user:password@host:1433?database=shop."},
+    "schema": {"type": "string", "title": "Schema", "default": "dbo", "x-group": "tables", "description": "The schema whose tables and views are offered as streams."},
+    "tables": {"type": "array", "title": "Tables", "items": {"type": "string"}, "x-group": "tables", "description": "The tables and views to offer as streams. Empty: every one in the schema."},
+    "cdcMethod": {
+      "type": "string", "title": "CDC method", "default": "change_tracking", "x-group": "cdc",
+      "oneOf": [
+        {"const": "change_tracking", "title": "Change tracking", "description": "Each changed key's current row, a key changed several times between polls arriving once; a delete carries the key alone. Needs change tracking on for the database and the table."},
+        {"const": "change_data_capture", "title": "Change data capture", "description": "Every change with its whole row, from the change tables the capture job fills, which needs SQL Server Agent and change data capture on for the database and the table."}
+      ],
+      "description": "How cdc reads changes: change_tracking, each changed key's current row; or change_data_capture, every change with its whole row, which needs SQL Server Agent. Either way, a table cdc can read replays a superset, which merge makes effectively once."
+    },
+    "chunkRows": {"type": "integer", "title": "Rows per chunk", "minimum": 1, "default": 100000, "x-group": "performance", "x-advanced": true, "description": "Rows per query on a table with a primary key, and changes per resume point of a cdc read; each chunk ends at a resume point."},
+    "batchBytes": {"type": "integer", "title": "Batch size in bytes", "minimum": 1, "default": 4194304, "x-group": "performance", "x-advanced": true, "description": "Approximate bytes of values per Arrow batch."},
+    "snapshotChunkRows": {"type": "integer", "title": "Rows per snapshot chunk", "minimum": 1, "default": 10000, "x-group": "performance", "x-advanced": true, "description": "Rows per chunk of a cdc table's snapshot; each chunk ends at a resume point."},
+    "maxConnections": {"type": "integer", "title": "Connections", "minimum": 1, "default": 4, "x-group": "performance", "x-advanced": true, "description": "The most connections a read holds to read tables in full or incrementally, as many as it has lanes up to this. A cdc read takes one more."}
+  }
+}
