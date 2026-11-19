@@ -89,7 +89,7 @@ const cdcOnly = "Needed only to read tables with cdc: a pipeline's preflight fai
 // opens one and closes it.
 func newKit(c *mysql.Config) *sqlcheck.Kit {
 	k := sqlcheck.New(func(context.Context) (*sql.DB, error) {
-		conn, err := mysql.NewConnector(connConfig(c))
+		conn, err := connector(c)
 		if err != nil {
 			return nil, err
 		}

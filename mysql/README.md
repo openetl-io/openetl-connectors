@@ -122,6 +122,8 @@ spec:
 
 `dsn` is a DSN as the Go MySQL driver spells it, `USER:PASSWORD@tcp(HOST:3306)/DATABASE`, or a URL, `mysql://USER:PASSWORD@HOST:3306/DATABASE`. It's a secret: store it with `openetl secret set app-db-dsn`.
 
+The connector's sessions are in `utf8mb4`, in UTC, and in the SQL mode `STRICT_ALL_TABLES,NO_ENGINE_SUBSTITUTION`, whatever the DSN or the server set: each connection sets them last. The DSN's `collation` is the sessions' if it's one of `utf8mb4`'s, any the server has, and is left out otherwise, as its `charset`, `time_zone`, `sql_mode` and character set variables are. Each other parameter the driver doesn't take must set a session variable, such as `wait_timeout=60` or `@@session.wait_timeout=60`; the connector refuses a DSN with one that doesn't, such as a global or a user variable.
+
 ### TLS
 
 Set `tls` to connect over TLS, for the source's queries and its binlog connection, and for the destination; without it, the DSN's `tls` parameter decides.
