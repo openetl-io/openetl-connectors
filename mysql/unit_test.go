@@ -1,6 +1,9 @@
 package mysql
 
 import (
+	"context"
+	"database/sql/driver"
+	"errors"
 	"fmt"
 	"maps"
 	"math/big"
@@ -208,22 +211,104 @@ func TestParseDSN(t *testing.T) {
 // quoteIdent's, quoteLiteral's and the driver's escapes hold only in a
 // session in utf8mb4 that keeps backslash escapes, whatever the DSN asks.
 func TestSessionsAreUTF8WithBackslashEscapes(t *testing.T) {
-	c, err := parseDSN("u:p@tcp(h)/d?charset=gbk&SQL_MODE='NO_BACKSLASH_ESCAPES'&@@session.character_set_client=sjis&Time_Zone='+05:30'&wait_timeout=60")
+	const session = "SET NAMES utf8mb4 COLLATE utf8mb4_general_ci, time_zone = '+00:00', sql_mode = 'STRICT_ALL_TABLES,NO_ENGINE_SUBSTITUTION'"
+	c, err := parseDSN("u:p@tcp(h)/d?charset=gbk&SQL_MODE='NO_BACKSLASH_ESCAPES'&@@session.character_set_client=sjis&Time_Zone='+05:30'" +
+		"&SESSION character_set_results=latin1&LOCAL\tsql_mode=''&@@LOCAL.collation_connection=latin1_bin&WAIT_TIMEOUT=60, sql_mode=''&@@net_read_timeout=30")
 	if err != nil {
 		t.Fatal(err)
 	}
-	got := connConfig(c)
-	if dsn := got.FormatDSN(); !strings.Contains(dsn, "charset=utf8mb4&collation=utf8mb4_general_ci") {
-		t.Errorf("%s: not in utf8mb4", dsn)
+	cfg, err := connConfig(c)
+	if err != nil {
+		t.Fatal(err)
 	}
-	want := map[string]string{"wait_timeout": "60", "time_zone": "'+00:00'", "sql_mode": "'STRICT_ALL_TABLES,NO_ENGINE_SUBSTITUTION'"}
-	if !maps.Equal(got.Params, want) {
-		t.Errorf("params %v, want %v", got.Params, want)
+	// The handshake takes the driver's default collation, and SET NAMES no
+	// text of the DSN's.
+	if dsn := cfg.FormatDSN(); !strings.Contains(dsn, "charset=utf8mb4&") || strings.Contains(dsn, "collation=") {
+		t.Errorf("%s: not in utf8mb4 alone", dsn)
 	}
-	c, _ = parseDSN("u:p@tcp(h)/d?collation=utf8mb4_0900_ai_ci")
-	if dsn := connConfig(c).FormatDSN(); !strings.Contains(dsn, "charset=utf8mb4&collation=utf8mb4_0900_ai_ci") {
-		t.Errorf("%s: not in the DSN's collation", dsn)
+	// What a value assigns besides, as wait_timeout's does, the session's
+	// own SET overrides, run after the driver's.
+	want := map[string]string{"wait_timeout": "60, sql_mode=''", "net_read_timeout": "30"}
+	if !maps.Equal(cfg.Params, want) {
+		t.Errorf("params %v, want %v", cfg.Params, want)
 	}
+	if got := sessionSQL(c); got != session {
+		t.Errorf("session %q", got)
+	}
+	conn, err := connector(c)
+	if s, ok := conn.(sessionConnector); err != nil || !ok || s.set != session {
+		t.Errorf("connector %#v %v", conn, err)
+	}
+
+	// The driver's handshake doesn't know MySQL's collations numbered from
+	// 256, so the session sets the DSN's; another character set's is left
+	// out.
+	for dsn, want := range map[string]string{
+		"u:p@tcp(h)/d?collation=utf8mb4_0900_AS_CS":          "SET NAMES utf8mb4 COLLATE utf8mb4_0900_as_cs, ",
+		"u:p@tcp(h)/d?charset=utf8mb4&collation=utf8mb4_bin": "SET NAMES utf8mb4 COLLATE utf8mb4_bin, ",
+		"u:p@tcp(h)/d?collation=latin1_swedish_ci":           "SET NAMES utf8mb4 COLLATE utf8mb4_general_ci, ",
+	} {
+		c, err := parseDSN(dsn)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg, err := connConfig(c); err != nil || cfg.Collation != "" {
+			t.Errorf("%s: handshake collation %q, %v", dsn, cfg.Collation, err)
+		}
+		if got := sessionSQL(c); !strings.HasPrefix(got, want) {
+			t.Errorf("%s: session %q", dsn, got)
+		}
+	}
+
+	for _, dsn := range []string{
+		"u:p@tcp(h)/d?collation=utf8mb4_bin, sql_mode=''",
+		"u:p@tcp(h)/d?sql_mode#=''",
+		"u:p@tcp(h)/d?sql_mode -- x=''",
+		"u:p@tcp(h)/d?@@global.sql_mode=''",
+		"u:p@tcp(h)/d?GLOBAL sql_mode=''",
+		"u:p@tcp(h)/d?@x=1",
+		"u:p@tcp(h)/d?names gbk, @x=1",
+		"u:p@tcp(h)/d?character set=gbk",
+		"u:p@tcp(h)/d?@@session . sql_mode=''",
+	} {
+		_, err := parseDSN(dsn)
+		if err == nil || !strings.Contains(err.Error(), "doesn't set a session variable") && !strings.Contains(err.Error(), "isn't a collation's name") {
+			t.Errorf("%s: %v", dsn, err)
+		}
+	}
+}
+
+// A session's statement runs once the driver's connection is set up, and a
+// connection it fails on is closed.
+func TestSessionConnectorSetsLast(t *testing.T) {
+	conn := &fakeConn{}
+	s := sessionConnector{Connector: fakeConnector{conn}, set: "SET x = 1"}
+	if _, err := s.Connect(context.Background()); err != nil || !slices.Equal(conn.ran, []string{"SET x = 1"}) || conn.closed {
+		t.Fatalf("%v %v", conn, err)
+	}
+	conn.fail = errors.New("refused")
+	if _, err := s.Connect(context.Background()); err == nil || !conn.closed {
+		t.Fatalf("%v %v", conn, err)
+	}
+}
+
+type fakeConnector struct{ conn *fakeConn }
+
+func (f fakeConnector) Connect(context.Context) (driver.Conn, error) { return f.conn, nil }
+func (f fakeConnector) Driver() driver.Driver                        { return nil }
+
+type fakeConn struct {
+	ran    []string
+	fail   error
+	closed bool
+}
+
+func (c *fakeConn) Prepare(string) (driver.Stmt, error) { return nil, errors.ErrUnsupported }
+func (c *fakeConn) Close() error                        { c.closed = true; return nil }
+func (c *fakeConn) Begin() (driver.Tx, error)           { return nil, errors.ErrUnsupported }
+func (c *fakeConn) ExecContext(_ context.Context, q string, _ []driver.NamedValue) (driver.Result, error) {
+	c.ran = append(c.ran, q)
+	return driver.RowsAffected(0), c.fail
 }
 
 func TestTLSConfigErrors(t *testing.T) {

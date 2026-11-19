@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"database/sql"
+	"database/sql/driver"
 	"errors"
 	"fmt"
 	"net"
@@ -19,27 +20,60 @@ import (
 
 // parseDSN reads a DSN as the Go driver spells it,
 // user:password@tcp(host:3306)/database?param=value, or as a URL,
-// mysql://user:password@host:3306/database?param=value.
+// mysql://user:password@host:3306/database?param=value. It refuses a
+// parameter the driver doesn't take that doesn't set a session variable,
+// and a collation that isn't a name.
 func parseDSN(dsn string) (*mysql.Config, error) {
 	u, err := url.Parse(dsn)
+	var c *mysql.Config
 	if err != nil || (u.Scheme != "mysql" && u.Scheme != "mariadb") {
-		c, err := mysql.ParseDSN(dsn)
-		if err != nil {
+		if c, err = mysql.ParseDSN(dsn); err != nil {
 			return nil, fmt.Errorf("mysql: dsn: %w", err)
 		}
-		return c, nil
+	} else {
+		host := u.Host
+		if u.Port() == "" {
+			host = net.JoinHostPort(u.Hostname(), "3306")
+		}
+		pass, _ := u.User.Password()
+		if c, err = mysql.ParseDSN(fmt.Sprintf("tcp(%s)/%s?%s", host, strings.TrimPrefix(u.Path, "/"), u.RawQuery)); err != nil {
+			return nil, fmt.Errorf("mysql: dsn: %w", err)
+		}
+		c.User, c.Passwd = u.User.Username(), pass
 	}
-	host := u.Host
-	if u.Port() == "" {
-		host = net.JoinHostPort(u.Hostname(), "3306")
+	for k := range c.Params {
+		if _, ok := sessionVariable(k); !ok {
+			return nil, fmt.Errorf("mysql: dsn: the parameter %q doesn't set a session variable, as wait_timeout or @@session.wait_timeout would", k)
+		}
 	}
-	pass, _ := u.User.Password()
-	c, err := mysql.ParseDSN(fmt.Sprintf("tcp(%s)/%s?%s", host, strings.TrimPrefix(u.Path, "/"), u.RawQuery))
-	if err != nil {
-		return nil, fmt.Errorf("mysql: dsn: %w", err)
+	if c.Collation != "" && !plainName(strings.ToLower(c.Collation)) {
+		return nil, fmt.Errorf("mysql: dsn: the collation %q isn't a collation's name", c.Collation)
 	}
-	c.User, c.Passwd = u.User.Username(), pass
 	return c, nil
+}
+
+// sessionVariable is the system variable that a DSN parameter's key sets
+// in the session, as SET spells it: lowercase, without @@ and SESSION or
+// LOCAL, dotted or as a keyword. ok is false for any other key, such as a
+// global or a user variable, or one with more than a name in it.
+func sessionVariable(key string) (name string, ok bool) {
+	name = strings.ToLower(strings.TrimSpace(key))
+	if rest, found := strings.CutPrefix(name, "@@"); found {
+		name = rest
+		for _, scope := range []string{"session.", "local."} {
+			if rest, found := strings.CutPrefix(name, scope); found {
+				name = rest
+				break
+			}
+		}
+	} else if f := strings.Fields(name); len(f) == 2 && (f[0] == "session" || f[0] == "local") {
+		name = f[1]
+	}
+	return name, plainName(name)
+}
+
+func plainName(s string) bool {
+	return s != "" && strings.Trim(s, "abcdefghijklmnopqrstuvwxyz0123456789_") == ""
 }
 
 // TLSConfig is how connections use TLS, in place of the DSN's tls parameter.
@@ -115,18 +149,65 @@ func applyTLS(c *mysql.Config, t *TLSConfig) error {
 	return nil
 }
 
+// connector makes c's connections, each in the session sessionSQL sets.
+func connector(c *mysql.Config) (driver.Connector, error) {
+	cfg, err := connConfig(c)
+	if err != nil {
+		return nil, err
+	}
+	conn, err := mysql.NewConnector(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("mysql: dsn: %w", err)
+	}
+	return sessionConnector{Connector: conn, set: sessionSQL(c)}, nil
+}
+
+// sessionConnector runs set on each connection once the driver has set it
+// up, its DSN's parameters included, so that set has the last word.
+type sessionConnector struct {
+	driver.Connector
+	set string
+}
+
+func (s sessionConnector) Connect(ctx context.Context) (driver.Conn, error) {
+	conn, err := s.Connector.Connect(ctx)
+	if err != nil {
+		return nil, err
+	}
+	ex, ok := conn.(driver.ExecerContext)
+	if !ok {
+		_ = conn.Close()
+		return nil, errors.New("mysql: the driver's connection doesn't run statements")
+	}
+	if _, err := ex.ExecContext(ctx, s.set, nil); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	return conn, nil
+}
+
+// sessionSQL sets what every session of the connector needs: utf8mb4, in
+// the DSN's collation if it's one of utf8mb4's, as the escapes of
+// quoteIdent, quoteLiteral and the driver need (in a character set such as
+// gbk or sjis, a backslash or quote they add can end a multibyte character
+// instead); UTC; and a SQL mode that stops writes of values a column can't
+// hold and keeps backslash escapes, which quoteLiteral needs. The collation
+// is set here and not in the handshake, which takes only those the driver
+// knows.
+func sessionSQL(c *mysql.Config) string {
+	collation := strings.ToLower(c.Collation)
+	if !strings.HasPrefix(collation, "utf8mb4_") || !plainName(collation) {
+		collation = "utf8mb4_general_ci"
+	}
+	return "SET NAMES utf8mb4 COLLATE " + collation + ", time_zone = '+00:00', sql_mode = 'STRICT_ALL_TABLES,NO_ENGINE_SUBSTITUTION'"
+}
+
 // connConfig is c as every connection of the connector needs it: values
 // interpolated into statements, temporal values as text, which keeps zero
-// dates apart from real ones, sessions in UTC, and a SQL mode that stops
-// writes of values a column can't hold.
-//
-// Sessions are in utf8mb4 whatever the DSN or the server say, in the DSN's
-// collation if it's one of utf8mb4's, as the escapes of quoteIdent,
-// quoteLiteral and the driver need: in a character set such as gbk or sjis,
-// a backslash or quote they add can end a multibyte character instead. The
-// SQL mode keeps backslash escapes, which quoteLiteral needs. The DSN's own
-// settings of these are dropped, in whatever case.
-func connConfig(c *mysql.Config) *mysql.Config {
+// dates apart from real ones, a handshake and a SET NAMES in utf8mb4 that
+// leave out the DSN's charset and collation, and the DSN's parameters, each
+// spelled as the session variable it sets, but for those sessionSQL sets.
+func connConfig(c *mysql.Config) (*mysql.Config, error) {
 	c = c.Clone()
 	c.InterpolateParams = true
 	c.ParseTime = false
@@ -134,24 +215,23 @@ func connConfig(c *mysql.Config) *mysql.Config {
 	if c.Timeout == 0 {
 		c.Timeout = 10 * time.Second
 	}
-	collation := "utf8mb4_general_ci"
-	if strings.HasPrefix(c.Collation, "utf8mb4_") {
-		collation = c.Collation
+	if err := c.Apply(mysql.Charset("utf8mb4", "")); err != nil {
+		return nil, fmt.Errorf("mysql: dsn: %w", err)
 	}
-	_ = c.Apply(mysql.Charset("utf8mb4", collation))
 	params := map[string]string{}
 	for k, v := range c.Params {
-		name := strings.TrimPrefix(strings.ToLower(k), "@@")
-		switch strings.TrimPrefix(strings.TrimPrefix(name, "session."), "local.") {
+		name, ok := sessionVariable(k)
+		if !ok {
+			return nil, fmt.Errorf("mysql: dsn: the parameter %q doesn't set a session variable", k)
+		}
+		switch name {
 		case "time_zone", "sql_mode", "character_set_client", "character_set_connection", "character_set_results", "collation_connection":
 		default:
-			params[k] = v
+			params[name] = v
 		}
 	}
 	c.Params = params
-	c.Params["time_zone"] = "'+00:00'"
-	c.Params["sql_mode"] = "'STRICT_ALL_TABLES,NO_ENGINE_SUBSTITUTION'"
-	return c
+	return c, nil
 }
 
 // server is what differs between MySQL and MariaDB.
@@ -164,9 +244,9 @@ type server struct {
 }
 
 func open(ctx context.Context, c *mysql.Config, conns int) (*sql.DB, server, error) {
-	conn, err := mysql.NewConnector(connConfig(c))
+	conn, err := connector(c)
 	if err != nil {
-		return nil, server{}, fmt.Errorf("mysql: dsn: %w", err)
+		return nil, server{}, err
 	}
 	db := sql.OpenDB(conn)
 	db.SetMaxOpenConns(conns)
