@@ -62,7 +62,7 @@ done
 # package_dir NAME is the directory of package NAME in this checkout.
 package_dir() {
   local p
-  for p in "${here[@]}"; do [ "${p%%=*}" != "$1" ] || { echo "${p#*=}"; return; }; done
+  for p in "${here[@]}"; do [[ "${p%%=*}" != "$1" ]] || { echo "${p#*=}"; return; }; done
 }
 
 # target NAME is what package NAME's checks run against.
@@ -74,11 +74,11 @@ for a in "$@"; do
   [[ "$name" =~ ^[a-z0-9]+$ ]] || { echo "$a isn't NAME or NAME=TARGET" >&2; exit 2; }
   names+=("$name")
   if [[ "$a" == *=* ]]; then
-    [ -n "${a#*=}" ] || { echo "$a has no TARGET" >&2; exit 2; }
+    [[ -n "${a#*=}" ]] || { echo "$a has no TARGET" >&2; exit 2; }
     printf -v "target_$name" '%s' "${a#*=}"
   else
     d=$(package_dir "$name")
-    [ -n "$d" ] || { echo "no package $name here" >&2; exit 2; }
+    [[ -n "$d" ]] || { echo "no package $name here" >&2; exit 2; }
     build+=("$d")
     printf -v "target_$name" '%s' "$dist/$name.connector.yaml"
   fi
@@ -97,7 +97,7 @@ check() {
   local name=$1 at
   at=$(target "$2")
   shift 2
-  [ -n "$at" ] || return 0
+  [[ -n "$at" ]] || return 0
   echo "::group::$name"
   if ! "$openetl" connector test -q "$@" "$at" 2>&1 | tee "$work/check.log"; then
     if [[ -n ${ROLE_OPTIONAL:-} && $at != "$dist"/* ]] && grep -q "has no [a-z]* role" "$work/check.log"; then
@@ -759,13 +759,13 @@ files_checks() {
 set -eo pipefail
 case $1 in
 # A bucket that's there already answers 409, and is fine.
-s3) [ -z "$3" ] && exec curl -s -o /dev/null -X PUT "$S3/packages"
+s3) [[ -z "$3" ]] && exec curl -s -o /dev/null -X PUT "$S3/packages"
   exec curl -sf -o /dev/null -X PUT --data-binary "@$3" "$S3/packages/$2" ;;
-gcs) [ -z "$3" ] && { curl -s -o /dev/null -X POST -H 'Content-Type: application/json' -d '{"name":"packages"}' "$GCS/storage/v1/b?project=openetl"; exit 0; }
+gcs) [[ -z "$3" ]] && { curl -s -o /dev/null -X POST -H 'Content-Type: application/json' -d '{"name":"packages"}' "$GCS/storage/v1/b?project=openetl"; exit 0; }
   exec curl -sf -o /dev/null -X POST --data-binary "@$3" "$GCS/upload/storage/v1/b/packages/o?uploadType=media&name=$2" ;;
 azure)
   account=${AZURE##*/} date=$(LC_ALL=C TZ=GMT date '+%a, %d %b %Y %H:%M:%S GMT')
-  if [ -z "$3" ]; then
+  if [[ -z "$3" ]]; then
     url="$AZURE/packages?restype=container" len="" type="" blob="" resource="/$account/$account/packages"$'\n'"restype:container" data=()
   else
     url="$AZURE/packages/$2" len=$(wc -c <"$3" | tr -d ' ') type=application/octet-stream blob=$'x-ms-blob-type:BlockBlob\n' resource="/$account/$account/packages/$2" data=(--data-binary "@$3")

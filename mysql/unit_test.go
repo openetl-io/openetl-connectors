@@ -2,6 +2,7 @@ package mysql
 
 import (
 	"fmt"
+	"maps"
 	"math/big"
 	"slices"
 	"strings"
@@ -201,6 +202,27 @@ func TestParseDSN(t *testing.T) {
 	}
 	if got := quoteLiteral("a'b\\c\x00"); got != `'a\'b\\c\0'` {
 		t.Fatal(got)
+	}
+}
+
+// quoteIdent's, quoteLiteral's and the driver's escapes hold only in a
+// session in utf8mb4 that keeps backslash escapes, whatever the DSN asks.
+func TestSessionsAreUTF8WithBackslashEscapes(t *testing.T) {
+	c, err := parseDSN("u:p@tcp(h)/d?charset=gbk&SQL_MODE='NO_BACKSLASH_ESCAPES'&@@session.character_set_client=sjis&Time_Zone='+05:30'&wait_timeout=60")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := connConfig(c)
+	if dsn := got.FormatDSN(); !strings.Contains(dsn, "charset=utf8mb4&collation=utf8mb4_general_ci") {
+		t.Errorf("%s: not in utf8mb4", dsn)
+	}
+	want := map[string]string{"wait_timeout": "60", "time_zone": "'+00:00'", "sql_mode": "'STRICT_ALL_TABLES,NO_ENGINE_SUBSTITUTION'"}
+	if !maps.Equal(got.Params, want) {
+		t.Errorf("params %v, want %v", got.Params, want)
+	}
+	c, _ = parseDSN("u:p@tcp(h)/d?collation=utf8mb4_0900_ai_ci")
+	if dsn := connConfig(c).FormatDSN(); !strings.Contains(dsn, "charset=utf8mb4&collation=utf8mb4_0900_ai_ci") {
+		t.Errorf("%s: not in the DSN's collation", dsn)
 	}
 }
 

@@ -119,6 +119,13 @@ func applyTLS(c *mysql.Config, t *TLSConfig) error {
 // interpolated into statements, temporal values as text, which keeps zero
 // dates apart from real ones, sessions in UTC, and a SQL mode that stops
 // writes of values a column can't hold.
+//
+// Sessions are in utf8mb4 whatever the DSN or the server say, in the DSN's
+// collation if it's one of utf8mb4's, as the escapes of quoteIdent,
+// quoteLiteral and the driver need: in a character set such as gbk or sjis,
+// a backslash or quote they add can end a multibyte character instead. The
+// SQL mode keeps backslash escapes, which quoteLiteral needs. The DSN's own
+// settings of these are dropped, in whatever case.
 func connConfig(c *mysql.Config) *mysql.Config {
 	c = c.Clone()
 	c.InterpolateParams = true
@@ -127,9 +134,21 @@ func connConfig(c *mysql.Config) *mysql.Config {
 	if c.Timeout == 0 {
 		c.Timeout = 10 * time.Second
 	}
-	if c.Params == nil {
-		c.Params = map[string]string{}
+	collation := "utf8mb4_general_ci"
+	if strings.HasPrefix(c.Collation, "utf8mb4_") {
+		collation = c.Collation
 	}
+	_ = c.Apply(mysql.Charset("utf8mb4", collation))
+	params := map[string]string{}
+	for k, v := range c.Params {
+		name := strings.TrimPrefix(strings.ToLower(k), "@@")
+		switch strings.TrimPrefix(strings.TrimPrefix(name, "session."), "local.") {
+		case "time_zone", "sql_mode", "character_set_client", "character_set_connection", "character_set_results", "collation_connection":
+		default:
+			params[k] = v
+		}
+	}
+	c.Params = params
 	c.Params["time_zone"] = "'+00:00'"
 	c.Params["sql_mode"] = "'STRICT_ALL_TABLES,NO_ENGINE_SUBSTITUTION'"
 	return c

@@ -17,7 +17,8 @@ import (
 // sourceColumn is a table's column as sys.columns has it.
 type sourceColumn struct {
 	name string
-	// The system type's name, such as nvarchar; an alias type's base type.
+	// The system type's name, such as nvarchar; an alias type's base type;
+	// a CLR type's own name, which can hold any character.
 	typ string
 	// In bytes; -1 for (max).
 	maxLength     int
@@ -49,7 +50,16 @@ func (c sourceColumn) sqlType() string {
 	case "timestamp", "rowversion":
 		return "binary(8)"
 	}
+	if !systemName(c.typ) {
+		return quote(c.typ)
+	}
 	return c.typ
+}
+
+// systemName reports whether a type's name is spelled as SQL Server's own
+// are, in lowercase letters, digits and underscores, which need no quotes.
+func systemName(typ string) bool {
+	return typ != "" && strings.Trim(typ, "abcdefghijklmnopqrstuvwxyz0123456789_") == ""
 }
 
 // selectExpr is how a query selects the column for its colBuilder: the CLR
