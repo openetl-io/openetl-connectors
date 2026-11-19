@@ -8,7 +8,7 @@
     {"id": "tls", "title": "TLS", "description": "How connections use TLS, in place of the dsn's tls parameter."}
   ],
   "properties": {
-    "dsn": {"type": "string", "x-secret": true, "title": "Connection string", "description": "A DSN as the Go MySQL driver spells it, or a mysql:// URL. Sessions are in utf8mb4, in UTC and in the connector's SQL mode, whatever its charset, time_zone and sql_mode say; a collation of utf8mb4's is kept. Its other parameters must each set a session variable.", "examples": ["USER:PASSWORD@tcp(HOST:3306)/DATABASE", "mysql://USER:PASSWORD@HOST:3306/DATABASE"]},
+    "dsn": {"type": "string", "x-secret": true, "title": "Connection string", "description": "A DSN as the Go MySQL driver spells it, or a mysql:// URL. Sessions are in utf8mb4, in UTC and in the connector's SQL mode, whatever its charset, time_zone and sql_mode say; a collation of utf8mb4's is kept. Each other parameter the driver does not take must set a session variable.", "examples": ["USER:PASSWORD@tcp(HOST:3306)/DATABASE", "mysql://USER:PASSWORD@HOST:3306/DATABASE"]},
     "database": {"type": "string", "title": "Database", "description": "The database tables are written to when the pipeline names no namespace. Default: the DSN's database."},
     "tls": {
       "type": "object",
