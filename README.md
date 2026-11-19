@@ -1,5 +1,10 @@
 # openetl-connectors
 
+[![Quality Gate Status](https://sonarcloud.io/api/project_badges/measure?project=openetl-io_openetl-connectors&metric=alert_status)](https://sonarcloud.io/summary/new_code?id=openetl-io_openetl-connectors)
+[![Security Rating](https://sonarcloud.io/api/project_badges/measure?project=openetl-io_openetl-connectors&metric=security_rating)](https://sonarcloud.io/summary/new_code?id=openetl-io_openetl-connectors)
+[![Reliability Rating](https://sonarcloud.io/api/project_badges/measure?project=openetl-io_openetl-connectors&metric=reliability_rating)](https://sonarcloud.io/summary/new_code?id=openetl-io_openetl-connectors)
+[![Maintainability Rating](https://sonarcloud.io/api/project_badges/measure?project=openetl-io_openetl-connectors&metric=sqale_rating)](https://sonarcloud.io/summary/new_code?id=openetl-io_openetl-connectors)
+
 The official connectors for [OpenETL](https://github.com/openetl-io/openetl): the programs that read from and write to the systems OpenETL copies data between. Each one has a page with what it reads or writes, how to set it up, and what it does when a source's schema changes.
 
 > [!NOTE]
