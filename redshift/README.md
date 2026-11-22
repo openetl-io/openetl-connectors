@@ -34,6 +34,7 @@ The cluster or workgroup needs:
 - An S3 bucket in the cluster's region. A lifecycle rule that expires objects under `prefix` after a day cleans up a file whose delete failed.
 - An IAM role associated with the cluster or workgroup, named by `iamRole` (`default` for its default role), with `s3:GetObject` and `s3:ListBucket` on the bucket. `COPY` reads Parquet files only as a role, and through S3's presigned URLs, so a bucket policy mustn't refuse those.
 - An identity that uploads the files, with `s3:PutObject` and `s3:DeleteObject` on the bucket's keys under `prefix`: `accessKeyId` and `secretAccessKey`, or else the AWS default credentials where the connector runs.
+- If the bucket encrypts its objects with a KMS key, `kms:Decrypt` on the key for the role, and `kms:GenerateDataKey` for the identity that uploads the files.
 
 ```sql
 CREATE USER openetl PASSWORD '...';
