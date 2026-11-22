@@ -277,7 +277,18 @@ func (s *Source) Checks() []check.Check {
 		return nil
 	})
 	read.Field, read.Params, read.Needs = "tables", check.Params{"database": database, "user": user}, readNeeds
-	return append(checks, read)
+	return withoutDeadline(append(checks, read))
+}
+
+// withoutDeadline has checks run as noDeadline does, so that a readonly
+// user's pass.
+func withoutDeadline(checks []check.Check) []check.Check {
+	for i, c := range checks {
+		if run := c.Run; run != nil {
+			checks[i].Run = func(ctx context.Context, p *check.Probe) error { return run(noDeadline{ctx}, p) }
+		}
+	}
+	return checks
 }
 
 // selectMissing is the failure of a user without SELECT on objects.
@@ -408,7 +419,7 @@ func (s *Source) Preflight(req source.PreflightRequest) []check.Check {
 			checks = append(checks, c)
 		}
 	}
-	return checks
+	return withoutDeadline(checks)
 }
 
 // Check is Checks run, its first failure as an error.

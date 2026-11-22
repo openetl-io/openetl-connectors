@@ -126,6 +126,39 @@ func TestSourceCheckItems(t *testing.T) {
 	connectortest.ExpectStatuses(t, connectortest.Items(t, s.Checks()), map[string]string{"database.found": "failed not_found", "tables.read": "skipped"})
 }
 
+// A readonly profile's user checks, discovers and reads under a deadline,
+// as the platform gives a check one, too: the driver would send it as
+// max_execution_time, which such a user can't set.
+func TestSourceReadonlyDeadline(t *testing.T) {
+	db := newDatabase(t)
+	e := sourceEnv{t: t, db: db, conn: testConn(t)}
+	e.exec("CREATE TABLE $db.items (id Int64) ENGINE = MergeTree ORDER BY id")
+	e.exec("INSERT INTO $db.items VALUES (1), (2)")
+	s, err := NewSource(userConfig(testUser(t, db, "readonly = 1", "SELECT ON $db.*"), db))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+	defer cancel()
+	if err := check.Run(ctx, s.Checks()).Err(); err != nil {
+		t.Errorf("checks: %v", err)
+	}
+	if _, err := s.Discover(ctx); err != nil {
+		t.Errorf("discover: %v", err)
+	}
+	cs := source.ConfiguredStream{Name: "items", SyncMode: source.FullRefresh}
+	if _, err := s.Splits(ctx, cs, nil); err != nil {
+		t.Errorf("splits: %v", err)
+	}
+	c := newCollector()
+	if err := s.Read(ctx, source.ReadRequest{Streams: []source.ConfiguredStream{cs}, Lanes: 1}, c); err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if got := c.ids("items"); !slices.Equal(got, []int64{1, 2}) {
+		t.Errorf("read %v", got)
+	}
+}
+
 func TestDestinationCheckItems(t *testing.T) {
 	db := newDatabase(t)
 	d, err := NewDestination(testConfig(testAddr(), "openetl", db))

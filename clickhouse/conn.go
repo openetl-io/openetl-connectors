@@ -85,6 +85,13 @@ func (c connConfig) open(conns int, settings ch.Settings) (driver.Conn, error) {
 	return conn, nil
 }
 
+// noDeadline is a context without its deadline, which the driver would send
+// with each query as max_execution_time, a setting a readonly user can't
+// change. The deadline still cancels it.
+type noDeadline struct{ context.Context }
+
+func (noDeadline) Deadline() (time.Time, bool) { return time.Time{}, false }
+
 // connect opens a pool and pings the server.
 func (c connConfig) connect(ctx context.Context, conns int, settings ch.Settings) (driver.Conn, error) {
 	conn, err := c.open(conns, settings)

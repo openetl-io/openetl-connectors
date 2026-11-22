@@ -38,7 +38,7 @@ The user needs `SELECT` on each table the source offers. ClickHouse lists only t
 GRANT SELECT ON analytics.* TO openetl;
 ```
 
-The user's profile's limits apply to each of the source's queries: a table read in one query, or a chunk, that reads past `max_rows_to_read` or `max_bytes_to_read`, or runs past `max_execution_time`, fails, and fails the same way when it's retried. Give the user a profile without them, or with room for the largest table read in one query.
+The source changes no setting, so a user whose profile has `readonly = 1` can read: the platform's time limit on a check or a read cancels its query, rather than going to the server as `max_execution_time`, which such a user couldn't set. The user's profile's limits apply to each of the source's queries: a table read in one query, or a chunk, that reads past `max_rows_to_read` or `max_bytes_to_read`, or runs past `max_execution_time`, fails, and fails the same way when it's retried. Give the user a profile without them, or with room for the largest table read in one query.
 
 The source's check is a list of items, each with what failed and how to fix it: the server's name resolves and its port answers (`net.dns`, `net.connect`), with TLS when `tls` is set (`net.tls`), the user signs in (`db.connect`), the server's version (`server.version`, which warns before 26.8, the version the connector is tested on), the database is there (`database.found`), each table in `tables` is (`tables.found`), and the user has `SELECT` on every table offered (`tables.read`).
 

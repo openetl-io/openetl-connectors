@@ -102,6 +102,7 @@ var (
 )
 
 func (s *Source) Discover(ctx context.Context) (source.Catalog, error) {
+	ctx = noDeadline{ctx}
 	conn, err := s.cfg.connect(ctx, 1, nil)
 	if err != nil {
 		return source.Catalog{}, err
@@ -275,6 +276,7 @@ type sourceState struct {
 }
 
 func (s *Source) Read(ctx context.Context, req source.ReadRequest, out source.Emitter) error {
+	ctx = noDeadline{ctx}
 	limit := min(max(req.Lanes, 1), s.cfg.MaxConnections)
 	conn, err := s.cfg.connect(ctx, limit, nil)
 	if err != nil {
