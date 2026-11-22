@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"slices"
 	"strconv"
@@ -157,8 +158,8 @@ func (w *writer) build(ctx context.Context, desc staged, s stagedStream, ready s
 // missing explains staging that isn't there: a newer generation's Recover
 // drops what older ones staged.
 func (w *writer) missing(ctx context.Context, desc staged, s stagedStream) error {
-	if g, err := w.fence(ctx); err == nil && g > w.cfg.Generation {
-		return fmt.Errorf("%w: fence is %d, applier is %d", destination.ErrFenced, g, w.cfg.Generation)
+	if err := w.checkFence(ctx); errors.Is(err, destination.ErrFenced) {
+		return err
 	}
 	return fmt.Errorf("clickhouse: staging for %s in epoch %d-g%d is missing", s.Name, desc.Epoch, desc.Generation)
 }
@@ -914,14 +915,14 @@ func (w *writer) Recover(ctx context.Context, gen uint64, e destination.Epoch, c
 			return 0, fmt.Errorf("clickhouse: prepare %s: %w", w.db, err)
 		}
 	}
-	fence, err := w.fence(ctx)
+	fence, raised, err := w.fence(ctx)
 	if err != nil {
 		return 0, err
 	}
 	if fence > gen {
 		return 0, fmt.Errorf("%w: recovering as generation %d, and the fence is %d", destination.ErrFenced, gen, fence)
 	}
-	if fence < gen {
+	if !raised || fence < gen {
 		if err := w.exec(ctx, "INSERT INTO "+w.q(fenceTable)+" (pipeline, generation) VALUES ("+literal(w.cfg.Pipeline)+", "+strconv.FormatUint(gen, 10)+")"); err != nil {
 			return 0, fmt.Errorf("clickhouse: raise the fence: %w", err)
 		}

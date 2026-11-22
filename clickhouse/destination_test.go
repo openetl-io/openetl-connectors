@@ -1002,3 +1002,24 @@ func TestDestinationPendingBound(t *testing.T) {
 		wantRows(t, s.Name, k.query("SELECT toString(count()) FROM $db."+ident(s.Name)), "30")
 	}
 }
+
+// Generation 0's fence is a fence like any other: once its Recover has
+// raised it, its commits apply. A pipeline whose fence has no row is told
+// to recover first.
+func TestDestinationFenceOfGenerationZero(t *testing.T) {
+	k := newKit(t)
+	s := schemaOf("a", idCol, vCol)
+	streams := []destination.Stream{{Name: "a", Mode: destination.Append}}
+	w, _ := k.open(0, streams, destination.Epoch{}, nil)
+	k.apply(w, s)
+	k.commit(w, epoch(0, 1), batchOf(s, ins(1, int64(1), "a")))
+	wantRows(t, "a", k.rows("a", "id", "v"), "1|a")
+	other, err := k.d.Open(t.Context(), destination.OpenConfig{Pipeline: "q", Generation: 1, Scope: destination.ScopeStream, Namespace: k.db, Streams: streams})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = other.Close(t.Context()) })
+	if err := other.(*writer).checkFence(t.Context()); err == nil || !strings.Contains(err.Error(), "Recover must run first") {
+		t.Errorf("a pipeline whose fence has no row: %v", err)
+	}
+}
