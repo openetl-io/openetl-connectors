@@ -62,7 +62,7 @@ func TestRegistryCredentialsOverHTTPWarn(t *testing.T) {
 				got += ":" + it.Failure.Reason
 			}
 			if it.Name == "registry.auth" && got != tc.want {
-				t.Errorf("%s with user %q: %s %s, want %s", shownURL(tc.c.SchemaRegistryURL), tc.c.SchemaRegistryUsername, it.Name, got, tc.want)
+				t.Errorf("%s with user %q: %s %s, want %s", ShownURL(tc.c.SchemaRegistryURL), tc.c.SchemaRegistryUsername, it.Name, got, tc.want)
 			}
 		}
 	}
@@ -81,7 +81,7 @@ func TestFailedRegistryChecksShowNoCredentials(t *testing.T) {
 		c := Config{SchemaRegistryURL: raw}
 		got := fmt.Sprintf("%+v", check.Run(t.Context(), c.RegistryChecks(5*time.Second)).Items)
 		if strings.Contains(got, "cret") || !strings.Contains(got, "failed") {
-			t.Errorf("%s: %s", shownURL(raw), got)
+			t.Errorf("%s: %s", ShownURL(raw), got)
 		}
 	}
 }

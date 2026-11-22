@@ -22,7 +22,7 @@ func (c *Config) RegistryChecks(timeout time.Duration) []check.Check {
 		return nil
 	}
 	var answered error
-	params := check.Params{"url": shownURL(c.SchemaRegistryURL)}
+	params := check.Params{"url": ShownURL(c.SchemaRegistryURL)}
 	authField := "schemaRegistryUrl"
 	if c.SchemaRegistryUsername != "" {
 		authField = "schemaRegistryPassword"
@@ -87,11 +87,11 @@ func (c *Config) sendsCredentialsInTheClear() bool {
 	return err == nil && u.Scheme == "http" && (c.SchemaRegistryUsername != "" || u.User != nil)
 }
 
-// shownURL is raw without its userinfo, query and fragment, which can hold
+// ShownURL is raw without its userinfo, query and fragment, which can hold
 // credentials, for params, which people see. A "?" or "#" in a password,
 // which ends the authority for url.Parse, doesn't keep the userinfo: an "@"
 // before the path ends it, wherever such a character is.
-func shownURL(raw string) string {
+func ShownURL(raw string) string {
 	scheme, rest := "", raw
 	if i := strings.Index(raw, "://"); i >= 0 {
 		scheme, rest = raw[:i+3], raw[i+3:]

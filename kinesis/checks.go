@@ -240,7 +240,7 @@ func registryCheck(c *records.Config) (check.Check, bool) {
 	if c.Format != records.Avro && c.Format != records.Protobuf {
 		return check.Check{}, false
 	}
-	host := c.SchemaRegistryURL
+	host := records.ShownURL(c.SchemaRegistryURL)
 	if u, err := url.Parse(host); err == nil && u.Host != "" {
 		host = u.Host
 	}

@@ -16,7 +16,7 @@ The source and the destination share their connection settings:
 - `region`: the streams' AWS region. Unset, the AWS default configuration's.
 - `accessKeyId` and `secretAccessKey`, together. Without them, the AWS SDK's default credential chain, which finds only what the runner gives the connector: by default, nothing. Name an IAM role in the source's or destination's `aws.role`, which the runner assumes for the connector, on EC2 and EKS alike. [Run on AWS](https://github.com/openetl-io/openetl/blob/main/docs/self-host/aws.md#credentials-for-connectors) explains the setup. Keys in the config are used even if a role is named.
 - `endpoint`: a Kinesis-compatible endpoint, such as a VPC endpoint or an emulator.
-- `format`: how each record's data is encoded: `json` (the default), `avro` or `protobuf`, the same as the [Kafka connectors](../kafka/README.md). Avro and Protobuf need `schemaRegistryUrl`.
+- `format`: how each record's data is encoded: `json` (the default), `avro` or `protobuf`, the same as the [Kafka connectors](../kafka/README.md). Avro and Protobuf need `schemaRegistryUrl`, and `schemaRegistryUsername` and `schemaRegistryPassword` if it asks for basic authentication. Basic authentication sends the password as it is, so use an `https` URL. Credentials in the URL, as `https://user:password@registry.internal`, sign in the same way; from 0.2.0, errors and the `registry.reach` check's title don't show them, even a password with a `#`, `?` or `/` in it.
 
 Keep `accessKeyId`, `secretAccessKey` and `schemaRegistryPassword` in secrets, as `{ secret: NAME }`.
 
@@ -99,6 +99,8 @@ Each record becomes a row, as in the [Kafka source](../kafka/README.md#rows): an
 | `_kinesis_subsequence` | From 0.2.0: its user record's number within an aggregated record; 0 for a record that isn't one |
 | `_kinesis_arrival` | When Kinesis received it, in UTC |
 | `_kinesis_partition_key` | Its partition key |
+
+Data that doesn't decode in the configured `format` stops the read with `DATA_INVALID`, naming its shard and sequence number. From 0.2.0, data whose schema the registry doesn't serve for now, as when it doesn't answer, answers with a server error or too many requests, or refuses the credentials, stops the read with the registry's error instead: `TRANSIENT`, or `AUTH_INVALID` or `PERMISSION_DENIED` for credentials it refuses. Before 0.2.0, that was `DATA_INVALID` too. A schema ID the registry doesn't have is still `DATA_INVALID`.
 
 ### Set it up
 

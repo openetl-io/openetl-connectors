@@ -16,6 +16,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/kinesis/types"
+	"github.com/twmb/franz-go/pkg/sr"
 	"google.golang.org/protobuf/encoding/protowire"
 
 	"github.com/openetl-io/openetl-connectors/records"
@@ -713,6 +714,43 @@ func TestAggregatesWhateverTheFormat(t *testing.T) {
 	rows, err := s.rows(t.Context(), "shard-0", recs)
 	if err != nil || len(rows) != 2 || !strings.Contains(string(rows[1]), `"two"`) {
 		t.Errorf("string, deaggregated: %s, %v", rows, err)
+	}
+}
+
+// The registry's param, which people see, holds no password, even one with
+// a character that ends the URL's authority.
+func TestTheRegistrysParamHoldsNoPassword(t *testing.T) {
+	for _, u := range []string{"http://u:s3cret@registry:8081", "http://u:s3#cret@registry:8081", "http://u:s3?cret@registry:8081", "http://u:s3/cret@registry:8081/x"} {
+		c, ok := registryCheck(&records.Config{Format: records.Avro, SchemaRegistryURL: u})
+		if got := c.Params["registry"]; !ok || strings.Contains(got, "s3") || !strings.Contains(got, "registry:8081") {
+			t.Errorf("%s: the registry's param is %q", u, got)
+		}
+	}
+}
+
+// A record whose schema the registry doesn't serve for now fails the read as
+// the registry's failure, which OpenETL tries again or reports as refused
+// credentials; a schema ID it doesn't have is invalid data.
+func TestARegistryThatDoesntAnswerFailsAsItself(t *testing.T) {
+	at := time.Now()
+	recs := []types.Record{{SequenceNumber: aws.String("1"), PartitionKey: aws.String("k"), Data: []byte{0, 0, 0, 0, 1, 2}, ApproximateArrivalTimestamp: &at}}
+	for status, want := range map[int]protocolv1.ErrorCode{
+		http.StatusServiceUnavailable: protocolv1.ErrorCode_ERROR_CODE_TRANSIENT,
+		http.StatusTooManyRequests:    protocolv1.ErrorCode_ERROR_CODE_TRANSIENT,
+		http.StatusUnauthorized:       protocolv1.ErrorCode_ERROR_CODE_AUTH_INVALID,
+		http.StatusForbidden:          protocolv1.ErrorCode_ERROR_CODE_PERMISSION_DENIED,
+		http.StatusNotFound:           protocolv1.ErrorCode_ERROR_CODE_DATA_INVALID,
+	} {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(status) }))
+		reg, err := sr.NewClient(sr.URLs(srv.URL))
+		if err != nil {
+			t.Fatal(err)
+		}
+		s := &Source{cfg: SourceConfig{}, values: records.NewDecoder(records.Avro, reg)}
+		if _, err := s.rows(t.Context(), "shard-0", recs); codeOf(err) != want {
+			t.Errorf("with the registry answering %d: %v, %v", status, codeOf(err), err)
+		}
+		srv.Close()
 	}
 }
 
