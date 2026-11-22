@@ -54,6 +54,12 @@ var (
 		Message: "{table} has no capture instance that {principal} can read.",
 		Fix:     "Run EXEC sys.sp_cdc_enable_table @source_schema = N'{schema}', @source_name = N'{name}', @role_name = NULL; and GRANT SELECT ON SCHEMA::cdc TO {principal};",
 	}
+	otherCodePage = check.Reason{
+		Name:    "code_page_differs",
+		Code:    protocolv1.ErrorCode_ERROR_CODE_CONFIG_INVALID,
+		Message: "{column} of {table} is a char, varchar or text column in a collation whose code page isn't the database's: change data capture keeps only the characters the database's code page has, and writes ? in the change table for the rest.",
+		Fix:     "Make {column} nchar or nvarchar, or give it the database's collation, or read {table} with change tracking.",
+	}
 	badCursor = check.Reason{
 		Name:    "cursor_invalid",
 		Code:    protocolv1.ErrorCode_ERROR_CODE_CONFIG_INVALID,
@@ -385,7 +391,7 @@ func (s *Source) cdcCheck(k *sqlcheck.Kit, name, ident string) check.Check {
 	if s.cfg.CDCMethod == methodCapture {
 		title = "Read {stream}'s changes through change data capture"
 	}
-	return k.Check(name, check.Compatibility, title, func(ctx context.Context, _ *check.Probe, db *sql.DB) error {
+	return k.Check(name, check.Compatibility, title, func(ctx context.Context, p *check.Probe, db *sql.DB) error {
 		var keyed int
 		var ok sql.NullInt64
 		q := "SELECT coalesce(OBJECTPROPERTY(OBJECT_ID(@p1), 'TableHasPrimaryKey'), 0), CHANGE_TRACKING_MIN_VALID_VERSION(OBJECT_ID(@p1))"
@@ -407,8 +413,24 @@ func (s *Source) cdcCheck(k *sqlcheck.Kit, name, ident string) check.Check {
 			return notCaptured.Fail()
 		case !ok.Valid:
 			return notTracked.Fail()
+		case s.cfg.CDCMethod != methodCapture:
+			return nil
 		}
-		return nil
+		// The capture job passes such a column's values through the
+		// database's code page; UTF-8 has every character.
+		var column string
+		err := db.QueryRowContext(ctx, `SELECT TOP (1) c.name FROM sys.columns c
+			CROSS JOIN (SELECT COLLATIONPROPERTY(CONVERT(sysname, DATABASEPROPERTYEX(DB_NAME(), 'Collation')), 'CodePage') AS cp) d
+			WHERE c.object_id = OBJECT_ID(@p1) AND TYPE_NAME(c.system_type_id) IN ('char', 'varchar', 'text')
+				AND d.cp <> 65001 AND COLLATIONPROPERTY(c.collation_name, 'CodePage') <> d.cp ORDER BY c.column_id`, ident).Scan(&column)
+		switch {
+		case errors.Is(err, sql.ErrNoRows):
+			return nil
+		case err != nil:
+			return k.Failure(err)
+		}
+		p.Param("column", column)
+		return check.Warn(otherCodePage.Fail())
 	})
 }
 

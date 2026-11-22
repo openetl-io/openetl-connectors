@@ -88,7 +88,7 @@ A preflight is about the streams a pipeline reads:
 |---|---|
 | `stream.NAME.read` | The stream's table or view exists, and the login has `SELECT` on it. |
 | `stream.NAME.cursor` | An incremental stream's cursor is a column of a type the source reads by. |
-| `stream.NAME.change-tracking`, `stream.NAME.change-data-capture` | A table read with CDC has a primary key and is tracked, with `VIEW CHANGE TRACKING`, or captured, with `SELECT` on its capture instance's change table. |
+| `stream.NAME.change-tracking`, `stream.NAME.change-data-capture` | A table read with CDC has a primary key and is tracked, with `VIEW CHANGE TRACKING`, or captured, with `SELECT` on its capture instance's change table. Captured, it warns of a `char`, `varchar` or `text` column in a collation whose code page isn't the database's (below). |
 | `cdc.retention` | Warns when the database keeps changes no longer than the pipeline's schedule goes between syncs. With change data capture, skipped unless the login has `SELECT` on `msdb.dbo.cdc_jobs`. |
 
 ### Example
@@ -163,6 +163,7 @@ A read that OpenETL gives an end, as it does to read a writer lane's part of an 
 - Change tracking sends net changes, as its rows are at the time of the read: an update and the delete after it arrive as the delete alone, and an update's row can be newer than the version it's sent with.
 - `sql_variant` values arrive as text, losing their base type.
 - A primary key with a `sql_variant` column that holds anything but text can't order a read in chunks: SQL Server compares a variant's type family before its value, and the text a read goes on from has lost it. A read of `chunkRows` rows or more, a CDC snapshot of `snapshotChunkRows` or more, or a change tracking poll of `chunkRows` changes or more, reads its first chunk again and again past a date, time or number, and ends after the chunk at a binary or `uniqueidentifier` value, without the rows after it. Read such a table through a view of it, which is read in a single query.
+- Under change data capture, a `char`, `varchar` or `text` column in a collation whose code page isn't the database's, such as a UTF-8 collation in a database that isn't, arrives in changes with `?` for each character the database's code page doesn't have: SQL Server's capture job writes them so to the change table. The snapshot has them right. Make such a column `nvarchar`, or read the table with change tracking.
 - Under change data capture, a computed column's value arrives only in the snapshot; changes leave it out, so a merge keeps the snapshot's value at the destination, which goes stale as the row changes.
 
 ## Destination

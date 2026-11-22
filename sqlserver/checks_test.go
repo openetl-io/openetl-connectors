@@ -121,6 +121,10 @@ func TestSourcePreflight(t *testing.T) {
 	e.exec("CREATE TABLE $schema.loose (id int)")
 	e.exec("CREATE TABLE $schema.captured (id int PRIMARY KEY)")
 	e.capture("captured")
+	// Change data capture keeps only the characters of the database's code
+	// page in a varchar of another.
+	e.exec("CREATE TABLE $schema.utf8 (id int PRIMARY KEY, v varchar(10) COLLATE Latin1_General_100_CI_AS_SC_UTF8, n nvarchar(10) COLLATE Cyrillic_General_CI_AS)")
+	e.capture("utf8")
 	e.exec("CREATE VIEW $schema.vw AS SELECT id, at FROM $schema.tracked")
 	e.exec("CREATE VIEW $schema.denied AS SELECT id FROM $schema.untracked")
 	e.exec("DENY SELECT ON $schema.denied TO openetl")
@@ -150,9 +154,10 @@ func TestSourcePreflight(t *testing.T) {
 	got = statuses(t, e.source("").Preflight(req))
 	wantStatus(t, got, "cdc.retention", "warning: The database keeps changes for 48h0m0s")
 
-	req = source.PreflightRequest{Streams: []source.ConfiguredStream{{Name: "captured", SyncMode: source.CDC}, {Name: "tracked", SyncMode: source.CDC}}}
+	req = source.PreflightRequest{Streams: []source.ConfiguredStream{{Name: "captured", SyncMode: source.CDC}, {Name: "tracked", SyncMode: source.CDC}, {Name: "utf8", SyncMode: source.CDC}}}
 	got = statuses(t, e.source(`, "cdcMethod": "change_data_capture"`).Preflight(req))
 	wantStatus(t, got, "stream.captured.change-data-capture", "passed")
+	wantStatus(t, got, "stream.utf8.change-data-capture", "warning: v of ["+e.schema+"].[utf8] is a char, varchar or text column")
 	wantStatus(t, got, "stream.tracked.change-data-capture", "failed: ["+e.schema+"].[tracked] has no capture instance")
 }
 
