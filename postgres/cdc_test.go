@@ -702,6 +702,36 @@ func TestCDCChangedColumnType(t *testing.T) {
 	}
 }
 
+// CDC reads dates and timestamps as a full refresh does, typed, in its
+// snapshot and its changes: BC ones too, whose text the engine can't parse,
+// infinite ones, and those past year 9999.
+func TestCDCReadsDatesAsAFullRefreshDoes(t *testing.T) {
+	e := newSourceEnv(t)
+	e.exec("CREATE TABLE $schema.users (id int PRIMARY KEY, d date, ts timestamp, tz timestamptz)")
+	rows := func(n int) string {
+		return fmt.Sprintf(`(%d, '0044-03-15 BC', '0044-03-15 12:30:45.123456 BC', '0044-03-15 12:30:45.5+00 BC'),
+			(%d, '2024-02-29', '2024-02-29 23:59:59.999999', '2024-02-29 23:59:59+05:30'),
+			(%d, 'infinity', '-infinity', 'infinity'),
+			(%d, '12345-06-07', '12345-06-07 01:02:03', '12345-06-07 01:02:03.25-07'),
+			(%d, NULL, NULL, NULL)`, n, n+1, n+2, n+3, n+4)
+	}
+	e.exec("INSERT INTO $schema.users VALUES " + rows(1))
+	s, pipeline := e.cdcSource("")
+	whole := read(t, s, map[string]string{"users": ""})
+	snapshot := readCDC(t, s, pipeline, map[string]string{"users": ""})
+	e.exec("INSERT INTO $schema.users VALUES " + rows(6))
+	changes := readCDC(t, s, pipeline, map[string]string{"users": snapshot.last("users")})
+	for _, col := range []string{"d", "ts", "tz"} {
+		want := whole.column("users", col)
+		if got := snapshot.column("users", col); !slices.Equal(got, want) {
+			t.Errorf("%s: the snapshot's %q, a full refresh's %q", col, got, want)
+		}
+		if got := changes.column("users", col); !slices.Equal(got, want) {
+			t.Errorf("%s: the changes' %q, a full refresh's %q", col, got, want)
+		}
+	}
+}
+
 // A column added after the run's Discover fails the read before its
 // snapshot, which would otherwise send the table's rows without it, and the
 // attempt that declares it reads it, in the snapshot and in the changes.

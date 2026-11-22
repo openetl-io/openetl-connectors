@@ -159,10 +159,13 @@ config:
 
 `openetl discover` lists a column as nullable unless it's `NOT NULL`. In a table CDC can read, only the key's columns are listed as not nullable, since a deleted row carries only its key.
 
-An array's bounds aren't kept: `'[0:1]={5,6}'` arrives as `[5, 6]`. Some values have no place in the type their column arrives as, and OpenETL can't quarantine a row of a list or interval column, so the read fails with `DATA_INVALID`, naming the column and the value:
+From 0.2.0, a CDC read sends dates and timestamps as a full refresh does, BC ones too. Before 0.2.0, it sent their text, which OpenETL can't parse for a year before 1, so it quarantined the rows with a BC date or timestamp.
+
+An array's bounds aren't kept: `'[0:1]={5,6}'` arrives as `[5, 6]`. Some values have no place in the type their column arrives as, and OpenETL can't quarantine a row of a list or interval column, or, from 0.2.0, of a CDC read's date or timestamp column, so the read fails with `DATA_INVALID`, naming the column and the value:
 
 - An array of more than one dimension in a column declared with one, such as `'{{1,2},{3,4}}'` in an `int[]`.
 - An interval whose hours, minutes and seconds are past about 292 years, the most nanoseconds a 64-bit integer holds, such as `'3000000 hours'`, and the infinite intervals of Postgres 17 and later. Months and days have their own parts, so `'1000 years'` arrives.
+- From 0.2.0, in a CDC read, a timestamp past 294247-01-10, the last that microseconds since 1970 hold. A full refresh or incremental read quarantines its row.
 
 To read such a column, read it through a view that casts it to `text`.
 

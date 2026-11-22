@@ -1525,7 +1525,7 @@ func textConv(oid uint32) func([]byte) []byte {
 
 // changeBatcher builds a CDC stream's batches: each column as text, which
 // the engine parses as the declared type, or built from its text where the
-// engine can't (typedText), then the control columns.
+// engine can't (changeTyped), then the control columns.
 type changeBatcher struct {
 	b     *array.RecordBuilder
 	typed []*textTyped
@@ -1539,7 +1539,7 @@ func newChangeBatcher(mem memory.Allocator, cols []sourceColumn) *changeBatcher 
 	typed := make([]*textTyped, len(cols))
 	for i, c := range cols {
 		f := arrow.Field{Name: c.name, Type: arrow.BinaryTypes.String, Nullable: true}
-		if typed[i] = typedText(c); typed[i] != nil {
+		if typed[i] = changeTyped(c); typed[i] != nil {
 			f.Type = typed[i].dt
 		}
 		fields = append(fields, f)

@@ -2,6 +2,7 @@ package postgres
 
 import (
 	"errors"
+	"math"
 	"strings"
 	"testing"
 
@@ -33,6 +34,40 @@ func TestReadSplitFailsOnAnUndeclaredColumn(t *testing.T) {
 		if !isTransient(err) || !strings.Contains(err.Error(), `"price"`) {
 			t.Errorf("%v read with price undeclared: %v", cs.SyncMode, err)
 		}
+	}
+}
+
+// pgTime reads Postgres's ISO text as a full refresh reads the binary:
+// days or microseconds since 1970, BC years, offsets to the second; a
+// timestamp past what microseconds since 1970 hold is DATA_INVALID.
+func TestPGTime(t *testing.T) {
+	for s, want := range map[string]int64{
+		"1970-01-02":    1,
+		"0001-01-01 BC": -719528,
+		"infinity":      math.MaxInt32,
+		"-infinity":     math.MinInt32,
+	} {
+		if got, err := pgTime(s, false); err != nil || got != want {
+			t.Errorf("date %s: %d, %v", s, got, err)
+		}
+	}
+	for s, want := range map[string]int64{
+		"1969-12-31 23:59:59.5":        -500_000,
+		"1970-01-01 01:00:00+01":       0,
+		"1970-01-01 00:53:28+00:53:28": 0,
+		"1969-12-31 17:00:00.25-07":    250_000,
+		"infinity":                     math.MaxInt64,
+	} {
+		if got, err := pgTime(s, true); err != nil || got != want {
+			t.Errorf("timestamp %s: %d, %v", s, got, err)
+		}
+	}
+	var coded interface{ ErrorCode() protocolv1.ErrorCode }
+	if _, err := pgTime("294270-01-01 00:00:00", true); !errors.As(err, &coded) || coded.ErrorCode() != protocolv1.ErrorCode_ERROR_CODE_DATA_INVALID {
+		t.Errorf("a timestamp past Arrow's: %v", err)
+	}
+	if _, err := pgTime("soon", false); err == nil {
+		t.Error("a date that isn't one")
 	}
 }
 
