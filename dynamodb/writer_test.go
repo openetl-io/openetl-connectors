@@ -9,6 +9,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 
 	"github.com/openetl-io/openetl/sdk/go/destination"
@@ -91,6 +92,30 @@ func TestRefusalsHaveFixes(t *testing.T) {
 		if r.Fix == "" {
 			t.Errorf("%s's refusal has no fix: %+v", r.Column, r)
 		}
+	}
+}
+
+// A patch that read an item before another write of it, as a replaced
+// attempt's can, leaves that write as it is: a newer version, or an
+// overwrite's sweep of the item.
+func TestStaleFillKeepsTheItem(t *testing.T) {
+	db := newMemDB(map[string][]string{controlTable: {"p", "n"}, "t": {"id"}})
+	w := memWriter(t, db, destination.Stream{Name: "t", Mode: destination.Merge, PrimaryKey: []string{"id"}})
+	stale := func(id string) map[string]types.AttributeValue {
+		return map[string]types.AttributeValue{"id": str(id), "v": str("old"), idColumn: str(id + "-20"),
+			heldColumn: &types.AttributeValueMemberM{Value: map[string]types.AttributeValue{"c": str(id + "-10")}}}
+	}
+	newer := map[string]types.AttributeValue{"id": str("1"), "v": str("new"), "c": str("filled"), idColumn: str("1-30")}
+	if _, err := db.PutItem(t.Context(), &dynamodb.PutItemInput{TableName: aws.String("t"), Item: newer}); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"1", "2"} {
+		if err := w.fill(t.Context(), "t", stale(id), id+"-10", map[string]types.AttributeValue{"c": str("filled")}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if items := db.items("t"); len(items) != 1 || stringOf(items[0]["v"]) != "new" || stringOf(items[0][idColumn]) != "1-30" {
+		t.Errorf("after stale patches, the table is %v; want only id 1's newer version", items)
 	}
 }
 

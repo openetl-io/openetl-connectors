@@ -1105,7 +1105,10 @@ func (w *writer) applyPatch(ctx context.Context, target string, p map[string]typ
 	return nil
 }
 
-// fill fills an item's columns that version holds with fills' values.
+// fill fills an item's columns that version holds with fills' values,
+// unless the item is no longer the version cur read, as when a replaced
+// attempt's patch read it: what wrote over it or removed it since came
+// after the patch's epoch was applied.
 func (w *writer) fill(ctx context.Context, target string, cur map[string]types.AttributeValue, version string, fills map[string]types.AttributeValue) error {
 	held, _ := cur[heldColumn].(*types.AttributeValueMemberM)
 	if held == nil {
@@ -1130,7 +1133,11 @@ func (w *writer) fill(ctx context.Context, target string, cur map[string]types.A
 	if len(held.Value) == 0 {
 		delete(cur, heldColumn)
 	}
-	return w.put(ctx, target, cur, nil, nil, nil)
+	err := w.put(ctx, target, cur, aws.String("#i = :i"), map[string]string{"#i": idColumn}, map[string]types.AttributeValue{":i": cur[idColumn]})
+	if conditionFailed(err) {
+		return nil
+	}
+	return err
 }
 
 // deletePartitions deletes the control table's items in the partitions.
