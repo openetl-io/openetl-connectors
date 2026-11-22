@@ -185,6 +185,10 @@ func (s *Source) declared(ctx context.Context, topic string) (*arrow.Schema, err
 type state struct {
 	Offsets map[string]int64 `json:"offsets"`
 	TopicID string           `json:"topicId,omitempty"`
+	// Where the read began, if it began with no state at the latest
+	// offsets, which no state says otherwise. States from before 0.2.0, and
+	// a later read's, have none.
+	From map[string]int64 `json:"from,omitempty"`
 }
 
 // splitState is the resume point of a partition read as a split: its next
@@ -287,15 +291,34 @@ func splitOffsets(splits []source.Split) (map[int32]int64, error) {
 }
 
 func parseState(b []byte) (map[int32]int64, error) {
-	out := map[int32]int64{}
+	next, _, err := parseWhole(b)
+	return next, err
+}
+
+// parseWhole is a whole stream's state: its offsets, and where its read
+// began, nil if it doesn't hold that.
+func parseWhole(b []byte) (next, from map[int32]int64, err error) {
 	if len(b) == 0 {
-		return out, nil
+		return map[int32]int64{}, nil, nil
 	}
 	var st state
 	if err := json.Unmarshal(b, &st); err != nil {
-		return nil, fmt.Errorf("kafka: state: %w", err)
+		return nil, nil, fmt.Errorf("kafka: state: %w", err)
 	}
-	for k, v := range st.Offsets {
+	if next, err = byPartition(st.Offsets); err != nil {
+		return nil, nil, err
+	}
+	if st.From != nil {
+		if from, err = byPartition(st.From); err != nil {
+			return nil, nil, err
+		}
+	}
+	return next, from, nil
+}
+
+func byPartition(offsets map[string]int64) (map[int32]int64, error) {
+	out := make(map[int32]int64, len(offsets))
+	for k, v := range offsets {
 		p, err := strconv.ParseInt(k, 10, 32)
 		if err != nil {
 			return nil, fmt.Errorf("kafka: state: partition %q", k)
@@ -305,10 +328,24 @@ func parseState(b []byte) (map[int32]int64, error) {
 	return out, nil
 }
 
+func byName(offsets map[int32]int64) map[string]int64 {
+	out := make(map[string]int64, len(offsets))
+	for p, o := range offsets {
+		out[strconv.Itoa(int(p))] = o
+	}
+	return out
+}
+
 func encodeState(next map[int32]int64, topicID string) []byte {
-	st := state{Offsets: make(map[string]int64, len(next)), TopicID: topicID}
-	for p, o := range next {
-		st.Offsets[strconv.Itoa(int(p))] = o
+	b, _ := json.Marshal(state{Offsets: byName(next), TopicID: topicID})
+	return b
+}
+
+// wholeAt is the state of the stream read whole at its next offsets.
+func (r *topicRead) wholeAt() []byte {
+	st := state{Offsets: byName(r.next), TopicID: r.id}
+	if r.from != nil {
+		st.From = byName(r.from)
 	}
 	b, _ := json.Marshal(st)
 	return b
@@ -333,6 +370,9 @@ type topicRead struct {
 	// The topic's partitions as last listed.
 	partitions []int32
 	next       map[int32]int64
+	// Read whole: where the read began, as state's From has it; nil for
+	// none.
+	from map[int32]int64
 	// Bounded reads: where each partition ends, and the partitions done.
 	end  map[int32]int64
 	done map[int32]bool
@@ -382,47 +422,12 @@ func (s *Source) Read(ctx context.Context, req source.ReadRequest, out source.Em
 	for _, st := range req.Streams {
 		r := &topicRead{name: st.Name, end: map[int32]int64{}, done: map[int32]bool{}, moved: map[int32]time.Time{}, hwm: map[int32]int64{}}
 		if len(st.Splits) == 0 {
-			r.whole, r.id = out.Split(st.Name, source.WholeStream), topicIDOf(st.State)
-			if r.next, err = parseState(st.State); err != nil {
-				return err
-			}
-			if stop := stopOf(st.Until, st.CompleteAt); stop != nil && !req.Continuous {
-				if r.until, err = parseState(stop); err != nil {
-					return err
-				}
-				r.bare = topicIDOf(stop) == ""
-			}
+			err = r.readWhole(st, out, req.Continuous)
 		} else {
-			if r.next, err = splitOffsets(st.Splits); err != nil {
-				return err
-			}
-			r.id = topicIDOf(splitStates(st.Splits)...)
-			r.splits = make(map[int32]source.SplitEmitter, len(st.Splits))
-			for _, sp := range st.Splits {
-				p, err := parsePartition(sp.ID)
-				if err != nil {
-					return err
-				}
-				r.splits[p] = out.Split(st.Name, sp.ID)
-				if p == 0 {
-					r.count = partitionsOf(sp.State)
-				}
-				if stop := stopOf(sp.Until, sp.CompleteAt); stop != nil && !req.Continuous {
-					var u splitState
-					if err := json.Unmarshal(stop, &u); err != nil {
-						return fmt.Errorf("kafka: where split %s stops: %w", sp.ID, err)
-					}
-					if r.until == nil {
-						r.until = map[int32]int64{}
-					}
-					r.until[p] = u.Offset
-					r.bare = r.bare || u.TopicID == ""
-					if p == 0 {
-						// As the read that reached the stop had it.
-						r.count = u.Partitions
-					}
-				}
-			}
+			err = r.readSplits(st, out, req.Continuous)
+		}
+		if err != nil {
+			return err
 		}
 		reads[st.Name] = r
 		topics = append(topics, st.Name)
@@ -573,6 +578,67 @@ func (s *Source) Read(ctx context.Context, req source.ReadRequest, out source.Em
 	}
 }
 
+// readWhole sets r up to read the stream st whole. A read that stops at a
+// state keeps where that state's read began, and starts there itself if
+// it has no state of its own, as a read again of a first epoch has.
+func (r *topicRead) readWhole(st source.ConfiguredStream, out source.Emitter, continuous bool) error {
+	var err error
+	r.whole, r.id = out.Split(st.Name, source.WholeStream), topicIDOf(st.State)
+	if r.next, err = parseState(st.State); err != nil {
+		return err
+	}
+	stop := stopOf(st.Until, st.CompleteAt)
+	if stop == nil || continuous {
+		return nil
+	}
+	if r.until, r.from, err = parseWhole(stop); err != nil {
+		return err
+	}
+	r.bare = topicIDOf(stop) == ""
+	if len(st.State) == 0 && r.from != nil {
+		r.next = maps.Clone(r.from)
+	}
+	return nil
+}
+
+// readSplits sets r up to read the splits of the stream st.
+func (r *topicRead) readSplits(st source.ConfiguredStream, out source.Emitter, continuous bool) error {
+	var err error
+	if r.next, err = splitOffsets(st.Splits); err != nil {
+		return err
+	}
+	r.id = topicIDOf(splitStates(st.Splits)...)
+	r.splits = make(map[int32]source.SplitEmitter, len(st.Splits))
+	for _, sp := range st.Splits {
+		p, err := parsePartition(sp.ID)
+		if err != nil {
+			return err
+		}
+		r.splits[p] = out.Split(st.Name, sp.ID)
+		if p == 0 {
+			r.count = partitionsOf(sp.State)
+		}
+		stop := stopOf(sp.Until, sp.CompleteAt)
+		if stop == nil || continuous {
+			continue
+		}
+		var u splitState
+		if err := json.Unmarshal(stop, &u); err != nil {
+			return fmt.Errorf("kafka: where split %s stops: %w", sp.ID, err)
+		}
+		if r.until == nil {
+			r.until = map[int32]int64{}
+		}
+		r.until[p] = u.Offset
+		r.bare = r.bare || u.TopicID == ""
+		if p == 0 {
+			// As the read that reached the stop had it.
+			r.count = u.Partitions
+		}
+	}
+	return nil
+}
+
 // batchKey is what one resume point covers: a partition's split, or the
 // whole topic, whose partition is -1.
 type batchKey struct {
@@ -596,7 +662,7 @@ func (r *topicRead) batchKey(p int32) batchKey {
 // resumePoint is the emitter and state of a batchKey, at the offsets reached.
 func (r *topicRead) resumePoint(p int32) (source.SplitEmitter, []byte) {
 	if r.splits == nil {
-		return r.whole, encodeState(r.next, r.id)
+		return r.whole, r.wholeAt()
 	}
 	return r.splits[p], r.splitAt(p)
 }
@@ -678,7 +744,7 @@ func (r *topicRead) finish(consumer *kgo.Client, reached func(p int32, from, u i
 	}
 	r.complete = true
 	if r.splits == nil {
-		return completeAt(r.whole, encodeState(r.next, r.id), r.until != nil)
+		return completeAt(r.whole, r.wholeAt(), r.until != nil)
 	}
 	return nil
 }
@@ -843,6 +909,9 @@ func (s *Source) position(ctx context.Context, adm *kadm.Client, reads map[strin
 				first, _ = firsts.Lookup(t, p)
 			}
 			r.next[p] = max(first.Offset, start.Offset)
+		}
+		if fresh && s.cfg.StartOffset == "latest" && r.until == nil {
+			r.from = maps.Clone(r.next)
 		}
 	}
 	return nil

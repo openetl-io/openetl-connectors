@@ -700,3 +700,75 @@ func TestAReadFromSplitsBefore020TakesThePartitionsItWasntGiven(t *testing.T) {
 		t.Errorf("partition 0's split ended at %s", outs[0].states["p0"])
 	}
 }
+
+// A topic read whole with no state, from the latest offsets, starts where
+// the topic ended when the read began, which a read again of its first
+// epoch, as OpenETL's redo is, has no state to say: its states hold it, so
+// that read starts where the first did, though the topic has moved on, and
+// returns the same rows up to the same end.
+func TestARedoOfAReadFromLatestStartsWhereItDid(t *testing.T) {
+	addrs := fake(t)
+	topic := "events"
+	produceRecords(t, addrs, topic, 2, 5, 5)
+	s, err := NewSource(fakeConfig(t, addrs, map[string]any{"topics": []string{topic}, "startOffset": "latest"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	first := &splitEvents{events: map[string][]string{}}
+	done := make(chan error, 1)
+	go func() {
+		done <- s.Read(ctx, source.ReadRequest{Streams: []source.ConfiguredStream{{Name: topic}}, Pipeline: "p", Lanes: 1, Continuous: true}, first)
+	}()
+	rows := func() []string {
+		first.mu.Lock()
+		defer first.mu.Unlock()
+		return rowsIn(first.events[source.WholeStream])
+	}
+	// The first read began at the end it found, so it leaves out the
+	// records added before then, and reads those added after.
+	starts := map[int32]int64{}
+	waitFor(t, "the first read's rows", func() bool {
+		produceMore(t, addrs, topic, 0, 1)
+		produceMore(t, addrs, topic, 1, 1)
+		time.Sleep(100 * time.Millisecond)
+		for _, r := range rows() {
+			var p int32
+			var o int64
+			if _, err := fmt.Sscanf(r, "p%d@%d", &p, &o); err != nil {
+				t.Fatal(err)
+			}
+			if s, ok := starts[p]; !ok || o < s {
+				starts[p] = o
+			}
+		}
+		return len(starts) == 2
+	})
+	n := len(rows())
+	time.Sleep(2 * time.Second)
+	if len(rows()) != n {
+		t.Fatalf("the first read went on from %d rows to %d", n, len(rows()))
+	}
+	cancel()
+	<-done
+	want, end := rows(), first.states[source.WholeStream]
+	produceMore(t, addrs, topic, 0, 3)
+	produceMore(t, addrs, topic, 1, 3)
+
+	for _, cs := range []source.ConfiguredStream{
+		{Name: topic, Until: end},
+		{Name: topic, CompleteAt: end},
+		// A state as 0.1.0 wrote it, which held no start: the first
+		// read's, given as where the read again starts.
+		{Name: topic, State: fmt.Appendf(nil, `{"offsets":{"0":%d,"1":%d}}`, starts[0], starts[1]), Until: end},
+	} {
+		got := readEvents(t, s, cs)[source.WholeStream]
+		if r := rowsIn(got); !slices.Equal(r, want) {
+			t.Errorf("a read to %s read %v, and the first read %v", end, r, want)
+		}
+		if !lastIs(got, "complete "+topicIDField.ReplaceAllString(string(end), "")) {
+			t.Errorf("a read to %s ended with %v", end, got)
+		}
+	}
+}
