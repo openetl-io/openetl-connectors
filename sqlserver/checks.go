@@ -70,7 +70,7 @@ var (
 		Name:    "cursor_invalid",
 		Code:    protocolv1.ErrorCode_ERROR_CODE_CONFIG_INVALID,
 		Message: "{table} has no column {cursor} of a type an incremental read orders by.",
-		Fix:     "Choose a cursor column of a number, date, datetime, text or rowversion type.",
+		Fix:     "Choose a cursor column of a number, date, datetime, text or rowversion type, but not (max).",
 	}
 	retentionShort = check.Reason{
 		Name:    "retention_short",
@@ -217,15 +217,31 @@ func (sv server) connect(k *sqlcheck.Kit) []check.Check {
 }
 
 // version needs SQL Server major version min, or Azure SQL, whose
-// versions don't compare.
-func version(k *sqlcheck.Kit, min int, name string) check.Check {
+// versions don't compare; with capture, one whose change tables have
+// __$command_id.
+func version(k *sqlcheck.Kit, min int, name string, capture bool) check.Check {
 	return k.Value("server.version", "Run on "+name+" or later", func(v string) error {
 		major, _, _ := strings.Cut(v, ".")
 		if n, err := strconv.Atoi(major); err == nil && n < min {
 			return check.UnsupportedVersion.Fail("required", name)
 		}
+		if capture && !commandIDs(v) {
+			return check.UnsupportedVersion.Fail("required", "SQL Server 2016 SP1 CU2, for change data capture,")
+		}
 		return nil
 	}, "SELECT CASE WHEN SERVERPROPERTY('EngineEdition') IN (5, 8) THEN N'Azure SQL' ELSE CONVERT(nvarchar(30), SERVERPROPERTY('ProductVersion')) END")
+}
+
+// commandIDs reports whether version v's change tables have __$command_id,
+// which SQL Server 2016 has from RTM CU5 (13.0.2197) and SP1 CU2
+// (13.0.4422), but not in SP1 and its first CU (13.0.4001 to 4421).
+func commandIDs(v string) bool {
+	parts := strings.Split(v, ".")
+	if len(parts) < 3 || parts[0] != "13" {
+		return true
+	}
+	build, err := strconv.Atoi(parts[2])
+	return err != nil || build >= 4422 || build >= 2197 && build < 4001
 }
 
 // schemaExists is a check that the user can see the schema.
@@ -256,7 +272,7 @@ func (s *Source) Checks() []check.Check {
 	sv := serverOf(s.cfg.DSN.Reveal())
 	k := sv.kit()
 	checks := sv.connect(k)
-	checks = append(checks, version(k, 13, "SQL Server 2016"), schemaExists(k, "schema.exists", s.cfg.Schema, "schema"))
+	checks = append(checks, version(k, 13, "SQL Server 2016", s.cfg.CDCMethod == methodCapture), schemaExists(k, "schema.exists", s.cfg.Schema, "schema"))
 	n := checkNames{}
 	if len(s.cfg.Tables) > 0 {
 		for _, t := range s.cfg.Tables {
@@ -364,13 +380,14 @@ func (s *Source) Preflight(req source.PreflightRequest) []check.Check {
 			params["cursor"] = st.Cursor
 			c = k.Check(n.of("stream", st.Name, "cursor"), check.Configuration, "Order {stream} by {cursor}", func(ctx context.Context, _ *check.Probe, db *sql.DB) error {
 				var typ string
-				err := db.QueryRowContext(ctx, "SELECT TYPE_NAME(system_type_id) FROM sys.columns WHERE object_id = OBJECT_ID(@p1) AND name = @p2", ident, st.Cursor).Scan(&typ)
+				var length int
+				err := db.QueryRowContext(ctx, "SELECT TYPE_NAME(system_type_id), max_length FROM sys.columns WHERE object_id = OBJECT_ID(@p1) AND name = @p2", ident, st.Cursor).Scan(&typ, &length)
 				switch {
 				case errors.Is(err, sql.ErrNoRows):
 					return badCursor.Fail()
 				case err != nil:
 					return k.Failure(err)
-				case !cursorTypes[typ]:
+				case !cursorTypes[typ] || length < 0:
 					return badCursor.Fail()
 				}
 				return nil
@@ -506,7 +523,7 @@ func (d *Destination) Checks() []check.Check {
 	compat.Description = "Applying a merge reads JSON with OPENJSON, which takes compatibility level 130."
 	create := k.True("database.create-table", "Create tables", check.PrivilegeMissing.Fail("principal", sv.principal, "privilege", "CREATE TABLE", "object", "the database"), nil,
 		"SELECT HAS_PERMS_BY_NAME(DB_NAME(), 'DATABASE', 'CREATE TABLE')")
-	return append(checks, version(k, 14, "SQL Server 2017"), compat, create, schemaWrite(k, sv, "schema.write", d.cfg.Schema, "schema"))
+	return append(checks, version(k, 14, "SQL Server 2017", false), compat, create, schemaWrite(k, sv, "schema.write", d.cfg.Schema, "schema"))
 }
 
 // schemaWrite is a check that the login can write tables in schema, or

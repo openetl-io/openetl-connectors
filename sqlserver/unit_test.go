@@ -301,6 +301,20 @@ func TestServerVerifiesCertificate(t *testing.T) {
 	}
 }
 
+// Change tables have __$command_id from SQL Server 2016 RTM CU5 and SP1 CU2:
+// SP1 and its first CU, and their GDRs, came before it.
+func TestCommandIDs(t *testing.T) {
+	for v, want := range map[string]bool{
+		"13.0.1601.5": false, "13.0.1745.2": false, "13.0.2197.0": true, "13.0.2216.0": true, "13.0.4001.0": false,
+		"13.0.4259.0": false, "13.0.4411.0": false, "13.0.4422.0": true, "13.0.5026.0": true, "14.0.1000.169": true,
+		"16.0.4135.4": true, "Azure SQL": true,
+	} {
+		if got := commandIDs(v); got != want {
+			t.Errorf("%s: %v, want %v", v, got, want)
+		}
+	}
+}
+
 // Of two patch columns that fill one held column, the first's UPDATE leaves
 // it held for the second's to match, and the second's takes it out.
 func TestPatchSharedHeldColumn(t *testing.T) {

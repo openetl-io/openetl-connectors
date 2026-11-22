@@ -115,7 +115,7 @@ func TestSourceChecks(t *testing.T) {
 
 func TestSourcePreflight(t *testing.T) {
 	e := newSourceEnv(t)
-	e.exec("CREATE TABLE $schema.tracked (id int PRIMARY KEY, at datetime2, v varbinary(10))")
+	e.exec("CREATE TABLE $schema.tracked (id int PRIMARY KEY, at datetime2, v varbinary(10), m nvarchar(max))")
 	e.exec("ALTER TABLE $schema.tracked ENABLE CHANGE_TRACKING")
 	e.exec("CREATE TABLE $schema.untracked (id int PRIMARY KEY)")
 	e.exec("CREATE TABLE $schema.loose (id int)")
@@ -136,6 +136,7 @@ func TestSourcePreflight(t *testing.T) {
 		{Name: "loose", SyncMode: source.CDC},
 		{Name: "tracked", SyncMode: source.Incremental, Cursor: "at"},
 		{Name: "tracked", SyncMode: source.Incremental, Cursor: "v"},
+		{Name: "tracked", SyncMode: source.Incremental, Cursor: "m"},
 		{Name: "gone", SyncMode: source.FullRefresh},
 	}}
 	got := statuses(t, e.source("").Preflight(req))
@@ -145,6 +146,7 @@ func TestSourcePreflight(t *testing.T) {
 	wantStatus(t, got, "stream.loose.change-tracking", "failed: ["+e.schema+"].[loose] has no primary key")
 	wantStatus(t, got, "stream.tracked.cursor", "passed")
 	wantStatus(t, got, "stream.tracked.cursor-2", "failed: ["+e.schema+"].[tracked] has no column v")
+	wantStatus(t, got, "stream.tracked.cursor-3", "failed: ["+e.schema+"].[tracked] has no column m")
 	wantStatus(t, got, "stream.gone.read", "failed")
 	wantStatus(t, got, "stream.vw.read", "passed")
 	wantStatus(t, got, "stream.vw.cursor", "passed")

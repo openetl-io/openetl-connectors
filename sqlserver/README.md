@@ -30,7 +30,7 @@ A column added to a table since the run discovered it fails the read, in any mod
 `cdcMethod` picks how `cdc` reads changes, for every stream of the source:
 
 - **`change_tracking`** (the default) needs the least setup, and no SQL Server Agent. Each poll reads the keys changed since the last, with their rows as they are at the time of the read. A key changed several times between polls arrives once, with its latest row; a delete carries its key alone.
-- **`change_data_capture`** reads every change with its whole row, from the change tables that SQL Server Agent's capture job fills from the transaction log, each transaction's in the order of their `__$command_id`, which SQL Server 2016 has from SP1 CU2. An update of a row's key arrives as a delete of the old key and an insert of the new. A change is read once the capture job has harvested it, a few seconds after it commits, and a read that isn't continuous ends at the changes harvested when it starts. Computed columns, and columns the table's capture instance doesn't capture, arrive null, named as columns the change didn't send, so a merge keeps the values the destination has for them. Choose it to keep every version of a row, or for a destination that reads a writer lane's part again (see [Delivery](#delivery)).
+- **`change_data_capture`** reads every change with its whole row, from the change tables that SQL Server Agent's capture job fills from the transaction log, each transaction's in the order of their `__$command_id`, which SQL Server 2016 has from RTM CU5 and SP1 CU2. An update of a row's key arrives as a delete of the old key and an insert of the new. A change is read once the capture job has harvested it, a few seconds after it commits, and a read that isn't continuous ends at the changes harvested when it starts. Computed columns, and columns the table's capture instance doesn't capture, arrive null, named as columns the change didn't send, so a merge keeps the values the destination has for them. Choose it to keep every version of a row, or for a destination that reads a writer lane's part again (see [Delivery](#delivery)).
 
 When a captured table's schema changes, make it a second capture instance with the new columns. The source reads the old instance up to where the new one starts, once the capture job has started it, then the new one, and the old one can be dropped once the source has read past it. Until then, a column added to the table arrives null in changes.
 
@@ -75,7 +75,7 @@ The source's check reports an item for each thing it looks at, with a fix for wh
 | `net.dns`, `net.connect` | The `dsn`'s host resolves, and its port takes a connection. Not checked for a named instance without a port, which SQL Server Browser resolves. |
 | `db.connect` | The login signs in and opens the database. A TLS handshake that fails, such as with a certificate the `dsn` doesn't trust, fails this item. |
 | `db.tls` | The connection is encrypted: the `dsn`'s `encrypt` is `true` or `strict`, or the server encrypts it, and whether the `dsn` verifies the server's certificate. Otherwise it warns. |
-| `server.version` | SQL Server 2016 or later. |
+| `server.version` | SQL Server 2016 or later; with `change_data_capture`, one whose change tables have `__$command_id`: 2016 from RTM CU5 or SP1 CU2. |
 | `schema.exists` | The schema exists. |
 | `schema.read` | The login has `SELECT` on every table and view in the schema. When `tables` is set, `table.NAME.read` instead, for each one it names. |
 | `database.change-tracking` | With `change_tracking`, the database has change tracking on. It only warns: CDC is a pipeline's choice. |
@@ -87,7 +87,7 @@ A preflight is about the streams a pipeline reads:
 | Item | What it checks |
 |---|---|
 | `stream.NAME.read` | The stream's table or view exists, and the login has `SELECT` on it. |
-| `stream.NAME.cursor` | An incremental stream's cursor is a column of a type the source reads by. |
+| `stream.NAME.cursor` | An incremental stream's cursor is a column of a type the source reads by, and not `(max)`. |
 | `stream.NAME.change-tracking`, `stream.NAME.change-data-capture` | A table read with CDC has a primary key and is tracked, with `VIEW CHANGE TRACKING`, or captured, with `SELECT` on its capture instance's change table. Captured, it warns of a `char`, `varchar` or `text` column in a collation whose code page isn't the database's (below). |
 | `cdc.retention` | Warns when the database keeps changes no longer than the pipeline's schedule goes between syncs. With change data capture, skipped unless the login has `SELECT` on `msdb.dbo.cdc_jobs`. |
 
