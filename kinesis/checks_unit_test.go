@@ -1,6 +1,7 @@
 package kinesis
 
 import (
+	"context"
 	"crypto/md5"
 	"encoding/json"
 	"maps"
@@ -195,6 +196,37 @@ func TestChecksAreValid(t *testing.T) {
 func schemaWith(table string) *arrow.Schema {
 	md := arrow.NewMetadata([]string{records.TableKey}, []string{table})
 	return arrow.NewSchema([]arrow.Field{{Name: "id", Type: arrow.PrimitiveTypes.Int64}, {Name: "name", Type: arrow.BinaryTypes.String, Nullable: true}}, &md)
+}
+
+// With an endpoint that takes connections and never answers, the source's
+// and the destination's checks end shortly after their deadline, as an
+// RPC's, rather than at their calls' own timeouts, and none passes sign-in.
+func TestChecksEndAtTheirDeadline(t *testing.T) {
+	hold := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { <-hold }))
+	t.Cleanup(srv.Close)
+	t.Cleanup(func() { close(hold) })
+	cfg := `{"region": "us-east-1", "endpoint": "` + srv.URL + `", "accessKeyId": "a", "secretAccessKey": "s"}`
+	src, err := NewSource([]byte(cfg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	dst, err := NewDestination([]byte(cfg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for role, checks := range map[string][]check.Check{"source": src.Checks(), "destination": dst.Checks()} {
+		ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+		start := time.Now()
+		r := check.Run(ctx, checks)
+		cancel()
+		if d := time.Since(start); d > 3*time.Second {
+			t.Errorf("%s: the checks took %s with 2s to answer", role, d)
+		}
+		if it := itemsOf(r)["kinesis.sign-in"]; it.Status == check.Passed || r.OK() {
+			t.Errorf("%s: sign-in %s, the run OK %v", role, it.Status, r.OK())
+		}
+	}
 }
 
 // Signing in fails as the reason AWS's error has, with the action and
