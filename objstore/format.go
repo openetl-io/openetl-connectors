@@ -1,6 +1,7 @@
 package objstore
 
 import (
+	"compress/bzip2"
 	"compress/gzip"
 	"context"
 	"encoding/json"
@@ -16,6 +17,8 @@ import (
 	"github.com/klauspost/compress/zstd"
 
 	"github.com/openetl-io/openetl-connectors/records"
+	sdk "github.com/openetl-io/openetl/sdk/go"
+	protocolv1 "github.com/openetl-io/openetl/sdk/go/protocol/v1"
 )
 
 // The formats the destination writes, and the source reads besides Avro.
@@ -263,7 +266,9 @@ func (t *textWriter) close() error {
 // compressionOf is the compression name's extension says, and the name
 // without it.
 func compressionOf(name string) (compression, base string) {
-	for ext, c := range map[string]string{".gz": "gzip", ".gzip": "gzip", ".zst": "zstd", ".zstd": "zstd", ".sz": "snappy", ".snappy": "snappy"} {
+	for ext, c := range map[string]string{".gz": "gzip", ".gzip": "gzip", ".zst": "zstd", ".zstd": "zstd", ".sz": "snappy", ".snappy": "snappy", ".bz2": "bzip2",
+		// What decompress refuses, rather than read as text.
+		".xz": "xz", ".lz4": "lz4", ".br": "brotli", ".zip": "zip", ".7z": "7z", ".lzo": "lzo"} {
 		if strings.HasSuffix(name, ext) {
 			return c, strings.TrimSuffix(name, ext)
 		}
@@ -271,7 +276,7 @@ func compressionOf(name string) (compression, base string) {
 	return "none", name
 }
 
-// decompress reads r decompressed with compression: gzip, zstd, snappy's
+// decompress reads r decompressed with compression: gzip, zstd, bzip2, snappy's
 // framing format, or none.
 func decompress(compression string, r io.Reader) (io.ReadCloser, error) {
 	switch compression {
@@ -283,8 +288,14 @@ func decompress(compression string, r io.Reader) (io.ReadCloser, error) {
 			return nil, err
 		}
 		return z.IOReadCloser(), nil
+	case "bzip2":
+		return io.NopCloser(bzip2.NewReader(r)), nil
 	case "snappy":
 		return io.NopCloser(snappy.NewReader(r)), nil
+	}
+	if compression != "none" {
+		return nil, sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_DATA_INVALID,
+			fmt.Errorf("%s compression is none of gzip, zstd, bzip2 and snappy, which the source reads", compression))
 	}
 	return io.NopCloser(r), nil
 }

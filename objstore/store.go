@@ -168,6 +168,35 @@ func (s *store) open(ctx context.Context) (*blob.Bucket, error) {
 	return b, nil
 }
 
+// writeOptions are o, with the options a Store that has
+//
+//	BeforeWrite(as func(any) bool) error
+//
+// gives each write to b. Its as gives what the write's and b's As do, and,
+// as a *context.Context, abort: an abort of the write, as of a multipart
+// upload that failed, ends with it too; nil for none.
+func (s *store) writeOptions(b *blob.Bucket, o blob.WriterOptions, abort context.Context) *blob.WriterOptions {
+	st, ok := s.st.(interface{ BeforeWrite(as func(any) bool) error })
+	if !ok {
+		return &o
+	}
+	before := o.BeforeWrite
+	o.BeforeWrite = func(as func(any) bool) error {
+		err := st.BeforeWrite(func(i any) bool {
+			if p, ok := i.(*context.Context); ok && abort != nil {
+				*p = abort
+				return true
+			}
+			return as(i) || b.As(i)
+		})
+		if err != nil || before == nil {
+			return err
+		}
+		return before(as)
+	}
+	return &o
+}
+
 // location is key as the URL names it.
 func (s *store) location(key string) string {
 	u := *s.u
@@ -200,6 +229,12 @@ func (s *store) version(a *blob.Attributes) *version {
 	return v
 }
 
+// versioner is a Store that gives a listed or opened file's version, such as
+// its ETag or generation, from its As; empty where it has none.
+type versioner interface {
+	Version(as func(any) bool) string
+}
+
 // errConflict: a conditional write found the object changed.
 var errConflict = errors.New("objstore: the object changed since it was read")
 
@@ -227,12 +262,12 @@ func (s *store) swap(ctx context.Context, b *blob.Bucket, key string, data []byt
 		}
 		return b.WriteAll(ctx, key, data, &blob.WriterOptions{Metadata: md})
 	}
-	opts := &blob.WriterOptions{Metadata: md, IfNotExist: was == nil, BeforeWrite: func(as func(any) bool) error {
+	opts := s.writeOptions(b, blob.WriterOptions{Metadata: md, IfNotExist: was == nil, BeforeWrite: func(as func(any) bool) error {
 		if was == nil {
 			return nil
 		}
 		return s.st.IfMatch(as, was.etag, was.generation)
-	}}
+	}}, nil)
 	err := b.WriteAll(ctx, key, data, opts)
 	if gcerrors.Code(err) == gcerrors.FailedPrecondition || err != nil && s.st.Conflict(err) {
 		return errConflict

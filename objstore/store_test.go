@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 	"time"
 
@@ -15,6 +16,7 @@ import (
 	"github.com/openetl-io/openetl/sdk/go/check"
 	"github.com/openetl-io/openetl/sdk/go/destination"
 	protocolv1 "github.com/openetl-io/openetl/sdk/go/protocol/v1"
+	"github.com/openetl-io/openetl/sdk/go/source"
 )
 
 // dirStore is a Store of a local directory, whose write over a version does
@@ -39,6 +41,73 @@ func (s *dirStore) Code(error) protocolv1.ErrorCode {
 func (s *dirStore) Conflict(err error) bool                               { return s.conflict != nil && s.conflict(err) }
 func (s *dirStore) Generation(*blob.Attributes) int64                     { return 0 }
 func (s *dirStore) IfMatch(as func(any) bool, etag string, _ int64) error { return s.ifMatch(as, etag) }
+
+// versionedStore is a dirStore whose files have versions, by name, which a
+// test changes as it overwrites a file at its time and size; a reader gives
+// read, empty for none.
+type versionedStore struct {
+	dirStore
+	versions map[string]string
+	read     string
+}
+
+func (s *versionedStore) Version(as func(any) bool) string {
+	var fi os.FileInfo
+	if as(&fi) {
+		return s.versions[fi.Name()]
+	}
+	return s.read
+}
+
+// A file overwritten in the same second, at the same size, is read again
+// where the store gives versions; a resume point in another version of a
+// file reads it from its start; and a file whose read gives another version
+// than its listing fails the read, which the next attempt reads again.
+func TestVersions(t *testing.T) {
+	dir := t.TempDir()
+	st := &versionedStore{dirStore: dirStore{dir: dir}, versions: map[string]string{}}
+	b, _ := json.Marshal(map[string]any{"url": "dir://bucket/files", "streams": []map[string]any{{"name": "v", "glob": "v/*", "format": "jsonl"}}})
+	s, err := NewSource(b, &struct{}{}, func(string) (Store, error) { return st, nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	file, at := filepath.Join(dir, "files", "v", "a.jsonl"), time.Unix(1000, 0)
+	write := func(body, version string) {
+		t.Helper()
+		if err := os.MkdirAll(filepath.Dir(file), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(file, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(file, at, at); err != nil {
+			t.Fatal(err)
+		}
+		st.versions["a.jsonl"] = version
+	}
+	write("{\"id\":1}\n", "v1")
+	first := mustRead(t, s, "v", source.Incremental, nil)
+	write("{\"id\":2}\n", "v2")
+	if got := values(mustRead(t, s, "v", source.Incremental, first.done["v/"]).rows["v/"], "id"); !slices.Equal(got, []string{"2"}) {
+		t.Errorf("overwritten in the same second: %v", got)
+	}
+
+	write("{\"id\":3}\n{\"id\":4}\n", "v4")
+	pos, _ := json.Marshal(readState{At: &filePos{Key: "v/a.jsonl", Modified: at.UnixNano(), Size: 18, Offset: 9, Records: 1, Version: "v3"}})
+	if got := values(mustRead(t, s, "v", source.FullRefresh, pos).rows["v/"], "id"); !slices.Equal(got, []string{"3", "4"}) {
+		t.Errorf("resumed in another version: %v", got)
+	}
+	pos, _ = json.Marshal(readState{At: &filePos{Key: "v/a.jsonl", Modified: at.UnixNano(), Size: 18, Offset: 9, Records: 1}})
+	if got := values(mustRead(t, s, "v", source.FullRefresh, pos).rows["v/"], "id"); !slices.Equal(got, []string{"4"}) {
+		t.Errorf("resumed from a point of before versions: %v", got)
+	}
+
+	st.read = "v5"
+	_, err = read(t, s, "v", source.FullRefresh, nil)
+	if c := check.Classify(err); c == nil || c.Code != protocolv1.ErrorCode_ERROR_CODE_TRANSIENT {
+		t.Errorf("a read of another version: %v", err)
+	}
+}
 
 func dirDestination(t *testing.T, st *dirStore) *Destination {
 	t.Helper()

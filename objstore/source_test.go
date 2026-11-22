@@ -46,6 +46,7 @@ func sourceTests(t *testing.T, newStore func(*testing.T) map[string]any) {
 		"Avro":                 testAvro,
 		"Resplit":              testResplit,
 		"Preflight":            testSourcePreflight,
+		"Versions":             testStoreVersions,
 	} {
 		t.Run(name, func(t *testing.T) { test(t, newStore(t)) })
 	}
@@ -492,6 +493,38 @@ func testIncrementalBoundary(t *testing.T, cfg map[string]any) {
 	}
 }
 
+// A file's version, where the store gives one, tells an overwrite in the
+// same second; a state of before versions matches by time alone, and one
+// without them is as it was.
+func TestStateVersions(t *testing.T) {
+	at := time.Unix(1000, 0)
+	var st readState
+	for i := range 2*maxRead + 1 {
+		st.finish(object{Key: fmt.Sprint(i), Modified: at.Add(time.Duration(i)), Version: "v1"}, true)
+	}
+	if len(st.Versions) != len(st.Read) {
+		t.Errorf("%d versions of %d files", len(st.Versions), len(st.Read))
+	}
+	last := fmt.Sprint(2 * maxRead)
+	next := st.next(time.Minute)
+	if len(next.Versions) != len(next.Read) || !next.done(object{Key: last, Modified: at.Add(2 * maxRead), Version: "v1"}, true) ||
+		next.done(object{Key: last, Modified: at.Add(2 * maxRead), Version: "v2"}, true) {
+		t.Errorf("an overwrite in the same second: %d versions of %d files", len(next.Versions), len(next.Read))
+	}
+	var old readState
+	if err := json.Unmarshal([]byte(`{"read":{"a":1000000000000}}`), &old); err != nil {
+		t.Fatal(err)
+	}
+	if !old.done(object{Key: "a", Modified: at, Version: "v2"}, true) {
+		t.Error("a state of before versions reads its files again")
+	}
+	var plain readState
+	plain.finish(object{Key: "a", Modified: at}, true)
+	if b, _ := json.Marshal(plain.next(time.Minute)); string(b) != `{"floor":940000000000,"read":{"a":1000000000000}}` {
+		t.Errorf("a state without versions: %s", b)
+	}
+}
+
 // The state reads a file at the instant of the newest it read, which a
 // cursor alone would skip, and none below its floor.
 func TestStateBoundary(t *testing.T) {
@@ -649,6 +682,42 @@ func TestGlob(t *testing.T) {
 				t.Errorf("%s matches %s", c.glob, k)
 			}
 		}
+	}
+}
+
+// A store that gives files' versions gives a reader the version it listed,
+// for a file uploaded in parts too, and a file written again at once, at its
+// size, is read again.
+func testStoreVersions(t *testing.T, cfg map[string]any) {
+	put(t, cfg, map[string][]byte{"w/a.jsonl": []byte("{\"id\":1}\n"), "w/parts": bytes.Repeat([]byte("x"), 10<<20)})
+	s := newSource(t, cfg, map[string]any{"name": "w", "glob": "w/*", "format": "jsonl"}, map[string]any{"name": "a", "glob": "w/a.jsonl", "format": "jsonl"})
+	if s.streams["w"].version == nil {
+		t.Skip("the store gives no versions")
+	}
+	b, err := s.store.open(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = b.Close() }()
+	files, err := s.streams["w"].list(t.Context(), b, wholeRange, false)
+	if err != nil || len(files) != 2 {
+		t.Fatal(files, err)
+	}
+	for _, o := range files {
+		r, err := open(t.Context(), b, o, o.Size-1)
+		if err != nil {
+			t.Errorf("%s: %v", o.Key, err)
+			continue
+		}
+		if read := o.version(r.As); o.Version == "" || read != o.Version {
+			t.Errorf("%s: listed version %q, read %q", o.Key, o.Version, read)
+		}
+		_ = r.Close()
+	}
+	first := mustRead(t, s, "a", source.Incremental, nil)
+	put(t, cfg, map[string][]byte{"w/a.jsonl": []byte("{\"id\":2}\n")})
+	if got := values(mustRead(t, s, "a", source.Incremental, first.done["a/"]).rows["a/"], "id"); !slices.Equal(got, []string{"2"}) {
+		t.Errorf("written again at once: %v", got)
 	}
 }
 

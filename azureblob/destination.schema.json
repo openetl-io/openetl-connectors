@@ -62,7 +62,7 @@
       "type": "string",
       "x-secret": true,
       "title": "SAS token",
-      "description": "A shared access signature for the container, the query string it is. It goes in each request's URL, so it needs an https endpoint.",
+      "description": "A shared access signature for the container, the query string it is. It goes in each request's URL, so it needs an https endpoint, and no line break or other control character.",
       "x-group": "azure"
     },
     "connectionString": {
@@ -99,9 +99,10 @@
     "fileSize": {
       "type": "integer",
       "minimum": 1048576,
+      "maximum": 4294967296,
       "default": 268435456,
       "title": "File size",
-      "description": "Bytes a file reaches, compressed, before the next one starts.",
+      "description": "Bytes a file reaches, compressed, before the next one starts: 1 MiB to 4 GiB.",
       "x-group": "files",
       "x-advanced": true
     }

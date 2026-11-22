@@ -39,7 +39,7 @@
       "type": "string",
       "x-secret": true,
       "title": "SAS token",
-      "description": "A shared access signature for the container, the query string it is. It goes in each request's URL, so it needs an https endpoint.",
+      "description": "A shared access signature for the container, the query string it is. It goes in each request's URL, so it needs an https endpoint, and no line break or other control character.",
       "x-group": "azure"
     },
     "connectionString": {
@@ -81,7 +81,7 @@
               "csv",
               "jsonl"
             ],
-            "description": "The files' format: Parquet, Avro object container files, CSV or JSON Lines. A file ending .gz, .gzip, .zst, .zstd, .sz or .snappy is decompressed with gzip, zstd or framed snappy first; Parquet's and Avro's own compression needs nothing.",
+            "description": "The files' format: Parquet, Avro object container files, CSV or JSON Lines. A file ending .gz, .gzip, .zst, .zstd, .bz2, .sz or .snappy is decompressed with gzip, zstd, bzip2 or framed snappy first, and one ending .xz, .lz4, .br, .zip, .7z or .lzo fails the read; Parquet's and Avro's own compression needs nothing.",
             "title": "Format"
           },
           "csv": {

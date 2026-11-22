@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"math/big"
 	"regexp"
 	"strconv"
 	"strings"
@@ -30,6 +31,10 @@ var (
 	localMicros = &arrow.TimestampType{Unit: arrow.Microsecond}
 	jsonMeta    = arrow.NewMetadata([]string{records.ExtensionNameKey, "ARROW:extension:metadata"}, []string{records.JSONExtension, ""})
 )
+
+func controlColumn(name string) bool {
+	return name == fileColumn || name == lineColumn || name == modifiedColumn
+}
 
 func controlFields() []arrow.Field {
 	return []arrow.Field{
@@ -269,9 +274,10 @@ type inferred struct {
 }
 
 var (
-	dateText  = regexp.MustCompile(`^\d{4}-\d{2}-\d{2}$`)
-	stampText = regexp.MustCompile(`^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(\.\d+)?(Z|z|[+-]\d{2}(:?\d{2})?)?$`)
-	zoneText  = regexp.MustCompile(`(Z|z|[+-]\d{2}(:?\d{2})?)$`)
+	dateText    = regexp.MustCompile(`^\d{4}-\d{2}-\d{2}$`)
+	stampText   = regexp.MustCompile(`^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(\.\d+)?(Z|z|[+-]\d{2}(:?\d{2})?)?$`)
+	zoneText    = regexp.MustCompile(`(Z|z|[+-]\d{2}(:?\d{2})?)$`)
+	leadingZero = regexp.MustCompile(`^[+-]?0\d`)
 )
 
 // text adds a CSV value, or a JSON string's, to what the column has seen.
@@ -283,8 +289,12 @@ func (in *inferred) text(s string) {
 	if _, err := strconv.ParseInt(s, 10, 64); err != nil {
 		in.notInt = true
 	}
-	if _, err := strconv.ParseFloat(s, 64); err != nil || strings.ContainsAny(s, "xXpP_") {
+	if !exactFloat(s) || strings.ContainsAny(s, "xXpP_") {
 		in.notFloat = true
+	}
+	// A leading zero, as a code like 007 has, which a number would drop.
+	if leadingZero.MatchString(s) {
+		in.notInt, in.notFloat = true, true
 	}
 	if _, err := time.Parse(time.DateOnly, s); err != nil || !dateText.MatchString(s) {
 		in.notDate = true
@@ -320,7 +330,25 @@ func (in *inferred) json(raw json.RawMessage) {
 		if _, err := strconv.ParseInt(string(raw), 10, 64); err != nil {
 			in.notInt = true
 		}
+		if !exactFloat(string(raw)) {
+			in.notFloat = true
+		}
 	}
+}
+
+// exactFloat: s is a number that a 64-bit float holds as s says it, to the
+// digits the float's shortest text has, or NaN or an infinity.
+func exactFloat(s string) bool {
+	f, err := strconv.ParseFloat(s, 64)
+	if err != nil {
+		return false
+	}
+	want, ok := new(big.Rat).SetString(s)
+	if !ok {
+		return true
+	}
+	got, _ := new(big.Rat).SetString(strconv.FormatFloat(f, 'g', -1, 64))
+	return want.Cmp(got) == 0
 }
 
 // field is the column's inferred type: text for one with no values.

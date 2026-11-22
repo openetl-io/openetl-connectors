@@ -19,7 +19,7 @@ The source and the destination share their connection settings. Keep keys in sec
 
 With none of them, the connector uses Azure's default credentials (`DefaultAzureCredential`) for `accountName`. `endpoint` sets the blob service's URL, such as Azurite's `http://127.0.0.1:10000/devstoreaccount1`; without it, the URL is `https://ACCOUNT.blob.core.windows.net`. A connection string names the URL itself, so the connector refuses `endpoint` with one.
 
-A SAS, in `sasToken` or a connection string, goes in each request's URL as it is, so the connector refuses it with an `http` endpoint. An account's key signs each request rather than going in it, so it works over `http`, as Azurite takes it.
+A SAS, in `sasToken` or a connection string, goes in each request's URL as it is, so the connector refuses it with an `http` endpoint. It refuses one with a line break or other control character too, which no request's URL can carry. An account's key signs each request rather than going in it, so it works over `http`, as Azurite takes it.
 
 ### Checks and preflights
 
@@ -58,7 +58,7 @@ Each of `streams` is the set of files under `url` that its `glob` matches, in on
 
 - `*` and `?` match within one path segment. `**` matches any number of segments. `{a,b}` matches either alternative, and `[...]` matches one character of a class, with `[!...]` for its complement.
 - The glob's part before the first of those characters is the prefix the source lists, so a glob that starts with a fixed directory lists only that directory.
-- A file whose name ends in `.gz` or `.gzip`, `.zst` or `.zstd`, or `.sz` or `.snappy` is decompressed with gzip, zstd or framed snappy first. Parquet's and Avro's own compression needs nothing.
+- A file whose name ends in `.gz` or `.gzip`, `.zst` or `.zstd`, `.bz2`, or `.sz` or `.snappy` is decompressed with gzip, zstd, bzip2 or framed snappy first. One ending in `.xz`, `.lz4`, `.br`, `.zip`, `.7z` or `.lzo` fails the read with `DATA_INVALID`, naming the file and its compression, as the source can't decompress it. Parquet's and Avro's own compression needs nothing.
 
 Each record gets three more columns:
 
@@ -67,6 +67,8 @@ Each record gets three more columns:
 | `_file` | The file's URL, such as `azblob://my-container/raw/2026/01/orders.csv.gz`. |
 | `_line` | The record's number in the file, from 1: its row in a Parquet file, its record in a CSV file (not counting the header), or its non-blank line in a JSON Lines file. |
 | `_modified` | When the store last modified the file, in UTC. |
+
+A file's own column of one of these names, as a file written from another files source has, gives way to the source's.
 
 A stream's primary key is `_file` and `_line` unless `primaryKey` names other columns, and its cursor is `_modified`.
 
@@ -105,7 +107,7 @@ The [config schema](./source.schema.json) has every setting.
 - **Full refresh** reads every matching file, in key order.
 - **Incremental** reads files that weren't read before, in the order of their `_modified`. A file that's written again after it was read is read again, whole.
 
-The state an incremental read leaves records each file it read since `lookback` (1 hour by default) before the newest file it read, with its modification time. The next read takes any file it doesn't list and that's no older than that, so files that share a modification time with ones already read, or that appear late, still get read. Files older than that, and not read, are skipped. The state lists at most 10,000 files; past that, the oldest ones drop out, and files no newer than them are treated as read. Files that share the oldest modification time the state keeps all stay in it, so when more than 10,000 files share one, the state lists every one of them.
+The state an incremental read leaves records each file it read since `lookback` (1 hour by default) before the newest file it read, with its modification time and ETag. The next read takes any file it doesn't list and that's no older than that, so files that share a modification time with ones already read, or that appear late, still get read. Files older than that, and not read, are skipped. The state lists at most 10,000 files; past that, the oldest ones drop out, and files no newer than them are treated as read. Files that share the oldest modification time the state keeps all stay in it, so when more than 10,000 files share one, the state lists every one of them.
 
 The source's replay is **superset**: a retried read may send records again, such as those of a file it was partway through, or of a file written again. A pipeline that needs exactly once has to drop repeats by the primary key, `_file` and `_line` by default.
 
@@ -121,7 +123,7 @@ Discovery lists each stream's files, and reads:
 - every CSV file's header, and up to 1,000 records or 1 MiB of each file's values;
 - up to 1,000 objects or 1 MiB of each JSON Lines file.
 
-A text column's type is inferred from those values: `boolean` if every value is `true` or `false`, then integer, number, date (`YYYY-MM-DD`), and a timestamp with or without a UTC offset (`YYYY-MM-DD[T ]HH:MM:SS[.fraction]`, then `Z`, `±HH`, `±HHMM` or `±HH:MM` for one with an offset). Anything else, or a mix, is text. A JSON Lines field whose values are all objects or arrays is JSON. A column with no values in the sample is text.
+A text column's type is inferred from those values: `boolean` if every value is `true` or `false`, then integer, number, date (`YYYY-MM-DD`), and a timestamp with or without a UTC offset (`YYYY-MM-DD[T ]HH:MM:SS[.fraction]`, then `Z`, `±HH`, `±HHMM` or `±HH:MM` for one with an offset). A value is a number only if a 64-bit float holds it exactly, so a column with a value such as an integer past 64 bits, or a decimal of more digits than a float keeps, is text, which keeps every digit: `columns` can declare it `decimal(P,S)`. A value with a leading zero, such as `007`, makes its column text too, which keeps the zero; `0` and decimals such as `0.5` don't. Anything else, or a mix, is text. A JSON Lines field whose values are all objects or arrays is JSON. A column with no values in the sample is text.
 
 `columns` overrides discovered types by name: `string`, `integer`, `number`, `boolean`, `date`, `time`, `timestamp` (without a time zone), `timestamp_tz`, `json`, `binary` (base64 text) or `decimal(P,S)`. Without a header, CSV columns are `f0`, `f1` and so on, unless `columnNames` names them. A Parquet or Avro column that `columns` names is sent as text, which OpenETL parses to the type, quarantining a value that doesn't fit. `columns` can't name `_file`, `_line` or `_modified`, which the source adds.
 
@@ -146,7 +148,7 @@ azblob://my-container/raw/orders/9af7d67a-fb93-45a8-9061-af62ce29978d-0000000000
 
 CSV and JSON Lines files are compressed whole with `compression`: `gzip` (adding `.gz` to the name), `zstd` (adding `.zst`), or `none` (the default).
 
-A file closes at `fileSize` bytes, 256 MiB by default, and the next one starts.
+A file closes at `fileSize` bytes, 256 MiB by default, and the next one starts. `fileSize` is at most 4 GiB.
 
 The destination keeps what it needs besides the tables under `URL/_openetl/`: files being staged, a marker per stream and epoch, and a record of each table's columns. Leave it in place, and point readers at the table directories, or at an overwritten table's manifest, as [Write modes](#write-modes) says.
 
@@ -267,8 +269,8 @@ The destination adds new columns: later files have them, and earlier files don't
 
 - An Avro read that resumes within a file decodes the file from its start again, as the Avro library doesn't give blocks' offsets.
 - Each read, as well as discovery, reads every Parquet file's footer and Avro file's header, 16 at a time, so it takes longer to start with more files.
-- A read checks that a file is the one it listed by the file's size and its modification time to the second, as precise as some stores' reads give it. A file replaced while it's read, by one of the same size within the same second, isn't noticed, and a Parquet file's row groups could then come from both.
-- The source doesn't capture deleted files or deleted rows. A file written again is read again whole, as new records, if its modification time changed: a file rewritten within the store's time resolution with the same time isn't read again.
+- A read checks that a file is the one it listed by its ETag, size and modification time, so a file replaced while it's read fails the read with `TRANSIENT`, and the next attempt reads it again.
+- The source doesn't capture deleted files or deleted rows. A file written again is read again whole, as new records, if its modification time changed or its ETag did, so a file rewritten within the same second is read again too.
 - Discovery reads every file's footer or header, so it takes longer with more files.
 - The destination doesn't merge or deduplicate.
 - Only Azurite is tested. It answers over plain HTTP, so the check's `net.tls` item is untested, and it has no hierarchical namespace, so Azure Data Lake Storage Gen2 accounts are untested. Azure's own consistency and permissions aren't shown by it.

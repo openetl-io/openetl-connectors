@@ -2,7 +2,12 @@ package azurestore
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
+
+	"gocloud.dev/blob"
+
+	sdk "github.com/openetl-io/openetl/sdk/go"
 )
 
 const key = "a2V5"
@@ -31,6 +36,46 @@ func TestCredentialsOverHTTP(t *testing.T) {
 		if _, err := New(cfg); (err == nil) != c.ok {
 			t.Errorf("%s: %v", c.config, err)
 		}
+	}
+}
+
+// A request that fails before the store answers doesn't show its URL's
+// query, which holds the SAS, in its error.
+func TestSASNotShown(t *testing.T) {
+	for name, cfg := range map[string]Config{
+		"sasToken":         {Endpoint: "https://127.0.0.1:1/a", SASToken: sdk.NewSecret("sv=2024-11-04&sig=SECRETSIG")},
+		"connectionString": {ConnectionString: sdk.NewSecret("BlobEndpoint=https://127.0.0.1:1/a;SharedAccessSignature=sv=2024-11-04&sig=SECRETSIG")},
+		"newline":          {Endpoint: "https://127.0.0.1:1/a", SASToken: sdk.NewSecret("sv=2024-11-04&sig=SECRETSIG\n")},
+		"newlineInString":  {ConnectionString: sdk.NewSecret("BlobEndpoint=https://127.0.0.1:1/a;SharedAccessSignature=sv=2024-11-04&sig=SECRETSIG\n")},
+		"escape":           {Endpoint: "https://127.0.0.1:1/a", SASToken: sdk.NewSecret("sv=2024-11-04&sig=SECRETSIG%zz")},
+		"accountKey":       {Endpoint: "https://127.0.0.1:1/a", AccountKey: sdk.NewSecret("SECRETSIG!")},
+		"malformed":        {ConnectionString: sdk.NewSecret("SECRETSIG")},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			s, err := New(cfg)
+			if err != nil {
+				if strings.Contains(err.Error(), "SECRETSIG") {
+					t.Errorf("new: %v", err)
+				}
+				return
+			}
+			b, err := s.Open(t.Context(), "c")
+			if err != nil {
+				if strings.Contains(err.Error(), "SECRETSIG") {
+					t.Errorf("open: %v", err)
+				}
+				return
+			}
+			defer func() { _ = b.Close() }()
+			_, _, err = b.ListPage(t.Context(), blob.FirstPageToken, 1, nil)
+			if err == nil || strings.Contains(err.Error(), "SECRETSIG") {
+				t.Errorf("list: %v", err)
+			}
+			if err := b.WriteAll(t.Context(), "k", []byte("x"), nil); err == nil || strings.Contains(err.Error(), "SECRETSIG") {
+				t.Errorf("write: %v", err)
+			}
+		})
 	}
 }
 

@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
@@ -51,6 +52,9 @@ func New(cfg Config) (*Store, error) {
 		return nil, errors.New("azureblob: set accountName, a connectionString or an endpoint")
 	case cfg.Endpoint != "" && !cfg.ConnectionString.IsZero():
 		return nil, errors.New("azureblob: set endpoint or connectionString, not both: a connection string names its endpoint")
+	// A request's URL with one fails to parse, in an error that shows it.
+	case strings.ContainsFunc(cfg.SASToken.Reveal()+cfg.ConnectionString.Reveal(), unicode.IsControl):
+		return nil, errors.New("azureblob: sasToken and connectionString can't have a line break or other control character")
 	}
 	s := &Store{cfg: cfg}
 	// A SAS goes in each request's URL, as it is; an account's key signs
@@ -75,7 +79,10 @@ func (s *Store) Scheme() string    { return "azblob" }
 func (s *Store) Container() string { return "container" }
 
 func (s *Store) Open(ctx context.Context, bucket string) (*blob.Bucket, error) {
-	opts := &container.ClientOptions{ClientOptions: policy.ClientOptions{Retry: policy.RetryOptions{MaxRetries: 3, TryTimeout: time.Minute}}}
+	opts := &container.ClientOptions{ClientOptions: policy.ClientOptions{
+		Retry:            policy.RetryOptions{MaxRetries: 3, TryTimeout: time.Minute},
+		PerRetryPolicies: []policy.Policy{hideQuery{}},
+	}}
 	service := s.cfg.Endpoint
 	if service == "" {
 		service = "https://" + s.cfg.AccountName + ".blob.core.windows.net"
@@ -104,6 +111,18 @@ func (s *Store) Open(ctx context.Context, bucket string) (*blob.Bucket, error) {
 			fmt.Errorf("azureblob: Azure credentials: set accountKey, sasToken or connectionString: %w", err))
 	}
 	return azureblob.OpenBucket(ctx, c, nil)
+}
+
+// hideQuery drops a request's query, which holds a SAS, from the error of
+// one that got no answer: net/http's error shows the whole URL.
+type hideQuery struct{}
+
+func (hideQuery) Do(req *policy.Request) (*http.Response, error) {
+	resp, err := req.Next()
+	if ue, ok := errors.AsType[*url.Error](err); ok {
+		ue.URL, _, _ = strings.Cut(ue.URL, "?")
+	}
+	return resp, err
 }
 
 // accountName is the configured account's, or the one an emulator's
@@ -203,3 +222,22 @@ func (s *Store) IfMatch(as func(any) bool, etag string, _ int64) error {
 }
 
 func (s *Store) Generation(*blob.Attributes) int64 { return 0 }
+
+// Version is a listed or opened blob's ETag, unquoted.
+func (s *Store) Version(as func(any) bool) string {
+	var etag *azcore.ETag
+	var item container.BlobItem
+	var r azblobblob.DownloadStreamResponse
+	switch {
+	case as(&item):
+		if item.Properties != nil {
+			etag = item.Properties.ETag
+		}
+	case as(&r):
+		etag = r.ETag
+	}
+	if etag == nil {
+		return ""
+	}
+	return strings.Trim(string(*etag), `"`)
+}
