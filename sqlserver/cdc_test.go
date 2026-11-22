@@ -6,10 +6,12 @@ import (
 	"context"
 	"crypto/rand"
 	"errors"
+	"fmt"
 	"math/big"
 	"net/url"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -334,6 +336,32 @@ func TestCDCPositionLost(t *testing.T) {
 			t.Errorf("retention of a lost position: %v, %v", r, err)
 		}
 	})
+}
+
+// Cleanup during a read, past changes it may not have reached, fails the
+// read before its next resume point, rather than moving past them.
+func TestCaptureCleanupMidRead(t *testing.T) {
+	e := newSourceEnv(t)
+	e.exec("CREATE TABLE $schema.t (id int PRIMARY KEY)")
+	e.capture("t")
+	e.harvested()
+	s := e.source(`, "cdcMethod": "change_data_capture", "chunkRows": 1`)
+	state := read(t, s, source.CDC, map[string]string{"t": ""}).last("t")
+	for i := range 4 {
+		e.exec(fmt.Sprintf("INSERT INTO $schema.t VALUES (%d)", i))
+	}
+	e.harvested()
+	var once sync.Once
+	c := &capturer{resumed: func() {
+		once.Do(func() {
+			e.exec("DECLARE @l binary(10) = sys.fn_cdc_get_max_lsn(); EXEC sys.sp_cdc_cleanup_change_table @capture_instance = @p1, @low_water_mark = @l, @threshold = 1000", e.schema+"_t")
+		})
+	}}
+	t.Cleanup(c.release)
+	err := s.Read(t.Context(), source.ReadRequest{Streams: []source.ConfiguredStream{{Name: "t", SyncMode: source.CDC, State: []byte(state)}}}, c)
+	if codeOf(err) != protocolv1.ErrorCode_ERROR_CODE_POSITION_LOST {
+		t.Errorf("read = %v, resume points %v", err, c.states["t"])
+	}
 }
 
 func TestRetention(t *testing.T) {

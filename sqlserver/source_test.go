@@ -210,6 +210,8 @@ type capturer struct {
 	// Where each stream's next read starts, once it's complete.
 	next     map[string]string
 	progress []source.Progress
+	// Called after each resume point, if set.
+	resumed func()
 }
 
 func (c *capturer) Rows(stream string, _ []json.RawMessage) error {
@@ -236,6 +238,9 @@ func (c *capturer) ResumePoint(stream string, state []byte) error {
 	}
 	c.states[stream] = append(c.states[stream], string(state))
 	c.log = append(c.log, fmt.Sprintf("%s@%s", stream, state))
+	if c.resumed != nil {
+		c.resumed()
+	}
 	return nil
 }
 

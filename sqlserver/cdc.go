@@ -856,6 +856,21 @@ func (m *capture) read(ctx context.Context, r *cdcReader, ct *cdcTable, in captu
 	for i := range vals {
 		ptrs[i] = &vals[i]
 	}
+	// Cleanup can remove changes the query hasn't reached yet, so at each
+	// resume point, and at the end, the oldest change kept is still at most
+	// the first read since the last.
+	start := lo
+	kept := func() error {
+		low, err := m.minLSN(ctx, in.name)
+		if err != nil {
+			return err
+		}
+		if low.Cmp(start) > 0 {
+			return positionLost("sqlserver: %s: the changes from %s were cleaned up while they were read; the oldest capture instance %s keeps is %s",
+				t.name, lsnText(lsnBytes(start)), in.name, lsnText(lsnBytes(low)))
+		}
+		return nil
+	}
 	var txn []byte
 	var place int64
 	n, since := 0, 0
@@ -870,10 +885,14 @@ func (m *capture) read(ctx context.Context, r *cdcReader, ct *cdcTable, in captu
 		}
 		if !bytes.Equal(lsn, txn) {
 			if txn != nil && since >= r.s.cfg.ChunkRows {
+				if err := kept(); err != nil {
+					return n, err
+				}
 				ct.st.Position = lsnText(txn)
 				if err := r.resume(ct); err != nil {
 					return n, err
 				}
+				start = new(big.Int).Add(new(big.Int).SetBytes(txn), big.NewInt(1))
 				since = 0
 			}
 			txn, place = slices.Clone(lsn), 0
@@ -891,7 +910,10 @@ func (m *capture) read(ctx context.Context, r *cdcReader, ct *cdcTable, in captu
 		n++
 		since++
 	}
-	return n, classify(rows.Err())
+	if err := rows.Err(); err != nil {
+		return n, classify(err)
+	}
+	return n, kept()
 }
 
 var lsnShift = big.NewInt(10_000_000_000_000)
