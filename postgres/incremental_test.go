@@ -226,3 +226,79 @@ func TestIncrementalSkipsNonFiniteCursors(t *testing.T) {
 		}
 	}
 }
+
+// readIncrementalUntil reads stream incrementally by cursor from state,
+// asked to end at until.
+func readIncrementalUntil(t *testing.T, s *Source, stream, cursor, state, until string) (*capture, error) {
+	t.Helper()
+	cs := source.ConfiguredStream{Name: stream, SyncMode: source.Incremental, Cursor: cursor, Until: []byte(until)}
+	if state != "" {
+		cs.State = []byte(state)
+	}
+	c := &capture{}
+	t.Cleanup(c.release)
+	return c, s.Read(t.Context(), source.ReadRequest{Streams: []source.ConfiguredStream{cs}}, c)
+}
+
+// A read given a resume point an incremental read sent goes up to that
+// read's highest cursor value, not the column's highest now, emits no row
+// past the resume point's, though its chunks end elsewhere, then that resume
+// point, byte for byte, and completes with it: as a redo of part of an epoch
+// asks, from where the epoch started, a completion's state, a split's or
+// none, in states as 0.1.0 wrote them, which name no key.
+func TestSourceIncrementalStopsWhereItIsAsked(t *testing.T) {
+	e := newSourceEnv(t)
+	e.exec("CREATE TABLE $schema.t (id int PRIMARY KEY, seq bigint)")
+	e.exec("INSERT INTO $schema.t VALUES (1, 10), (2, 20), (3, 30), (4, 40)")
+	e.exec("CREATE TABLE $schema.k (seq int, v text)")
+	e.exec("INSERT INTO $schema.k VALUES (1, 'a'), (2, 'b')")
+	first := mustReadIncremental(t, e.source(`, "chunkRows": 2`), "t", "seq", `{"since":"10"}`)
+	until := `{"after":["20","2"],"since":"10","until":"40"}`
+	if !slices.Contains(first.log, "t@"+until) {
+		t.Fatalf("the first read emitted %q", first.log)
+	}
+	keyless := mustReadIncremental(t, e.source(""), "k", "seq", `{"since":"1"}`)
+	if !slices.Contains(keyless.log, `k@{"done":true,"since":"1","until":"2"}`) {
+		t.Fatalf("the first read of k emitted %q", keyless.log)
+	}
+	// A row past the resume point and under the read's highest value, and
+	// one above it, which raises the column's highest.
+	e.exec("INSERT INTO $schema.t VALUES (5, 35), (6, 50)")
+	e.exec("INSERT INTO $schema.k VALUES (3, 'c')")
+
+	for _, c := range []struct {
+		name, stream, chunkRows, state, until string
+		ids                                   []string
+	}{
+		{"whole, from a completion", "t", "2", `{"since":"10"}`, until, []string{"1", "2"}},
+		{"in chunks that end past it", "t", "3", `{"since":"10"}`, until, []string{"1", "2"}},
+		{"from no state", "t", "3", "", `{"after":["20","2"],"until":"40"}`, []string{"1", "2"}},
+		{"from a resume point", "t", "2", `{"after":["10","1"],"since":"10","until":"40"}`, `{"after":["30","3"],"since":"10","until":"40"}`, []string{"2", "3"}},
+		{"a split's", "t", "3", `{"since":"10","until":"40","hi":"4"}`, `{"after":["20","2"],"since":"10","until":"40","hi":"4"}`, []string{"1", "2"}},
+		{"where no row was read", "t", "3", `{"since":"100"}`, `{"since":"100","until":"40"}`, nil},
+		{"without a read order", "k", "3", `{"since":"1"}`, `{"done":true,"since":"1","until":"2"}`, []string{"1", "2"}},
+	} {
+		got, err := readIncrementalUntil(t, e.source(`, "chunkRows": `+c.chunkRows), c.stream, "seq", c.state, c.until)
+		if err != nil {
+			t.Errorf("%s: %v", c.name, err)
+			continue
+		}
+		col := "id"
+		if c.stream == "k" {
+			col = "seq"
+		}
+		n := len(got.log)
+		if ids := got.column(c.stream, col); !slices.Equal(ids, c.ids) || n < 2 || got.log[n-2] != c.stream+"@"+c.until || got.log[n-1] != c.stream+" complete"+c.until {
+			t.Errorf("%s: read %v, emitted %q", c.name, ids, got.log)
+		}
+	}
+
+	// An until in another order than the table's, or of another width, isn't
+	// a position of this read.
+	if _, err := readIncrementalUntil(t, e.source(""), "t", "seq", `{"since":"10"}`, `{"after":["20","2"],"key":["seq"],"since":"10","until":"40"}`); codeOf(err) != protocolv1.ErrorCode_ERROR_CODE_POSITION_LOST {
+		t.Errorf("an until in another order: %v", err)
+	}
+	if _, err := readIncrementalUntil(t, e.source(""), "t", "seq", `{"since":"10"}`, `{"after":["20"],"since":"10","until":"40"}`); err == nil {
+		t.Error("an until with one column of two")
+	}
+}
