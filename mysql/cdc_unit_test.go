@@ -142,6 +142,10 @@ func TestStatementChangesFail(t *testing.T) {
 		{"app", "DELETE FROM items AS i WHERE i.id = 1", true},
 		{"app", "DELETE log FROM log JOIN items USING (id)", false},
 		{"app", "DELETE i FROM items AS l JOIN log AS i USING (id)", false},
+		{"app", "WITH c AS (SELECT id FROM log) UPDATE items JOIN c USING (id) SET v = 'x'", true},
+		{"app", "WITH c AS (SELECT 1 AS id), d AS (SELECT 2) DELETE FROM items WHERE id IN (SELECT id FROM c)", true},
+		{"app", "WITH RECURSIVE c (n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < 3) UPDATE log SET n = (SELECT max(n) FROM c)", false},
+		{"app", "WITH c AS (DELETE FROM items) SELECT 1", false},
 	} {
 		r, _ := binlogReader(t, false)
 		err := feed(t, r, at(100, replication.QUERY_EVENT, query("BEGIN")), at(200, replication.QUERY_EVENT, &replication.QueryEvent{Schema: []byte(c.schema), Query: []byte(c.q)}))

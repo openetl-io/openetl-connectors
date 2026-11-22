@@ -926,6 +926,23 @@ func statementWrites(q string) (written []tableName, cols []string, refs []table
 	if len(ts) == 0 {
 		return nil, nil, nil, false
 	}
+	if ts[0] == "WITH" {
+		// The statement after the common table expressions, outside their
+		// parentheses.
+		depth := 0
+	cte:
+		for j, t := range ts {
+			switch {
+			case t == "(":
+				depth++
+			case t == ")":
+				depth--
+			case depth == 0 && (t == "UPDATE" || t == "DELETE"):
+				ts = ts[j:]
+				break cte
+			}
+		}
+	}
 	i := 1
 	skip := func(words ...string) {
 		for i < len(ts) && slices.Contains(words, ts[i]) {
