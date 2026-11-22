@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -215,5 +216,25 @@ func TestABinaryHeaderLandsWhole(t *testing.T) {
 	h, ok := rows[0][headersColumn].(map[string]any)
 	if !ok || h["text"] != "é" || h["bin"] != "/wD+" {
 		t.Errorf("headers landed as %v", rows[0][headersColumn])
+	}
+}
+
+// A tombstone is a row of the record's columns alone, not a delete.
+func TestATombstoneIsARowOfItsRecordsColumns(t *testing.T) {
+	addrs := fake(t)
+	topic := "compacted"
+	produceOne(t, addrs, topic, &kgo.Record{Key: []byte(`{"id":1}`)})
+	s, err := NewSource(fakeConfig(t, addrs, map[string]any{"topics": []string{topic}}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows, err := readRows(t, s, topic)
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("%v, %v", rows, err)
+	}
+	for c := range rows[0] {
+		if !strings.HasPrefix(c, "_kafka_") {
+			t.Errorf("a tombstone has column %s: %v", c, rows[0])
+		}
 	}
 }

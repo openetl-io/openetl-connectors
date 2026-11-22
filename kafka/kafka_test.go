@@ -587,6 +587,34 @@ func TestSourcePositionLost(t *testing.T) {
 	}
 }
 
+// A topic deleted and created again, shorter than where the read was, has
+// lost the read's position, scheduled or continuous.
+func TestSourcePositionLostWithTheTopic(t *testing.T) {
+	topic := uniq("recreated")
+	createTopic(t, topic, 1)
+	produce(t, topic, 0, 10)
+	cl, _ := kgo.NewClient(kgo.SeedBrokers(brokers()))
+	defer cl.Close()
+	if _, err := kadm.NewClient(cl).DeleteTopic(t.Context(), topic); err != nil {
+		t.Fatal(err)
+	}
+	awaitFor(t, "the topic to be created again", 30*time.Second, func() bool {
+		_, err := kadm.NewClient(cl).CreateTopic(t.Context(), 1, 1, nil, topic)
+		return err == nil
+	})
+	produce(t, topic, 0, 3)
+	s := newSource(t, map[string]any{"topics": []string{topic}})
+	for _, continuous := range []bool{false, true} {
+		ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+		err := s.Read(ctx, source.ReadRequest{Pipeline: "p", Continuous: continuous, Streams: []source.ConfiguredStream{{Name: topic, SyncMode: source.Stream, State: []byte(`{"offsets":{"0":10}}`)}}}, newCapture())
+		cancel()
+		var coded interface{ ErrorCode() protocolv1.ErrorCode }
+		if !errors.As(err, &coded) || coded.ErrorCode() != protocolv1.ErrorCode_ERROR_CODE_POSITION_LOST {
+			t.Errorf("Read (continuous %v) = %v, want POSITION_LOST", continuous, err)
+		}
+	}
+}
+
 // What the destination writes in Avro and Protobuf, the source reads back
 // with the registry's schemas, and declares their types.
 func TestRegistryFormats(t *testing.T) {

@@ -60,7 +60,7 @@ If the topic's retention deleted records the read hadn't reached, the read stops
 
 ### Rows
 
-Each record becomes a row. A value that decodes to an object gives its fields as columns; any other value goes in a column named `value`. Every row also has:
+Each record becomes a row. A value that decodes to an object gives its fields as columns; any other value goes in a column named `value`. A record with no value, such as a compacted topic's tombstone, is a row of the columns below alone: the source doesn't read it as a delete. Compaction may also have removed a key's earlier records, and the tombstone itself once the topic's `delete.retention.ms` has passed. Every row also has:
 
 | Column | What it holds |
 |---|---|
