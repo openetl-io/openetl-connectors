@@ -582,7 +582,8 @@ func (w *writer) PatchSQL(s stagedStream, p prepared) []string {
 // other columns as they were, with its metadata columns updated, or with
 // hard deletes removes the row. A column in unchanged that the latest
 // version didn't send takes its value from the key's latest staged version
-// that did, or else keeps the target's.
+// that did, unless the target's row is newer than that version, or else
+// keeps the target's.
 //
 // Each row's values are worked out in the SELECT, against the target's row
 // joined as cur, and ON DUPLICATE KEY UPDATE only takes them: its
@@ -662,7 +663,8 @@ func (w *writer) MergeSQL(s stagedStream, p prepared) []string {
 
 // latest is merge's derived table of each key's latest staged version. With
 // unchanged columns, each comes from the key's latest earlier version that
-// sent it, if any; its _openetl_unchanged then leaves it out.
+// sent it and isn't older than the target's row, if any; its
+// _openetl_unchanged then leaves it out.
 func (w *writer) latest(s stagedStream, p prepared, hasSeq bool) string {
 	cols := p.cols
 	q := quoteIdent
@@ -678,7 +680,17 @@ func (w *writer) latest(s stagedStream, p prepared, hasSeq bool) string {
 	}
 	before := "e." + q(ordColumn) + " < l." + q(ordColumn)
 	if hasSeq {
-		before = "(e." + q(seqColumn) + ", e." + q(ordColumn) + ") < (l." + q(seqColumn) + ", l." + q(ordColumn) + ")"
+		// e was staged before l as l was picked, where a null seq is below
+		// every other: a row comparison with a null in it is unknown.
+		es, ls := "e."+q(seqColumn), "l."+q(seqColumn)
+		before = "(" + es + " < " + ls + " OR (" + es + " IS NULL AND " + ls + " IS NOT NULL) OR (" + es + " <=> " + ls + " AND " + before + "))"
+		// Nor older than the target's row, whose value is newer; a missing
+		// seq doesn't stop it, as in MergeSQL.
+		target := make([]string, len(s.Key))
+		for i, k := range s.Key {
+			target[i] = "tgt." + q(k) + " = l." + q(k)
+		}
+		before += " AND NOT EXISTS (SELECT 1 FROM " + w.ident(s.Table) + " tgt WHERE " + strings.Join(target, " AND ") + " AND tgt." + q(seqColumn) + " > " + es + ")"
 	}
 	// sent is where e is a version of l's key before it that sent c.
 	sent := func(c string) string {

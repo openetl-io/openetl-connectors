@@ -279,3 +279,85 @@ func TestSessionsCommitAndReadEveryRow(t *testing.T) {
 		}
 	})
 }
+
+// unchangedFields are a merge's columns for its unchanged tests; usersN
+// lists its rows as id:name:n:unchanged.
+var unchangedFields = []arrow.Field{
+	{Name: "id", Type: arrow.PrimitiveTypes.Int64}, {Name: "name", Type: arrow.BinaryTypes.String, Nullable: true},
+	{Name: "n", Type: arrow.PrimitiveTypes.Int64, Nullable: true}, {Name: opColumn, Type: arrow.BinaryTypes.String},
+	{Name: seqColumn, Type: seqType, Nullable: true}, {Name: unchangedColumn, Type: arrow.ListOf(arrow.BinaryTypes.String), Nullable: true},
+}
+
+// merge opens a writer that merges users, whose table ApplySchema makes
+// with unchangedFields, as the engine does first.
+func (e *destEnv) merge() destination.Writer {
+	e.t.Helper()
+	w := e.open(destination.Stream{Name: "users", Mode: destination.Merge, PrimaryKey: []string{"id"}})
+	if _, err := w.(destination.SchemaApplier).ApplySchema(e.t.Context(), []destination.StreamSchema{{Name: "users", Schema: arrow.NewSchema(unchangedFields, nil)}}); err != nil {
+		e.t.Fatal(err)
+	}
+	return w
+}
+
+func (e *destEnv) usersN() string {
+	e.t.Helper()
+	rows, err := e.db.QueryContext(e.t.Context(), "SELECT id, coalesce(name, '-'), n, coalesce(_openetl_unchanged, '-') FROM "+quoteIdent(e.database)+".users ORDER BY id")
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	defer func() { _ = rows.Close() }()
+	var out []string
+	for rows.Next() {
+		var id, name, n, unchanged string
+		if err := rows.Scan(&id, &name, &n, &unchanged); err != nil {
+			e.t.Fatal(err)
+		}
+		out = append(out, id+":"+name+":"+n+":"+unchanged)
+	}
+	return strings.Join(out, ",")
+}
+
+// TestMergeUnchangedWithoutSeq takes a column the latest version didn't
+// send from the version staged before it that did, where the versions have
+// no seq too: a null seq ranks below every other, as where the latest is
+// picked.
+func TestMergeUnchangedWithoutSeq(t *testing.T) {
+	eachServer(t, func(t *testing.T, srv testServer) {
+		e := newDestEnv(t, srv)
+		w := e.merge()
+		e.commit(w, 1, "users", batchOf(t, unchangedFields, `[
+			{"id": 1, "name": "a", "n": 1, "_openetl_op": "insert"},
+			{"id": 1, "name": null, "n": 2, "_openetl_op": "update", "_openetl_unchanged": ["name"]},
+			{"id": 2, "name": "b", "n": 1, "_openetl_op": "insert"},
+			{"id": 2, "name": null, "n": 2, "_openetl_op": "update", "_openetl_seq": 4, "_openetl_unchanged": ["name"]},
+			{"id": 3, "name": "c", "n": 1, "_openetl_op": "insert", "_openetl_seq": 1},
+			{"id": 3, "name": "old", "n": 0, "_openetl_op": "insert"},
+			{"id": 3, "name": null, "n": 2, "_openetl_op": "update", "_openetl_seq": 2, "_openetl_unchanged": ["name"]}]`))
+		if got := e.usersN(); got != "1:a:2:-,2:b:2:-,3:c:2:-" {
+			t.Errorf("users = %s", got)
+		}
+	})
+}
+
+// TestMergeUnchangedOlderThanTarget keeps the target's value of a column
+// the latest version didn't send where the staged version that sent it is
+// older than the target's row, or where no staged version sent it.
+func TestMergeUnchangedOlderThanTarget(t *testing.T) {
+	eachServer(t, func(t *testing.T, srv testServer) {
+		e := newDestEnv(t, srv)
+		w := e.merge()
+		e.commit(w, 1, "users", batchOf(t, unchangedFields, `[
+			{"id": 1, "name": "current", "n": 10, "_openetl_op": "insert", "_openetl_seq": 10},
+			{"id": 2, "name": "current", "n": 10, "_openetl_op": "insert", "_openetl_seq": 10},
+			{"id": 3, "name": "current", "n": 10, "_openetl_op": "insert", "_openetl_seq": 10}]`))
+		e.commit(w, 2, "users", batchOf(t, unchangedFields, `[
+			{"id": 1, "name": "old", "n": 5, "_openetl_op": "update", "_openetl_seq": 5},
+			{"id": 1, "name": null, "n": 11, "_openetl_op": "update", "_openetl_seq": 11, "_openetl_unchanged": ["name"]},
+			{"id": 2, "name": "newer", "n": 12, "_openetl_op": "update", "_openetl_seq": 12},
+			{"id": 2, "name": null, "n": 13, "_openetl_op": "update", "_openetl_seq": 13, "_openetl_unchanged": ["name"]},
+			{"id": 3, "name": null, "n": 11, "_openetl_op": "update", "_openetl_seq": 11, "_openetl_unchanged": ["name"]}]`))
+		if got := e.usersN(); got != "1:current:11:-,2:newer:13:-,3:current:11:-" {
+			t.Errorf("users = %s", got)
+		}
+	})
+}
