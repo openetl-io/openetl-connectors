@@ -33,7 +33,7 @@ Every second, the source starts a LogMiner session over the redo written since t
 
 Connected to a pluggable database, LogMiner finds the logs that hold the redo itself, and returns only that PDB's changes. Connected to a database that isn't a container database (or to `CDB$ROOT`), the source finds the archived and online logs in `V$ARCHIVED_LOG` and `V$LOG` and adds them to each session.
 
-The source doesn't use `CONTINUOUS_MINE`, which Oracle removed in 19c, nor `COMMITTED_DATA_ONLY`. Changes that are still in the log buffer when a session reads its window aren't in it; the next window starts 5 seconds back from the end of the last, so they're read when they reach the log file, a commit among them too, and a change or a commit read twice is sent once.
+The source doesn't use `CONTINUOUS_MINE`, which Oracle removed in 19c, nor `COMMITTED_DATA_ONLY`. Changes that are still in the log buffer when a session reads its window aren't in it, and LGWR may write them seconds later, as it may a commit made with `COMMIT WRITE NOWAIT` or `BATCH`. Each redo thread writes its redo in SCN order, so a row the window reads shows the redo before it is in the log files: the next window mines again from the last row read, and a stream's position starts no later, so such changes are read whenever they're written, and a change or a commit read twice is sent once.
 
 Every change carries a sequence number: its commit's SCN times 10¹² plus its place in the transaction, so the destination applies a key's versions in order.
 
@@ -179,13 +179,13 @@ A read OpenETL asks to end at an earlier resume point (`until`), to read a part 
 - Mining a pluggable database's own redo needs Oracle 19.10 or later; an earlier container database can't be read with CDC by a PDB's user. The source doesn't mine a PDB from `CDB$ROOT`.
 - A table without a primary key or a unique index on `NOT NULL` columns, or whose key has a column the source can't order by (a float, an `INTERVAL`, a LOB, `ROWID`), can't be read with CDC, and is read whole in one query.
 - A transaction's changes to the tables read are held in memory until it commits.
+- While a pluggable database has no transactions, each window mines again from its last one, back at most to the start of the current redo log, which other containers' redo fills.
 - A LOB or `XMLTYPE` value is read from the table as of its change's commit, not from the redo log; it's sent as unchanged when the undo for that is gone.
 - A table's rows written with direct-path loads (`INSERT /*+ APPEND */` into a table with `NOLOGGING`, or SQL\*Loader's direct path without logging) aren't in the redo log, and CDC doesn't see them.
-- A commit that reaches the log file more than 5 seconds after its SCN, as one made with `COMMIT WRITE NOWAIT` or `BATCH` can, can be missed. So can one that reaches it after a later commit to the same table, if the read stops in between: the next read starts after the later one.
 - Dates before the Gregorian calendar's start, 15 October 1582, are read through go-ora, which counts them in the Gregorian calendar, while Oracle counts them in the Julian: they're days off, and a key or cursor that has such a date can resume a read at the wrong row. Years before 1 AD arrive as the proleptic Gregorian calendar counts them (Oracle's year -1 is year 0).
 - A change made before a change of its table's columns, which LogMiner gives in Oracle's internal format, is read assuming the database's character set is `AL32UTF8` and its national one `AL16UTF16`, the defaults.
 - An empty LOB, `EMPTY_CLOB()` or `EMPTY_BLOB()`, which Oracle doesn't count as `NULL`, arrives as null: go-ora reads it so.
-- The source is tested against single-instance databases; with RAC, LogMiner reads every thread's redo, and the source checks every thread's logs are on disk, but it isn't tested.
+- The source is tested against single-instance databases; with RAC, LogMiner reads every thread's redo, and the source checks every thread's logs are on disk, but it isn't tested. A change an instance writes late can be missed while the read has seen no row of that instance's redo.
 
 ## Destination
 

@@ -25,9 +25,8 @@ const (
 	resumeEvery   = time.Second
 	quietEvery    = 10 * time.Second
 	progressEvery = 10 * time.Second
-	// How long redo can stay in the log buffer before LGWR writes it, at
-	// most: a window mines again what was this new when the last one
-	// started, so a change written late isn't passed.
+	// How long ago a redo log must have begun for the redo before it to be
+	// taken as in the log files.
 	flushLag = 5 * time.Second
 	// Of a fresh snapshot's SCN, while the table's definition is newer.
 	settleTries = 30
@@ -111,6 +110,7 @@ type logRow struct {
 	info, redo         string
 	at                 time.Time
 	objv               uint64
+	thread             int64
 }
 
 // lookahead asks for the window's later changes of a table's definition,
@@ -138,12 +138,16 @@ type cdcReader struct {
 	// The commits handled, by transaction, while a window can read them
 	// again: a commit is sent once, though a later window reads it too.
 	sent map[string]uint64
-	// Every row at or before done is handled, but a commit whose redo
-	// reaches the log file after its window: the next reads it again.
+	// Every row at or before done that a window found is handled; handled
+	// says which of them the log files certainly held.
 	done uint64
+	// By redo thread, the SCN of the last row read: the thread's redo before
+	// it is in the log files, as a thread writes its redo in SCN order.
+	seen map[int64]uint64
+	// What's handled before a row is read: the streams' first position.
+	start uint64
 	// Where the next window starts.
-	lo      uint64
-	samples []scnSample
+	lo uint64
 	// The first SCN of the redo log that changes still in the log buffer
 	// come after, and when it began; 0 if not known.
 	mark   uint64
@@ -156,11 +160,6 @@ type cdcReader struct {
 	// The window's changes of tables' definitions, by table, once looked
 	// ahead at: whether each drops a column, by the object version it makes.
 	ddls map[string]map[uint64]bool
-}
-
-type scnSample struct {
-	at  time.Time
-	scn uint64
 }
 
 // readCDC reads the cdc streams: each table's snapshot, as of one SCN by a
@@ -180,7 +179,7 @@ func (s *Source) readCDC(ctx context.Context, conns *connPool, req source.ReadRe
 			return err
 		}
 	}
-	r := &cdcReader{ctx: ctx, s: s, out: out, conn: conn, schema: schema, streams: map[string]*cdcStream{}, continuous: req.Continuous, txns: map[string]*txn{}, sent: map[string]uint64{}, done: ^uint64(0)}
+	r := &cdcReader{ctx: ctx, s: s, out: out, conn: conn, schema: schema, streams: map[string]*cdcStream{}, continuous: req.Continuous, txns: map[string]*txn{}, sent: map[string]uint64{}, seen: map[int64]uint64{}, done: ^uint64(0)}
 	if err := conn.QueryRowContext(ctx, `SELECT dbid || ':' || resetlogs_change# FROM v$database`).Scan(&r.db); err != nil {
 		return classify(fmt.Errorf("oracle: read the database's identity: %w", err))
 	}
@@ -415,6 +414,7 @@ func (r *cdcReader) mine() error {
 	if err := covered(logs, r.lo); err != nil {
 		return err
 	}
+	r.start = r.done
 	if !r.continuous {
 		if end, err = currentSCN(r.ctx, r.conn); err != nil {
 			return err
@@ -427,7 +427,6 @@ func (r *cdcReader) mine() error {
 		if err != nil {
 			return err
 		}
-		r.samples = append(r.samples, scnSample{started, e})
 		if e >= r.lo {
 			if err := r.window(r.lo, e); err != nil {
 				return err
@@ -437,14 +436,8 @@ func (r *cdcReader) mine() error {
 		if r.mark, r.markAt, err = logMark(r.ctx, r.conn); err != nil {
 			return err
 		}
-		// The next window starts where this one would have missed changes
-		// still in the log buffer.
-		for len(r.samples) > 1 && started.Sub(r.samples[1].at) >= flushLag {
-			r.samples = r.samples[1:]
-		}
-		if started.Sub(r.samples[0].at) >= flushLag {
-			r.lo = max(r.lo, r.samples[0].scn)
-		}
+		// Redo still in the log buffer comes after what's handled.
+		r.lo = max(r.lo, r.handled()+1)
 		if r.restart != "" {
 			for _, st := range r.order {
 				if st.until == nil && !st.finished {
@@ -529,7 +522,7 @@ func (r *cdcReader) mineRange(lo, e uint64) error {
 	}
 	rows, err := r.conn.QueryContext(r.ctx, `SELECT scn, xidusn, xidslt, xidsqn, operation_code, rollback, csf,
 	  nvl(rs_id, ' '), ssn, nvl(row_id, ' '), nvl(table_name, ' '), nvl(info, ' '), nvl(sql_redo, ' '), timestamp,
-	  nvl(data_objv#, 0)
+	  nvl(data_objv#, 0), thread#
 	FROM v$logmnr_contents
 	WHERE `+thisContainer+` AND (operation_code IN (7, 36)
 	  OR (seg_owner = :1 AND table_name IN (`+strings.Join(names, ", ")+`) AND operation_code IN (1, 2, 3, 5, 9, 68, 255)))`, r.schema)
@@ -544,7 +537,7 @@ func (r *cdcReader) mineRange(lo, e uint64) error {
 		var y logRow
 		var rollback, csf int
 		var part string
-		if err := rows.Scan(&y.scn, &y.usn, &y.slt, &y.sqn, &y.op, &rollback, &csf, &y.rsID, &y.ssn, &y.rowID, &y.table, &y.info, &part, &y.at, &y.objv); err != nil {
+		if err := rows.Scan(&y.scn, &y.usn, &y.slt, &y.sqn, &y.op, &rollback, &csf, &y.rsID, &y.ssn, &y.rowID, &y.table, &y.info, &part, &y.at, &y.objv, &y.thread); err != nil {
 			return mining(err)
 		}
 		y.rollback = rollback == 1
@@ -576,6 +569,7 @@ func (r *cdcReader) mineRange(lo, e uint64) error {
 
 // row handles a row of the redo, in SCN order.
 func (r *cdcReader) row(x logRow) error {
+	r.seen[x.thread] = max(r.seen[x.thread], x.scn)
 	if err := r.reached(x.scn - 1); err != nil {
 		return err
 	}
@@ -887,12 +881,31 @@ func (r *cdcReader) allFinished() bool {
 	return !slices.ContainsFunc(r.order, func(st *cdcStream) bool { return !st.finished })
 }
 
+// handled is the SCN at and before which every row is handled: of what the
+// windows mined, the redo the last row read of each thread that has had one
+// shows is in the log files, and the redo before the mark, which a log
+// switch wrote.
+func (r *cdcReader) handled() uint64 {
+	h := r.start
+	if len(r.seen) > 0 {
+		h = ^uint64(0)
+	}
+	for _, scn := range r.seen {
+		h = min(h, scn-1)
+	}
+	if r.mark > 0 {
+		h = max(h, r.mark-1)
+	}
+	return min(h, r.done)
+}
+
 // position is where a stream's next read starts, which depends on the
 // stream's changes and the redo logs, not on when the read ended, so a read
 // again from a resume point ends where the first did. Its SCN is past the
-// stream's last change and, up to what's mined, the start of the redo log
+// stream's last change and, up to what's handled, the start of the redo log
 // the log buffer's changes come after; its From is before the first change
-// of every transaction open at it.
+// of every transaction open at it, and of redo that may not have been in
+// the log files when it was mined.
 func (r *cdcReader) position(st *cdcStream) cdcState {
 	s := st.state
 	if s.Snapshot != nil || r.done == ^uint64(0) {
@@ -901,15 +914,16 @@ func (r *cdcReader) position(st *cdcStream) cdcState {
 	if st.last > s.SCN {
 		s.SCN, s.At = st.last, new(st.lastAt.UTC())
 	}
-	if m := min(r.mark-1, r.done); r.mark > 0 && m > s.SCN {
+	h := r.handled()
+	if m := min(r.mark-1, h); r.mark > 0 && m > s.SCN {
 		s.SCN = m
 		if m == r.mark-1 {
 			s.At = new(r.markAt.UTC())
 		}
 	}
 	// A transaction whose first change wasn't mined began after the mark,
-	// or after the read's start.
-	s.From = min(max(st.state.From, r.mark), r.done+1)
+	// or after what's handled.
+	s.From = min(max(st.state.From, r.mark), h+1)
 	for _, tx := range r.txns {
 		if len(tx.events) > 0 {
 			s.From = min(s.From, tx.first)

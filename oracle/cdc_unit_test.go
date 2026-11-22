@@ -26,7 +26,7 @@ func cdcReaderOf(t *testing.T, scn uint64) (*cdcReader, *cdcStream, *connectorte
 	t.Cleanup(st.b.release)
 	out := &connectortest.Recorder{}
 	r := &cdcReader{s: &Source{cfg: SourceConfig{BatchBytes: 1 << 20}}, out: out, schema: "S",
-		streams: map[string]*cdcStream{"T": st}, order: []*cdcStream{st}, txns: map[string]*txn{}, sent: map[string]uint64{}, done: scn}
+		streams: map[string]*cdcStream{"T": st}, order: []*cdcStream{st}, txns: map[string]*txn{}, sent: map[string]uint64{}, seen: map[int64]uint64{}, done: scn}
 	return r, st, out
 }
 
@@ -37,9 +37,11 @@ func insertRow(scn, usn uint64, id string) logRow {
 
 func commitRow(scn, usn uint64) logRow { return logRow{scn: scn, usn: usn, slt: 1, sqn: 1, op: 7} }
 
-// A commit whose redo reached the log file only after the window that
-// passed its SCN was mined is read by the next window, which mines the last
-// flushLag again; a commit read by both windows is sent once.
+// A thread's redo reaches its log files in SCN order, so a row read shows
+// the redo before it is there, and nothing past the last row read is known
+// to be: the next window mines again from that row, as a read from the
+// stream's position does. A commit whose redo is written late, as COMMIT
+// WRITE NOWAIT's can be, is read then, and a commit read twice is sent once.
 func TestCDCReadsACommitWrittenLate(t *testing.T) {
 	r, st, out := cdcReaderOf(t, 50)
 	feed := func(rows ...logRow) {
@@ -50,16 +52,21 @@ func TestCDCReadsACommitWrittenLate(t *testing.T) {
 			}
 		}
 	}
-	// The first window mines to SCN 200: transaction 1 inserted 1 and
-	// committed at 110, and transaction 3 inserted 3 and committed at 160;
-	// transaction 2 inserted 2, and its commit, at SCN 150, isn't in the log
-	// file yet.
-	feed(insertRow(100, 1, "1"), insertRow(105, 2, "2"), commitRow(110, 1), insertRow(155, 3, "3"), commitRow(160, 3))
+	// The first window mines to SCN 200, but the log file holds redo only to
+	// SCN 110: transaction 1 inserted 1 and committed at 110; transaction 2
+	// inserted 2, and its commit, at SCN 150, is still in the log buffer.
+	feed(insertRow(100, 1, "1"), insertRow(105, 2, "2"), commitRow(110, 1))
 	if err := r.reached(200); err != nil {
 		t.Fatal(err)
 	}
-	// The next window mines from SCN 100 again, and finds the commit.
-	feed(insertRow(100, 1, "1"), insertRow(105, 2, "2"), commitRow(110, 1), commitRow(150, 2), insertRow(155, 3, "3"), commitRow(160, 3))
+	if next := r.handled() + 1; next > 110 {
+		t.Fatalf("the next window starts at SCN %d, past redo that may not be in the log file yet", next)
+	}
+	if p := r.position(st); p.SCN != 110 || p.From > 105 {
+		t.Errorf("the position is SCN %d from %d, want SCN 110, from 105 or before", p.SCN, p.From)
+	}
+	// The next window mines from SCN 110 again, and finds the commit.
+	feed(commitRow(110, 1), commitRow(150, 2), insertRow(155, 3, "3"), commitRow(160, 3))
 	if err := r.reached(300); err != nil {
 		t.Fatal(err)
 	}
@@ -70,10 +77,9 @@ func TestCDCReadsACommitWrittenLate(t *testing.T) {
 	for _, row := range out.RowsOf("T") {
 		got = append(got, row["ID"])
 	}
-	if want := []string{"1", "3", "2"}; !slices.Equal(got, want) {
+	if want := []string{"1", "2", "3"}; !slices.Equal(got, want) {
 		t.Fatalf("sent %v, want %v", got, want)
 	}
-	// Past every commit sent, so a read from it sends none again.
 	if p := r.position(st); p.SCN < 160 {
 		t.Errorf("the position is at SCN %d, before the last commit sent, 160", p.SCN)
 	}

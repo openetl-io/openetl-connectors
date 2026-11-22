@@ -517,3 +517,42 @@ func TestCDCRetention(t *testing.T) {
 		t.Errorf("a position beside another database's: got %+v, %v", ps, err)
 	}
 }
+
+// Commits whose redo LGWR writes when it likes, made while a read runs,
+// are each sent once.
+func TestCDCNoWaitCommits(t *testing.T) {
+	db := testDB(t)
+	cdcTable(t, db, "CDC_NOWAIT", `(id NUMBER(10) PRIMARY KEY)`)
+	s := cdcSource(t, "")
+	first := mustRead(t, s, nil, "CDC_NOWAIT")
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	out := newCDCOut()
+	done := make(chan error, 1)
+	go func() {
+		done <- s.Read(ctx, source.ReadRequest{Continuous: true, Lanes: 1, Streams: []source.ConfiguredStream{{Name: "CDC_NOWAIT", SyncMode: source.CDC, State: first.state("CDC_NOWAIT")}}}, out)
+	}()
+	exec(t, db, `BEGIN
+	  FOR i IN 1..200 LOOP
+	    INSERT INTO cdc_nowait VALUES (i);
+	    COMMIT WRITE BATCH NOWAIT;
+	    IF MOD(i, 20) = 0 THEN DBMS_SESSION.SLEEP(0.3); END IF;
+	  END LOOP;
+	END;`)
+	for deadline := time.Now().Add(30 * time.Second); len(out.records("CDC_NOWAIT")) < 200 && time.Now().Before(deadline); {
+		time.Sleep(200 * time.Millisecond)
+	}
+	cancel()
+	<-done
+	var got []string
+	for _, row := range out.records("CDC_NOWAIT") {
+		got = append(got, row["ID"])
+	}
+	want := make([]string, 200)
+	for i := range want {
+		want[i] = fmt.Sprint(i + 1)
+	}
+	if !slices.Equal(got, want) {
+		t.Errorf("sent %d rows, want 1 to 200 once each, in order: %v", len(got), got)
+	}
+}
