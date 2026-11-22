@@ -1083,19 +1083,29 @@ func TestDestinationFencedKeepsNewerReads(t *testing.T) {
 	}
 }
 
-// raceConn runs race once, before the first query of system.tables, which
-// Recover makes once it has read the epoch's markers.
+// raceConn runs race once, before the first query or statement that starts
+// with prefix.
 type raceConn struct {
 	driver.Conn
-	race func()
+	prefix string
+	race   func()
 }
 
-func (c *raceConn) QueryRow(ctx context.Context, query string, args ...any) driver.Row {
-	if race := c.race; race != nil && strings.HasPrefix(query, "SELECT count() FROM system.tables") {
+func (c *raceConn) before(query string) {
+	if race := c.race; race != nil && strings.HasPrefix(query, c.prefix) {
 		c.race = nil
 		race()
 	}
+}
+
+func (c *raceConn) QueryRow(ctx context.Context, query string, args ...any) driver.Row {
+	c.before(query)
 	return c.Conn.QueryRow(ctx, query, args...)
+}
+
+func (c *raceConn) Exec(ctx context.Context, query string, args ...any) error {
+	c.before(query)
+	return c.Conn.Exec(ctx, query, args...)
 }
 
 // A Recover that finds an epoch's markers missing and its staging gone
@@ -1122,7 +1132,9 @@ func TestDestinationRecoverLostOnlyBehindItsOwnFence(t *testing.T) {
 					}
 				}
 			}
-			w2.conn = &raceConn{Conn: w2.conn, race: race}
+			// Recover's first query of system.tables follows its read of
+			// the epoch's markers.
+			w2.conn = &raceConn{Conn: w2.conn, prefix: "SELECT count() FROM system.tables", race: race}
 			r, err := w2.Recover(t.Context(), 2, e, []destination.Staged{st})
 			switch {
 			case !newer && (err != nil || r != destination.Lost):
@@ -1174,4 +1186,60 @@ func TestDestinationReplaceWithNoTable(t *testing.T) {
 	if k.exists(read) {
 		t.Error("the next attempt kept the read's table")
 	}
+}
+
+// A commit whose epoch's table another applier of the epoch built first,
+// between this one's look for it and its rename, reports as collapsed only
+// the rows Dedupe left out of that table.
+func TestDestinationCollapsedWhenBuiltByAnother(t *testing.T) {
+	k := newKit(t)
+	s := schemaOf("d", idCol, vCol)
+	streams := []destination.Stream{{Name: "d", Mode: destination.Append, Dedupe: destination.DedupeEpoch}}
+	w, _ := k.open(1, streams, destination.Epoch{}, nil)
+	k.apply(w, s)
+	e := epoch(1, 1)
+	st := k.stage(w, e, batchOf(s, ins(1, int64(1), "a"), ins(1, int64(1), "a"), ins(1, int64(2), "b")))
+	other := k.writer(1, streams)
+	w.conn = &raceConn{Conn: w.conn, prefix: "RENAME TABLE", race: func() {
+		desc, err := other.mergeLanes([]destination.Staged{st})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := other.build(t.Context(), desc, desc.Streams[0], readyName("p", "d", e.Generation, e.N)); err != nil {
+			t.Fatal(err)
+		}
+	}}
+	c, err := w.Commit(t.Context(), e, []destination.Staged{st})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := c.Collapsed["d"]; got != 1 {
+		t.Errorf("collapsed %d rows, not 1", got)
+	}
+	wantRows(t, "d", k.rows("d", "id", "v"), "1|a", "2|b")
+
+	// The other applier goes on to apply the epoch, and drop its table,
+	// before this one counts the table's rows: this one's commit then finds
+	// the marker, and reports nothing collapsed.
+	e = epoch(1, 2)
+	st = k.stage(w, e, batchOf(s, ins(2, int64(3), "c"), ins(2, int64(3), "c")))
+	ready := readyName("p", "d", e.Generation, e.N)
+	applies := &raceConn{Conn: w.conn.(*raceConn).Conn, prefix: "SELECT count() FROM " + w.q(ready), race: func() {
+		if _, err := other.Commit(t.Context(), e, []destination.Staged{st}); err != nil {
+			t.Fatal(err)
+		}
+	}}
+	w.conn = &raceConn{Conn: applies, prefix: "RENAME TABLE", race: func() {
+		desc, err := other.mergeLanes([]destination.Staged{st})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := other.build(t.Context(), desc, desc.Streams[0], ready); err != nil {
+			t.Fatal(err)
+		}
+	}}
+	if c, err = w.Commit(t.Context(), e, []destination.Staged{st}); err != nil || c.Collapsed["d"] != 0 {
+		t.Errorf("commit after the other applier applied the epoch: collapsed %d, %v", c.Collapsed["d"], err)
+	}
+	wantRows(t, "d after the other applier's commit", k.rows("d", "id", "v"), "1|a", "2|b", "3|c")
 }

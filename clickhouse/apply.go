@@ -139,19 +139,32 @@ func (w *writer) build(ctx context.Context, desc staged, s stagedStream, ready s
 	if err := w.exec(ch.Context(ctx, ch.WithSettings(ch.Settings{"join_use_nulls": 0, "max_partitions_per_insert_block": 0})), q); err != nil {
 		return 0, err
 	}
-	var n uint64
-	if err := w.conn.QueryRow(ctx, "SELECT count() FROM "+w.q(tmp)).Scan(&n); err != nil {
-		return 0, classify(err)
+	n, err := w.count(ctx, tmp)
+	if err != nil {
+		return 0, err
 	}
 	err = w.exec(ctx, "RENAME TABLE "+w.q(tmp)+" TO "+w.q(ready))
 	if isCode(err, codeTableAlreadyExists) {
-		// Another attempt built it first.
-		return 0, nil
+		// Another attempt built it first: its rows are the epoch's. Gone
+		// since, it was applied, and the epoch's marker says so.
+		n, err := w.count(ctx, ready)
+		if isCode(err, codeUnknownTable) {
+			return 0, nil
+		}
+		return n, err
 	}
 	if err != nil {
 		return 0, err
 	}
 	built = true
+	return n, nil
+}
+
+func (w *writer) count(ctx context.Context, table string) (uint64, error) {
+	var n uint64
+	if err := w.conn.QueryRow(ctx, "SELECT count() FROM "+w.q(table)).Scan(&n); err != nil {
+		return 0, classify(err)
+	}
 	return n, nil
 }
 
