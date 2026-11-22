@@ -38,6 +38,8 @@ The user needs `SELECT` on each table the source offers. ClickHouse lists only t
 GRANT SELECT ON analytics.* TO openetl;
 ```
 
+The user's profile's limits apply to each of the source's queries: a table read in one query, or a chunk, that reads past `max_rows_to_read` or `max_bytes_to_read`, or runs past `max_execution_time`, fails, and fails the same way when it's retried. Give the user a profile without them, or with room for the largest table read in one query.
+
 The source's check is a list of items, each with what failed and how to fix it: the server's name resolves and its port answers (`net.dns`, `net.connect`), with TLS when `tls` is set (`net.tls`), the user signs in (`db.connect`), the server's version (`server.version`, which warns before 26.8, the version the connector is tested on), the database is there (`database.found`), each table in `tables` is (`tables.found`), and the user has `SELECT` on every table offered (`tables.read`).
 
 Before a pipeline runs, its preflight looks at each stream as the pipeline reads it: the table or view is there and the user can select from it (`stream.NAME.read`); a full refresh says whether it reads in sorting-key order, resumably, or in one query (`stream.NAME.order`); an incremental read's cursor is a column of a type the source reads by (`stream.NAME.cursor`); and a stream read with `cdc` or `stream` fails (`stream.NAME.mode`), as ClickHouse keeps no change log.
@@ -101,7 +103,7 @@ spec:
 | `Array(T)` | list of `T` as above |
 | `Map(K, V)`, `Tuple(...)`, an `Array` of `Time`, `Time64` or a `DateTime64(7)` to `(9)`, `JSON`, `Dynamic`, `Variant`, geo types such as `Point`, and anything else, anywhere in a column's type | JSON, as `toJSONString` gives it |
 
-In that JSON, such as a `Map`'s, a `Tuple`'s or a `DateTime` array's, a date and time is wall-clock text in the column's time zone, or the server's if it has none, with no UTC offset: `"2026-11-03 10:00:00.123456789"`.
+In that JSON, such as a `Map`'s, a `Tuple`'s or a `DateTime64(7)` to `(9)` array's, a date and time is wall-clock text in the column's time zone, or the server's if it has none, with no UTC offset: `"2026-11-03 10:00:00.123456789"`. A float's NaN or infinity is `null` there, unless the user's profile turns `output_format_json_quote_denormals` on.
 
 As a `DateTime64(7)` to `(9)` column, and a `Time` or `Time64` one, can arrive as text, a read whose run didn't declare such a column, as one added to the table since, fails before it reads a row, with an error the platform retries, and the next attempt declares it.
 
@@ -144,7 +146,7 @@ ClickHouse has no transactions across statements, so a commit is built from step
 4. It applies the epoch's patches, if the stream has any, in one `ALTER TABLE … UPDATE` ([Holds](#holds)).
 5. It writes the stream's marker in `_openetl_loads`, and drops the staging and ready tables.
 
-A fence in `_openetl_fence`, the pipeline's highest generation, stops a replaced attempt from committing. If a commit is cut off anywhere, the next attempt finishes it from the step it reached, so each epoch lands exactly once. These steps aren't one transaction: readers can see a stream's rows before its patches, and each stream's part of an epoch becomes visible on its own, not together with the other streams'. Leave `_openetl_fence` and `_openetl_loads` in place; tables named `_openetl_stage_…`, `_openetl_ready_…` and `_openetl_read_…` are the destination's, and a later attempt drops the ones left behind.
+A fence in `_openetl_fence`, the pipeline's highest generation, stops a replaced attempt: a commit reads it before step 2 and again before step 3, and stops if a newer attempt has raised it. Nothing holds it between a read and the steps after, so an attempt replaced just after one can still run them. For `append` and `merge` streams they're the same epoch's steps, under the same names and marker, that the newer attempt redoes, and a partition moved or a patch applied once isn't again. An `overwrite` stream's commit also drops its stream's other read tables and, when its read has ended, replaces the target's partitions with its read's, both after the last read of the fence. If a commit is cut off anywhere, the next attempt finishes it from the step it reached, so each epoch lands exactly once. These steps aren't one transaction: readers can see a stream's rows before its patches, and each stream's part of an epoch becomes visible on its own, not together with the other streams'. Leave `_openetl_fence` and `_openetl_loads` in place; tables named `_openetl_stage_…`, `_openetl_ready_…` and `_openetl_read_…` are the destination's, and a later attempt drops the ones left behind.
 
 A continuous pipeline commits every 10 seconds unless it sets its own `delivery.commit.interval`.
 
@@ -158,7 +160,7 @@ GRANT SELECT, INSERT, CREATE TABLE, DROP TABLE, ALTER ADD COLUMN, ALTER MODIFY C
 GRANT SELECT ON system.parts, SELECT ON system.mutations TO openetl;
 ```
 
-`ALTER TABLE` on the database covers every `ALTER` there. The destination sets `async_insert = 0` and `mutations_sync = 2` on its queries, so a write is in a part, and a change done, before it goes on, and `join_use_nulls = 0` on a merge's. The user's settings profile must let it change them, with `readonly = 0`, which writes need anyway.
+`ALTER TABLE` on the database covers every `ALTER` there. The destination sets `async_insert = 0` and `mutations_sync = 2` on its queries, so a write is in a part, and a change done, before it goes on, and `join_use_nulls = 0` when it builds an epoch's table. The user's settings profile must let it change them, with `readonly = 0`, which writes need anyway.
 
 The destination's check is a list of items, each with what failed and the `GRANT` or setting that fixes it: the server's name resolves and its port answers (`net.dns`, `net.connect`), with TLS when `tls` is set (`net.tls`), the user signs in (`db.connect`), the server's version (`server.version`), the database is there or the user may create it (`database.create`), the user's grants, checked with `CHECK GRANT`, to create and drop tables (`grant.tables`), insert and select (`grant.rows`), add and widen columns (`grant.columns`), move, replace and drop partitions (`grant.partitions`), and fill held cells (`grant.update`), its `SELECT` on the system tables (`grant.system`), and that it may set what the destination's queries set (`settings.write`). A user whose profile has `readonly` set fails each grant, whatever its grants, as it can write nothing.
 
@@ -197,11 +199,12 @@ spec:
 | timestamp | `DateTime64(0, 3, 6 or 9, 'UTC')` by its unit, clamped to 1900-01-01 to 2262-04-11 23:47:16.854775807, as the driver counts in nanoseconds |
 | time of day | `Time64(0, 3, 6 or 9)` |
 | duration | `Int64`, a count of its unit |
-| interval | `Tuple(months Int32, days Int32, nanoseconds Int64)`; a null lands as zeroes |
+| month interval | `Int32`, a count of months |
+| day-time, month-day-nano interval | `Tuple(months Int32, days Int32, nanoseconds Int64)`; a null lands as zeroes |
 | list | `Array(T)`; a null list lands as an empty one |
 | map | `Map(K, Nullable(V))` |
 | struct | `Tuple(name Nullable(T), ...)`; a null struct lands with every field null |
-| dictionary | `LowCardinality(T)` |
+| dictionary | `LowCardinality(Nullable(T))`, or `LowCardinality(T)` where `T` can't be `Nullable` |
 | UUID | `UUID` |
 | JSON | `String` |
 
@@ -242,6 +245,7 @@ Only a single server was tested. The destination creates plain `MergeTree` and `
 - A patch rewrites the table's parts that hold a patched row, as any `ALTER TABLE … UPDATE` does.
 - The database's name can't have a `.` in it on a stream that takes patches, as `joinGet` takes its table as `database.table`.
 - An epoch isn't visible all at once: each stream's part becomes visible on its own, its rows before its patches, and in a table partitioned by its user, partition by partition, as nothing in ClickHouse moves several tables' or partitions' rows, or changes them, at once.
+- A stream's part of an epoch is built in one `INSERT … SELECT`. In a table partitioned by its user, a block of that insert with rows in more partitions than the user's `max_partitions_per_insert_block`, 100 unless its profile sets it, fails the commit, each attempt, with `TOO_MANY_PARTS`. Raise it in the profile, or set it to 0 for no limit.
 - JSON lands as a `String`, not ClickHouse's `JSON` type.
-- A timestamp outside 1900 to 2262-04-11 and a date outside 1900 to 2299 are clamped to the range; a null interval or list isn't kept as null.
+- A timestamp outside 1900 to 2262-04-11 and a date outside 1900 to 2299 are clamped to the range; a null day-time or month-day-nano interval, list, map or struct isn't kept as null.
 - Table and column names can be up to 160 bytes. ClickHouse takes a table name of up to 213 bytes less its database's name, so this leaves 53 for that.
