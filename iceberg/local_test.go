@@ -332,3 +332,32 @@ func TestCloseDoesntWaitForTheStore(t *testing.T) {
 		t.Fatal("Close is waiting for the store")
 	}
 }
+
+// Close drops the files of an epoch that was never pre-committed, the one
+// it was writing among them.
+func TestCloseDropsAnEpochsFiles(t *testing.T) {
+	cat := localCatalog(t)
+	streams := []destination.Stream{{Name: "users", Mode: destination.Append}}
+	w1 := localWriter(t, cat, 1, streams...)
+	e1 := destination.Epoch{Generation: 1, N: 1}
+	localWrite(t, w1, e1, "users", `[{"id": 1, "name": "a"}]`)
+	st, err := w1.PreCommit(t.Context(), e1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w1.Commit(t.Context(), e1, []destination.Staged{st}); err != nil {
+		t.Fatal(err)
+	}
+	w := localWriter(t, cat, 2, streams...)
+	// A part takes a batch at a time, so the third waits until the first's
+	// file is open.
+	for range 3 {
+		localWrite(t, w, destination.Epoch{Generation: 2, N: 2}, "users", `[{"id": 2, "name": "b"}]`)
+	}
+	if err := w.Close(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := os.ReadDir(localDataDir(t, cat, "users")); err != nil || len(got) != 1 {
+		t.Errorf("the data files are %v, %v; want only epoch 1's", got, err)
+	}
+}

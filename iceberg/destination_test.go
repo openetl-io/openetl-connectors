@@ -669,3 +669,31 @@ func TestGlueNeedsStreamScope(t *testing.T) {
 		t.Fatal("pipeline scope on Glue: no error")
 	}
 }
+
+// Close drops what an epoch that was never pre-committed wrote, the file it
+// was writing among them, of which the store keeps nothing.
+func TestCloseDropsAnEpochsObjects(t *testing.T) {
+	env := newEnv(t)
+	w := env.open(1, destination.ScopeStream, appends("users")...)
+	recov(t, w, 1, destination.Epoch{}, nil)
+	e1 := destination.Epoch{Generation: 1, N: 1}
+	write(t, w, e1, "users", 1)
+	commitEpoch(t, w, e1)
+	tbl := env.table("users")
+	before := env.objects(tbl, "data")
+	w2 := env.open(2, destination.ScopeStream, appends("users")...)
+	recov(t, w2, 2, destination.Epoch{}, nil)
+	e2 := destination.Epoch{Generation: 2, N: 2}
+	// A part takes a batch at a time, so the third waits until the first's
+	// file is open.
+	for i := range int64(3) {
+		write(t, w2, e2, "users", 10+i)
+	}
+	if err := w2.Close(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if after := env.objects(tbl, "data"); len(after) != len(before) {
+		t.Errorf("the table's data is %v after Close; want %v", after, before)
+	}
+	env.wantIDs("users", 1)
+}
