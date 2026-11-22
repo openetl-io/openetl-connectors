@@ -916,3 +916,43 @@ func TestDestinationReplaceAfterApplied(t *testing.T) {
 	}
 	wantRows(t, "o after a late replace", k.rows("o", "id", "v"), "1|a")
 }
+
+// A replaced attempt that drops its stream's abandoned reads after a newer
+// generation started a read of its own, as one paused past its checks
+// would, leaves the newer read's table, which holds that read's epochs.
+func TestDestinationStaleDropsNoNewerRead(t *testing.T) {
+	k := newKit(t)
+	s := schemaOf("o", idCol, vCol)
+	streams := []destination.Stream{{Name: "o", Mode: destination.Overwrite}}
+	w1, _ := k.open(1, streams, destination.Epoch{}, nil)
+	k.apply(w1, s)
+	start := time.Now()
+	if err := w1.StartReads(t.Context(), map[string]time.Time{"o": start}); err != nil {
+		t.Fatal(err)
+	}
+	if err := w1.EndRead(t.Context(), epoch(1, 1), "o"); err != nil {
+		t.Fatal(err)
+	}
+	st := k.stage(w1, epoch(1, 1), batchOf(s, ins(1, int64(1), "a")))
+	w2, r := k.open(2, streams, epoch(1, 1), []destination.Staged{st})
+	if r != destination.Redone {
+		t.Fatalf("recovered %v, not redone", r)
+	}
+	k.apply(w2, s)
+	if err := w2.StartReads(t.Context(), map[string]time.Time{"o": start.Add(time.Second)}); err != nil {
+		t.Fatal(err)
+	}
+	k.commit(w2, epoch(2, 2), batchOf(s, ins(1, int64(2), "b")))
+	desc, err := w1.mergeLanes([]destination.Staged{st})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w1.dropAbandonedReads(t.Context(), w1.abandoned(desc.Streams[0])); err != nil {
+		t.Fatal(err)
+	}
+	if err := w2.EndRead(t.Context(), epoch(2, 3), "o"); err != nil {
+		t.Fatal(err)
+	}
+	k.commit(w2, epoch(2, 3))
+	wantRows(t, "o after generation 2's read", k.rows("o", "id", "v"), "2|b")
+}

@@ -603,7 +603,7 @@ func (w *writer) ensureRead(ctx context.Context, s stagedStream) error {
 	if ok {
 		return w.reconcile(ctx, s.Read, s.Table)
 	}
-	l := label{Pipeline: w.cfg.Pipeline, Stream: s.Name}
+	l := label{Pipeline: w.cfg.Pipeline, Generation: w.cfg.Generation, Stream: s.Name}
 	err = w.exec(ctx, "CREATE TABLE IF NOT EXISTS "+w.q(s.Read)+" AS "+w.q(s.Table)+" COMMENT "+literal(l.comment()))
 	if err != nil {
 		return fmt.Errorf("clickhouse: create the read table for %s: %w", s.Name, err)

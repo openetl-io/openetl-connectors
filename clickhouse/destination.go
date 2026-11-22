@@ -678,7 +678,7 @@ func (w *writer) apply(ctx context.Context, desc staged, s stagedStream) (uint64
 		}
 	}
 	if s.Mode == modeOverwrite {
-		if err := w.dropAbandonedReads(ctx, func(l label, table string) bool { return l.Stream == s.Name && table != s.Read }); err != nil {
+		if err := w.dropAbandonedReads(ctx, w.abandoned(s)); err != nil {
 			return 0, err
 		}
 		if s.Ended {
@@ -696,6 +696,15 @@ func (w *writer) apply(ctx context.Context, desc staged, s stagedStream) (uint64
 		w.drop(ctx, s.Read)
 	}
 	return collapsed, nil
+}
+
+// abandoned says which read tables an apply of s drops: its stream's other
+// reads, but not a newer generation's, as an attempt that generation
+// replaced can get here past the fence.
+func (w *writer) abandoned(s stagedStream) func(l label, table string) bool {
+	return func(l label, table string) bool {
+		return l.Stream == s.Name && table != s.Read && l.Generation <= w.cfg.Generation
+	}
 }
 
 // drop is best effort: what's left behind is never applied twice, as its
