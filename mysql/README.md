@@ -18,18 +18,18 @@ A stream can be read three ways, which the pipeline picks with each stream's `sy
 | Sync mode | Offered for | How it reads |
 |---|---|---|
 | `full_refresh` | Every table | The whole table each time. A table whose primary key's columns are integers, decimals, strings, binary strings, dates, date-times, times, years or MariaDB UUIDs is read in key order, `chunkRows` rows a query, and a stopped read resumes after its last chunk. Another table is read in a single query. |
-| `incremental` | Tables with an integer, `decimal`, `date`, `datetime`, `timestamp`, `year`, `char`, `varchar` or `text` column | The rows whose `cursor` column is at or above where the last read got to, up to the column's highest value when this read starts, in chunks ordered by the cursor, then the key. |
+| `incremental` | Tables with an integer, `decimal`, `date`, `datetime`, `timestamp`, `year`, `char`, `varchar` or `text` column, or MariaDB's `inet4` or `inet6` | The rows whose `cursor` column is at or above where the last read got to, up to the column's highest value when this read starts, in chunks ordered by the cursor, then the key. |
 | `cdc` | Tables with a primary key read in chunks, as above | First a snapshot of the table, in chunks of `snapshotChunkRows`, then every change from the binlog, which the source reads as a replica does. |
 
 An incremental read starts at the last read's highest cursor value, not after it, so the rows that had that value are read again. Rows whose cursor is `NULL` are never read, and deleted rows aren't seen: CDC is the mode that sees deletes.
 
-A table whose key starts with an integer column is read in up to 32 key ranges at once, between the column's least and greatest values, as many as the optimizer's estimate of its rows fills at `chunkRows` a range. A range that falls behind is divided again at the midpoint of what it has left. A read holds up to `maxConnections` connections, one for each lane it runs, and CDC holds one binlog connection besides.
+A table read in key order whose key starts with an integer column other than `year` is read in up to 32 key ranges at once, between the column's least and greatest values, as many as the optimizer's estimate of its rows fills at `chunkRows` a range. A range that falls behind is divided again at the midpoint of what it has left. A read holds up to `maxConnections` connections, one for each lane it runs, and CDC holds one binlog connection besides.
 
 ### How CDC hands over from the snapshot
 
 Each chunk of a table's snapshot is read with a locking read (`LOCK IN SHARE MODE`), which waits for the transactions writing its rows to commit and holds back new writes to them until it has noted where the binlog ends. The chunk then holds exactly the changes before that position. The source holds the chunk until it has read the binlog up to it, emits it there, and emits the changes after it, so nothing is lost or repeated. Writes to the chunk's rows wait while it's read, as they would for any locking read; `snapshotChunkRows` bounds how many rows that is.
 
-Transactions MySQL compresses in the binlog (`binlog_transaction_compression`) are read as any other. An XA transaction's changes are in the binlog from its `XA PREPARE`, and are read from there: one rolled back after it is read all the same. Every change carries a sequence number made of the binlog file's number, the position its transaction starts at and its place in the transaction, so the destination applies a key's versions in order.
+Transactions MySQL compresses in the binlog (`binlog_transaction_compression`) are read as any other. An XA transaction's changes are in the binlog from its `XA PREPARE`, and are read from there: one rolled back after it is read all the same. Every change carries a sequence number made of the read's epoch, which goes up each time a read continues on another server, the binlog file's number, the position its transaction starts at and its place in the transaction, so the destination applies a key's versions in order.
 
 ### Set it up
 
@@ -122,7 +122,7 @@ spec:
   destination: { ref: warehouse }
 ```
 
-`dsn` is a DSN as the Go MySQL driver spells it, `USER:PASSWORD@tcp(HOST:3306)/DATABASE`, or a URL, `mysql://USER:PASSWORD@HOST:3306/DATABASE`. It's a secret: store it with `openetl secret set app-db-dsn`.
+`dsn` is a DSN as the Go MySQL driver spells it, `USER:PASSWORD@tcp(HOST:3306)/DATABASE`, or a URL, `mysql://USER:PASSWORD@HOST:3306/DATABASE` or `mariadb://…`. It's a secret: store it with `openetl secret set app-db-dsn`.
 
 The connector's sessions are in `utf8mb4`, in UTC, in the SQL mode `STRICT_ALL_TABLES,NO_ENGINE_SUBSTITUTION`, and without a `sql_select_limit`, whatever the DSN or the server set: each connection sets them last. The DSN's `collation` is the sessions' if it's one of `utf8mb4`'s, any the server has, and is left out otherwise, as its `charset`, `time_zone`, `sql_mode` and character set variables are. Each other parameter the driver doesn't take must set a session variable, such as `wait_timeout=60` or `@@session.wait_timeout=60`; the connector refuses a DSN with one that doesn't, such as a global or a user variable.
 
@@ -186,7 +186,7 @@ A column added to a table read with CDC fails the read once, retryably, and the 
 
 Full refresh and CDC streams replay exactly: a read resumed from a checkpoint yields the same rows in the same order. OpenETL counts incremental streams as ones that may repeat rows, because of the rows at the cursor's last value, and the destination's capabilities decide what guarantee that leaves.
 
-A read OpenETL asks to end at an earlier resume point (`until`), to read a part again, sends nothing past it, then that resume point, and completes there. A full refresh or incremental read sends the rows between the two resume points again, as the table has them now. A CDC read from the same server sends the binlog's changes again as they were, with the same sequence numbers; the snapshot's rows of that part come as the table has them now, after those changes and before any later one, so the stream lands as it did. From another server, by GTIDs, it sends the same changes with the new server's sequence numbers, which are above every one the first read sent, and the snapshot's rows after them.
+A read OpenETL asks to end at an earlier resume point (`until`), to read a part again, sends nothing past it, then that resume point, and completes there. A full refresh or incremental read sends the rows between the two resume points again, as the table has them now. A CDC read from the same server sends the binlog's changes again as they were, with the same sequence numbers; the snapshot's rows of that part come as the table has them now, after those changes and before any later one, so a merged stream lands as it did, and an appended one has the rows as they are now. From another server, by GTIDs, it sends the same changes with the new server's sequence numbers, which are above every one the first read sent, and the snapshot's rows after them.
 
 ### Limits
 
@@ -252,7 +252,7 @@ spec:
 | string | `longtext` |
 | binary | `longblob` |
 | date | `date` |
-| time of day | `time(6)` |
+| time of day | `time(6)`; nanoseconds are cut to microseconds |
 | timestamp | `datetime(6)` in UTC, with or without a time zone, since `timestamp` ends in 2038; nanoseconds are cut to microseconds |
 | UUID | `char(36)` |
 | JSON, intervals, lists, structs and maps | `json`; on MariaDB `longtext` checked by `json_valid` |

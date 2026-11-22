@@ -760,7 +760,7 @@ func cursorColumn(t table, cursor string) (int, error) {
 	case ci < 0:
 		return 0, configInvalid("mysql: %s has no column %q for a cursor", t.name, cursor)
 	case !cursorKinds[t.cols[ci].kind]:
-		return 0, configInvalid("mysql: %s.%s can't be a cursor: that takes an integer, decimal, date, datetime, timestamp, year, char or varchar column", t.name, cursor)
+		return 0, configInvalid("mysql: %s.%s can't be a cursor: that takes an integer, decimal, date, datetime, timestamp, year, char, varchar or text column", t.name, cursor)
 	}
 	return ci, nil
 }

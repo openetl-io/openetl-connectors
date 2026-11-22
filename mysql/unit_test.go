@@ -200,12 +200,41 @@ func TestParseDSN(t *testing.T) {
 	if err != nil || c.User != "u" || c.Passwd != "p@ss" || c.Addr != "db.example:3307" || c.DBName != "app" || c.TLSConfig != "skip-verify" {
 		t.Fatalf("%+v %v", c, err)
 	}
+	c, err = parseDSN("mariadb://u:p%40ss@db.example/app")
+	if err != nil || c.User != "u" || c.Passwd != "p@ss" || c.Addr != "db.example:3306" || c.DBName != "app" {
+		t.Fatalf("%+v %v", c, err)
+	}
 	c, err = parseDSN("u:p@tcp(h)/d")
 	if err != nil || c.Addr != "h:3306" || c.DBName != "d" {
 		t.Fatalf("%+v %v", c, err)
 	}
 	if got := quoteLiteral("a'b\\c\x00"); got != `'a\'b\\c\0'` {
 		t.Fatal(got)
+	}
+}
+
+// A cursor is a column of a kind the error lists: text and MariaDB's inet
+// types are, a boolean and JSON aren't.
+func TestCursorColumn(t *testing.T) {
+	cols := []sourceColumn{
+		{name: "body", dataType: "text", columnType: "text"},
+		{name: "ip", dataType: "inet6", columnType: "inet6"},
+		{name: "flag", dataType: "tinyint", columnType: "tinyint(1)"},
+		{name: "doc", dataType: "json", columnType: "json"},
+	}
+	for i := range cols {
+		cols[i].kind = kindOf(cols[i])
+	}
+	tb := table{name: "t", cols: cols}
+	for i, c := range cols[:2] {
+		if got, err := cursorColumn(tb, c.name); err != nil || got != i {
+			t.Errorf("%s: %d %v", c.name, got, err)
+		}
+	}
+	for _, c := range cols[2:] {
+		if _, err := cursorColumn(tb, c.name); err == nil || !strings.Contains(err.Error(), "char, varchar or text column") {
+			t.Errorf("%s: %v", c.name, err)
+		}
 	}
 }
 
