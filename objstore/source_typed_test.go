@@ -704,8 +704,8 @@ func TestControlColumnsOfFiles(t *testing.T) {
 }
 
 // A file of a compression the source doesn't read fails the read with
-// DATA_INVALID, which isn't retried, rather than giving its compressed bytes
-// as text.
+// DATA_INVALID, naming the file, rather than giving its compressed bytes as
+// text; the format preflight fails as file_unreadable.
 func TestUnreadCompression(t *testing.T) {
 	cfg := map[string]any{"url": "file://" + t.TempDir()}
 	put(t, cfg, map[string][]byte{"c/a.csv.xz": []byte("\xfd7zXZ\x00 not csv\n")})
