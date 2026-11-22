@@ -309,13 +309,18 @@ func (t table) orderKey() []string {
 }
 
 // sameOrder fails a read resumed in another order than the one its state
-// was read in, which only a read from the start carries on from. A split's
-// range is of its order's first column, so it holds before its first row.
+// was read in, which only a read from the start carries on from, or without
+// one. A split's range is of its order's first column, so it holds before
+// its first row. Only a read in an order has a position or a range.
 func sameOrder(t table, st sourceState) error {
-	if (st.After != nil || st.Lo != nil || st.Hi != nil) && !slices.Equal(st.Key, t.orderKey()) {
-		return positionLost("postgres: %s was read in the order of columns %v, and is now read in another; it's read again from the start", t.name, st.Key)
+	if st.After == nil && st.Lo == nil && st.Hi == nil || len(t.order) > 0 && slices.Equal(st.Key, t.orderKey()) {
+		return nil
 	}
-	return nil
+	was := "its primary key"
+	if st.Key != nil {
+		was = "columns " + strings.Join(st.Key, ", ")
+	}
+	return positionLost("postgres: %s was read in the order of %s, and is now read in another, or in none; it's read again from the start", t.name, was)
 }
 
 func indexOf(xs []int, x int) int {

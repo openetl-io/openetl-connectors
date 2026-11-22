@@ -90,6 +90,37 @@ func TestSourceReadsInAUniqueIndexsOrder(t *testing.T) {
 	}
 }
 
+// A read resumed after its table lost its primary key, with no unique index
+// in its place, fails with POSITION_LOST rather than read every row again in
+// one query, in full or incrementally; while the key is there, a state
+// written as 0.1.0 wrote it, naming no key, resumes.
+func TestSourceReadOfATableThatLostItsKey(t *testing.T) {
+	e := newSourceEnv(t)
+	e.exec("CREATE TABLE $schema.t (id int PRIMARY KEY, seq int)")
+	e.exec("INSERT INTO $schema.t SELECT i, i FROM generate_series(1, 6) i")
+	s := e.source(`, "chunkRows": 2`)
+	full, inc := `{"after":["2"]}`, `{"after":["2","2"],"until":"6"}`
+	if got := read(t, s, map[string]string{"t": full}).column("t", "id"); !slices.Equal(got, []string{"3", "4", "5", "6"}) {
+		t.Fatalf("resumed after 2: %v", got)
+	}
+	if got := mustReadIncremental(t, s, "t", "seq", inc).column("t", "id"); !slices.Equal(got, []string{"3", "4", "5", "6"}) {
+		t.Fatalf("resumed incrementally after 2: %v", got)
+	}
+
+	e.exec("ALTER TABLE $schema.t DROP CONSTRAINT t_pkey")
+	cs := source.ConfiguredStream{Name: "t", State: []byte(full)}
+	c := &capture{}
+	t.Cleanup(c.release)
+	err := s.Read(t.Context(), source.ReadRequest{Streams: []source.ConfiguredStream{cs}}, c)
+	if code := codeOf(err); code.String() != "ERROR_CODE_POSITION_LOST" {
+		t.Errorf("a full refresh resumed without a key: %v (%v), emitted %q", err, code, c.log)
+	}
+	c, err = readIncremental(t, s, "t", "seq", inc)
+	if code := codeOf(err); code.String() != "ERROR_CODE_POSITION_LOST" {
+		t.Errorf("an incremental read resumed without a key: %v (%v), emitted %q", err, code, c.log)
+	}
+}
+
 // A table's splits hold the order they were cut in from the start: once
 // another index takes its place, a split not yet read fails with
 // POSITION_LOST rather than read its range of another column.
