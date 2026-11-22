@@ -800,6 +800,67 @@ func TestSourceChunksAndResumesExactly(t *testing.T) {
 	})
 }
 
+// TestReadOrderChangedBetweenAttempts resumes reads from states made before
+// a table's primary key was added, changed or dropped. One read in a single
+// query, and done, completes without reading the table again, and read
+// again up to that state reads it as it did. One read in key order fails
+// as a lost position: its position is in an order the table no longer has.
+func TestReadOrderChangedBetweenAttempts(t *testing.T) {
+	eachServer(t, func(t *testing.T, srv testServer) {
+		e := newSourceEnv(t, srv)
+		e.exec("CREATE TABLE $db.loose (id int NOT NULL, at int)")
+		e.exec("CREATE TABLE $db.keyed (a int NOT NULL, b int NOT NULL, PRIMARY KEY (a))")
+		e.exec("INSERT INTO $db.loose SELECT i, i FROM " + numbers(5))
+		e.exec("INSERT INTO $db.keyed SELECT i, 7 - i FROM " + numbers(6))
+		s := e.source(`, "chunkRows": 2`)
+		// Each read's first resume point, and how many rows came before it.
+		type part struct {
+			cs    source.ConfiguredStream
+			state string
+			rows  int
+		}
+		var parts []part
+		for _, cs := range []source.ConfiguredStream{
+			{Name: "loose", SyncMode: source.FullRefresh},
+			{Name: "loose", SyncMode: source.Incremental, Cursor: "at"},
+			{Name: "keyed", SyncMode: source.FullRefresh},
+			{Name: "keyed", SyncMode: source.Incremental, Cursor: "b"},
+		} {
+			first := readLog(t, s, cs)
+			j := resumePoints(first)[0]
+			parts = append(parts, part{cs, first[j].state, len(rowsOf(first, -1, j))})
+		}
+		e.exec("ALTER TABLE $db.loose ADD PRIMARY KEY (id)")
+		e.exec("ALTER TABLE $db.keyed DROP PRIMARY KEY, ADD PRIMARY KEY (b)")
+		for _, p := range parts[:2] {
+			cs := p.cs
+			cs.State = []byte(p.state)
+			if again := readLog(t, s, cs); len(rowsOf(again, -1, len(again))) > 0 || !again[len(again)-1].complete {
+				t.Fatalf("%v from %s, once the table has a key: %+v", cs.SyncMode, p.state, again)
+			}
+			cs.State, cs.Until = nil, []byte(p.state)
+			again := readLog(t, s, cs)
+			endsAt(t, again, p.state)
+			if n := len(rowsOf(again, -1, len(again))); n != p.rows {
+				t.Fatalf("%v until %s, once the table has a key: %d rows, not %d", cs.SyncMode, p.state, n, p.rows)
+			}
+		}
+		lost := func(when string) {
+			for _, p := range parts[2:] {
+				cs := p.cs
+				cs.State = []byte(p.state)
+				err := s.Read(t.Context(), source.ReadRequest{Streams: []source.ConfiguredStream{cs}, Lanes: 1}, &eventLog{})
+				if codeOf(err) != protocolv1.ErrorCode_ERROR_CODE_POSITION_LOST {
+					t.Fatalf("%v from %s, %s: %v", cs.SyncMode, p.state, when, err)
+				}
+			}
+		}
+		lost("with another key")
+		e.exec("ALTER TABLE $db.keyed DROP PRIMARY KEY")
+		lost("without a key")
+	})
+}
+
 func TestSourceReadsIncrementally(t *testing.T) {
 	eachServer(t, func(t *testing.T, srv testServer) {
 		e := newSourceEnv(t, srv)

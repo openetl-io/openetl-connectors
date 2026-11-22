@@ -25,6 +25,8 @@ An incremental read starts at the last read's highest cursor value, not after it
 
 A table read in key order whose key starts with an integer column other than `year` is read in up to 32 key ranges at once, between the column's least and greatest values, as many as the optimizer's estimate of its rows fills at `chunkRows` a range. A range that falls behind is divided again at the midpoint of what it has left. A read holds up to `maxConnections` connections, one for each lane it runs, and CDC holds one binlog connection besides.
 
+A stopped full refresh or incremental read resumes in the order it started in. If the table's primary key was dropped or changed in between, a read that had got part of the way in key order fails with `POSITION_LOST`, and so does a key range that hadn't started yet, since its range is of the old key's first column: only a read from the start goes on from there. A table read in a single query that has been read is done, even if it has been given a key since.
+
 ### How CDC hands over from the snapshot
 
 Each chunk of a table's snapshot is read with a locking read (`LOCK IN SHARE MODE`), which waits for the transactions writing its rows to commit and holds back new writes to them until it has noted where the binlog ends. The chunk then holds exactly the changes before that position. The source holds the chunk until it has read the binlog up to it, emits it there, and emits the changes after it, so nothing is lost or repeated. Writes to the chunk's rows wait while it's read, as they would for any locking read; `snapshotChunkRows` bounds how many rows that is.

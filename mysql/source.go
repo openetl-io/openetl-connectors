@@ -301,6 +301,9 @@ type sourceState struct {
 	// The primary key of the last row read, spelled as keyText spells it; in
 	// an incremental read, its cursor value first.
 	After []string `json:"after,omitempty"`
+	// The primary key's columns that After and the key range are of: see
+	// orderKey.
+	Key []string `json:"key,omitempty"`
 	// Set once a table read in one query has been read.
 	Done bool `json:"done,omitempty"`
 	// An incremental read's cursor floor, inclusive, and the highest value
@@ -310,6 +313,31 @@ type sourceState struct {
 	Until *string `json:"until,omitempty"`
 	// A split's key range.
 	keyRange
+}
+
+// orderKey is what a state names a table's read order by: its primary key's
+// columns, or none for a table read in one query.
+func orderKey(t table) []string {
+	if !chunked(t) {
+		return nil
+	}
+	names := make([]string, len(t.key))
+	for i, k := range t.key {
+		names[i] = t.cols[k].name
+	}
+	return names
+}
+
+// sameOrder fails a read resumed in another order than the one its state
+// was read in, as once the table's primary key has changed, which only a
+// read from the start carries on from. A split's range is of its order's
+// first column, so it holds before its first row.
+func sameOrder(t table, st sourceState) error {
+	key := orderKey(t)
+	if (st.After != nil || st.Lo != nil || st.Hi != nil) && (key == nil || !slices.Equal(st.Key, key)) {
+		return positionLost("mysql: %s was read in the order of columns %v, and is now read in the order of %v; read it again from the start", t.name, st.Key, key)
+	}
+	return nil
 }
 
 // keyText spells a key's or cursor's value for a state: binary as hex.
@@ -390,12 +418,15 @@ func (s *Source) readSplit(ctx context.Context, conns *connPool, tables []table,
 			return fmt.Errorf("mysql: %s state: %w", cs.Name, err)
 		}
 	}
+	t, _ := findTable(tables, cs.Name)
+	if err := sameOrder(t, st); err != nil {
+		return err
+	}
 	conn, err := conns.Get(ctx)
 	if err != nil {
 		return err
 	}
 	defer conns.Put(conn)
-	t, _ := findTable(tables, cs.Name)
 	b, err := newBatcher(memory.DefaultAllocator, t.cols, false)
 	if err != nil {
 		return fmt.Errorf("mysql: %s: %w", t.name, err)
@@ -419,6 +450,9 @@ func (r *tableReader) readUntil(ctx context.Context, cs source.ConfiguredStream,
 	var u sourceState
 	if err := json.Unmarshal(until, &u); err != nil {
 		return fmt.Errorf("mysql: %s until: %w", cs.Name, err)
+	}
+	if err := sameOrder(r.t, u); err != nil {
+		return err
 	}
 	order := r.t.key
 	bounds := func(w *where) error { return nil }
@@ -447,8 +481,8 @@ func (r *tableReader) readUntil(ctx context.Context, cs source.ConfiguredStream,
 		}
 	}
 	switch {
-	case !chunked(r.t):
-		if !st.Done && u.Done {
+	case u.Done:
+		if !st.Done {
 			var w where
 			if err := bounds(&w); err != nil {
 				return err
@@ -556,7 +590,9 @@ func (w *where) sql() string {
 }
 
 func (r *tableReader) readTable(ctx context.Context, id string, st sourceState) error {
-	if !chunked(r.t) {
+	// A read in one query, as of a table before it had a key, is done once
+	// that query is.
+	if !chunked(r.t) || st.Done {
 		if !st.Done {
 			if _, _, err := r.query(ctx, "SELECT "+r.list()+" FROM "+r.ident(), nil, nil); err != nil {
 				return err
@@ -573,7 +609,7 @@ func (r *tableReader) readTable(ctx context.Context, id string, st sourceState) 
 	if st.After != nil && len(st.After) != len(key) {
 		return fmt.Errorf("mysql: %s state has %d key columns, the table has %d", r.t.name, len(st.After), len(key))
 	}
-	st = sourceState{After: st.After, keyRange: st.keyRange}
+	st = sourceState{After: st.After, Key: orderKey(r.t), keyRange: st.keyRange}
 	reading := r.s.Start(r.t.name, id, true)
 	defer r.s.End(r.t.name, id)
 	for {
@@ -668,7 +704,7 @@ func (r *tableReader) readIncremental(ctx context.Context, id, cursor string, st
 			order = append(order, k)
 		}
 	}
-	if !chunked(r.t) {
+	if !chunked(r.t) || st.Done {
 		if !st.Done {
 			var w where
 			if err := bounds(&w); err != nil {
@@ -688,6 +724,7 @@ func (r *tableReader) readIncremental(ctx context.Context, id, cursor string, st
 		return fmt.Errorf("mysql: %s state has %d cursor and key columns, the read has %d", r.t.name, len(st.After), len(order))
 	}
 	orderCols := r.cols(order)
+	st.Key = orderKey(r.t)
 	reading := r.s.Start(r.t.name, id, true)
 	defer r.s.End(r.t.name, id)
 	for {
