@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -418,29 +419,25 @@ func TestStartsDespiteClockSkew(t *testing.T) {
 // would read on from the oldest record left, past the gap, without a word.
 func TestReadBehindRetentionFailsOnANewIterator(t *testing.T) {
 	retention := 24 * time.Hour
-	since := time.Now().Add(-retention + 300*time.Millisecond)
+	// Within retention when the read starts, past it once the iterator
+	// expires.
+	since := time.Now().Add(-retention + 2*time.Second)
 	f := &fakeStream{perCall: 3, shards: []*fakeShard{{id: "shardId-0"}}}
 	f.put(f.shards[0], 10, since)
 	f.trim(f.shards[0], "105")
-	var expired sync.Once
+	var expired atomic.Bool
 	f.override = func(op string, _ map[string]any) (int, any, bool) {
-		hit := false
-		if op == "GetRecords" {
-			expired.Do(func() { hit = true })
-		}
-		if !hit {
+		if op != "GetRecords" || !expired.CompareAndSwap(false, true) {
 			return 0, nil, false
 		}
-		// The read stalls past its position's retention, and its iterator
-		// expires.
-		time.Sleep(600 * time.Millisecond)
+		time.Sleep(time.Until(since.Add(retention + 10*time.Millisecond)))
 		status, body := apiError("ExpiredIteratorException", "Iterator expired.")
 		return status, body, true
 	}
 	s := newReadSource(t, f)
 	log, err := readOnce(t, s, source.ConfiguredStream{State: encodeState(map[string]shardState{"shardId-0": {After: "102", Since: since}})})
-	if codeOf(err) != protocolv1.ErrorCode_ERROR_CODE_POSITION_LOST {
-		t.Errorf("polling: %v isn't POSITION_LOST, and the read emitted %v", err, log.rowSeqs())
+	if codeOf(err) != protocolv1.ErrorCode_ERROR_CODE_POSITION_LOST || !expired.Load() {
+		t.Errorf("polling: %v isn't POSITION_LOST after the iterator expired (%v), and the read emitted %v", err, expired.Load(), log.rowSeqs())
 	}
 
 	cl, err := s.cfg.client(t.Context())

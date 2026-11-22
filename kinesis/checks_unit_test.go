@@ -198,15 +198,17 @@ func schemaWith(table string) *arrow.Schema {
 	return arrow.NewSchema([]arrow.Field{{Name: "id", Type: arrow.PrimitiveTypes.Int64}, {Name: "name", Type: arrow.BinaryTypes.String, Nullable: true}}, &md)
 }
 
-// With an endpoint that takes connections and never answers, the source's
-// and the destination's checks end shortly after their deadline, as an
-// RPC's, rather than at their calls' own timeouts, and none passes sign-in.
+// With Kinesis and the schema registry at an endpoint that takes connections
+// and never answers, the source's and the destination's checks end shortly
+// after their deadline, as an RPC's, rather than at their calls' own
+// timeouts: the list, and each check alone, which passes only if it reaches
+// no further than the connection.
 func TestChecksEndAtTheirDeadline(t *testing.T) {
 	hold := make(chan struct{})
 	srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { <-hold }))
 	t.Cleanup(srv.Close)
 	t.Cleanup(func() { close(hold) })
-	cfg := `{"region": "us-east-1", "endpoint": "` + srv.URL + `", "accessKeyId": "a", "secretAccessKey": "s"}`
+	cfg := `{"region": "us-east-1", "endpoint": "` + srv.URL + `", "accessKeyId": "a", "secretAccessKey": "s", "format": "avro", "schemaRegistryUrl": "` + srv.URL + `"}`
 	src, err := NewSource([]byte(cfg))
 	if err != nil {
 		t.Fatal(err)
@@ -215,16 +217,31 @@ func TestChecksEndAtTheirDeadline(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for role, checks := range map[string][]check.Check{"source": src.Checks(), "destination": dst.Checks()} {
-		ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	within := func(what string, d time.Duration, checks []check.Check) check.Report {
+		ctx, cancel := context.WithTimeout(t.Context(), d)
+		defer cancel()
 		start := time.Now()
 		r := check.Run(ctx, checks)
-		cancel()
-		if d := time.Since(start); d > 3*time.Second {
-			t.Errorf("%s: the checks took %s with 2s to answer", role, d)
+		if took := time.Since(start); took > d+time.Second {
+			t.Errorf("%s took %s with %s to answer", what, took, d)
 		}
-		if it := itemsOf(r)["kinesis.sign-in"]; it.Status == check.Passed || r.OK() {
-			t.Errorf("%s: sign-in %s, the run OK %v", role, it.Status, r.OK())
+		return r
+	}
+	for role, checks := range map[string][]check.Check{"source": src.Checks(), "destination": dst.Checks()} {
+		if r := within(role+"'s checks", 2*time.Second, checks); r.OK() {
+			t.Errorf("%s: the checks passed", role)
+		}
+		names := map[string]bool{}
+		for _, c := range checks {
+			names[c.Name] = true
+			c.Needs = nil
+			it := itemsOf(within(role+"'s "+c.Name, time.Second, []check.Check{c}))[c.Name]
+			if it.Status == check.Passed && !strings.HasPrefix(c.Name, "net.") {
+				t.Errorf("%s: %s passed", role, c.Name)
+			}
+		}
+		if !names["kinesis.sign-in"] || !names["registry.reach"] {
+			t.Errorf("%s's checks: %v", role, names)
 		}
 	}
 }
