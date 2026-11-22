@@ -73,9 +73,22 @@ func TestWriteBatchesRetriesUnprocessed(t *testing.T) {
 	}
 }
 
+// The nth pause in a row is between half and all of a bound that doubles
+// from 50ms to 5s, at random, so that writers paused together don't send
+// again together.
 func TestUnprocessedPause(t *testing.T) {
-	if unprocessedPause(0) != 50*time.Millisecond || unprocessedPause(3) != 400*time.Millisecond || unprocessedPause(100) != 5*time.Second {
-		t.Errorf("pauses %v %v %v", unprocessedPause(0), unprocessedPause(3), unprocessedPause(100))
+	for n, bound := range map[int]time.Duration{0: 50 * time.Millisecond, 3: 400 * time.Millisecond, 100: 5 * time.Second} {
+		seen := map[time.Duration]bool{}
+		for range 50 {
+			p := unprocessedPause(n)
+			if p < bound/2 || p > bound {
+				t.Errorf("pause %d is %v, want %v to %v", n, p, bound/2, bound)
+			}
+			seen[p] = true
+		}
+		if len(seen) < 2 {
+			t.Errorf("pause %d is always %v", n, slices.Collect(maps.Keys(seen)))
+		}
 	}
 }
 

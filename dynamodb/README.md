@@ -208,7 +208,7 @@ DynamoDB has no multi-table transaction for a whole epoch, and no table rename:
 
 Each row costs about three writes: staging it, applying it, and deleting it from staging. An overwritten row costs two more, as it's copied into its read's partition of the control table and deleted from there after the switch, which also scans the target for the items the read didn't write. A merged row that keeps a target value, or a soft delete, also reads the item. Recovery and the start of an overwrite read scan the control table. Up to 16 writer lanes write at once. A continuous pipeline commits every 10 seconds unless it sets its own `delivery.commit.interval`.
 
-Throttled requests are retried with backoff, up to 10 attempts at most 10 seconds apart, and unprocessed batch items are sent again after a pause that grows from 50 ms to 5 s.
+Throttled requests are retried with backoff, up to 10 attempts at most 10 seconds apart, and unprocessed batch items are sent again after a random pause, between half and all of a bound that grows from 50 ms to 5 s.
 
 ### Set it up
 

@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"maps"
+	"math/rand/v2"
 	"slices"
 	"strconv"
 	"strings"
@@ -1282,9 +1283,12 @@ type batchAPI interface {
 }
 
 // unprocessedPause is how long writeBatches waits before sending a batch's
-// unprocessed items again, the nth time in a row: from 50ms, doubling, to
-// 5s.
-var unprocessedPause = func(n int) time.Duration { return min(5*time.Second, 50*time.Millisecond<<min(n, 7)) }
+// unprocessed items again, the nth time in a row: between half and all of a
+// bound that doubles from 50ms to 5s, at random.
+var unprocessedPause = func(n int) time.Duration {
+	bound := min(5*time.Second, 50*time.Millisecond<<min(n, 7))
+	return bound/2 + rand.N(bound/2+1)
+}
 
 // writeBatches sends reqs to table 25 at a time, sending again, after a
 // pause, what DynamoDB left unprocessed, as it does when the table's
