@@ -102,6 +102,30 @@ func TestKeysNotShown(t *testing.T) {
 	}
 }
 
+// The check's write to an endpoint carries no checksum the store didn't ask
+// for, as some S3-compatible stores refuse S3's.
+func TestNoChecksumOnAnEndpoint(t *testing.T) {
+	noAWS(t)
+	var checksums []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		for k := range r.Header {
+			if strings.Contains(strings.ToLower(k), "checksum") {
+				checksums = append(checksums, r.Method+" "+k)
+			}
+		}
+		w.Header().Set("ETag", `"e"`)
+	}))
+	t.Cleanup(srv.Close)
+	b, _ := json.Marshal(map[string]any{"url": "s3://lake/files", "region": "us-east-1", "endpoint": srv.URL, "accessKeyId": "a", "secretAccessKey": "b"})
+	d, err := NewDestination(b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := check.Run(t.Context(), d.Checks()).Err(); err != nil || len(checksums) > 0 {
+		t.Errorf("check: %v; %v", err, checksums)
+	}
+}
+
 // noAWS gives the test no AWS credentials, as the runner gives a connector
 // by default.
 func noAWS(t *testing.T) {

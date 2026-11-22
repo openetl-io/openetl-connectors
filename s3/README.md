@@ -27,7 +27,7 @@ Set `region`. With `accessKeyId` and `secretAccessKey`, the connector uses those
 
 ### S3-compatible stores
 
-A store with S3's API, such as MinIO, Cloudflare R2 or Ceph, takes the same settings, with `endpoint` set to its S3 API's URL, `region` to one the store takes, and its keys in `accessKeyId` and `secretAccessKey`. With `endpoint`, the connector addresses buckets by path, `ENDPOINT/BUCKET/KEY`, rather than by host name.
+A store with S3's API, such as MinIO, Cloudflare R2 or Ceph, takes the same settings, with `endpoint` set to its S3 API's URL, `region` to one the store takes, and its keys in `accessKeyId` and `secretAccessKey`. With `endpoint`, the connector addresses buckets by path, `ENDPOINT/BUCKET/KEY`, rather than by host name. From 0.2.0, the destination's uploads to an `endpoint` carry a checksum only where the store asks for one, as some S3-compatible stores refuse the CRC32 that Amazon S3 takes with every upload.
 
 Only SeaweedFS's S3 API is tested; the stores named here aren't. Appends need only S3's reads, writes, copies, deletes and listings. Overwrite also needs the store to honor S3's conditional writes, `If-None-Match` and `If-Match`: a pipeline that overwrites runs the destination's `store.conditional-write` preflight, which warns as `conditional_writes_ignored` on a store that ignores them, as [Checks and preflights](#checks-and-preflights) says.
 
@@ -216,6 +216,8 @@ A continuous pipeline commits every minute unless it sets its own `delivery.comm
 ### Permissions
 
 The credentials need to read, write, copy, delete and list objects under the URL. On Amazon S3 that's `s3:ListBucket` on the bucket, and `s3:GetObject`, `s3:PutObject` and `s3:DeleteObject` on its objects under the URL. Overwrite also needs the store to honor conditional writes, `If-None-Match` and `If-Match`, which the `store.conditional-write` preflight checks. The destination's check writes and deletes an object under `_openetl/`. The source needs to list and read objects under the URL.
+
+A file over 16 MiB is uploaded in parts. From 0.2.0, a staged file whose write stops partway, as when a sync fails, has its parts dropped with `s3:AbortMultipartUpload`. A bucket lifecycle rule that aborts incomplete multipart uploads after a day also clears those of a connector that was killed.
 
 ## Types
 

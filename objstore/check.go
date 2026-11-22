@@ -291,7 +291,7 @@ func (d *Destination) Checks() []check.Check {
 					return d.store.classify(err)
 				}
 				defer func() { _ = b.Close() }()
-				if err := b.WriteAll(ctx, key, nil, nil); err != nil {
+				if err := b.WriteAll(ctx, key, nil, d.store.writeOptions(b, blob.WriterOptions{})); err != nil {
 					return d.store.denied(fmt.Errorf("objstore: write %s: %w", key, err), "write", d.cfg.URL)
 				}
 				return nil

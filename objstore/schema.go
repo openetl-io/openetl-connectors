@@ -83,7 +83,7 @@ func (w *writer) ApplySchema(ctx context.Context, streams []destination.StreamSc
 		if err != nil {
 			return out, err
 		}
-		if err := w.b.WriteAll(ctx, key, b, &blob.WriterOptions{ContentType: "application/json"}); err != nil {
+		if err := w.b.WriteAll(ctx, key, b, w.d.store.writeOptions(w.b, blob.WriterOptions{ContentType: "application/json"})); err != nil {
 			return out, fmt.Errorf("objstore: write %s: %w", key, err)
 		}
 	}

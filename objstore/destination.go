@@ -267,7 +267,7 @@ func (w *writer) startPart(e destination.Epoch, stream string, ef *epochFiles, s
 		Target: fmt.Sprintf("%s%s-%020d-g%020d-%s%s", dir, w.cfg.Pipeline, e.N, e.Generation, k, ext),
 	}}
 	ctx, cancel := context.WithCancel(w.ctx)
-	bw, err := w.b.NewWriter(ctx, p.file.Staged, &blob.WriterOptions{ContentType: contentType(w.d.cfg.Format)})
+	bw, err := w.b.NewWriter(ctx, p.file.Staged, w.d.store.writeOptions(w.b, blob.WriterOptions{ContentType: contentType(w.d.cfg.Format)}))
 	if err != nil {
 		cancel()
 		return nil, fmt.Errorf("objstore: stage %s: %w", p.file.Staged, err)
@@ -506,7 +506,7 @@ func (w *writer) apply(ctx context.Context, d staged, st stagedStream) error {
 	if err != nil {
 		return err
 	}
-	if err := w.b.WriteAll(ctx, marker, body, &blob.WriterOptions{ContentType: "application/json"}); err != nil {
+	if err := w.b.WriteAll(ctx, marker, body, w.d.store.writeOptions(w.b, blob.WriterOptions{ContentType: "application/json"})); err != nil {
 		return fmt.Errorf("objstore: write the marker of %s: %w", st.Name, err)
 	}
 	return nil

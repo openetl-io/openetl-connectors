@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
@@ -157,3 +158,22 @@ func (s *Store) IfMatch(as func(any) bool, etag string, _ int64) error {
 }
 
 func (s *Store) Generation(*blob.Attributes) int64 { return 0 }
+
+// BeforeWrite gives an upload a minute of its own to abort a multipart
+// upload that failed, which the context that ended it can't, and, on an
+// endpoint, only the checksums the store asks for: S3 takes a CRC32 of every
+// upload, which some S3-compatible stores refuse.
+func (s *Store) BeforeWrite(as func(any) bool) error {
+	var tm *transfermanager.Client
+	var c *awss3.Client
+	if !as(&tm) || !as(&c) {
+		return nil
+	}
+	*tm = *transfermanager.New(c, func(o *transfermanager.Options) {
+		o.FailTimeout = time.Minute
+		if s.cfg.Endpoint != "" {
+			o.RequestChecksumCalculation = aws.RequestChecksumCalculationWhenRequired
+		}
+	})
+	return nil
+}
