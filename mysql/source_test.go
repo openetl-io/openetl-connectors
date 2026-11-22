@@ -435,6 +435,34 @@ func TestCDCRefusesPartialRowImages(t *testing.T) {
 	})
 }
 
+// TestCDCRefusesStatementChanges reads a session's change logged with
+// binlog_format = STATEMENT, which has no rows: it fails the read rather
+// than go unread.
+func TestCDCRefusesStatementChanges(t *testing.T) {
+	eachServer(t, func(t *testing.T, srv testServer) {
+		e := newSourceEnv(t, srv)
+		e.exec("CREATE TABLE $db.items (id int PRIMARY KEY, v varchar(20))")
+		s := e.source("")
+		first := read(t, s, cdc("statement", nil, "items"))
+		conn, err := e.db.Conn(t.Context())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = conn.Close() }()
+		for _, q := range []string{"SET SESSION binlog_format = 'STATEMENT'", "INSERT INTO " + quoteIdent(e.database) + ".items VALUES (1, 'a')"} {
+			if _, err := conn.ExecContext(t.Context(), q); err != nil {
+				t.Fatalf("%s: %v", q, err)
+			}
+		}
+		next := &capture{}
+		t.Cleanup(next.release)
+		err = s.Read(t.Context(), cdc("statement", map[string]string{"items": first.state("items")}, "items"), next)
+		if codeOf(err) != protocolv1.ErrorCode_ERROR_CODE_CONFIG_INVALID || !strings.Contains(err.Error(), "binlog_format") {
+			t.Fatalf("a change logged as a statement: %v (%v), rows %v", err, codeOf(err), next.rows("items"))
+		}
+	})
+}
+
 func TestCDCNewColumnRestartsTheRead(t *testing.T) {
 	eachServer(t, func(t *testing.T, srv testServer) {
 		e := newSourceEnv(t, srv)

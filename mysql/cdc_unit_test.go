@@ -101,6 +101,35 @@ func TestMariaDBTransactionsHaveNoBegin(t *testing.T) {
 	}
 }
 
+// TestStatementChangesFail reads changes a session logged as statements,
+// with binlog_format STATEMENT or MIXED, which have no rows: one to a table
+// the read has fails it, and others are no concern of it.
+func TestStatementChangesFail(t *testing.T) {
+	for q, fails := range map[string]bool{
+		"INSERT INTO items VALUES (3, 's')":                  true,
+		"update `items` set v = 'x' where id = 1":            true,
+		"DELETE FROM app.items WHERE id = 1":                 true,
+		"REPLACE INTO items (id, v) VALUES (1, 'x')":         true,
+		"INSERT INTO items_log VALUES (1)":                   false,
+		"INSERT INTO other.items VALUES (1)":                 false,
+		"SAVEPOINT items":                                    false,
+		"ALTER TABLE items ADD COLUMN w int":                 false,
+		"/* app */ INSERT INTO items VALUES (3, 's')":        true,
+		"INSERT INTO other.log SELECT * FROM app.items_x":    false,
+		"UPDATE other.log JOIN app.items USING (id) SET n=1": true,
+	} {
+		r, _ := binlogReader(t, false)
+		schema := "app"
+		if strings.Contains(q, "other.") {
+			schema = "other"
+		}
+		err := feed(t, r, at(100, replication.QUERY_EVENT, query("BEGIN")), at(200, replication.QUERY_EVENT, &replication.QueryEvent{Schema: []byte(schema), Query: []byte(q)}))
+		if fails != (connectortest.CodeOf(err) == protocolv1.ErrorCode_ERROR_CODE_CONFIG_INVALID) || fails && !strings.Contains(err.Error(), "binlog_format") {
+			t.Errorf("%s: %v", q, err)
+		}
+	}
+}
+
 // TestTaggedGTIDsAreKept reads a transaction whose GTID has a tag, as MySQL
 // logs from 8.3: the read's GTIDs have it, so that a read on another server
 // after a failover doesn't read it again.

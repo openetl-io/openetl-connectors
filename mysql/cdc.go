@@ -813,6 +813,14 @@ func (r *cdcReader) event(ctx context.Context, ev *replication.BinlogEvent) erro
 		case q == "COMMIT":
 			return r.commit(h)
 		}
+		if statementChange(q) && (string(e.Schema) == r.s.cfg.Database || namesWord(q, strings.ToUpper(r.s.cfg.Database))) {
+			for _, st := range r.streams {
+				if !st.finished && (r.txn == nil || !r.txn.skip[st]) && namesWord(q, strings.ToUpper(st.t.name)) {
+					return configInvalid("mysql: binlog: a change to %s logged as a statement, which has no rows to read: a session set binlog_format to STATEMENT or MIXED; "+
+						"log changes with binlog_format = ROW, and read %[1]s again", st.t.name)
+				}
+			}
+		}
 		if strings.HasPrefix(q, "TRUNCATE") && string(e.Schema) == r.s.cfg.Database {
 			for _, st := range r.streams {
 				if strings.Contains(q, strings.ToUpper(st.t.name)) {
@@ -856,6 +864,41 @@ func (r *cdcReader) event(ctx context.Context, ev *replication.BinlogEvent) erro
 		return r.passed()
 	}
 	return nil
+}
+
+// statementChange is whether q, a statement in upper case, changes rows,
+// which in the binlog means a session logged it as a statement.
+func statementChange(q string) bool {
+	for strings.HasPrefix(q, "/*") {
+		_, q, _ = strings.Cut(q, "*/")
+		q = strings.TrimSpace(q)
+	}
+	for _, verb := range []string{"INSERT", "UPDATE", "DELETE", "REPLACE"} {
+		if strings.HasPrefix(q, verb) && (len(q) == len(verb) || !nameChar(q[len(verb)])) {
+			return true
+		}
+	}
+	return false
+}
+
+// namesWord is whether q has w other than inside a longer name.
+func namesWord(q, w string) bool {
+	for i := 0; w != ""; {
+		j := strings.Index(q[i:], w)
+		if j < 0 {
+			return false
+		}
+		j += i
+		if end := j + len(w); (j == 0 || !nameChar(q[j-1])) && (end == len(q) || !nameChar(q[end])) {
+			return true
+		}
+		i = j + 1
+	}
+	return false
+}
+
+func nameChar(c byte) bool {
+	return c == '_' || c == '$' || c >= '0' && c <= '9' || c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z' || c >= 0x80
 }
 
 func maxPos(a, b binlogPos) binlogPos {

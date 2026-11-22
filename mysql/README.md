@@ -56,7 +56,7 @@ The server needs these settings, which a CDC read checks before it starts; it re
 | `binlog_row_metadata` | `FULL` | the default is `MINIMAL`; `FULL` puts the columns' names in the binlog |
 | `binlog_row_value_options` | not `PARTIAL_JSON` | MySQL only |
 
-A session can set its own `binlog_row_image` or `binlog_row_value_options`. A change it logs without a column the stream reads, other than a delete's or an old row's columns outside the key, or with a partial update of a JSON column, fails the read rather than set the column null, and the stream has to be read again.
+A session can set its own `binlog_format`, `binlog_row_image` or `binlog_row_value_options`. A change it logs as a statement, under `STATEMENT` or `MIXED`, has no rows to read; one whose statement names a table the read has fails the read rather than go unread. A change it logs without a column the stream reads, other than a delete's or an old row's columns outside the key, or with a partial update of a JSON column, fails the read rather than set the column null. Either way the stream has to be read again.
 
 The binlog connection presents a server ID, which must differ from every replica's: `serverId`, or else one derived from the pipeline's name, at or above 2147483648. MariaDB ends a binlog connection when another connects with its server ID, as a replica or another pipeline of the same name can, and the read then fails as invalid config, naming `serverId`.
 
