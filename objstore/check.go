@@ -150,6 +150,10 @@ func (s *store) storeChecks() []check.Check {
 				case err == nil, f.Code == protocolv1.ErrorCode_ERROR_CODE_PERMISSION_DENIED, gcerrors.Code(listed) == gcerrors.NotFound:
 					// The store knows the identity, whatever it may do.
 					return nil
+				case f.Code == protocolv1.ErrorCode_ERROR_CODE_CONFIG_INVALID:
+					// The bucket is elsewhere, as in another region, which
+					// store.bucket says.
+					return nil
 				}
 				return err
 			},
@@ -159,6 +163,9 @@ func (s *store) storeChecks() []check.Check {
 			Run: func(context.Context, *check.Probe) error {
 				if gcerrors.Code(listed) == gcerrors.NotFound {
 					return check.NotFound.Wrap(listed, "resource", "The "+what+" "+s.bucket)
+				}
+				if err := s.classify(listed); check.Classify(err).ErrorCode() == protocolv1.ErrorCode_ERROR_CODE_CONFIG_INVALID {
+					return err
 				}
 				return nil
 			},

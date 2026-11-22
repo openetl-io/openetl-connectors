@@ -715,6 +715,10 @@ func TestUnreadCompression(t *testing.T) {
 	if !errors.As(err, &coded) || coded.ErrorCode() != protocolv1.ErrorCode_ERROR_CODE_DATA_INVALID || !strings.Contains(err.Error(), "c/a.csv.xz") {
 		t.Errorf("read: %v, %v", err, e.rows)
 	}
+	r := check.Run(t.Context(), s.Preflight(source.PreflightRequest{Streams: []source.ConfiguredStream{{Name: "c"}}}))
+	if it := r.Items[len(r.Items)-1]; it.Name != "stream.c.format" || it.Failure == nil || it.Failure.Reason != "file_unreadable" {
+		t.Errorf("preflight: %+v", it)
+	}
 }
 
 // A file named .bz2 is decompressed with bzip2.

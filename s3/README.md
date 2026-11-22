@@ -43,7 +43,7 @@ From 0.2.0, a check reports these items, in order, for either role. Each one aft
 | --- | --- |
 | `net.dns`, `net.connect`, `net.tls` | The store's API resolves, accepts a connection and, over HTTPS, completes a TLS handshake: `endpoint`, or `s3.REGION.amazonaws.com`. Without `endpoint`, a failure here only warns, since a runner can reach AWS through a proxy that the store's SDK uses and a direct connection doesn't. |
 | `store.auth` | The store accepts the credentials. If the store knows the identity but refuses it access, this item passes, and the items after it show what access is missing. |
-| `store.bucket` | The bucket exists. |
+| `store.bucket` | The bucket exists. From 0.2.0, a bucket in another region than `region` fails this item, which names the bucket's region. |
 | `store.list` | The identity lists the files under `url`: `s3:ListBucket`. |
 | `store.write`, `store.delete` | The destination's only: it writes a file under `URL/_openetl/` (`s3:PutObject`), then deletes it (`s3:DeleteObject`). |
 

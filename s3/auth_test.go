@@ -133,9 +133,15 @@ func TestWrongRegion(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			err = check.Run(t.Context(), d.Checks()).Err()
+			rep := check.Run(t.Context(), d.Checks())
+			err = rep.Err()
 			if codeOf(err) != protocolv1.ErrorCode_ERROR_CODE_CONFIG_INVALID || err == nil || !strings.Contains(err.Error(), "set region to eu-west-1") {
 				t.Errorf("Check: %s (%v)", codeOf(err), err)
+			}
+			for _, it := range rep.Items {
+				if it.Status == check.Failed && it.Name != "store.bucket" {
+					t.Errorf("%s failed, not store.bucket", it.Name)
+				}
 			}
 		})
 	}
