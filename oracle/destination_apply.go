@@ -169,8 +169,9 @@ func (w *writer) PatchSQL(s stagedStream, p prepared) []string {
 // other columns as they were, with its metadata columns updated, or with
 // hard deletes removes the row. A column in unchanged that the latest
 // version didn't send takes its value from the key's latest staged version
-// that did, or else keeps the target's. An update's values all see the
-// target's row as it was.
+// that did, unless the target's row is newer than that version, or else
+// keeps the target's. An update's values all see the target's row as it
+// was.
 func (w *writer) MergeSQL(s stagedStream, p prepared) []string {
 	cols := p.cols
 	q := quoteIdent
@@ -245,8 +246,9 @@ func (w *writer) MergeSQL(s stagedStream, p prepared) []string {
 
 // latest is merge's derived table of each key's latest staged version. With
 // unchanged columns, each comes from the key's latest earlier version that
-// sent it, if any, which a window finds by its _openetl_ord; its
-// _openetl_unchanged then leaves it out. A null _openetl_seq comes first.
+// sent it and isn't older than the target's row, if any, which a window
+// finds by its _openetl_ord; its _openetl_unchanged then leaves it out. A
+// null _openetl_seq comes first.
 func (w *writer) latest(s stagedStream, p prepared, hasSeq bool) string {
 	cols := p.cols
 	q := quoteIdent
@@ -280,7 +282,17 @@ func (w *writer) latest(s stagedStream, p prepared, hasSeq bool) string {
 		if _, ok := e[c]; !ok {
 			return "1 = 0"
 		}
-		return "(" + has("l", colUnchanged, c) + " AND " + e[c] + "." + ord + " IS NOT NULL)"
+		f := has("l", colUnchanged, c) + " AND " + e[c] + "." + ord + " IS NOT NULL"
+		if hasSeq {
+			// Nor from a version older than the target's row, whose value is
+			// newer; a missing sequence doesn't stop it, as in merge.
+			cur := make([]string, len(s.Key))
+			for i, k := range s.Key {
+				cur[i] = "cur." + q(k) + " = l." + q(k)
+			}
+			f += " AND NOT EXISTS (SELECT 1 FROM " + w.target(s.Table) + " cur WHERE " + strings.Join(cur, " AND ") + " AND cur." + q(colSeq) + " > " + e[c] + "." + q(colSeq) + ")"
+		}
+		return "(" + f + ")"
 	}
 	hasHeld := slices.Contains(cols, colHeld) && slices.Contains(cols, colID)
 	sel := make([]string, len(cols))
