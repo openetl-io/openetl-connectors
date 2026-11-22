@@ -119,6 +119,11 @@ func avroField(name string, n *avro.SchemaNode) arrow.Field {
 	case "uuid":
 		f.Type, f.Metadata = &arrow.FixedSizeBinaryType{ByteWidth: 16}, uuidMeta
 		return f
+	case "duration":
+		if n.Type == "fixed" && n.Size == 12 {
+			f.Metadata = jsonMeta
+			return f
+		}
 	}
 	switch n.Type {
 	case "boolean":
@@ -223,6 +228,8 @@ func generic(v any) any {
 		return v.UTC().Format(time.RFC3339Nano)
 	case time.Duration:
 		return time.Time{}.Add(v).Format("15:04:05.000000")
+	case avro.Duration:
+		return map[string]any{"months": v.Months, "days": v.Days, "milliseconds": v.Milliseconds}
 	case *big.Rat:
 		// A decimal where its scale isn't at hand, nested in a JSON value:
 		// a whole number over a power of ten, written exactly.

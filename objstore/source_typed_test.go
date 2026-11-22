@@ -274,6 +274,120 @@ func TestAvroNamedTypes(t *testing.T) {
 	}
 }
 
+// A duration logical type is declared as JSON and read as a JSON object of
+// months, days and milliseconds, at the top level, in unions and nested.
+func TestAvroDuration(t *testing.T) {
+	cfg := map[string]any{"url": "file://" + t.TempDir()}
+	d1 := avro.Duration{Months: 1, Days: 2, Milliseconds: 3}
+	d0 := avro.Duration{}
+	raw12 := [12]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}
+	schema := `{"type": "record", "name": "R", "fields": [
+		{"name": "d", "type": {"type": "fixed", "name": "Dur", "size": 12, "logicalType": "duration"}},
+		{"name": "named", "type": "Dur"},
+		{"name": "maybe", "type": ["null", "Dur"]},
+		{"name": "either", "type": ["null", "string", "Dur"]},
+		{"name": "rec", "type": {"type": "record", "name": "In", "fields": [{"name": "d", "type": "Dur"}]}},
+		{"name": "arr", "type": {"type": "array", "items": "Dur"}},
+		{"name": "m", "type": {"type": "map", "values": "Dur"}},
+		{"name": "raw12", "type": {"type": "fixed", "name": "Raw12", "size": 12}}
+	]}`
+	put(t, cfg, map[string][]byte{"dur/a.avro": avroFile(t, schema,
+		map[string]any{
+			"d": d1, "named": d1, "maybe": d1, "either": d1,
+			"rec": map[string]any{"d": d1}, "arr": []any{d1}, "m": map[string]any{"k": d1},
+			"raw12": raw12,
+		},
+		map[string]any{
+			"d": d0, "named": d0, "maybe": nil, "either": "none",
+			"rec": map[string]any{"d": d0}, "arr": []any{d0}, "m": map[string]any{},
+			"raw12": raw12,
+		},
+	)})
+	s := newSource(t, cfg, map[string]any{"name": "dur", "glob": "dur/*", "format": "avro"})
+	cat, err := s.Discover(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotTypes := map[string]string{}
+	for _, f := range cat.Streams[0].Schema.Fields() {
+		gotTypes[f.Name] = f.Type.String()
+		if ext := extName(f); ext != "" {
+			gotTypes[f.Name] = ext
+		}
+	}
+	for _, col := range []string{"d", "named", "maybe", "either", "rec", "arr", "m"} {
+		if gotTypes[col] != jsonExt {
+			t.Errorf("%s: declared %s, want %s", col, gotTypes[col], jsonExt)
+		}
+	}
+	if gotTypes["raw12"] != "binary" {
+		t.Errorf("raw12: declared %s, want binary", gotTypes["raw12"])
+	}
+
+	e := mustRead(t, s, "dur", source.FullRefresh, nil)
+	checkBatches(t, cat, e)
+	r := e.rows["dur/"]
+	if len(r) != 2 {
+		t.Fatalf("%d rows", len(r))
+	}
+	// JSON columns' values are JSON objects/arrays, not text holding them.
+	if _, ok := r[0]["d"].(map[string]any); !ok {
+		t.Fatalf("d is %T, want JSON object", r[0]["d"])
+	}
+	for k, want := range map[string]string{
+		"d":      `{"days":2,"milliseconds":3,"months":1}`,
+		"named":  `{"days":2,"milliseconds":3,"months":1}`,
+		"maybe":  `{"days":2,"milliseconds":3,"months":1}`,
+		"either": `{"days":2,"milliseconds":3,"months":1}`,
+		"rec":    `{"d":{"days":2,"milliseconds":3,"months":1}}`,
+		"arr":    `[{"days":2,"milliseconds":3,"months":1}]`,
+		"m":      `{"k":{"days":2,"milliseconds":3,"months":1}}`,
+	} {
+		if got, _ := json.Marshal(r[0][k]); string(got) != want {
+			t.Errorf("row 0 %s: %s, want %s", k, got, want)
+		}
+	}
+	if got, _ := json.Marshal(r[1]["d"]); string(got) != `{"days":0,"milliseconds":0,"months":0}` {
+		t.Errorf("row 1 d: %s", got)
+	}
+	if v, ok := r[1]["maybe"]; !ok || v != nil {
+		t.Errorf("row 1 maybe: %v (present=%v), want nil", v, ok)
+	}
+	if got, _ := json.Marshal(r[1]["either"]); string(got) != `"none"` {
+		t.Errorf("row 1 either: %s", got)
+	}
+	if got := values(r[:1], "raw12")[0]; got != "AQIDBAUGBwgJCgsM" {
+		t.Errorf("raw12: %q, want AQIDBAUGBwgJCgsM", got)
+	}
+
+	// Declared as string via columns: emitted as JSON text.
+	ss := newSource(t, cfg, map[string]any{"name": "dur", "glob": "dur/*", "format": "avro", "columns": map[string]string{"d": "string"}})
+	sr := mustRead(t, ss, "dur", source.FullRefresh, nil).rows["dur/"]
+	if got, ok := sr[0]["d"].(string); !ok || got != `{"days":2,"milliseconds":3,"months":1}` {
+		t.Errorf("string-declared d: %#v (%T)", sr[0]["d"], sr[0]["d"])
+	}
+
+	// Cross-file widening between duration and string yields utf8 JSON text.
+	put(t, cfg, map[string][]byte{
+		"wide/a.avro": avroFile(t, `{"type": "record", "name": "W", "fields": [{"name": "d", "type": {"type": "fixed", "name": "Dur", "size": 12, "logicalType": "duration"}}]}`, map[string]any{"d": d1}),
+		"wide/b.avro": avroFile(t, `{"type": "record", "name": "W", "fields": [{"name": "d", "type": "string"}]}`, map[string]any{"d": "plain"}),
+	})
+	ws := newSource(t, cfg, map[string]any{"name": "wide", "glob": "wide/*", "format": "avro"})
+	wcat, err := ws.Discover(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	wf := wcat.Streams[0].Schema.Fields()[0]
+	if wf.Type.ID() != arrow.STRING || extName(wf) != "" {
+		t.Errorf("widened d: %s (ext %q), want plain utf8", wf.Type, extName(wf))
+	}
+	we := mustRead(t, ws, "wide", source.FullRefresh, nil)
+	checkBatches(t, wcat, we)
+	if got := values(we.rows["wide/"], "d"); !slices.Equal(got, []string{`{"days":2,"milliseconds":3,"months":1}`, "plain"}) {
+		t.Errorf("widened d rows: %q", got)
+	}
+}
+
 // Resplit halves a running split's files left: every file is read once,
 // a read again up to a resume point past the halving stops there with the
 // first read's records, and the next read goes on from the splits it left.
