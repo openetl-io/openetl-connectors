@@ -181,6 +181,33 @@ func TestCDCImages(t *testing.T) {
 	)
 }
 
+// An update of a 9 MB field of a 9 MB document reads: its change event
+// would pass 16 MB with the update's description, which repeats the field,
+// or with its pre-image, which an update doesn't need.
+func TestCDCLargeUpdate(t *testing.T) {
+	for _, images := range []bool{false, true} {
+		t.Run(fmt.Sprintf("images %v", images), func(t *testing.T) {
+			db := testDB(t)
+			ctx := t.Context()
+			if err := db.CreateCollection(ctx, "c", options.CreateCollection().SetChangeStreamPreAndPostImages(bson.D{{Key: "enabled", Value: images}})); err != nil {
+				t.Fatal(err)
+			}
+			coll := db.Collection("c")
+			insert(t, coll, bson.D{{Key: "_id", Value: 1}, {Key: "a", Value: strings.Repeat("x", 9<<20)}})
+			s := newTestSource(t, db, "")
+			state, _ := readAll(t, s, source.ConfiguredStream{Name: "c", SyncMode: source.CDC}).Last("c")
+			if _, err := coll.UpdateOne(ctx, bson.D{{Key: "_id", Value: 1}}, bson.D{{Key: "$set", Value: bson.D{{Key: "a", Value: strings.Repeat("y", 9<<20)}}}}); err != nil {
+				t.Fatal(err)
+			}
+			rec := readAll(t, s, source.ConfiguredStream{Name: "c", SyncMode: source.CDC, State: state})
+			rows := rec.RowsOf("c")
+			if len(rows) != 1 || rows[0]["openetl.op"] != "update" || rows[0]["a"] != strings.Repeat("y", 9<<20) {
+				t.Errorf("%d rows, want the update", len(rows))
+			}
+		})
+	}
+}
+
 func TestCDCUpdateOfDeleted(t *testing.T) {
 	db := testDB(t)
 	ctx := t.Context()

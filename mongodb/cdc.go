@@ -237,7 +237,7 @@ func (r *cdcReader) follow(ctx context.Context) error {
 		}
 		opts.SetStartAtOperationTime(&start)
 	}
-	stream, err := r.coll.Watch(ctx, mongo.Pipeline{}, opts)
+	stream, err := r.coll.Watch(ctx, unused, opts)
 	if err != nil {
 		return r.failed(err)
 	}
@@ -326,6 +326,17 @@ func (r *cdcReader) follow(ctx context.Context) error {
 			}
 		}
 	}
+}
+
+// unused leaves out of each change event what the read doesn't use: an
+// update's description, which can repeat as much as the document it
+// changed, and the pre-image of any change but a delete. A change event
+// past 16 MB fails the change stream, on every attempt.
+var unused = mongo.Pipeline{
+	{{Key: "$unset", Value: "updateDescription"}},
+	{{Key: "$set", Value: bson.D{{Key: "fullDocumentBeforeChange", Value: bson.D{{Key: "$cond", Value: bson.A{
+		bson.D{{Key: "$eq", Value: bson.A{"$operationType", "delete"}}}, "$fullDocumentBeforeChange", "$$REMOVE",
+	}}}}}}},
 }
 
 // fieldGone reports whether no document of the collection has a field
