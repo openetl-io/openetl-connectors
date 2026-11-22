@@ -357,6 +357,17 @@ func TestDestinationMergeUnchanged(t *testing.T) {
 	})
 }
 
+// An epoch whose rows have _openetl_unchanged, none listing a column,
+// applies.
+func TestDestinationMergeNoneUnchanged(t *testing.T) {
+	e := newDestEnv(t, "OPENETL_D_UNCHNONE", ownGrants...)
+	w := e.open(1, destination.OpenConfig{Streams: []destination.Stream{{Name: "U", Mode: destination.Merge, PrimaryKey: []string{"k"}}}})
+	fields := []arrow.Field{{Name: "k", Type: arrow.PrimitiveTypes.Int64}, {Name: "v", Type: arrow.BinaryTypes.String, Nullable: true}, opField, seqField, unchField}
+	e.commit(w, 1, streamBatch{"U", batchOf(t, fields, `[{"k": 1, "v": "a", "_openetl_op": "insert", "_openetl_seq": "1"}]`)})
+	e.commit(w, 2, streamBatch{"U", batchOf(t, fields, `[{"k": 1, "v": "b", "_openetl_op": "update", "_openetl_seq": "2"}]`)})
+	equal(t, "U", e.rows(e.user, "U", "k", "v", colUnchanged), []string{"k=1, v=b, _openetl_unchanged=<null>"})
+}
+
 // A column the latest version didn't send keeps the target's value where
 // the staged version that sent it is older than the target's row.
 func TestDestinationMergeUnchangedOlderThanTarget(t *testing.T) {

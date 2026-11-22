@@ -35,11 +35,13 @@ func holds(rel, col, name string) string {
 	return "JSON_EXISTS(" + rel + "." + quoteIdent(col) + ", " + jsonPath(name) + ")"
 }
 
-// jsonArray is a JSON array of the parts that aren't null, each a string;
-// null if all are.
+// jsonArray is a CLOB of a JSON array of the parts that aren't null, each a
+// string; null if all are.
 func jsonArray(parts []string) string {
 	if len(parts) == 0 {
-		return "NULL"
+		// Typed, as a CASE of untyped nulls is CHAR, which a CLOB column
+		// doesn't take.
+		return "TO_CLOB(NULL)"
 	}
 	a := "JSON_ARRAY(" + strings.Join(parts, ", ") + " ABSENT ON NULL RETURNING CLOB)"
 	return "CASE WHEN JSON_EXISTS(" + a + ", '$[0]') THEN " + a + " END"
