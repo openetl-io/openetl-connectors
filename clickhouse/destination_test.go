@@ -15,6 +15,7 @@ import (
 	"time"
 
 	ch "github.com/ClickHouse/clickhouse-go/v2"
+	"github.com/ClickHouse/clickhouse-go/v2/lib/driver"
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/decimal128"
@@ -55,16 +56,29 @@ func newKit(t *testing.T) kit {
 // open opens lane 0's writer as generation gen, and recovers e.
 func (k kit) open(gen uint64, streams []destination.Stream, e destination.Epoch, staged []destination.Staged) (*writer, destination.Recovery) {
 	k.t.Helper()
+	w := k.writer(gen, streams)
+	r, err := w.Recover(k.t.Context(), gen, e, staged)
+	if err != nil {
+		k.t.Fatalf("recover generation %d: %v", gen, err)
+	}
+	return w, r
+}
+
+// writer opens lane 0's writer as generation gen, without recovering.
+func (k kit) writer(gen uint64, streams []destination.Stream) *writer {
+	k.t.Helper()
 	w, err := k.d.Open(k.t.Context(), destination.OpenConfig{Pipeline: "p", Generation: gen, Scope: destination.ScopeStream, Namespace: k.db, Streams: streams})
 	if err != nil {
 		k.t.Fatal(err)
 	}
 	k.t.Cleanup(func() { _ = w.Close(k.t.Context()) })
-	r, err := w.Recover(k.t.Context(), gen, e, staged)
-	if err != nil {
-		k.t.Fatalf("recover generation %d: %v", gen, err)
-	}
-	return w.(*writer), r
+	return w.(*writer)
+}
+
+// exists reports whether the kit's database has table.
+func (k kit) exists(table string) bool {
+	k.t.Helper()
+	return slices.Equal(k.query("SELECT toString(count()) FROM system.tables WHERE database = '"+k.db+"' AND name = '"+table+"'"), []string{"1"})
 }
 
 func (k kit) apply(w *writer, schemas ...*arrow.Schema) destination.SchemaApplied {
@@ -1001,4 +1015,231 @@ func TestDestinationPendingBound(t *testing.T) {
 	for _, s := range streams {
 		wantRows(t, s.Name, k.query("SELECT toString(count()) FROM $db."+ident(s.Name)), "30")
 	}
+}
+
+// Generation 0's fence is a fence like any other: once its Recover has
+// raised it, its commits apply. A pipeline whose fence has no row is told
+// to recover first.
+func TestDestinationFenceOfGenerationZero(t *testing.T) {
+	k := newKit(t)
+	s := schemaOf("a", idCol, vCol)
+	streams := []destination.Stream{{Name: "a", Mode: destination.Append}}
+	w, _ := k.open(0, streams, destination.Epoch{}, nil)
+	k.apply(w, s)
+	k.commit(w, epoch(0, 1), batchOf(s, ins(1, int64(1), "a")))
+	wantRows(t, "a", k.rows("a", "id", "v"), "1|a")
+	other, err := k.d.Open(t.Context(), destination.OpenConfig{Pipeline: "q", Generation: 1, Scope: destination.ScopeStream, Namespace: k.db, Streams: streams})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = other.Close(t.Context()) })
+	if err := other.(*writer).checkFence(t.Context()); err == nil || !strings.Contains(err.Error(), "Recover must run first") {
+		t.Errorf("a pipeline whose fence has no row: %v", err)
+	}
+}
+
+// A generation that no longer overwrites a stream drops the stream's read
+// tables when it recovers, but none once a newer generation has raised the
+// fence, which may overwrite the stream and be writing the read, and none a
+// newer generation made. Each generation here drops them as its Recover
+// would once paused past its own raise of the fence.
+func TestDestinationFencedKeepsNewerReads(t *testing.T) {
+	k := newKit(t)
+	s := schemaOf("o", idCol, vCol)
+	overwrite := []destination.Stream{{Name: "o", Mode: destination.Overwrite}}
+	appends := []destination.Stream{{Name: "o", Mode: destination.Append}}
+	start := time.Now()
+	w1, _ := k.open(1, overwrite, destination.Epoch{}, nil)
+	k.apply(w1, s)
+	if err := w1.StartReads(t.Context(), map[string]time.Time{"o": start}); err != nil {
+		t.Fatal(err)
+	}
+	k.commit(w1, epoch(1, 1), batchOf(s, ins(1, int64(1), "a")))
+	// Generation 2 goes on with the read, whose table keeps generation 1's
+	// label.
+	w2, _ := k.open(2, overwrite, destination.Epoch{}, nil)
+	k.apply(w2, s)
+	if err := w2.StartReads(t.Context(), map[string]time.Time{"o": start}); err != nil {
+		t.Fatal(err)
+	}
+	k.commit(w2, epoch(2, 2), batchOf(s, ins(1, int64(2), "b")))
+	read := readName("p", "o", start)
+	k.writer(1, appends).dropRemovedReads(t.Context(), 1)
+	if !k.exists(read) {
+		t.Fatal("a generation behind the fence dropped the read a newer one goes on with")
+	}
+	// Generation 3 makes a read of its own, as it would once it raised the
+	// fence after generation 2's drop read it.
+	newer := readName("p", "o", start.Add(time.Second))
+	if err := k.writer(3, overwrite).ensureRead(t.Context(), stagedStream{Name: "o", Table: "o", Read: newer}); err != nil {
+		t.Fatal(err)
+	}
+	k.writer(2, appends).dropRemovedReads(t.Context(), 2)
+	if !k.exists(newer) {
+		t.Error("the fence's generation dropped a newer generation's read")
+	}
+	if k.exists(read) {
+		t.Error("the fence's generation, which appends, kept the stream's read")
+	}
+}
+
+// raceConn runs race once, before the first query or statement that starts
+// with prefix.
+type raceConn struct {
+	driver.Conn
+	prefix string
+	race   func()
+}
+
+func (c *raceConn) before(query string) {
+	if race := c.race; race != nil && strings.HasPrefix(query, c.prefix) {
+		c.race = nil
+		race()
+	}
+}
+
+func (c *raceConn) QueryRow(ctx context.Context, query string, args ...any) driver.Row {
+	c.before(query)
+	return c.Conn.QueryRow(ctx, query, args...)
+}
+
+func (c *raceConn) Exec(ctx context.Context, query string, args ...any) error {
+	c.before(query)
+	return c.Conn.Exec(ctx, query, args...)
+}
+
+// A Recover that finds an epoch's markers missing and its staging gone
+// reports it lost, unless a newer generation has raised the fence since,
+// and may have applied the epoch and dropped its staging: then it's fenced.
+func TestDestinationRecoverLostOnlyBehindItsOwnFence(t *testing.T) {
+	for _, newer := range []bool{false, true} {
+		t.Run(fmt.Sprint("newer=", newer), func(t *testing.T) {
+			k := newKit(t)
+			s := schemaOf("a", idCol, vCol)
+			streams := []destination.Stream{{Name: "a", Mode: destination.Append}}
+			w1, _ := k.open(1, streams, destination.Epoch{}, nil)
+			k.apply(w1, s)
+			e := epoch(1, 1)
+			st := k.stage(w1, e, batchOf(s, ins(1, int64(1), "a")))
+			w2 := k.writer(2, streams)
+			race := func() {
+				w1.drop(t.Context(), k.tablesLeft()...)
+			}
+			if newer {
+				race = func() {
+					if _, r := k.open(3, streams, e, []destination.Staged{st}); r != destination.Redone {
+						t.Errorf("generation 3 recovered %v, not redone", r)
+					}
+				}
+			}
+			// Recover's first query of system.tables follows its read of
+			// the epoch's markers.
+			w2.conn = &raceConn{Conn: w2.conn, prefix: "SELECT count() FROM system.tables", race: race}
+			r, err := w2.Recover(t.Context(), 2, e, []destination.Staged{st})
+			switch {
+			case !newer && (err != nil || r != destination.Lost):
+				t.Errorf("with its staging gone, recovered %v, %v; want lost", r, err)
+			case newer && !errorsIsFenced(err):
+				t.Errorf("after generation 3 applied the epoch meanwhile, recovered %v, %v; want fenced", r, err)
+			}
+		})
+	}
+}
+
+// A commit that ends an overwrite read with rows, on a writer that never
+// had the stream's schema and so has no target table for it, is refused:
+// the read's table and its rows stay, and no marker is written. The next
+// attempt, with the recorded schemas applied before its Recover, replaces
+// the target with the read's rows.
+func TestDestinationReplaceWithNoTable(t *testing.T) {
+	k := newKit(t)
+	s := schemaOf("o", idCol, vCol)
+	streams := []destination.Stream{{Name: "o", Mode: destination.Overwrite}}
+	start := time.Now()
+	w1, _ := k.open(1, streams, destination.Epoch{}, nil)
+	k.apply(w1, s)
+	if err := w1.StartReads(t.Context(), map[string]time.Time{"o": start}); err != nil {
+		t.Fatal(err)
+	}
+	k.commit(w1, epoch(1, 1), batchOf(s, ins(1, int64(1), "a")))
+	w2, _ := k.open(2, streams, destination.Epoch{}, nil)
+	if err := w2.StartReads(t.Context(), map[string]time.Time{"o": start}); err != nil {
+		t.Fatal(err)
+	}
+	e := epoch(2, 2)
+	if err := w2.EndRead(t.Context(), e, "o"); err != nil {
+		t.Fatal(err)
+	}
+	st := k.stage(w2, e)
+	if _, err := w2.Commit(t.Context(), e, []destination.Staged{st}); err == nil || !strings.Contains(err.Error(), "no target table") {
+		t.Errorf("commit of a read with rows and no table: %v", err)
+	}
+	read := readName("p", "o", start)
+	wantRows(t, "the read's rows", k.rows(read, "id", "v"), "1|a")
+	wantRows(t, "markers of the epoch", k.query("SELECT toString(count()) FROM $db._openetl_loads WHERE generation = 2 AND epoch = 2"), "0")
+	w3 := k.writer(3, streams)
+	k.apply(w3, s)
+	if r, err := w3.Recover(t.Context(), 3, e, []destination.Staged{st}); err != nil || r != destination.Redone {
+		t.Fatalf("the next attempt recovered %v, %v; want redone", r, err)
+	}
+	wantRows(t, "o after the next attempt", k.rows("o", "id", "v"), "1|a")
+	if k.exists(read) {
+		t.Error("the next attempt kept the read's table")
+	}
+}
+
+// A commit whose epoch's table another applier of the epoch built first,
+// between this one's look for it and its rename, reports as collapsed only
+// the rows Dedupe left out of that table.
+func TestDestinationCollapsedWhenBuiltByAnother(t *testing.T) {
+	k := newKit(t)
+	s := schemaOf("d", idCol, vCol)
+	streams := []destination.Stream{{Name: "d", Mode: destination.Append, Dedupe: destination.DedupeEpoch}}
+	w, _ := k.open(1, streams, destination.Epoch{}, nil)
+	k.apply(w, s)
+	e := epoch(1, 1)
+	st := k.stage(w, e, batchOf(s, ins(1, int64(1), "a"), ins(1, int64(1), "a"), ins(1, int64(2), "b")))
+	other := k.writer(1, streams)
+	w.conn = &raceConn{Conn: w.conn, prefix: "RENAME TABLE", race: func() {
+		desc, err := other.mergeLanes([]destination.Staged{st})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := other.build(t.Context(), desc, desc.Streams[0], readyName("p", "d", e.Generation, e.N)); err != nil {
+			t.Fatal(err)
+		}
+	}}
+	c, err := w.Commit(t.Context(), e, []destination.Staged{st})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := c.Collapsed["d"]; got != 1 {
+		t.Errorf("collapsed %d rows, not 1", got)
+	}
+	wantRows(t, "d", k.rows("d", "id", "v"), "1|a", "2|b")
+
+	// The other applier goes on to apply the epoch, and drop its table,
+	// before this one counts the table's rows: this one's commit then finds
+	// the marker, and reports nothing collapsed.
+	e = epoch(1, 2)
+	st = k.stage(w, e, batchOf(s, ins(2, int64(3), "c"), ins(2, int64(3), "c")))
+	ready := readyName("p", "d", e.Generation, e.N)
+	applies := &raceConn{Conn: w.conn.(*raceConn).Conn, prefix: "SELECT count() FROM " + w.q(ready), race: func() {
+		if _, err := other.Commit(t.Context(), e, []destination.Staged{st}); err != nil {
+			t.Fatal(err)
+		}
+	}}
+	w.conn = &raceConn{Conn: applies, prefix: "RENAME TABLE", race: func() {
+		desc, err := other.mergeLanes([]destination.Staged{st})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := other.build(t.Context(), desc, desc.Streams[0], ready); err != nil {
+			t.Fatal(err)
+		}
+	}}
+	if c, err = w.Commit(t.Context(), e, []destination.Staged{st}); err != nil || c.Collapsed["d"] != 0 {
+		t.Errorf("commit after the other applier applied the epoch: collapsed %d, %v", c.Collapsed["d"], err)
+	}
+	wantRows(t, "d after the other applier's commit", k.rows("d", "id", "v"), "1|a", "2|b", "3|c")
 }

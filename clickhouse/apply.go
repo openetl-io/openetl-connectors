@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"slices"
 	"strconv"
@@ -138,14 +139,19 @@ func (w *writer) build(ctx context.Context, desc staged, s stagedStream, ready s
 	if err := w.exec(ch.Context(ctx, ch.WithSettings(ch.Settings{"join_use_nulls": 0, "max_partitions_per_insert_block": 0})), q); err != nil {
 		return 0, err
 	}
-	var n uint64
-	if err := w.conn.QueryRow(ctx, "SELECT count() FROM "+w.q(tmp)).Scan(&n); err != nil {
-		return 0, classify(err)
+	n, err := w.count(ctx, tmp)
+	if err != nil {
+		return 0, err
 	}
 	err = w.exec(ctx, "RENAME TABLE "+w.q(tmp)+" TO "+w.q(ready))
 	if isCode(err, codeTableAlreadyExists) {
-		// Another attempt built it first.
-		return 0, nil
+		// Another attempt built it first: its rows are the epoch's. Gone
+		// since, it was applied, and the epoch's marker says so.
+		n, err := w.count(ctx, ready)
+		if isCode(err, codeUnknownTable) {
+			return 0, nil
+		}
+		return n, err
 	}
 	if err != nil {
 		return 0, err
@@ -154,11 +160,19 @@ func (w *writer) build(ctx context.Context, desc staged, s stagedStream, ready s
 	return n, nil
 }
 
+func (w *writer) count(ctx context.Context, table string) (uint64, error) {
+	var n uint64
+	if err := w.conn.QueryRow(ctx, "SELECT count() FROM "+w.q(table)).Scan(&n); err != nil {
+		return 0, classify(err)
+	}
+	return n, nil
+}
+
 // missing explains staging that isn't there: a newer generation's Recover
 // drops what older ones staged.
 func (w *writer) missing(ctx context.Context, desc staged, s stagedStream) error {
-	if g, err := w.fence(ctx); err == nil && g > w.cfg.Generation {
-		return fmt.Errorf("%w: fence is %d, applier is %d", destination.ErrFenced, g, w.cfg.Generation)
+	if err := w.checkFence(ctx); errors.Is(err, destination.ErrFenced) {
+		return err
 	}
 	return fmt.Errorf("clickhouse: staging for %s in epoch %d-g%d is missing", s.Name, desc.Epoch, desc.Generation)
 }
@@ -553,7 +567,12 @@ func (w *writer) reconcile(ctx context.Context, table, like string) error {
 // it changes nothing more.
 func (w *writer) replace(ctx context.Context, desc staged, s stagedStream) error {
 	if s.Table == "" {
-		return nil
+		// The stream never had a schema, so it has no table to empty.
+		rows, err := w.partitions(ctx, s.Read)
+		if err == nil && len(rows) > 0 {
+			err = fmt.Errorf("its read has rows in %s, and no target table", s.Read)
+		}
+		return err
 	}
 	ok, err := w.exists(ctx, s.Table)
 	if err != nil || !ok {
@@ -914,51 +933,29 @@ func (w *writer) Recover(ctx context.Context, gen uint64, e destination.Epoch, c
 			return 0, fmt.Errorf("clickhouse: prepare %s: %w", w.db, err)
 		}
 	}
-	fence, err := w.fence(ctx)
+	fence, raised, err := w.fence(ctx)
 	if err != nil {
 		return 0, err
 	}
 	if fence > gen {
 		return 0, fmt.Errorf("%w: recovering as generation %d, and the fence is %d", destination.ErrFenced, gen, fence)
 	}
-	if fence < gen {
+	if !raised || fence < gen {
 		if err := w.exec(ctx, "INSERT INTO "+w.q(fenceTable)+" (pipeline, generation) VALUES ("+literal(w.cfg.Pipeline)+", "+strconv.FormatUint(gen, 10)+")"); err != nil {
 			return 0, fmt.Errorf("clickhouse: raise the fence: %w", err)
 		}
 	}
 	if e.IsZero() {
-		w.dropRemovedReads(ctx)
+		w.dropRemovedReads(ctx, gen)
 		return destination.Applied, nil
 	}
 	desc, err := w.mergeLanes(committables)
 	if err != nil {
 		return 0, err
 	}
-	var missing []stagedStream
-	needs, present := 0, 0
-	for _, s := range desc.Streams {
-		done, err := w.marked(ctx, desc, s.Name)
-		if err != nil {
-			return 0, err
-		}
-		if done {
-			continue
-		}
-		missing = append(missing, s)
-		ready, err := w.exists(ctx, readyName(w.cfg.Pipeline, s.Name, desc.Generation, desc.Epoch))
-		if err != nil {
-			return 0, err
-		}
-		for _, t := range s.staged() {
-			needs++
-			ok, err := w.exists(ctx, t)
-			if err != nil {
-				return 0, err
-			}
-			if ok || ready {
-				present++
-			}
-		}
+	missing, needs, present, err := w.unapplied(ctx, desc)
+	if err != nil {
+		return 0, err
 	}
 	var r destination.Recovery
 	switch {
@@ -975,7 +972,12 @@ func (w *writer) Recover(ctx context.Context, gen uint64, e destination.Epoch, c
 		}
 		r = destination.Redone
 	case len(missing) == len(desc.Streams):
-		// Nothing of it is visible, and some lane's staging is gone.
+		// Nothing of it is visible, and some lane's staging is gone, unless
+		// a newer generation has raised the fence since, applied the epoch
+		// and dropped its staging.
+		if err := w.fenceAt(ctx, gen); err != nil {
+			return 0, err
+		}
 		r = destination.Lost
 	default:
 		return 0, fmt.Errorf("clickhouse: epoch %d-g%d is partly applied and the staging for the rest is gone", desc.Epoch, desc.Generation)
@@ -984,8 +986,39 @@ func (w *writer) Recover(ctx context.Context, gen uint64, e destination.Epoch, c
 		w.trimMarkers(ctx, desc.Epoch)
 	}
 	w.dropStale(ctx, gen)
-	w.dropRemovedReads(ctx)
+	w.dropRemovedReads(ctx, gen)
 	return r, nil
+}
+
+// unapplied returns the streams of desc whose marker is missing, how many
+// staging tables they have, and how many of those are there: a stream's
+// ready table stands in for its staging.
+func (w *writer) unapplied(ctx context.Context, desc staged) (missing []stagedStream, needs, present int, err error) {
+	for _, s := range desc.Streams {
+		done, err := w.marked(ctx, desc, s.Name)
+		if err != nil {
+			return nil, 0, 0, err
+		}
+		if done {
+			continue
+		}
+		missing = append(missing, s)
+		ready, err := w.exists(ctx, readyName(w.cfg.Pipeline, s.Name, desc.Generation, desc.Epoch))
+		if err != nil {
+			return nil, 0, 0, err
+		}
+		for _, t := range s.staged() {
+			needs++
+			ok, err := w.exists(ctx, t)
+			if err != nil {
+				return nil, 0, 0, err
+			}
+			if ok || ready {
+				present++
+			}
+		}
+	}
+	return missing, needs, present, nil
 }
 
 // trimMarkers deletes the pipeline's markers below an applied epoch, which
@@ -1051,10 +1084,14 @@ func (w *writer) dropAbandonedReads(ctx context.Context, drop func(l label, tabl
 }
 
 // dropRemovedReads drops the read tables of streams that no longer
-// overwrite, once Recover has raised the fence. Best effort.
-func (w *writer) dropRemovedReads(ctx context.Context) {
+// overwrite, once Recover has raised the fence to gen: none a newer
+// generation made, and none once a newer generation has raised the fence,
+// as it may overwrite such a stream and be writing its read. With no
+// transaction to hold the fence in, it reads it again before each drop.
+// Best effort.
+func (w *writer) dropRemovedReads(ctx context.Context, gen uint64) {
 	_ = w.dropAbandonedReads(ctx, func(l label, _ string) bool {
-		return w.streams[l.Stream].Mode != destination.Overwrite
+		return l.Generation <= gen && w.streams[l.Stream].Mode != destination.Overwrite && w.fenceAt(ctx, gen) == nil
 	})
 }
 
