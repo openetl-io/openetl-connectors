@@ -105,17 +105,30 @@ type fakeStream struct {
 	// The shards in the order their reads started, and the order they were
 	// read to their ends.
 	started, ended []string
+	// DescribeStream's calls, and whether it refuses a ShardFilter.
+	describes int
+	noFilter  bool
 }
 
 func (f *fakeStream) DescribeStream(_ context.Context, in *dynamodbstreams.DescribeStreamInput, _ ...func(*dynamodbstreams.Options)) (*dynamodbstreams.DescribeStreamOutput, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.describes++
+	shards := f.shards
+	if in.ShardFilter != nil {
+		if f.noFilter {
+			return nil, &smithy.GenericAPIError{Code: "ValidationException", Message: "ShardFilter"}
+		}
+		shards = slices.DeleteFunc(slices.Clone(shards), func(s streamtypes.Shard) bool { return aws.ToString(s.ParentShardId) != *in.ShardFilter.ShardId })
+	}
 	// A page of one shard, so that listing pages.
 	i := 0
 	if in.ExclusiveStartShardId != nil {
-		i = slices.IndexFunc(f.shards, func(s streamtypes.Shard) bool { return *s.ShardId == *in.ExclusiveStartShardId }) + 1
+		i = slices.IndexFunc(shards, func(s streamtypes.Shard) bool { return *s.ShardId == *in.ExclusiveStartShardId }) + 1
 	}
-	d := &streamtypes.StreamDescription{Shards: f.shards[i : i+1]}
-	if i+1 < len(f.shards) {
-		d.LastEvaluatedShardId = f.shards[i].ShardId
+	d := &streamtypes.StreamDescription{Shards: shards[i:min(i+1, len(shards))]}
+	if i+1 < len(shards) {
+		d.LastEvaluatedShardId = shards[i].ShardId
 	}
 	return &dynamodbstreams.DescribeStreamOutput{StreamDescription: d}, nil
 }
@@ -259,6 +272,33 @@ func TestShardLineage(t *testing.T) {
 	}
 }
 
+// A shard read to its end lists its children alone, unless the endpoint
+// refuses the filter, when the read lists every shard.
+func TestChildShards(t *testing.T) {
+	at := time.Now().Add(-time.Minute)
+	for _, noFilter := range []bool{false, true} {
+		// a splits into b and c; b's child is d; e to h are open.
+		f := &fakeStream{
+			shards: []streamtypes.Shard{shard("a", "", true), shard("b", "a", true), shard("c", "a", true), shard("d", "b", false),
+				shard("e", "", false), shard("f", "", false), shard("g", "", false), shard("h", "", false)},
+			records:  map[string][]streamtypes.Record{"a": {insert(1, 1, at)}, "b": {insert(2, 2, at)}, "c": {insert(3, 3, at)}, "d": {insert(4, 4, at)}},
+			noFilter: noFilter,
+		}
+		rec := &connectortest.Recorder{}
+		if err := lineageRead(f, rec, cdcState{Stream: "arn", G: 1, Skip: at.Add(-time.Hour), Shards: map[string]shardState{"a": {Since: at.Add(-time.Hour)}}}).follow(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		if rows := rec.RowsOf("t"); len(rows) != 4 {
+			t.Errorf("refusing the filter %v: read %v, want a's, b's, c's and d's", noFilter, rows)
+		}
+		// One listing of 8 pages, then a's children in 2 pages, and b's and
+		// c's in one each.
+		if !noFilter && f.describes != 8+2+1+1 {
+			t.Errorf("%d DescribeStream calls, want 12", f.describes)
+		}
+	}
+}
+
 func TestTrimmedPositionIsLost(t *testing.T) {
 	at := time.Now().Add(-time.Minute)
 	f := &fakeStream{
@@ -318,7 +358,7 @@ func TestAWSClock(t *testing.T) {
 	ahead = time.Hour
 	err := lineageRead(f, &connectortest.Recorder{}, cdcState{Stream: "arn", G: 1, Skip: host, Shards: map[string]shardState{
 		"gone": {After: "1", Since: host.Add(-23*time.Hour - 30*time.Minute)}, "a": {Since: host},
-	}}).list(t.Context())
+	}}).list(t.Context(), "")
 	if connectortest.CodeOf(err) != protocolv1.ErrorCode_ERROR_CODE_POSITION_LOST {
 		t.Errorf("with the host an hour behind, a shard gone 24.5 hours after its position: %v, want POSITION_LOST", err)
 	}

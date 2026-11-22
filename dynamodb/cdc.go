@@ -181,7 +181,7 @@ func (s *Source) readCDC(ctx context.Context, cl *clients, cs source.ConfiguredS
 // begin lists the stream's shards, each to be read from the snapshot's
 // skip: skipMargin before now, unless the read has one.
 func (r *cdcRead) begin(ctx context.Context) error {
-	if err := r.list(ctx); err != nil {
+	if err := r.list(ctx, ""); err != nil {
 		return err
 	}
 	if r.st.Skip.IsZero() {
@@ -287,12 +287,21 @@ func (r *cdcRead) snapshot(ctx context.Context) error {
 }
 
 // list lists the stream's shards, and checks every shard the state has
-// that isn't read to its end is still there.
-func (r *cdcRead) list(ctx context.Context) error {
+// that isn't read to its end is still there. With a parent, it lists only
+// that shard's children, which join the shards listed before: DescribeStream
+// allows 10 calls a second, and a whole listing takes one per 100 shards.
+func (r *cdcRead) list(ctx context.Context, parent string) error {
 	listed := map[string]shardInfo{}
 	in := &dynamodbstreams.DescribeStreamInput{StreamArn: aws.String(r.st.Stream)}
+	if parent != "" {
+		in.ShardFilter = &streamtypes.ShardFilter{Type: streamtypes.ShardFilterTypeChildShards, ShardId: aws.String(parent)}
+	}
 	for {
 		res, err := r.streams.DescribeStream(ctx, in)
+		if parent != "" && apiCode(err) == "ValidationException" {
+			// An endpoint without ShardFilter.
+			return r.list(ctx, "")
+		}
 		if err != nil {
 			if apiCode(err) == "ResourceNotFoundException" {
 				return positionLost(fmt.Errorf("dynamodb: %s's stream %s is gone: the stream needs a re-sync", r.cs.Name, r.st.Stream))
@@ -314,9 +323,13 @@ func (r *cdcRead) list(ctx context.Context) error {
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.listed = listed
+	if parent != "" {
+		maps.Copy(r.listed, listed)
+	} else {
+		r.listed = listed
+	}
 	for id, sh := range r.st.Shards {
-		if _, ok := listed[id]; ok {
+		if _, ok := r.listed[id]; ok {
 			continue
 		}
 		// A shard leaves the list once its records are past the stream's
@@ -383,7 +396,7 @@ type shardEnd struct {
 // end. A bounded read completes once no shard can run; a continuous one
 // lists shards again while none is open.
 func (r *cdcRead) follow(ctx context.Context) error {
-	if err := r.list(ctx); err != nil {
+	if err := r.list(ctx, ""); err != nil {
 		return err
 	}
 	var wg sync.WaitGroup
@@ -431,7 +444,7 @@ func (r *cdcRead) follow(ctx context.Context) error {
 			}
 			r.mu.Unlock()
 			if e.ended {
-				if err := r.list(ctx); err != nil {
+				if err := r.list(ctx, e.id); err != nil {
 					return err
 				}
 			}
@@ -440,7 +453,7 @@ func (r *cdcRead) follow(ctx context.Context) error {
 				continue
 			}
 			if idle {
-				if err := r.list(ctx); err != nil {
+				if err := r.list(ctx, ""); err != nil {
 					return err
 				}
 			}
