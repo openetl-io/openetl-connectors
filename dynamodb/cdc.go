@@ -98,7 +98,7 @@ type shardInfo struct {
 // end. Its emits are serial, each resume point covering every shard.
 type cdcRead struct {
 	s          *Source
-	db         *dynamodb.Client
+	db         dbAPI
 	streams    streamsAPI
 	cs         source.ConfiguredStream
 	t          *table

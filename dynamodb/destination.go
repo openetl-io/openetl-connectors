@@ -145,8 +145,8 @@ const (
 	readColumn = "_openetl_read"
 	// An unkeyed table's sort key: the staged row's order, so that two rows
 	// with one _openetl_id, as two rows alike without a key have, both land;
-	// "-" where the stream is deduplicated, so that a row's _openetl_id
-	// finds it.
+	// "-" where the stream is deduplicated against the target, so that a
+	// row's _openetl_id finds it.
 	rowColumn = "_openetl_row"
 	// The table of a namespace's, or a prefix's, staging and fences.
 	controlTable = "_openetl_state"
@@ -156,7 +156,7 @@ const (
 )
 
 type writer struct {
-	db      *dynamodb.Client
+	db      dbAPI
 	cfg     destination.OpenConfig
 	prefix  string
 	control string
@@ -347,7 +347,7 @@ func (w *writer) stage(ctx context.Context, e destination.Epoch, stream string, 
 		w.row++
 		if !keyed(cfg) && !r.patch {
 			r.item[rowColumn] = str("-")
-			if cfg.Dedupe == destination.DedupeNone {
+			if cfg.Dedupe != destination.DedupeTarget {
 				r.item[rowColumn] = str(order(e, w.cfg.Lane, w.row))
 			}
 		}
@@ -766,31 +766,42 @@ func (w *writer) Commit(ctx context.Context, e destination.Epoch, committables [
 // collapsed: the rows dedupe skipped.
 func (w *writer) Apply(ctx context.Context, s stagedStream) (collapsed uint64, err error) {
 	if s.Mode == destination.Overwrite {
-		return 0, w.copyToRead(ctx, s)
+		return w.copyToRead(ctx, s)
 	}
 	return w.applyParts(ctx, s.config(), s.Target, s.parts, "")
 }
 
 // copyToRead copies an epoch's staged rows of an overwrite stream into its
-// read's partitions, keeping their order.
-func (w *writer) copyToRead(ctx context.Context, s stagedStream) error {
+// read's partitions, keeping their order. Deduped within each epoch, it
+// leaves out a row whose _openetl_id an earlier row of the epoch has, as
+// the swap, which writes every epoch's rows, can't: collapsed counts them.
+func (w *writer) copyToRead(ctx context.Context, s stagedStream) (collapsed uint64, err error) {
 	for b, parts := range s.parts {
+		seen := map[string]bool{}
 		for _, p := range parts {
 			var reqs []types.WriteRequest
 			err := w.query(ctx, p, func(it map[string]types.AttributeValue) error {
+				if d, ok := it["d"].(*types.AttributeValueMemberM); ok && it["x"] == nil && s.Dedupe == destination.DedupeEpoch {
+					id := stringOf(d.Value[idColumn])
+					if seen[id] {
+						collapsed++
+						return nil
+					}
+					seen[id] = true
+				}
 				it["p"] = str(fmt.Sprintf("%s#%d", s.Read, b))
 				reqs = append(reqs, types.WriteRequest{PutRequest: &types.PutRequest{Item: it}})
 				return nil
 			})
 			if err != nil {
-				return err
+				return 0, err
 			}
 			if err := writeBatches(ctx, w.db, w.control, reqs); err != nil {
-				return err
+				return 0, err
 			}
 		}
 	}
-	return nil
+	return collapsed, nil
 }
 
 // Swap writes an ended overwrite read's rows to its target, each tagged
