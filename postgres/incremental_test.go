@@ -182,3 +182,47 @@ func TestSourceIncrementalCompletesWhereItIsAsked(t *testing.T) {
 		t.Errorf("a read to where an empty table's read completed: %q", c.log)
 	}
 }
+
+// A cursor's NaN and infinities are never read, as its nulls aren't, and
+// don't hold the next read's floor above the values written after them,
+// whole or in splits. A floor at one, as earlier versions took, reads from
+// the start.
+func TestIncrementalSkipsNonFiniteCursors(t *testing.T) {
+	e := newSourceEnv(t)
+	s := e.source(`, "chunkRows": 10`)
+	for typ, c := range map[string]struct{ rows, later, floor, stuck string }{
+		"numeric":     {"(1, 1), (2, 'NaN'), (3, 'Infinity'), (4, '-Infinity'), (5, NULL)", "(6, 7)", "1", "NaN"},
+		"date":        {"(1, '2020-01-01'), (2, 'infinity'), (3, '-infinity')", "(6, '2021-01-01')", "2020-01-01", "infinity"},
+		"timestamp":   {"(1, '2020-01-01'), (2, 'infinity'), (3, '-infinity')", "(6, '2021-01-01')", "2020-01-01 00:00:00", "infinity"},
+		"timestamptz": {"(1, '2020-01-01Z'), (2, 'infinity'), (3, '-infinity')", "(6, '2021-01-01Z')", "2020-01-01 00:00:00+00", "infinity"},
+	} {
+		e.exec("CREATE TABLE $schema." + typ + "s (id int PRIMARY KEY, v " + typ + ")")
+		e.exec("INSERT INTO $schema." + typ + "s VALUES " + c.rows)
+		first := mustReadIncremental(t, s, typ+"s", "v", "")
+		if got, state := first.column(typ+"s", "id"), first.last(typ+"s"); !slices.Equal(got, []string{"1"}) || state != `{"since":"`+c.floor+`"}` {
+			t.Errorf("%s: read %q, then %s", typ, got, state)
+			continue
+		}
+		e.exec("INSERT INTO $schema." + typ + "s VALUES " + c.later)
+		if got := mustReadIncremental(t, s, typ+"s", "v", first.last(typ+"s")).column(typ+"s", "id"); !slices.Equal(got, []string{"1", "6"}) {
+			t.Errorf("%s: the next read read %q", typ, got)
+		}
+		if got := mustReadIncremental(t, s, typ+"s", "v", `{"since":"`+c.stuck+`"}`).column(typ+"s", "id"); !slices.Equal(got, []string{"1", "6"}) {
+			t.Errorf("%s: a read from %s read %q", typ, c.stuck, got)
+		}
+	}
+
+	e.exec("CREATE TABLE $schema.many (id int PRIMARY KEY, v numeric)")
+	e.exec("INSERT INTO $schema.many SELECT i, i FROM generate_series(1, 200) i")
+	e.exec("INSERT INTO $schema.many VALUES (201, 'NaN'), (202, 'Infinity')")
+	e.exec("ANALYZE $schema.many")
+	splits := e.mustSplits(s, source.ConfiguredStream{Name: "many", SyncMode: source.Incremental, Cursor: "v"}, nil)
+	if len(splits) < 2 {
+		t.Fatalf("%d splits", len(splits))
+	}
+	for _, sp := range splits {
+		if st := parseState(t, string(sp.State)); st.Until == nil || *st.Until != "200" {
+			t.Errorf("split %q's state %s", sp.ID, sp.State)
+		}
+	}
+}

@@ -558,6 +558,15 @@ func (s *Source) readIncremental(ctx context.Context, conn *pgx.Conn, t table, i
 	if completeAt != nil {
 		end = func() error { return out.Complete(completeAt) }
 	}
+	only, where := "", ""
+	if f := finite(t.cols[ci], cols[ci]); f != "" {
+		only, where = " AND "+f, " WHERE "+f
+		// A floor at NaN or infinity, as versions before 0.2.0 took, is
+		// above every value read now: the read starts from the beginning.
+		if st.Since != nil && (*st.Since == "NaN" || strings.EqualFold(*st.Since, "infinity")) {
+			st.Since = nil
+		}
+	}
 	if st.Until == nil {
 		var until *string
 		if completeAt != nil {
@@ -566,7 +575,7 @@ func (s *Source) readIncremental(ctx context.Context, conn *pgx.Conn, t table, i
 				return fmt.Errorf("postgres: where %s completes: %w", t.name, err)
 			}
 			until = at.Since
-		} else if err := conn.QueryRow(ctx, "SELECT max("+cols[ci]+")::text FROM "+ident).Scan(&until); err != nil {
+		} else if err := conn.QueryRow(ctx, "SELECT max("+cols[ci]+")::text FROM "+ident+where).Scan(&until); err != nil {
 			return classify(fmt.Errorf("postgres: read %s: %w", t.name, err))
 		}
 		if until == nil {
@@ -584,7 +593,7 @@ func (s *Source) readIncremental(ctx context.Context, conn *pgx.Conn, t table, i
 	}
 	bounds := func() string {
 		args = args[:0]
-		w := cols[ci] + " <= " + arg(*st.Until)
+		w := cols[ci] + " <= " + arg(*st.Until) + only
 		if st.Since != nil {
 			w += " AND " + cols[ci] + " >= " + arg(*st.Since)
 		}
@@ -660,6 +669,21 @@ func (s *Source) readIncremental(ctx context.Context, conn *pgx.Conn, t table, i
 			return end()
 		}
 	}
+}
+
+// finite is the condition that col, a cursor of type c, holds neither NaN
+// nor an infinity, which sort above or below every value and would hold a
+// read's floor there; "" for a type without them. A numeric's v - v is 0
+// only where v is finite, on every version, where 'Infinity' isn't a
+// numeric before Postgres 14.
+func finite(c sourceColumn, col string) string {
+	switch c.oid {
+	case pgtype.NumericOID:
+		return col + " - " + col + " = 0"
+	case pgtype.DateOID, pgtype.TimestampOID, pgtype.TimestamptzOID:
+		return "isfinite(" + col + ")"
+	}
+	return ""
 }
 
 // cursorColumn is the index of a table's column that an incremental read can
