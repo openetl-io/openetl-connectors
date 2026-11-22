@@ -12,6 +12,7 @@ import (
 	"github.com/twmb/franz-go/pkg/sr"
 
 	"github.com/openetl-io/openetl/sdk/go/check"
+	protocolv1 "github.com/openetl-io/openetl/sdk/go/protocol/v1"
 )
 
 // RegistryChecks reach the schema registry and sign in to it, each taking up
@@ -65,10 +66,25 @@ func (c *Config) RegistryChecks(timeout time.Duration) []check.Check {
 					}
 					return check.Unknown.Wrap(answered)
 				}
+				if answered == nil && c.sendsCredentialsInTheClear() {
+					return check.Warn(clearCredentials.Fail())
+				}
 				return answered
 			},
 		},
 	}
+}
+
+var clearCredentials = check.Reason{
+	Name: "credentials_unencrypted", Code: protocolv1.ErrorCode_ERROR_CODE_CONFIG_INVALID,
+	Message: "The schema registry's URL is http, so its username and password cross the network unencrypted.",
+	Fix:     "Use the registry's https URL.",
+}
+
+// sendsCredentialsInTheClear: credentials for a registry reached over http.
+func (c *Config) sendsCredentialsInTheClear() bool {
+	u, err := url.Parse(c.SchemaRegistryURL)
+	return err == nil && u.Scheme == "http" && (c.SchemaRegistryUsername != "" || u.User != nil)
 }
 
 // shownURL is raw without its userinfo, query and fragment, which can hold

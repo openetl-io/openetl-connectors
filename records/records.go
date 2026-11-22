@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"slices"
 	"strings"
 
@@ -56,9 +57,20 @@ func (c *Config) Registry() (*sr.Client, error) {
 	if c.SchemaRegistryURL == "" {
 		return nil, nil
 	}
-	opts := []sr.ClientOpt{sr.URLs(c.SchemaRegistryURL), sr.UserAgent("openetl")}
-	if c.SchemaRegistryUsername != "" {
-		opts = append(opts, sr.BasicAuth(c.SchemaRegistryUsername, c.SchemaRegistryPassword.Reveal()))
+	// The URL's own credentials sign in as basic authentication does, and
+	// leave the URL, which the client's errors show.
+	raw, user, pass := c.SchemaRegistryURL, c.SchemaRegistryUsername, c.SchemaRegistryPassword.Reveal()
+	if u, err := url.Parse(raw); err == nil && u.User != nil {
+		if user == "" {
+			user = u.User.Username()
+			pass, _ = u.User.Password()
+		}
+		u.User = nil
+		raw = u.String()
+	}
+	opts := []sr.ClientOpt{sr.URLs(raw), sr.UserAgent("openetl")}
+	if user != "" {
+		opts = append(opts, sr.BasicAuth(user, pass))
 	}
 	cl, err := sr.NewClient(opts...)
 	if err != nil {
