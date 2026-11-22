@@ -273,7 +273,7 @@ func TestDestinationPendingSwap(t *testing.T) {
 	commitRows(t, w, e, "t", fields, []any{1, "new", "00000000-0000-0000-0000-000000000001", "insert", 1})
 	// The read ended in e, and the crash came after its marker, before the
 	// swap.
-	if err := w.SetMarkers(t.Context(), []marker{{Stream: "t", Generation: 1, N: 1, Swap: readName("p", "t", first), Target: ns + ".t"}}); err != nil {
+	if err := w.SetMarkers(t.Context(), []marker{{Stream: "t", Generation: 1, N: 1, Swap: readName("p", "t", first), Target: ns + ".t", Key: s.PrimaryKey}}); err != nil {
 		t.Fatal(err)
 	}
 	if err := w.StartReads(t.Context(), map[string]time.Time{"t": time.Now()}); err != nil {

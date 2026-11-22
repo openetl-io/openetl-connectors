@@ -663,9 +663,33 @@ func cmpOr(a, b string) string {
 type marker = docstore.Marker
 
 func markerAttribute(m marker) types.AttributeValue {
-	return &types.AttributeValueMemberM{Value: map[string]types.AttributeValue{
+	v := map[string]types.AttributeValue{
 		"g": num(strconv.FormatUint(m.Generation, 10)), "n": num(strconv.FormatUint(m.N, 10)), "swap": str(m.Swap), "t": str(m.Target),
-	}}
+	}
+	if len(m.Key) > 0 {
+		key := make([]types.AttributeValue, len(m.Key))
+		for i, k := range m.Key {
+			key[i] = str(k)
+		}
+		v["k"] = &types.AttributeValueMemberL{Value: key}
+	}
+	if m.Hard {
+		v["h"] = &types.AttributeValueMemberBOOL{Value: true}
+	}
+	return &types.AttributeValueMemberM{Value: v}
+}
+
+// markerOf is stream's marker as markerAttribute wrote it.
+func markerOf(stream string, v map[string]types.AttributeValue) marker {
+	m := marker{Stream: stream, Generation: uintOf(v["g"]), N: uintOf(v["n"]), Swap: stringOf(v["swap"]), Target: stringOf(v["t"])}
+	if key, ok := v["k"].(*types.AttributeValueMemberL); ok {
+		for _, k := range key.Value {
+			m.Key = append(m.Key, stringOf(k))
+		}
+	}
+	hard, _ := v["h"].(*types.AttributeValueMemberBOOL)
+	m.Hard = hard != nil && hard.Value
+	return m
 }
 
 // The fence item's attributes: gen, its generation, and applied, a map of
@@ -702,13 +726,8 @@ func (w *writer) Markers(ctx context.Context) (map[string]marker, error) {
 		return out, nil
 	}
 	for name, v := range applied.Value {
-		m, isMap := v.(*types.AttributeValueMemberM)
-		if !isMap {
-			continue
-		}
-		out[name] = marker{
-			Stream: name, Generation: uintOf(m.Value["g"]), N: uintOf(m.Value["n"]),
-			Swap: stringOf(m.Value["swap"]), Target: stringOf(m.Value["t"]),
+		if m, isMap := v.(*types.AttributeValueMemberM); isMap {
+			out[name] = markerOf(name, m.Value)
 		}
 	}
 	return out, nil
@@ -808,7 +827,9 @@ func (w *writer) copyToRead(ctx context.Context, s stagedStream) (collapsed uint
 // Swap writes an ended overwrite read's rows to its target, each tagged
 // with the read, deletes the target's items the read didn't write, and then
 // clears the marker's Swap. It applies alike however often it runs, and
-// isn't atomic: while it runs, readers see the old items and the new.
+// isn't atomic: while it runs, readers see the old items and the new. The
+// rows apply with the key and deletes the marker has, as the attempt may
+// not have the stream.
 func (w *writer) Swap(ctx context.Context, m marker) error {
 	if m.Swap == "" {
 		return nil
@@ -818,8 +839,10 @@ func (w *writer) Swap(ctx context.Context, m marker) error {
 	for b := range buckets {
 		parts[b] = []string{fmt.Sprintf("%s#%d", m.Swap, b)}
 	}
-	cfg := w.streams[m.Stream]
-	cfg.Mode = destination.Overwrite
+	cfg := destination.Stream{Name: m.Stream, Mode: destination.Overwrite, PrimaryKey: m.Key, Deletes: destination.SoftDelete}
+	if m.Hard {
+		cfg.Deletes = destination.HardDelete
+	}
 	if _, err := w.applyParts(ctx, cfg, m.Target, parts, tag); err != nil {
 		return err
 	}
@@ -831,7 +854,7 @@ func (w *writer) Swap(ctx context.Context, m marker) error {
 			return err
 		}
 	}
-	m.Swap = ""
+	m.Swap, m.Key, m.Hard = "", nil, false
 	return w.SetMarkers(ctx, []marker{m})
 }
 
@@ -1250,7 +1273,11 @@ func (w *writer) settleRecorded(ctx context.Context, e destination.Epoch, commit
 }
 
 func (w *writer) Mark(s stagedStream, e destination.Epoch) marker {
-	return docstore.Mark(e, s.Name, s.Mode == destination.Overwrite && s.Ended, s.Read, s.Target)
+	m := docstore.Mark(e, s.Name, s.Mode == destination.Overwrite && s.Ended, s.Read, s.Target)
+	if m.Swap != "" {
+		m.Key, m.Hard = s.Key, s.Hard
+	}
+	return m
 }
 
 func (w *writer) DropStaging(ctx context.Context, s stagedStream) error {

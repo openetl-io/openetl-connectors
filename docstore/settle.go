@@ -16,6 +16,11 @@ type Marker struct {
 	N          uint64 `bson:"n"`
 	Swap       string `bson:"swap,omitempty"`
 	Target     string `bson:"t,omitempty"`
+	// With Swap, for a store whose swap applies the read's rows: the
+	// stream's primary key, and whether its deletes are hard, as they were
+	// when the read ended.
+	Key  []string `bson:"k,omitempty"`
+	Hard bool     `bson:"h,omitempty"`
 }
 
 func (m Marker) Is(e destination.Epoch) bool { return m.Generation == e.Generation && m.N == e.N }
