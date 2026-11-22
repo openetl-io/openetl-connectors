@@ -193,6 +193,20 @@ func newColBuilder(mem memory.Allocator, c sourceColumn) (*colBuilder, error) {
 	return cb, nil
 }
 
+// declaredType is the type a column of c's type is declared as; nil if it
+// can't be read.
+func declaredType(c sourceColumn) arrow.DataType {
+	cb, err := newColBuilder(memory.DefaultAllocator, c)
+	if err != nil {
+		return nil
+	}
+	defer cb.b.Release()
+	if cb.declared != nil {
+		return cb.declared
+	}
+	return cb.b.Type()
+}
+
 // numericType is the decimal a numeric column is declared as: its own
 // precision and scale where Decimal128 holds them, otherwise decimal(38, 9).
 func numericType(typmod int32) *arrow.Decimal128Type {
@@ -281,6 +295,101 @@ func typedText(c sourceColumn) *textTyped {
 		}
 		return nil
 	}}
+}
+
+// changeTyped is how a CDC read, which reads text, builds c: as typedText
+// says, and a date or timestamp as a full refresh reads it, since the
+// engine can't parse a BC one's text.
+func changeTyped(c sourceColumn) *textTyped {
+	switch c.oid {
+	case pgtype.DateOID:
+		return &textTyped{dt: arrow.FixedWidthTypes.Date32, add: func(b array.Builder, v []byte) error {
+			d, err := pgTime(string(v), false)
+			if err != nil {
+				return err
+			}
+			b.(*array.Date32Builder).Append(arrow.Date32(d))
+			return nil
+		}}
+	case pgtype.TimestampOID, pgtype.TimestamptzOID:
+		t := &arrow.TimestampType{Unit: arrow.Microsecond}
+		if c.oid == pgtype.TimestamptzOID {
+			t.TimeZone = "UTC"
+		}
+		return &textTyped{dt: t, add: func(b array.Builder, v []byte) error {
+			us, err := pgTime(string(v), true)
+			if err != nil {
+				return err
+			}
+			b.(*array.TimestampBuilder).Append(arrow.Timestamp(us))
+			return nil
+		}}
+	}
+	return typedText(c)
+}
+
+// pgTime reads a date, or with clock a timestamp, as Postgres writes it with
+// DateStyle ISO: days, or microseconds, since 1970-01-01. A year past 9999
+// has more digits, one before 1 ends in BC, and a timestamptz's offset
+// follows its time. Infinities are the type's largest and smallest values,
+// as a full refresh reads them.
+func pgTime(s string, clock bool) (int64, error) {
+	top, bottom := int64(math.MaxInt32), int64(math.MinInt32)
+	if clock {
+		top, bottom = math.MaxInt64, math.MinInt64
+	}
+	switch s {
+	case "infinity":
+		return top, nil
+	case "-infinity":
+		return bottom, nil
+	}
+	bad := func() (int64, error) { return 0, dataInvalid("a date or time %q", s) }
+	text, bc := strings.CutSuffix(s, " BC")
+	date, rest, _ := strings.Cut(text, " ")
+	ys, md, _ := strings.Cut(date, "-")
+	ms, ds, _ := strings.Cut(md, "-")
+	y, err1 := strconv.Atoi(ys)
+	m, err2 := strconv.Atoi(ms)
+	d, err3 := strconv.Atoi(ds)
+	if errors.Join(err1, err2, err3) != nil {
+		return bad()
+	}
+	if bc {
+		y = 1 - y
+	}
+	days := time.Date(y, time.Month(m), d, 0, 0, 0, 0, time.UTC).Unix() / 86_400
+	if !clock {
+		return days, nil
+	}
+	const day = 86_400_000_000
+	if days >= math.MaxInt64/day || days <= math.MinInt64/day {
+		return 0, dataInvalid("a timestamp %q, past what microseconds since 1970 hold", s)
+	}
+	hms, zone := rest, ""
+	if i := strings.IndexAny(rest, "+-"); i >= 0 {
+		hms, zone = rest[:i], rest[i:]
+	}
+	t, err := time.Parse("15:04:05", hms)
+	if err != nil {
+		return bad()
+	}
+	us := days*day + int64(t.Hour()*3600+t.Minute()*60+t.Second())*1_000_000 + int64(t.Nanosecond()/1000)
+	if zone != "" {
+		var off int64
+		for i, part := range strings.Split(zone[1:], ":") {
+			n, err := strconv.Atoi(part)
+			if err != nil || i > 2 {
+				return bad()
+			}
+			off += int64(n) * []int64{3600, 60, 1}[i] * 1_000_000
+		}
+		if zone[0] == '-' {
+			off = -off
+		}
+		us -= off
+	}
+	return us, nil
 }
 
 // appendItem appends an array item's text form.

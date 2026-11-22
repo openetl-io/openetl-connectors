@@ -229,12 +229,29 @@ func (w *writer) Stage(ctx context.Context, tables map[uint64]map[string]*stagin
 		_, err = w.pool.CopyFrom(ctx, pgx.Identifier{w.schema, st.Name}, names(cols), src)
 	}
 	if err != nil {
-		return nil, fmt.Errorf("postgres: stage %s: %w", stream, err)
+		return nil, stageError(stream, cols, err)
 	}
 	if n > 0 {
 		st.Rows += uint64(n)
 	}
 	return st, nil
+}
+
+// stageError is the error of staging stream's cols. A string or JSON value
+// that text and jsonb can't hold, with a NUL or bytes that aren't UTF-8, is
+// DATA_INVALID, naming its column, which COPY's context ends with.
+func stageError(stream string, cols []column, err error) error {
+	pe := (*pgconn.PgError)(nil)
+	if !errors.As(err, &pe) || pe.Code != "22021" && pe.Code != "22P05" {
+		return fmt.Errorf("postgres: stage %s: %w", stream, err)
+	}
+	for _, c := range cols {
+		if strings.HasSuffix(pe.Where, ", column "+c.name) {
+			err = fmt.Errorf("column %q: %w", c.name, err)
+			break
+		}
+	}
+	return sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_DATA_INVALID, fmt.Errorf("postgres: stage %s: %w", stream, err))
 }
 
 func (w *writer) createLabelled(ctx context.Context, name string, label any, cols []column) error {
@@ -389,8 +406,13 @@ func (r lanesRows) latestFirst(rel string) string {
 // It adds the rows each deduped stream skipped to collapsed.
 func (w *writer) Apply(ctx context.Context, desc staged, streams []stagedStream, collapsed map[string]uint64) error {
 	todo, err := w.Unapplied(ctx, desc, streams)
-	if err != nil || len(todo) == 0 {
+	if err != nil {
 		return err
+	}
+	if len(todo) == 0 {
+		// Applied, maybe by a newer generation's Recover: this one is then
+		// fenced, and says so.
+		return w.unfenced(ctx, w.pool, "")
 	}
 	prep := make(map[string]prepared, len(todo))
 	for _, s := range todo {
@@ -438,7 +460,9 @@ func (w *writer) applyTx(ctx context.Context, desc staged, streams []stagedStrea
 			if err != nil {
 				return fmt.Errorf("postgres: apply %s: %w", s.Name, err)
 			}
-			if s.Deduped() && s.Rows > n {
+			// Dedupe skips append and overwrite rows; a merge's apply counts
+			// none of the rows it applies.
+			if s.Deduped() && s.Mode != modeMerge && s.Rows > n {
 				skipped[s.Name] = s.Rows - n
 			}
 			if _, err := tx.Exec(ctx, "INSERT INTO "+w.ident("_openetl_loads")+" (pipeline, stream, generation, epoch) VALUES ($1, $2, $3, $4)",
@@ -561,17 +585,31 @@ func (w *writer) patch(s stagedStream, p prepared) []string {
 	} else {
 		match = []string{"t." + q(idColumn) + " = p." + q(idColumn)}
 	}
+	heldOf := func(c string) string {
+		if f, ok := s.Fills[c]; ok {
+			return f
+		}
+		return c
+	}
+	// The last column that fills each held column, whose UPDATE takes it out
+	// of the target's _openetl_held: an UPDATE before it needs it there.
+	last := map[string]string{}
+	for _, c := range cols {
+		if !slices.Contains(metadataColumns, c) && !slices.Contains(s.Key, c) {
+			last[heldOf(c)] = c
+		}
+	}
 	var out []string
 	for _, c := range cols {
 		if slices.Contains(metadataColumns, c) || slices.Contains(s.Key, c) {
 			continue
 		}
-		held := c
-		if f, ok := s.Fills[c]; ok {
-			held = f
-		}
+		held := heldOf(c)
 		lit := quoteLiteral(held)
-		set := q(c) + " = p." + q(c) + ", " + q(heldColumn) + " = nullif(t." + q(heldColumn) + " - " + lit + ", '{}'::jsonb)"
+		set := q(c) + " = p." + q(c)
+		if last[held] == c {
+			set += ", " + q(heldColumn) + " = nullif(t." + q(heldColumn) + " - " + lit + ", '{}'::jsonb)"
+		}
 		if slices.Contains(cols, syncedColumn) {
 			set += ", " + q(syncedColumn) + " = p." + q(syncedColumn)
 		}
@@ -586,7 +624,8 @@ func (w *writer) patch(s stagedStream, p prepared) []string {
 // other columns as they were, with its metadata columns updated, or with
 // hard deletes removes the row. A column in unchanged that the latest
 // version didn't send takes its value from the key's latest staged version
-// that did, or else keeps the target's.
+// that did, unless the target's row is newer than that version, or else
+// keeps the target's.
 func (w *writer) merge(s stagedStream, p prepared) []string {
 	cols, unchanged := p.cols, p.unchanged
 	q := func(c string) string { return pgx.Identifier{c}.Sanitize() }
@@ -663,7 +702,8 @@ func (w *writer) merge(s stagedStream, p prepared) []string {
 
 // latestResolved is merge's CTE of each key's latest staged version, whose
 // unchanged columns come from the key's latest earlier version that sent
-// them, if any; its _openetl_unchanged then leaves them out.
+// them and isn't older than the target's row, if any; its
+// _openetl_unchanged then leaves them out.
 func (w *writer) latestResolved(s stagedStream, prep prepared, hasSeq bool) string {
 	cols, unchanged := prep.cols, prep.unchanged
 	q := func(c string) string { return pgx.Identifier{c}.Sanitize() }
@@ -671,12 +711,22 @@ func (w *writer) latestResolved(s stagedStream, prep prepared, hasSeq bool) stri
 	order, before, latestFirst := key, "("+prep.rows.place("e", "ctid")+") < ("+prep.rows.place("l", "_openetl_ctid")+")", prep.rows.latestFirst("e")
 	if hasSeq {
 		order += ", " + q(seqColumn) + " DESC NULLS LAST"
-		before = "(e." + q(seqColumn) + ", " + prep.rows.place("e", "ctid") + ") < (l." + q(seqColumn) + ", " + prep.rows.place("l", "_openetl_ctid") + ")"
-		latestFirst = "e." + q(seqColumn) + " DESC, " + latestFirst
+		// e was staged before l as order ranks them, where a null seq is
+		// below every other: a row comparison with a null in it is unknown.
+		es, ls := "e."+q(seqColumn), "l."+q(seqColumn)
+		before = "(" + es + " < " + ls + " OR (" + es + " IS NULL AND " + ls + " IS NOT NULL) OR (" + es + " IS NOT DISTINCT FROM " + ls + " AND " + before + "))"
+		latestFirst = es + " DESC NULLS LAST, " + latestFirst
 	}
 	match := make([]string, len(s.Key))
+	target := make([]string, len(s.Key))
 	for i, k := range s.Key {
 		match[i] = "e." + q(k) + " = l." + q(k)
+		target[i] = "cur." + q(k) + " = l." + q(k)
+	}
+	if hasSeq {
+		// Nor older than the target's row, whose value is newer; a missing
+		// seq doesn't stop it, as in merge.
+		before += " AND NOT EXISTS (SELECT 1 FROM " + w.ident(s.Table) + " cur WHERE " + strings.Join(target, " AND ") + " AND cur." + q(seqColumn) + " > e." + q(seqColumn) + ")"
 	}
 	sel := make([]string, len(cols))
 	for i, c := range cols {
@@ -968,9 +1018,10 @@ func (w *writer) ensureRead(ctx context.Context, s stagedStream, cols []column) 
 	return w.ensureTable(ctx, s.Name, s.Read, cols)
 }
 
-// ensureIndex builds the index without blocking the table's writers. A
-// concurrent build that was cut off leaves the index invalid, so it drops
-// such an index and builds it again.
+// ensureIndex builds the index without blocking the table's writers, unless
+// a valid non-partial index matching cols already exists. A concurrent build
+// that was cut off leaves the index invalid, so it drops such an index and
+// builds it again.
 func (w *writer) ensureIndex(ctx context.Context, table, name string, unique bool, cols []string) error {
 	if w.indexed[name] {
 		return nil
@@ -983,6 +1034,22 @@ func (w *writer) ensureIndex(ctx context.Context, table, name string, unique boo
 	if err == nil && !valid {
 		if err := w.dropIndex(ctx, name); err != nil {
 			return err
+		}
+	}
+	if !unique && len(cols) > 0 {
+		var has bool
+		err := w.pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM pg_index i
+			WHERE i.indrelid = to_regclass($1) AND i.indisvalid AND i.indpred IS NULL AND i.indnkeyatts >= cardinality($2::text[])
+			AND (SELECT array_agg(a.attname::text ORDER BY k.ord)
+				FROM unnest((i.indkey::int2[])[0:cardinality($2::text[]) - 1]) WITH ORDINALITY AS k(attnum, ord)
+				JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.attnum AND a.attnum > 0 AND NOT a.attisdropped)
+				= $2::text[])`, w.ident(table), cols).Scan(&has)
+		if err != nil {
+			return err
+		}
+		if has {
+			w.indexed[name] = true
+			return nil
 		}
 	}
 	kind := "INDEX"
@@ -1457,12 +1524,33 @@ func (w *writer) dropAbandonedReads(ctx context.Context, q querier, drop func(l 
 }
 
 // DropRemovedReads drops the read tables of streams that no longer
-// overwrite, once Recover has raised the fence. Best effort, like
-// dropStaging.
+// overwrite, once Recover has raised the fence, and while it holds it: a
+// newer generation that overwrites such a stream may have raised it since.
+// Best effort, like dropStaging.
 func (w *writer) DropRemovedReads(ctx context.Context) {
-	_ = w.dropAbandonedReads(ctx, w.pool, func(l sqlstage.ReadLabel, _ string) bool {
-		return w.streams[l.Stream].Mode != destination.Overwrite
+	_ = pgx.BeginFunc(ctx, w.pool, func(tx pgx.Tx) error {
+		if err := w.unfenced(ctx, tx, "FOR SHARE"); err != nil {
+			return err
+		}
+		return w.dropAbandonedReads(ctx, tx, func(l sqlstage.ReadLabel, _ string) bool {
+			return w.streams[l.Stream].Mode != destination.Overwrite
+		})
 	})
+}
+
+// unfenced fails with destination.ErrFenced if a newer generation has
+// raised the fence, which q reads with lock: "" or a lock that holds it.
+func (w *writer) unfenced(ctx context.Context, q interface {
+	QueryRow(context.Context, string, ...any) pgx.Row
+}, lock string) error {
+	var fence uint64
+	if err := q.QueryRow(ctx, "SELECT generation FROM "+w.ident("_openetl_fence")+" WHERE pipeline = $1 "+lock, w.cfg.Pipeline).Scan(&fence); err != nil {
+		return err
+	}
+	if fence > w.cfg.Generation {
+		return fmt.Errorf("%w: fence is %d, applier is %d", destination.ErrFenced, fence, w.cfg.Generation)
+	}
+	return nil
 }
 
 func (w *writer) Close(context.Context) error {

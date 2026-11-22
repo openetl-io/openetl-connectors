@@ -376,3 +376,23 @@ func TestPatchFillsAnotherColumn(t *testing.T) {
 		t.Errorf("got %s", got)
 	}
 }
+
+// Two patch columns that fill one held column both land: the first's
+// UPDATE leaves the cell held for the second's.
+func TestPatchFillsAHeldColumnTwice(t *testing.T) {
+	env := newEnv(t)
+	w := env.openStreams(1, destination.ScopePipeline, destination.Stream{Name: "users", Mode: destination.Merge, PrimaryKey: []string{"id"}})
+	recov(t, w, 1, destination.Epoch{}, nil)
+	v2 := arrow.Field{Name: "price__v2", Type: arrow.PrimitiveTypes.Float64, Nullable: true}
+	e := func(n uint64) destination.Epoch { return destination.Epoch{Generation: 1, N: n} }
+	write(t, w, e(1), "users", batch(t, []arrow.Field{idField, rowID, opField, seqField, priceField, v2, heldField}, "["+row(1, 1, "null", `["price"]`)+"]"))
+	commit(t, w, e(1))
+	fills := v2
+	fills.Metadata = arrow.NewMetadata([]string{destination.FillsKey}, []string{"price"})
+	patch(t, w, e(2), "users", batch(t, []arrow.Field{idField, rowID, seqField, heldField, fills, priceField},
+		`[{"id": 1, "_openetl_id": `+uid(1)+`, "_openetl_seq": 1, "_openetl_held": ["price"], "price__v2": 2.5, "price": "2.50"}]`))
+	commit(t, w, e(2))
+	if got := env.text("SELECT coalesce(price, '-') || ':' || price__v2 || ':' || coalesce(_openetl_held::text, '-') FROM $schema.users"); got != "2.50:2.5:-" {
+		t.Errorf("got %s", got)
+	}
+}

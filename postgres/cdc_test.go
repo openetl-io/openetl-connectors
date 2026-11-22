@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/apache/arrow-go/v18/arrow"
+	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/jackc/pglogrepl"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -652,15 +653,94 @@ func TestCDCNewColumnsAndTruncates(t *testing.T) {
 	}
 }
 
-// A column added after the run's Discover isn't read, though the table has
-// it when the read starts: its values would land as text. The change that
-// shows it fails the read, and the attempt that declares it reads it.
+// A column whose type changes while CDC reads its table fails the read,
+// retryably, at the first change the log describes with its new type, whose
+// values would land as the type the run declared. The next attempt, which
+// declares the new type, reads on, the changes from before it too. A change
+// that's declared the same, as varchar to text, reads on.
+func TestCDCChangedColumnType(t *testing.T) {
+	for _, c := range []struct {
+		name, from, to, before, after string
+		fails                         bool
+		want                          []string
+	}{
+		{"int to bigint", "int", "bigint", "2", "3000000000", true, []string{"2", "3000000000"}},
+		{"int to text", "int", "text", "2", "'abc'", true, []string{"2", "abc"}},
+		{"numeric scale", "numeric(10,2)", "numeric(12,4)", "2", "1.2345", true, []string{"2.00", "1.2345"}},
+		// abcd is base64 too, so it would land as a binary's three bytes.
+		{"bytea to text", "bytea", "text", "NULL", "'abcd'", true, []string{array.NullValueStr, "abcd"}},
+		{"varchar to text", "varchar(10)", "text", "'b'", "'abc'", false, []string{"b", "abc"}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			e := newSourceEnv(t)
+			e.exec("CREATE TABLE $schema.users (id int PRIMARY KEY, v " + c.from + ")")
+			s, pipeline := e.cdcSource("")
+			state := readCDC(t, s, pipeline, map[string]string{"users": ""}).last("users")
+			f := follow(t, s, pipeline, map[string]string{"users": state})
+			f.await(t, "a resume point", func() bool { return f.last("users") != "" })
+			e.exec("INSERT INTO $schema.users VALUES (1, " + c.before + ")")
+			e.exec("ALTER TABLE $schema.users ALTER COLUMN v TYPE " + c.to)
+			e.exec("INSERT INTO $schema.users VALUES (2, " + c.after + ")")
+			if c.fails {
+				select {
+				case err := <-f.done:
+					if codeOf(err) != protocolv1.ErrorCode_ERROR_CODE_TRANSIENT || !strings.Contains(err.Error(), `"v"`) {
+						t.Fatalf("a read that saw v's new type: %v", err)
+					}
+				case <-time.After(30 * time.Second):
+					t.Fatal("the read didn't end at v's new type")
+				}
+			} else {
+				f.await(t, "the change after", func() bool { return len(f.column("users", "id")) == 2 })
+				f.cancel()
+				<-f.done
+			}
+			if got := readCDC(t, s, pipeline, map[string]string{"users": state}).column("users", "v"); !slices.Equal(got, c.want) {
+				t.Errorf("v is %q", got)
+			}
+		})
+	}
+}
+
+// CDC reads dates and timestamps as a full refresh does, typed, in its
+// snapshot and its changes: BC ones too, whose text the engine can't parse,
+// infinite ones, and those past year 9999.
+func TestCDCReadsDatesAsAFullRefreshDoes(t *testing.T) {
+	e := newSourceEnv(t)
+	e.exec("CREATE TABLE $schema.users (id int PRIMARY KEY, d date, ts timestamp, tz timestamptz)")
+	rows := func(n int) string {
+		return fmt.Sprintf(`(%d, '0044-03-15 BC', '0044-03-15 12:30:45.123456 BC', '0044-03-15 12:30:45.5+00 BC'),
+			(%d, '2024-02-29', '2024-02-29 23:59:59.999999', '2024-02-29 23:59:59+05:30'),
+			(%d, 'infinity', '-infinity', 'infinity'),
+			(%d, '12345-06-07', '12345-06-07 01:02:03', '12345-06-07 01:02:03.25-07'),
+			(%d, NULL, NULL, NULL)`, n, n+1, n+2, n+3, n+4)
+	}
+	e.exec("INSERT INTO $schema.users VALUES " + rows(1))
+	s, pipeline := e.cdcSource("")
+	whole := read(t, s, map[string]string{"users": ""})
+	snapshot := readCDC(t, s, pipeline, map[string]string{"users": ""})
+	e.exec("INSERT INTO $schema.users VALUES " + rows(6))
+	changes := readCDC(t, s, pipeline, map[string]string{"users": snapshot.last("users")})
+	for _, col := range []string{"d", "ts", "tz"} {
+		want := whole.column("users", col)
+		if got := snapshot.column("users", col); !slices.Equal(got, want) {
+			t.Errorf("%s: the snapshot's %q, a full refresh's %q", col, got, want)
+		}
+		if got := changes.column("users", col); !slices.Equal(got, want) {
+			t.Errorf("%s: the changes' %q, a full refresh's %q", col, got, want)
+		}
+	}
+}
+
+// A column added after the run's Discover fails the read before its
+// snapshot, which would otherwise send the table's rows without it, and the
+// attempt that declares it reads it, in the snapshot and in the changes.
 func TestCDCReadsOnlyDeclaredColumns(t *testing.T) {
 	e := newSourceEnv(t)
 	e.exec("CREATE TABLE $schema.users (id int PRIMARY KEY, name text, doc text)")
 	e.exec("INSERT INTO $schema.users VALUES (1, 'a', NULL)")
 	s, pipeline := e.cdcSource("")
-	e.exec("ALTER TABLE $schema.users ADD COLUMN w bigint")
+	e.exec("ALTER TABLE $schema.users ADD COLUMN w bigint DEFAULT 5")
 	read := func(state string, columns ...string) (*capture, error) {
 		req := cdcRequest(pipeline, false, map[string]string{"users": state})
 		req.Streams[0].Columns = columns
@@ -669,26 +749,23 @@ func TestCDCReadsOnlyDeclaredColumns(t *testing.T) {
 		return c, s.Read(t.Context(), req, c)
 	}
 	c, err := read("", "id", "name", "doc")
+	if codeOf(err) != protocolv1.ErrorCode_ERROR_CODE_TRANSIENT || !strings.Contains(err.Error(), `new column "w"`) {
+		t.Fatalf("a read that has a column it didn't declare: %v", err)
+	}
+	if got := c.column("users", "id"); got != nil {
+		t.Errorf("the read sent rows: %q", got)
+	}
+
+	c, err = read("", "id", "name", "doc", "w")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := c.column("users", "id"); !slices.Equal(got, []string{"1"}) {
-		t.Fatalf("the snapshot's ids: %q", got)
-	}
-	if got := c.column("users", "w"); got != nil {
-		t.Errorf("the snapshot read w: %q", got)
+	if got := c.column("users", "w"); !slices.Equal(got, []string{"5"}) {
+		t.Errorf("the snapshot's w is %q", got)
 	}
 	state := c.last("users")
 
 	e.exec("INSERT INTO $schema.users VALUES (2, 'b', NULL, 7)")
-	c, err = read(state, "id", "name", "doc")
-	if codeOf(err) != protocolv1.ErrorCode_ERROR_CODE_TRANSIENT || !strings.Contains(err.Error(), `new column "w"`) {
-		t.Fatalf("a read that saw a column it didn't declare: %v", err)
-	}
-	if got := c.column("users", "w"); got != nil {
-		t.Errorf("the read sent w: %q", got)
-	}
-
 	c, err = read(state, "id", "name", "doc", "w")
 	if err != nil {
 		t.Fatal(err)

@@ -239,6 +239,11 @@ type cdcReader struct {
 // changes gets its chunk row first. Nothing is written to the source but the
 // slot and, if missing, the publication.
 func (s *Source) readCDC(ctx context.Context, conns *connPool, req source.ReadRequest, cfgs []source.ConfiguredStream, tables []table, out source.Emitter) error {
+	for _, cs := range cfgs {
+		if err := undeclared(tables[slices.IndexFunc(tables, func(t table) bool { return t.name == cs.Name })], cs.Columns); err != nil {
+			return err
+		}
+	}
 	conn, err := conns.get(ctx)
 	if err != nil {
 		return err
@@ -259,9 +264,6 @@ func (s *Source) readCDC(ctx context.Context, conns *connPool, req source.ReadRe
 		t := tables[i]
 		if len(t.key) == 0 {
 			return configInvalid("postgres: %s has no primary key, so it can't be read with cdc", t.name)
-		}
-		if t, err = declaredOnly(t, cs.Columns); err != nil {
-			return err
 		}
 		st := &cdcStream{t: t}
 		var state cdcState
@@ -846,6 +848,9 @@ func (r *cdcReader) relation(ctx context.Context, m *pglogrepl.RelationMessage) 
 		if j < 0 {
 			return sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_TRANSIENT, fmt.Errorf("postgres: %s has a new column %q; the read starts again to take it", st.t.name, c.Name))
 		}
+		if err := r.sameType(ctx, st.t, st.t.cols[j], m.RelationID, c); err != nil {
+			return err
+		}
 		for k, kc := range st.t.key {
 			if kc == j {
 				rel.key[k] = len(rel.at)
@@ -861,6 +866,31 @@ func (r *cdcReader) relation(ctx context.Context, m *pglogrepl.RelationMessage) 
 		}
 	}
 	return nil
+}
+
+// sameType fails, retryably, where the log describes t's column sc with a
+// type declared otherwise than sc's, as an ALTER COLUMN ... TYPE since the
+// read started leaves it: its values would land as sc's type. The next
+// attempt declares the new type. The log describes the changes before such
+// an ALTER with the old type, which reads on once the table's column has
+// the declared type: the declared type takes the old one's values.
+func (r *cdcReader) sameType(ctx context.Context, t table, sc sourceColumn, relid uint32, c *pglogrepl.RelationMessageColumn) error {
+	if c.DataType == sc.oid && c.TypeModifier == sc.typmod {
+		return nil
+	}
+	declared := declaredType(sc)
+	if arrow.TypeEqual(declaredType(sourceColumn{oid: c.DataType, typmod: c.TypeModifier, dims: sc.dims}), declared) {
+		return nil
+	}
+	now := sourceColumn{dims: sc.dims}
+	err := r.conn.QueryRow(ctx, "SELECT atttypid, atttypmod FROM pg_attribute WHERE attrelid = $1 AND attname = $2 AND NOT attisdropped", relid, sc.name).Scan(&now.oid, &now.typmod)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return classify(err)
+	}
+	if err == nil && arrow.TypeEqual(declaredType(now), declared) {
+		return nil
+	}
+	return sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_TRANSIENT, fmt.Errorf("postgres: %s's column %q changed type; the read starts again to declare it", t.name, sc.name))
 }
 
 func (r *cdcReader) stream(name string) *cdcStream {
@@ -1493,37 +1523,9 @@ func textConv(oid uint32) func([]byte) []byte {
 	return nil
 }
 
-// declaredOnly narrows t to the columns the run declared. A column added
-// since the run's Discover has no declared type, so its text would land as
-// text. Left out here, it fails the read in relation, and the next attempt
-// declares it. No columns: the request doesn't say.
-func declaredOnly(t table, columns []string) (table, error) {
-	if len(columns) == 0 {
-		return t, nil
-	}
-	cols := make([]sourceColumn, 0, len(t.cols))
-	at := make(map[int]int, len(t.cols))
-	for i, c := range t.cols {
-		if slices.Contains(columns, c.name) {
-			at[i] = len(cols)
-			cols = append(cols, c)
-		}
-	}
-	key := make([]int, len(t.key))
-	for i, k := range t.key {
-		j, ok := at[k]
-		if !ok {
-			return t, sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_TRANSIENT, fmt.Errorf("postgres: %s has a new key column %q; the read starts again to take it", t.name, t.cols[k].name))
-		}
-		key[i] = j
-	}
-	t.cols, t.key, t.order = cols, key, key
-	return t, nil
-}
-
 // changeBatcher builds a CDC stream's batches: each column as text, which
 // the engine parses as the declared type, or built from its text where the
-// engine can't (typedText), then the control columns.
+// engine can't (changeTyped), then the control columns.
 type changeBatcher struct {
 	b     *array.RecordBuilder
 	typed []*textTyped
@@ -1537,7 +1539,7 @@ func newChangeBatcher(mem memory.Allocator, cols []sourceColumn) *changeBatcher 
 	typed := make([]*textTyped, len(cols))
 	for i, c := range cols {
 		f := arrow.Field{Name: c.name, Type: arrow.BinaryTypes.String, Nullable: true}
-		if typed[i] = typedText(c); typed[i] != nil {
+		if typed[i] = changeTyped(c); typed[i] != nil {
 			f.Type = typed[i].dt
 		}
 		fields = append(fields, f)

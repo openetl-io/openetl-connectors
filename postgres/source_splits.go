@@ -84,7 +84,11 @@ func (s *Source) Splits(ctx context.Context, cs source.ConfiguredStream, ended [
 	}
 	if len(ranges) > 0 && ci >= 0 {
 		col := pgx.Identifier{t.cols[ci].name}.Sanitize()
-		err := conn.QueryRow(ctx, "SELECT max("+col+")::text FROM "+pgx.Identifier{s.cfg.Schema, t.name}.Sanitize()).Scan(&st.Until)
+		q := "SELECT max(" + col + ")::text FROM " + pgx.Identifier{s.cfg.Schema, t.name}.Sanitize()
+		if f := finite(t.cols[ci], col); f != "" {
+			q += " WHERE " + f
+		}
+		err := conn.QueryRow(ctx, q).Scan(&st.Until)
 		if err != nil {
 			return nil, classify(fmt.Errorf("postgres: read %s: %w", t.name, err))
 		}
