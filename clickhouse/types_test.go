@@ -1,6 +1,7 @@
 package clickhouse
 
 import (
+	"net"
 	"slices"
 	"strings"
 	"testing"
@@ -314,6 +315,20 @@ func TestContainerNulls(t *testing.T) {
 			if err := col.AppendRow(c.value(arr, i)); err != nil {
 				t.Errorf("%s, row %d: %v", c.typ, i, err)
 			}
+		}
+	}
+}
+
+// An IPv6 address keeps its text, an IPv4-mapped one too, which net.IP
+// spells as IPv4; an IPv4 column's scans in 4 bytes.
+func TestIPText(t *testing.T) {
+	for ip, want := range map[string]string{"::ffff:1.2.3.4": "::ffff:1.2.3.4", "::1": "::1", "1.2.3.4": "1.2.3.4"} {
+		v := net.ParseIP(ip)
+		if !strings.Contains(ip, ":") {
+			v = v.To4()
+		}
+		if got := text(v); got != want {
+			t.Errorf("%s: %q", ip, got)
 		}
 	}
 }

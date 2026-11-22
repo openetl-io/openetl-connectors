@@ -95,7 +95,7 @@ spec:
 | `Date`, `Date32` | date |
 | `DateTime`, `DateTime64(p)` | timestamp in microseconds, in UTC: the same instant, whatever the column's time zone. A `DateTime64(7)` to `(9)` value arrives as text with all its digits, which the engine parses into microseconds, or nanoseconds for a stream that keeps them. |
 | `Time`, `Time64(p)` | time of day in microseconds, `Time64`'s digits past the sixth cut; a value outside a day arrives as text, which the engine quarantines |
-| `Enum8`, `Enum16`, `IPv4`, `IPv6` | string |
+| `Enum8`, `Enum16`, `IPv4`, `IPv6` | string; an IPv4-mapped `IPv6` as `::ffff:1.2.3.4` |
 | `LowCardinality(T)`, `SimpleAggregateFunction(f, T)` | as `T` |
 | `Nullable(T)` | as `T`, nullable |
 | `Array(T)` | list of `T` as above |
