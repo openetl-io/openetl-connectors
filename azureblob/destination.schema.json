@@ -99,9 +99,10 @@
     "fileSize": {
       "type": "integer",
       "minimum": 1048576,
+      "maximum": 4294967296,
       "default": 268435456,
       "title": "File size",
-      "description": "Bytes a file reaches, compressed, before the next one starts.",
+      "description": "Bytes a file reaches, compressed, before the next one starts: 1 MiB to 4 GiB.",
       "x-group": "files",
       "x-advanced": true
     }

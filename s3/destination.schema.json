@@ -92,9 +92,10 @@
     "fileSize": {
       "type": "integer",
       "minimum": 1048576,
+      "maximum": 4294967296,
       "default": 268435456,
       "title": "File size",
-      "description": "Bytes a file reaches, compressed, before the next one starts.",
+      "description": "Bytes a file reaches, compressed, before the next one starts: at least 1 MiB and, from 0.2.0, at most 4 GiB, as Commit copies each file into place and S3 copies at most 5 GiB at once.",
       "x-group": "files",
       "x-advanced": true
     }

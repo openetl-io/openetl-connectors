@@ -161,7 +161,7 @@ s3://my-bucket/raw/orders/9af7d67a-fb93-45a8-9061-af62ce29978d-00000000000000000
 
 CSV and JSON Lines files are compressed whole with `compression`: `gzip` (adding `.gz` to the name), `zstd` (adding `.zst`), or `none` (the default).
 
-A file closes at `fileSize` bytes, 256 MiB by default, and the next one starts.
+A file closes at `fileSize` bytes, 256 MiB by default, and the next one starts. `fileSize` is at most 4 GiB (from 0.2.0), as Commit copies each file into place and S3 copies at most 5 GiB in one request.
 
 The destination keeps what it needs besides the tables under `URL/_openetl/`: files being staged, a marker per stream and epoch, and a record of each table's columns. Leave it in place, and point readers at the table directories, or at an overwritten table's manifest, as [Write modes](#write-modes) says.
 

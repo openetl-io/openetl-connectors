@@ -120,6 +120,11 @@ func NewDestination(config []byte, settings any, store NewStore) (*Destination, 
 	if cfg.FileSize < 1<<20 {
 		return nil, fmt.Errorf("objstore: fileSize %d is under 1 MiB", cfg.FileSize)
 	}
+	// Commit copies each file, and S3 copies at most 5 GiB at once; a file
+	// can pass fileSize by a batch.
+	if cfg.FileSize > 4<<30 {
+		return nil, fmt.Errorf("objstore: fileSize %d is over 4 GiB", cfg.FileSize)
+	}
 	return &Destination{cfg: cfg, store: st}, nil
 }
 

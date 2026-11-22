@@ -716,3 +716,14 @@ func testDestinationPreflight(e *env) {
 		t.Errorf("the preflight left %s", obj.Key)
 	}
 }
+
+// A file's size is at most 4 GiB, which Commit's copy of it can take: S3
+// copies at most 5 GiB at once.
+func TestFileSizeLimits(t *testing.T) {
+	for size, ok := range map[int64]bool{1<<20 - 1: false, 1 << 20: true, 4 << 30: true, 4<<30 + 1: false} {
+		b, _ := json.Marshal(map[string]any{"url": "file://" + t.TempDir(), "fileSize": size})
+		if _, err := testDestination(b); (err == nil) != ok {
+			t.Errorf("%d: %v", size, err)
+		}
+	}
+}
