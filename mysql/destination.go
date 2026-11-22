@@ -1463,11 +1463,14 @@ func (w *writer) dropAbandonedReads(ctx context.Context, drop func(l sqlstage.Re
 }
 
 // DropRemovedReads drops the read tables of streams that no longer
-// overwrite, once Recover has raised the fence. Best effort, like
-// dropStaging.
+// overwrite, once Recover has raised the fence, and while it holds it: a
+// newer generation that overwrites such a stream may have raised it since.
+// Best effort, like dropStaging.
 func (w *writer) DropRemovedReads(ctx context.Context) {
-	_ = w.dropAbandonedReads(ctx, func(l sqlstage.ReadLabel, _ string) bool {
-		return w.streams[l.Stream].Mode != destination.Overwrite
+	_ = w.Fenced(ctx, "LOCK IN SHARE MODE", func() error {
+		return w.dropAbandonedReads(ctx, func(l sqlstage.ReadLabel, _ string) bool {
+			return w.streams[l.Stream].Mode != destination.Overwrite
+		})
 	})
 }
 

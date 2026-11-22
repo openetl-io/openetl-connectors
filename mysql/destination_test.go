@@ -361,3 +361,57 @@ func TestMergeUnchangedOlderThanTarget(t *testing.T) {
 		}
 	})
 }
+
+// TestFencedKeepsNewerReads: an older generation, for which the stream
+// appends, doesn't drop the read table of a newer one that overwrites it
+// once the newer has raised the fence.
+func TestFencedKeepsNewerReads(t *testing.T) {
+	eachServer(t, func(t *testing.T, srv testServer) {
+		e := newDestEnv(t, srv)
+		open := func(gen uint64, mode destination.WriteMode) destination.Writer {
+			w, err := e.d.Open(t.Context(), destination.OpenConfig{Pipeline: "p1", Generation: gen, Scope: destination.ScopePipeline,
+				Streams: []destination.Stream{{Name: "users", Mode: mode}}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = w.Close(context.Background()) })
+			if _, err := w.Recover(t.Context(), gen, destination.Epoch{}, nil); err != nil {
+				t.Fatal(err)
+			}
+			return w
+		}
+		old := open(1, destination.Append)
+		newer := open(2, destination.Overwrite)
+		if err := newer.(interface {
+			StartReads(context.Context, map[string]time.Time) error
+		}).StartReads(t.Context(), map[string]time.Time{"users": time.UnixMicro(1000)}); err != nil {
+			t.Fatal(err)
+		}
+		ep := destination.Epoch{Generation: 2, N: 1}
+		if err := newer.Write(t.Context(), ep, "users", batchOf(t, []arrow.Field{{Name: "id", Type: arrow.PrimitiveTypes.Int64}}, `[{"id": 1}]`)); err != nil {
+			t.Fatal(err)
+		}
+		st, err := newer.PreCommit(t.Context(), ep)
+		if err == nil {
+			_, err = newer.Commit(t.Context(), ep, []destination.Staged{st})
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		exists := func() bool {
+			var n int
+			if err := e.db.QueryRowContext(t.Context(), "SELECT count(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?",
+				e.database, sqlstage.ReadName("p1", "users", time.UnixMicro(1000))).Scan(&n); err != nil {
+				t.Fatal(err)
+			}
+			return n == 1
+		}
+		if !exists() {
+			t.Fatal("the newer generation's read has no table")
+		}
+		old.(*writer).DropRemovedReads(t.Context())
+		if !exists() {
+			t.Error("the fenced generation dropped the newer one's read")
+		}
+	})
+}
