@@ -1133,3 +1133,45 @@ func TestDestinationRecoverLostOnlyBehindItsOwnFence(t *testing.T) {
 		})
 	}
 }
+
+// A commit that ends an overwrite read with rows, on a writer that never
+// had the stream's schema and so has no target table for it, is refused:
+// the read's table and its rows stay, and no marker is written. The next
+// attempt, with the recorded schemas applied before its Recover, replaces
+// the target with the read's rows.
+func TestDestinationReplaceWithNoTable(t *testing.T) {
+	k := newKit(t)
+	s := schemaOf("o", idCol, vCol)
+	streams := []destination.Stream{{Name: "o", Mode: destination.Overwrite}}
+	start := time.Now()
+	w1, _ := k.open(1, streams, destination.Epoch{}, nil)
+	k.apply(w1, s)
+	if err := w1.StartReads(t.Context(), map[string]time.Time{"o": start}); err != nil {
+		t.Fatal(err)
+	}
+	k.commit(w1, epoch(1, 1), batchOf(s, ins(1, int64(1), "a")))
+	w2, _ := k.open(2, streams, destination.Epoch{}, nil)
+	if err := w2.StartReads(t.Context(), map[string]time.Time{"o": start}); err != nil {
+		t.Fatal(err)
+	}
+	e := epoch(2, 2)
+	if err := w2.EndRead(t.Context(), e, "o"); err != nil {
+		t.Fatal(err)
+	}
+	st := k.stage(w2, e)
+	if _, err := w2.Commit(t.Context(), e, []destination.Staged{st}); err == nil || !strings.Contains(err.Error(), "no target table") {
+		t.Errorf("commit of a read with rows and no table: %v", err)
+	}
+	read := readName("p", "o", start)
+	wantRows(t, "the read's rows", k.rows(read, "id", "v"), "1|a")
+	wantRows(t, "markers of the epoch", k.query("SELECT toString(count()) FROM $db._openetl_loads WHERE generation = 2 AND epoch = 2"), "0")
+	w3 := k.writer(3, streams)
+	k.apply(w3, s)
+	if r, err := w3.Recover(t.Context(), 3, e, []destination.Staged{st}); err != nil || r != destination.Redone {
+		t.Fatalf("the next attempt recovered %v, %v; want redone", r, err)
+	}
+	wantRows(t, "o after the next attempt", k.rows("o", "id", "v"), "1|a")
+	if k.exists(read) {
+		t.Error("the next attempt kept the read's table")
+	}
+}

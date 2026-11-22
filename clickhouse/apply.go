@@ -554,7 +554,12 @@ func (w *writer) reconcile(ctx context.Context, table, like string) error {
 // it changes nothing more.
 func (w *writer) replace(ctx context.Context, desc staged, s stagedStream) error {
 	if s.Table == "" {
-		return nil
+		// The stream never had a schema, so it has no table to empty.
+		rows, err := w.partitions(ctx, s.Read)
+		if err == nil && len(rows) > 0 {
+			err = fmt.Errorf("its read has rows in %s, and no target table", s.Read)
+		}
+		return err
 	}
 	ok, err := w.exists(ctx, s.Table)
 	if err != nil || !ok {
