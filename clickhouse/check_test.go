@@ -206,12 +206,13 @@ func TestDestinationCheckItems(t *testing.T) {
 	}
 
 	// A profile that pins a setting the destination sets.
-	pinned := testUser(t, db, "mutations_sync = 0 CONST", readmeGrants...)
-	d, err = NewDestination(userConfig(pinned, db))
-	if err != nil {
-		t.Fatal(err)
+	for _, pin := range []string{"mutations_sync = 0 CONST", "max_partitions_per_insert_block = 100 CONST"} {
+		d, err = NewDestination(userConfig(testUser(t, db, pin, readmeGrants...), db))
+		if err != nil {
+			t.Fatal(err)
+		}
+		connectortest.ExpectStatuses(t, connectortest.Items(t, d.Checks()), map[string]string{"settings.write": "failed setting_locked"})
 	}
-	connectortest.ExpectStatuses(t, connectortest.Items(t, d.Checks()), map[string]string{"settings.write": "failed setting_locked"})
 
 	// Preflight: a merge without a key, an existing table whose key can't
 	// take the stream's type, a seq that can't version, and a hard delete

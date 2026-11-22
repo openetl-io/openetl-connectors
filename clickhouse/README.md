@@ -160,7 +160,7 @@ GRANT SELECT, INSERT, CREATE TABLE, DROP TABLE, ALTER ADD COLUMN, ALTER MODIFY C
 GRANT SELECT ON system.parts, SELECT ON system.mutations TO openetl;
 ```
 
-`ALTER TABLE` on the database covers every `ALTER` there. The destination sets `async_insert = 0` and `mutations_sync = 2` on its queries, so a write is in a part, and a change done, before it goes on, and `join_use_nulls = 0` when it builds an epoch's table. The user's settings profile must let it change them, with `readonly = 0`, which writes need anyway.
+`ALTER TABLE` on the database covers every `ALTER` there. The destination sets `async_insert = 0` and `mutations_sync = 2` on its queries, so a write is in a part, and a change done, before it goes on, and `join_use_nulls = 0` and `max_partitions_per_insert_block = 0` when it builds an epoch's table, so that its rows land in any number of a table's partitions. The user's settings profile must let it change them, with `readonly = 0`, which writes need anyway.
 
 The destination's check is a list of items, each with what failed and the `GRANT` or setting that fixes it: the server's name resolves and its port answers (`net.dns`, `net.connect`), with TLS when `tls` is set (`net.tls`), the user signs in (`db.connect`), the server's version (`server.version`), the database is there or the user may create it (`database.create`), the user's grants, checked with `CHECK GRANT`, to create and drop tables (`grant.tables`), insert and select (`grant.rows`), add and widen columns (`grant.columns`), move, replace and drop partitions (`grant.partitions`), and fill held cells (`grant.update`), its `SELECT` on the system tables (`grant.system`), and that it may set what the destination's queries set (`settings.write`). A user whose profile has `readonly` set fails each grant, whatever its grants, as it can write nothing.
 
@@ -245,7 +245,6 @@ Only a single server was tested. The destination creates plain `MergeTree` and `
 - A patch rewrites the table's parts that hold a patched row, as any `ALTER TABLE … UPDATE` does.
 - The database's name can't have a `.` in it on a stream that takes patches, as `joinGet` takes its table as `database.table`.
 - An epoch isn't visible all at once: each stream's part becomes visible on its own, its rows before its patches, and in a table partitioned by its user, partition by partition, as nothing in ClickHouse moves several tables' or partitions' rows, or changes them, at once.
-- A stream's part of an epoch is built in one `INSERT … SELECT`. In a table partitioned by its user, a block of that insert with rows in more partitions than the user's `max_partitions_per_insert_block`, 100 unless its profile sets it, fails the commit, each attempt, with `TOO_MANY_PARTS`. Raise it in the profile, or set it to 0 for no limit.
 - JSON lands as a `String`, not ClickHouse's `JSON` type.
 - A timestamp outside 1900 to 2262-04-11 and a date outside 1900 to 2299 are clamped to the range; a null day-time or month-day-nano interval, list, map or struct isn't kept as null.
 - Table and column names can be up to 160 bytes. ClickHouse takes a table name of up to 213 bytes less its database's name, so this leaves 53 for that.

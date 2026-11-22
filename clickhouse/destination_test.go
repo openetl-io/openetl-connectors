@@ -866,3 +866,23 @@ func TestKillPatch(t *testing.T) {
 		t.Errorf("mutations left: %q, not only theirs", got)
 	}
 }
+
+// A table its user partitioned finely takes an epoch that spans more of
+// its partitions than one insert block may by default, 100: the epoch's
+// rows are built in a table of the destination's own, whose partitions
+// then move one at a time.
+func TestDestinationManyPartitions(t *testing.T) {
+	k := newKit(t)
+	if err := testConn(t).Exec(t.Context(), "CREATE TABLE "+qualified(k.db, "p")+" (id Int64, v Nullable(String)) ENGINE = MergeTree PARTITION BY id ORDER BY id"); err != nil {
+		t.Fatal(err)
+	}
+	s := schemaOf("p", idCol, vCol)
+	w, _ := k.open(1, []destination.Stream{{Name: "p", Mode: destination.Append}}, destination.Epoch{}, nil)
+	k.apply(w, s)
+	var rows []row
+	for i := range 150 {
+		rows = append(rows, ins(1, int64(i), "x"))
+	}
+	k.commit(w, epoch(1, 1), batchOf(s, rows...))
+	wantRows(t, "p's rows and partitions", k.query("SELECT concat(toString(count()), ' ', toString(uniqExact(_partition_id))) FROM $db.p"), "150 150")
+}

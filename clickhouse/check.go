@@ -518,7 +518,7 @@ func databaseChecks(k *sqlcheck.Kit, database, user, field string) []check.Check
 	system.Params = params
 
 	settings := k.Check("settings.write", check.Compatibility, "Set what the destination's queries set", func(ctx context.Context, p *check.Probe, db *sql.DB) error {
-		_, err := db.ExecContext(ctx, "SELECT 1 SETTINGS async_insert = 0, mutations_sync = 2, join_use_nulls = 0")
+		_, err := db.ExecContext(ctx, "SELECT 1 SETTINGS async_insert = 0, mutations_sync = 2, join_use_nulls = 0, max_partitions_per_insert_block = 0")
 		if isCode(err, codeReadonly, codeSettingConstraint) {
 			return settingLocked.Wrap(err)
 		}
@@ -528,8 +528,8 @@ func databaseChecks(k *sqlcheck.Kit, database, user, field string) []check.Check
 		p.Found("{user} can set {settings}.")
 		return nil
 	})
-	settings.Params = check.Params{"user": user, "settings": "async_insert, mutations_sync and join_use_nulls"}
-	settings.Description = "The destination sets async_insert = 0 and mutations_sync = 2 so a write is in a part, and a change done, before it goes on, and join_use_nulls = 0 for the joins a merge makes."
+	settings.Params = check.Params{"user": user, "settings": "async_insert, mutations_sync, join_use_nulls and max_partitions_per_insert_block"}
+	settings.Description = "The destination sets async_insert = 0 and mutations_sync = 2 so a write is in a part, and a change done, before it goes on, and join_use_nulls = 0 for the joins a merge makes and max_partitions_per_insert_block = 0 when it builds an epoch's table, so that rows of any number of a table's partitions land."
 	return append(checks, system, settings)
 }
 

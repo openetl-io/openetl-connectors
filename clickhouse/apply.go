@@ -133,7 +133,9 @@ func (w *writer) build(ctx context.Context, desc staged, s stagedStream, ready s
 	} else {
 		q = w.insertQuery(s, names(cols), rel, tmp)
 	}
-	if err := w.exec(ch.Context(ctx, ch.WithSettings(ch.Settings{"join_use_nulls": 0})), q); err != nil {
+	// The epoch's table, partitioned as the target is, takes rows of any
+	// number of its partitions, as they arrived.
+	if err := w.exec(ch.Context(ctx, ch.WithSettings(ch.Settings{"join_use_nulls": 0, "max_partitions_per_insert_block": 0})), q); err != nil {
 		return 0, err
 	}
 	var n uint64
