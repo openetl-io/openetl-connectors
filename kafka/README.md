@@ -139,7 +139,7 @@ Each row is one record:
 - Its key is the row's primary key, in the same format, if the stream has one.
 - Its header `openetl-id` holds the row's `_openetl_id`.
 
-A record, with its key and headers, must fit in 1,000,012 bytes, the client's batch limit and the brokers' default `max.message.bytes`, and in its topic's `max.message.bytes` if that is lower. A row whose record doesn't fails its epoch, and the attempt; from 0.2.0 the error names the topic and the limits. Raising the topic's limit doesn't raise the client's.
+A record, with its key and headers, must fit in the client's batch limit of 1,000,012 bytes and in its topic's `max.message.bytes`. A row whose record doesn't fails its epoch, and the attempt; from 0.2.0 the error names the topic and the limits. Raising the topic's limit doesn't raise the client's.
 
 With `avro` or `protobuf`, the destination registers each stream's schemas under `<topic>-value` and `<topic>-key`. Only append is supported: deletes from a CDC source arrive as rows whose `_openetl_op` is `delete`. With `tombstones: true`, each delete is followed by a tombstone for its key, so a compacted topic drops the key.
 
