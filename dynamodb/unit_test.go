@@ -292,7 +292,8 @@ func TestShardLineage(t *testing.T) {
 }
 
 // A shard read to its end lists its children alone, unless the endpoint
-// refuses the filter, when the read lists every shard.
+// refuses the filter, or the shard has none listed, when the read lists
+// every shard.
 func TestChildShards(t *testing.T) {
 	at := time.Now().Add(-time.Minute)
 	for _, noFilter := range []bool{false, true} {
@@ -310,10 +311,10 @@ func TestChildShards(t *testing.T) {
 		if rows := rec.RowsOf("t"); len(rows) != 4 {
 			t.Errorf("refusing the filter %v: read %v, want a's, b's, c's and d's", noFilter, rows)
 		}
-		// One listing of 8 pages, then a's children in 2 pages, and b's and
-		// c's in one each.
-		if !noFilter && f.describes != 8+2+1+1 {
-			t.Errorf("%d DescribeStream calls, want 12", f.describes)
+		// One listing of 8 pages, then a's children in 2 pages, b's in one,
+		// and c's none in one, then 8 again.
+		if !noFilter && f.describes != 8+2+1+1+8 {
+			t.Errorf("%d DescribeStream calls, want 20", f.describes)
 		}
 	}
 }

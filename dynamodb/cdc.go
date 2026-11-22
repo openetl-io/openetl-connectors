@@ -324,6 +324,11 @@ func (r *cdcRead) list(ctx context.Context, parent string) error {
 		}
 		in.ExclusiveStartShardId = d.LastEvaluatedShardId
 	}
+	if parent != "" && len(listed) == 0 {
+		// No child listed: a whole listing, which also finds a child that an
+		// earlier shard's lookup came too early for.
+		return r.list(ctx, "")
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if parent != "" {
