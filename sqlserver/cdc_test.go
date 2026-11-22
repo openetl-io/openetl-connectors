@@ -235,6 +235,8 @@ func TestCDCKeyChanges(t *testing.T) {
 				e.exec("UPDATE $schema.t SET id = CASE id WHEN 2 THEN 3 WHEN 3 THEN 2 ELSE id END")
 				e.exec("UPDATE $schema.t SET id = 10 WHERE id = 4")
 				e.exec("BEGIN TRAN; DELETE FROM $schema.t WHERE id = 10; INSERT INTO $schema.t VALUES (10, 99); UPDATE $schema.t SET id = 11 WHERE id = 10; INSERT INTO $schema.t VALUES (10, 100); COMMIT")
+				// __$command_id counts through a transaction, not a statement.
+				e.exec("BEGIN TRAN; INSERT INTO $schema.t VALUES (20, 20), (21, 21), (22, 22); DELETE FROM $schema.t WHERE id = 22; UPDATE $schema.t SET v = 210 WHERE id = 21; INSERT INTO $schema.t VALUES (22, 220); COMMIT")
 				harvested()
 				c := read(t, s, source.CDC, map[string]string{"t": snap.last("t")})
 				got := fold(changes(snap, "t", "id", "v", "openetl.seq"), changes(c, "t", "id", "v", "openetl.seq"))
