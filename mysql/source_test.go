@@ -405,6 +405,53 @@ func TestCDCReadsSavepointsAndXA(t *testing.T) {
 	})
 }
 
+// TestCDCRefusesRolledBackXA reads an XA transaction's rows at its prepare,
+// and fails at its XA ROLLBACK, whether the same read or a later one gets
+// there: the rows it read never committed. One that commits, and one that
+// changed no table read, are read.
+func TestCDCRefusesRolledBackXA(t *testing.T) {
+	eachServer(t, func(t *testing.T, srv testServer) {
+		e := newSourceEnv(t, srv)
+		e.exec("CREATE TABLE $db.items (id int PRIMARY KEY, v varchar(20))")
+		e.exec("CREATE TABLE $db.other (id int PRIMARY KEY)")
+		s := e.source("")
+		first := read(t, s, cdc("xa", nil, "items"))
+		items, other := quoteIdent(e.database)+".items", quoteIdent(e.database)+".other"
+		for _, x := range []struct{ id, insert, end string }{
+			{"'c1'", "INSERT INTO " + items + " VALUES (1, 'a')", "COMMIT"},
+			{"'o1'", "INSERT INTO " + other + " VALUES (1)", "ROLLBACK"},
+			{"X'7231',X'62',7", "INSERT INTO " + items + " VALUES (2, 'b')", ""},
+		} {
+			conn, err := e.db.Conn(t.Context())
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, q := range []string{"XA START " + x.id, x.insert, "XA END " + x.id, "XA PREPARE " + x.id} {
+				if _, err := conn.ExecContext(t.Context(), q); err != nil {
+					t.Fatalf("%s: %v", q, err)
+				}
+			}
+			_ = conn.Close()
+			if x.end != "" {
+				e.exec("XA " + x.end + " " + x.id)
+			}
+		}
+		prepared := read(t, s, cdc("xa", map[string]string{"items": first.state("items")}, "items"))
+		if rows := prepared.rows("items"); len(rows) != 2 || strings.Contains(prepared.state("items"), "6331") {
+			t.Fatalf("rows %v, state %s", rows, prepared.state("items"))
+		}
+		e.exec("XA ROLLBACK X'7231',X'62',7")
+		for _, from := range []*capture{prepared, first} {
+			next := &capture{}
+			t.Cleanup(next.release)
+			err := s.Read(t.Context(), cdc("xa", map[string]string{"items": from.state("items")}, "items"), next)
+			if code := codeOf(err); code != protocolv1.ErrorCode_ERROR_CODE_CONFIG_INVALID || !strings.Contains(err.Error(), "items") {
+				t.Fatalf("a read of a rolled back XA: %v (%v), rows %v", err, code, next.rows("items"))
+			}
+		}
+	})
+}
+
 // TestCDCRefusesPartialRowImages reads a session's changes logged with
 // binlog_row_image = MINIMAL: its delete has the key it needs, its update
 // hasn't the columns it left alone and fails the read.

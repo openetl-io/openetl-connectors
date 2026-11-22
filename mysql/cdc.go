@@ -94,6 +94,9 @@ type cdcState struct {
 	// it: a read again from no state starts there.
 	Start     *binlogPos `json:"start,omitempty"`
 	StartGTID string     `json:"startGtid,omitempty"`
+	// The XA transactions prepared whose rows were read, by their xids as
+	// the binlog writes them, until their XA COMMIT.
+	XA []string `json:"xa,omitempty"`
 }
 
 type snapshotCursor struct {
@@ -140,6 +143,8 @@ type cdcStream struct {
 	fromState cdcState
 	// It got to until, and completed.
 	finished bool
+	// As its state's XA.
+	xa []string
 }
 
 // relation is a table as a binlog table map describes it.
@@ -160,8 +165,11 @@ type txn struct {
 	// A BEGIN was read: statements before the commit are its.
 	begun bool
 	skip  map[*cdcStream]bool
-	// Rows emitted so far.
-	n uint64
+	// Rows emitted so far, and the streams they're of.
+	n    uint64
+	sent map[*cdcStream]bool
+	// Its xid, from its XA END, if it's an XA transaction.
+	xa string
 }
 
 // chunk is a snapshot's chunk, held until the binlog passes its position.
@@ -239,7 +247,7 @@ func (s *Source) readCDC(ctx context.Context, conns *connPool, srv server, req s
 		// again.
 		if state.File != "" {
 			st.from = &state
-			st.start, st.startGTID = state.Start, state.StartGTID
+			st.start, st.startGTID, st.xa = state.Start, state.StartGTID, state.XA
 		}
 		if cs.Until != nil && !req.Continuous {
 			if err := r.stopAt(st, state, cs.Until); err != nil {
@@ -817,6 +825,23 @@ func (r *cdcReader) event(ctx context.Context, ev *replication.BinlogEvent) erro
 		case q == "COMMIT":
 			return r.commit(h)
 		}
+		if x, ok := strings.CutPrefix(q, "XA END "); ok && r.txn != nil {
+			r.txn.xa = x
+		}
+		// An XA transaction prepared before: its rows were read then.
+		xaCommit, committed := strings.CutPrefix(q, "XA COMMIT ")
+		xaRollback, rolledBack := strings.CutPrefix(q, "XA ROLLBACK ")
+		for _, st := range r.streams {
+			switch {
+			case st.finished || r.txn != nil && r.txn.skip[st]:
+			case rolledBack && slices.Contains(st.xa, xaRollback):
+				return configInvalid("mysql: binlog: XA transaction %s changed %s and was prepared, when its changes were read, and then rolled back: "+
+					"the destination has changes that never committed; read %[2]s again", xaRollback, st.t.name)
+			case committed && slices.Contains(st.xa, xaCommit):
+				st.xa = slices.DeleteFunc(st.xa, func(x string) bool { return x == xaCommit })
+				st.dirty = true
+			}
+		}
 		if schema, name, ok := statementTarget(q); ok && cmp.Or(schema, strings.ToUpper(string(e.Schema))) == strings.ToUpper(r.s.cfg.Database) {
 			for _, st := range r.streams {
 				if !st.finished && (r.txn == nil || !r.txn.skip[st]) && name == strings.ToUpper(st.t.name) {
@@ -841,8 +866,16 @@ func (r *cdcReader) event(ctx context.Context, ev *replication.BinlogEvent) erro
 		return r.commit(h)
 	case *replication.GenericEvent:
 		// An XA transaction's changes end at its XA PREPARE; its XA COMMIT
-		// comes later, as a statement on its own.
+		// or XA ROLLBACK comes later, as a statement on its own, unless its
+		// body's first byte says it's an XA COMMIT ONE PHASE.
 		if h.EventType == replication.XA_PREPARE_LOG_EVENT {
+			if r.txn != nil && r.txn.xa != "" && len(e.Data) > 0 && e.Data[0] == 0 {
+				for st := range r.txn.sent {
+					if !slices.Contains(st.xa, r.txn.xa) {
+						st.xa = append(st.xa, r.txn.xa)
+					}
+				}
+			}
 			return r.commit(h)
 		}
 	case *replication.TableMapEvent:
@@ -942,7 +975,7 @@ func (r *cdcReader) begin(g gomysql.GTIDSet, at time.Time) error {
 	if r.txn != nil {
 		return errors.New("mysql: binlog: a transaction began inside another")
 	}
-	r.txn = &txn{start: r.pos, gtid: g, at: at, skip: map[*cdcStream]bool{}}
+	r.txn = &txn{start: r.pos, gtid: g, at: at, skip: map[*cdcStream]bool{}, sent: map[*cdcStream]bool{}}
 	for _, st := range r.streams {
 		switch {
 		case st.from == nil:
@@ -1142,6 +1175,7 @@ func (rel *relation) values(row []any, skipped []int, keyOnly bool) ([]any, erro
 
 func (r *cdcReader) emit(st *cdcStream, op string, vals []any, unchanged []string) error {
 	r.txn.n++
+	r.txn.sent[st] = true
 	return r.add(st, op, seqOf(r.epoch, r.txn.start, r.txn.n), vals, unchanged)
 }
 
@@ -1339,7 +1373,7 @@ func (r *cdcReader) resume() error {
 // state is the stream's state at the read's position, or at its own if
 // that's ahead.
 func (r *cdcReader) state(st *cdcStream) ([]byte, error) {
-	s := cdcState{Server: r.server, binlogPos: r.pos, Epoch: r.epoch, Snapshot: st.cursor(), Start: st.start, StartGTID: st.startGTID}
+	s := cdcState{Server: r.server, binlogPos: r.pos, Epoch: r.epoch, Snapshot: st.cursor(), Start: st.start, StartGTID: st.startGTID, XA: st.xa}
 	if r.gset != nil {
 		s.GTID = r.gset.String()
 	}
