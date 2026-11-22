@@ -19,6 +19,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/dynamodbstreams"
 	streamtypes "github.com/aws/aws-sdk-go-v2/service/dynamodbstreams/types"
 	"github.com/aws/smithy-go"
+	"github.com/aws/smithy-go/middleware"
 
 	"github.com/openetl-io/openetl-connectors/connectortest"
 	"github.com/openetl-io/openetl/sdk/go/check"
@@ -286,6 +287,40 @@ func TestTrimmedPositionIsLost(t *testing.T) {
 	err = lineageRead(f, &connectortest.Recorder{}, cdcState{Stream: "arn", G: 1, Skip: at, Shards: map[string]shardState{"a": {Since: time.Now().Add(-25 * time.Hour)}}}).follow(t.Context())
 	if connectortest.CodeOf(err) != protocolv1.ErrorCode_ERROR_CODE_POSITION_LOST {
 		t.Errorf("a position past 24 hours: %v (%v), want POSITION_LOST", err, connectortest.CodeOf(err))
+	}
+}
+
+// A read reckons by AWS's clock, as its responses' Date headers have it:
+// with the host 10 minutes ahead, a record written as the snapshot starts
+// is read, not skipped; with the host an hour behind, a shard gone 24.5
+// hours after its position is lost.
+func TestAWSClock(t *testing.T) {
+	host := time.Date(2026, 1, 1, 0, 10, 0, 0, time.UTC)
+	ahead := -10 * time.Minute
+	defer func(n func() time.Time, s func(middleware.Metadata) (time.Time, bool)) { now, serverTime = n, s }(now, serverTime)
+	now = func() time.Time { return host }
+	serverTime = func(middleware.Metadata) (time.Time, bool) { return now().Add(ahead), true }
+	f := &fakeStream{
+		shards:  []streamtypes.Shard{shard("a", "", false)},
+		records: map[string][]streamtypes.Record{"a": {insert(1, 1, host.Add(ahead).Add(time.Second))}},
+	}
+	rec := &connectortest.Recorder{}
+	r := lineageRead(f, rec, cdcState{Stream: "arn", G: 1})
+	if err := r.begin(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.follow(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if rows := rec.RowsOf("t"); len(rows) != 1 {
+		t.Errorf("with the host 10 minutes ahead, a record written as the snapshot started: read %v, skip %v", rows, r.st.Skip)
+	}
+	ahead = time.Hour
+	err := lineageRead(f, &connectortest.Recorder{}, cdcState{Stream: "arn", G: 1, Skip: host, Shards: map[string]shardState{
+		"gone": {After: "1", Since: host.Add(-23*time.Hour - 30*time.Minute)}, "a": {Since: host},
+	}}).list(t.Context())
+	if connectortest.CodeOf(err) != protocolv1.ErrorCode_ERROR_CODE_POSITION_LOST {
+		t.Errorf("with the host an hour behind, a shard gone 24.5 hours after its position: %v, want POSITION_LOST", err)
 	}
 }
 
