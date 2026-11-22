@@ -680,6 +680,17 @@ func TestControlColumnsOfFiles(t *testing.T) {
 	}
 }
 
+// A file of a compression the source doesn't read fails the read, rather
+// than giving its compressed bytes as text.
+func TestUnreadCompression(t *testing.T) {
+	cfg := map[string]any{"url": "file://" + t.TempDir()}
+	put(t, cfg, map[string][]byte{"c/a.csv.xz": []byte("\xfd7zXZ\x00 not csv\n")})
+	s := newSource(t, cfg, map[string]any{"name": "c", "glob": "c/*", "format": "csv"})
+	if e, err := read(t, s, "c", source.FullRefresh, nil); err == nil || !strings.Contains(err.Error(), "c/a.csv.xz") {
+		t.Errorf("read: %v, %v", err, e.rows)
+	}
+}
+
 // A file named .bz2 is decompressed with bzip2.
 func TestBzip2(t *testing.T) {
 	cfg := map[string]any{"url": "file://" + t.TempDir()}

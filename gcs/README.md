@@ -52,7 +52,7 @@ Each of `streams` is the set of files under `url` that its `glob` matches, in on
 
 - `*` and `?` match within one path segment. `**` matches any number of segments. `{a,b}` matches either alternative, and `[...]` matches one character of a class, with `[!...]` for its complement.
 - The glob's part before the first of those characters is the prefix the source lists, so a glob that starts with a fixed directory lists only that directory.
-- A file whose name ends in `.gz` or `.gzip`, `.zst` or `.zstd`, `.bz2`, or `.sz` or `.snappy` is decompressed with gzip, zstd, bzip2 or framed snappy first. Parquet's and Avro's own compression needs nothing.
+- A file whose name ends in `.gz` or `.gzip`, `.zst` or `.zstd`, `.bz2`, or `.sz` or `.snappy` is decompressed with gzip, zstd, bzip2 or framed snappy first. One ending in `.xz`, `.lz4`, `.br`, `.zip`, `.7z` or `.lzo` fails the read, as the source can't decompress it. Parquet's and Avro's own compression needs nothing.
 
 Each record gets three more columns:
 

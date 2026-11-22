@@ -264,7 +264,9 @@ func (t *textWriter) close() error {
 // compressionOf is the compression name's extension says, and the name
 // without it.
 func compressionOf(name string) (compression, base string) {
-	for ext, c := range map[string]string{".gz": "gzip", ".gzip": "gzip", ".zst": "zstd", ".zstd": "zstd", ".sz": "snappy", ".snappy": "snappy", ".bz2": "bzip2"} {
+	for ext, c := range map[string]string{".gz": "gzip", ".gzip": "gzip", ".zst": "zstd", ".zstd": "zstd", ".sz": "snappy", ".snappy": "snappy", ".bz2": "bzip2",
+		// What decompress refuses, rather than read as text.
+		".xz": "xz", ".lz4": "lz4", ".br": "brotli", ".zip": "zip", ".7z": "7z", ".lzo": "lzo"} {
 		if strings.HasSuffix(name, ext) {
 			return c, strings.TrimSuffix(name, ext)
 		}
@@ -288,6 +290,9 @@ func decompress(compression string, r io.Reader) (io.ReadCloser, error) {
 		return io.NopCloser(bzip2.NewReader(r)), nil
 	case "snappy":
 		return io.NopCloser(snappy.NewReader(r)), nil
+	}
+	if compression != "none" {
+		return nil, fmt.Errorf("%s compression is none of gzip, zstd, bzip2 and snappy, which the source reads", compression)
 	}
 	return io.NopCloser(r), nil
 }
