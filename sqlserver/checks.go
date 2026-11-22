@@ -429,12 +429,12 @@ func (s *Source) cdcCheck(k *sqlcheck.Kit, name, ident string) check.Check {
 			return nil
 		}
 		// The capture job passes such a column's values through the
-		// database's code page; UTF-8 has every character.
+		// database's code page.
 		var column string
 		err := db.QueryRowContext(ctx, `SELECT TOP (1) c.name FROM sys.columns c
-			CROSS JOIN (SELECT COLLATIONPROPERTY(CONVERT(sysname, DATABASEPROPERTYEX(DB_NAME(), 'Collation')), 'CodePage') AS cp) d
 			WHERE c.object_id = OBJECT_ID(@p1) AND TYPE_NAME(c.system_type_id) IN ('char', 'varchar', 'text')
-				AND d.cp <> 65001 AND COLLATIONPROPERTY(c.collation_name, 'CodePage') <> d.cp ORDER BY c.column_id`, ident).Scan(&column)
+				AND COLLATIONPROPERTY(c.collation_name, 'CodePage') <> COLLATIONPROPERTY(CONVERT(sysname, DATABASEPROPERTYEX(DB_NAME(), 'Collation')), 'CodePage')
+			ORDER BY c.column_id`, ident).Scan(&column)
 		switch {
 		case errors.Is(err, sql.ErrNoRows):
 			return nil

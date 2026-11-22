@@ -842,9 +842,9 @@ func (m *capture) read(ctx context.Context, r *cdcReader, ct *cdcTable, in captu
 	// In a transaction's order, __$command_id's, as fn_cdc_get_all_changes
 	// can't give it: a statement's deletes come before its inserts, and an
 	// insert shares its __$seqval with the delete of the row it was, which
-	// in a heap has another key.
+	// in a heap has another key. An update's row before it, 3, isn't read.
 	q := "SELECT " + strings.Join(sel, ", ") + ", c.__$start_lsn, CONVERT(bigint, c.__$operation) FROM cdc." + quote(in.name+"_CT") +
-		" AS c WHERE c.__$start_lsn BETWEEN @p1 AND @p2 ORDER BY c.__$start_lsn, c.__$command_id, c.__$seqval, c.__$operation"
+		" AS c WHERE c.__$start_lsn BETWEEN @p1 AND @p2 AND c.__$operation <> 3 ORDER BY c.__$start_lsn, c.__$command_id, c.__$seqval, c.__$operation"
 	rows, err := r.s.db.QueryContext(ctx, q, lsnBytes(lo), lsnBytes(hi))
 	if err != nil {
 		return 0, classify(fmt.Errorf("sqlserver: read %s's changes: %w", t.name, err))
