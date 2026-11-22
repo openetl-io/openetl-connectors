@@ -16,6 +16,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 
+	"github.com/openetl-io/openetl-connectors/sqlstage"
 	"github.com/openetl-io/openetl/sdk/go/destination"
 )
 
@@ -164,6 +165,43 @@ func TestCommitAppliesOnce(t *testing.T) {
 	}
 	if got := env.rows("SELECT count(*) FROM sys.tables WHERE schema_id = SCHEMA_ID('" + env.schema + "') AND name LIKE '\\_openetl\\_stage\\_%' ESCAPE '\\'"); got[0] != "0" {
 		t.Errorf("%s staging tables left", got[0])
+	}
+}
+
+// Streams whose names differ only in case, as a source's tables can, each
+// land: their markers are told apart in a database whose collation ignores
+// case, as SQL Server's default does.
+func TestStreamsDifferingInCase(t *testing.T) {
+	for _, scope := range []destination.Scope{destination.ScopePipeline, destination.ScopeStream} {
+		env := newEnv(t)
+		w := env.openStreams(1, scope, destination.Stream{Name: "Orders", Mode: destination.Append}, destination.Stream{Name: "orders", Mode: destination.Append})
+		recov(t, w, 1, destination.Epoch{})
+		e := destination.Epoch{Generation: 1, N: 1}
+		for stream, table := range map[string]string{"Orders": "upper", "orders": "lower"} {
+			md := arrow.NewMetadata([]string{sqlstage.TableKey}, []string{table})
+			rec, _, err := array.RecordFromJSON(memory.DefaultAllocator, arrow.NewSchema([]arrow.Field{idField}, &md), strings.NewReader(`[{"id": 1}]`))
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(rec.Release)
+			if err := w.Write(t.Context(), e, stream, rec); err != nil {
+				t.Fatal(err)
+			}
+		}
+		st, err := w.PreCommit(t.Context(), e)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := w.Commit(t.Context(), e, []destination.Staged{st}); err != nil {
+			t.Fatal(err)
+		}
+		// The target is created before the apply, so it's its rows that
+		// tell.
+		for _, table := range []string{"upper", "lower"} {
+			if got := env.rows("SELECT count(*) FROM $schema." + table); got[0] != "1" {
+				t.Errorf("scope %v: %s has %s rows, want 1", scope, table, got[0])
+			}
+		}
 	}
 }
 

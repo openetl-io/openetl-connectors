@@ -1401,9 +1401,11 @@ func (w *writer) Fence(ctx context.Context, gen uint64) error {
 	if err := w.ensureSchema(ctx); err != nil {
 		return err
 	}
+	// Names compare by code point: the database's collation may take
+	// streams that differ in case as one.
 	for _, q := range []string{
-		"IF OBJECT_ID(" + literal(w.fenceTable()) + ", N'U') IS NULL CREATE TABLE " + w.fenceTable() + " (pipeline nvarchar(450) NOT NULL PRIMARY KEY, generation bigint NOT NULL)",
-		"IF OBJECT_ID(" + literal(w.loadsTable()) + ", N'U') IS NULL CREATE TABLE " + w.loadsTable() + ` (pipeline nvarchar(200) NOT NULL, stream nvarchar(200) NOT NULL,
+		"IF OBJECT_ID(" + literal(w.fenceTable()) + ", N'U') IS NULL CREATE TABLE " + w.fenceTable() + " (pipeline nvarchar(450) COLLATE " + binaryCollation + " NOT NULL PRIMARY KEY, generation bigint NOT NULL)",
+		"IF OBJECT_ID(" + literal(w.loadsTable()) + ", N'U') IS NULL CREATE TABLE " + w.loadsTable() + ` (pipeline nvarchar(200) COLLATE ` + binaryCollation + ` NOT NULL, stream nvarchar(200) COLLATE ` + binaryCollation + ` NOT NULL,
 			generation bigint NOT NULL, epoch bigint NOT NULL, loaded_at datetime2 NOT NULL DEFAULT SYSUTCDATETIME(),
 			PRIMARY KEY (pipeline, stream, generation, epoch))`,
 	} {
