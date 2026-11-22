@@ -405,10 +405,59 @@ func TestStartsDespiteClockSkew(t *testing.T) {
 		}
 		return subscription(nil, types.SubscribeToShardEvent{ChildShards: []types.ChildShard{{ShardId: aws.String("child")}}}), nil
 	}
-	r := &streamRead{name: "s", consumer: "arn:consumer", splits: map[string]bool{"shard-0": true}, shards: map[string]shardState{}, behind: map[string]time.Duration{}}
-	sr := &shardRead{rd: rd, r: r, shard: "shard-0", em: &unitEmitter{}, st: shardState{From: time.Now()}, th: throttle{retry: &s.cfg.Retry}}
+	r := &streamRead{name: "s", consumer: "arn:consumer", retention: 24 * time.Hour, splits: map[string]bool{"shard-0": true}, shards: map[string]shardState{}, behind: map[string]time.Duration{}}
+	sr := &shardRead{rd: rd, r: r, shard: "shard-0", em: &unitEmitter{}, st: shardState{From: time.Now(), Since: time.Now()}, th: throttle{retry: &s.cfg.Retry}}
 	if over, err := sr.subscribe(t.Context()); err != nil || !over {
 		t.Errorf("enhanced fan-out: over %v, %v", over, err)
+	}
+}
+
+// A read further behind than the stream's retention that needs a new
+// iterator, its last having expired, or a new subscription, fails with
+// POSITION_LOST if retention removed what follows its position: Kinesis
+// would read on from the oldest record left, past the gap, without a word.
+func TestReadBehindRetentionFailsOnANewIterator(t *testing.T) {
+	retention := 24 * time.Hour
+	since := time.Now().Add(-retention + 300*time.Millisecond)
+	f := &fakeStream{perCall: 3, shards: []*fakeShard{{id: "shardId-0"}}}
+	f.put(f.shards[0], 10, since)
+	f.trim(f.shards[0], "105")
+	var expired sync.Once
+	f.override = func(op string, _ map[string]any) (int, any, bool) {
+		hit := false
+		if op == "GetRecords" {
+			expired.Do(func() { hit = true })
+		}
+		if !hit {
+			return 0, nil, false
+		}
+		// The read stalls past its position's retention, and its iterator
+		// expires.
+		time.Sleep(600 * time.Millisecond)
+		status, body := apiError("ExpiredIteratorException", "Iterator expired.")
+		return status, body, true
+	}
+	s := newReadSource(t, f)
+	log, err := readOnce(t, s, source.ConfiguredStream{State: encodeState(map[string]shardState{"shardId-0": {After: "102", Since: since}})})
+	if codeOf(err) != protocolv1.ErrorCode_ERROR_CODE_POSITION_LOST {
+		t.Errorf("polling: %v isn't POSITION_LOST, and the read emitted %v", err, log.rowSeqs())
+	}
+
+	cl, err := s.cfg.client(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	rd := &reading{s: s, cl: cl, lanes: make(chan struct{}, 1), start: time.Now()}
+	rd.subscribe = func(context.Context, *awskinesis.SubscribeToShardInput) (eventStream, error) {
+		return subscription(nil, types.SubscribeToShardEvent{ContinuationSequenceNumber: aws.String("102"), MillisBehindLatest: aws.Int64(1000)}), nil
+	}
+	r := &streamRead{name: "s", consumer: "arn:consumer", retention: retention, splits: map[string]bool{"shardId-0": true}, shards: map[string]shardState{}, behind: map[string]time.Duration{}}
+	sr := &shardRead{rd: rd, r: r, shard: "shardId-0", em: &unitEmitter{}, st: shardState{After: "102", Since: since}, th: throttle{retry: &s.cfg.Retry}}
+	time.Sleep(time.Until(since.Add(retention)))
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	if _, err := sr.subscribe(ctx); codeOf(err) != protocolv1.ErrorCode_ERROR_CODE_POSITION_LOST {
+		t.Errorf("enhanced fan-out: %v isn't POSITION_LOST", err)
 	}
 }
 

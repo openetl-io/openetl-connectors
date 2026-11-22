@@ -73,6 +73,8 @@ A **scheduled** pipeline reads each shard until it has caught up, then stops. A 
 
 Before it reads, the source checks that each shard still holds the record it would resume from. If the stream's retention period has passed it, the read stops and the pipeline gets an incident: the position it would resume from is gone.
 
+From 0.2.0, a read further behind than the retention period checks again each time it needs a new shard iterator, its last having expired after 5 minutes unused, or a new enhanced fan-out subscription: Kinesis would otherwise go on from the oldest record left, past the ones it removed, without an error. Between those checks, a read that stays further behind than the retention period can still miss records Kinesis removes before the read reaches them, so keep reads well within it.
+
 ### Polling or enhanced fan-out
 
 From 0.2.0, `consumer.type` picks how shards are read:

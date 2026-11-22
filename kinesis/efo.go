@@ -202,6 +202,15 @@ func (sr *shardRead) subscribe(ctx context.Context) (bool, error) {
 			return false, nil
 		case <-time.After(time.Until(last.Add(subscribeEvery))):
 		}
+		if !last.IsZero() {
+			pos := sr.st
+			if cont != "" {
+				pos.After = cont
+			}
+			if err := sr.retained(ctx, pos); err != nil {
+				return false, err
+			}
+		}
 		last = time.Now()
 		at := sr.startingPosition(cont)
 		es, err := sr.rd.subscribe(ctx, &awskinesis.SubscribeToShardInput{

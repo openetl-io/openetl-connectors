@@ -994,6 +994,17 @@ func (s *Source) checkRetained(ctx context.Context, cl *awskinesis.Client, r *st
 		r.name, id, st.After, st.Since.UTC().Format(time.RFC3339), r.retention))
 }
 
+// retained fails unless the shard still holds the record at pos, where the
+// read is further behind than the stream's retention: a new iterator or
+// subscription from a record retention removed reads on from the oldest
+// one left, past the gap, and Kinesis says nothing of it.
+func (sr *shardRead) retained(ctx context.Context, pos shardState) error {
+	if time.Since(pos.Since) <= sr.r.retention {
+		return nil
+	}
+	return sr.rd.s.checkRetained(ctx, sr.rd.cl, sr.r, sr.shard, pos)
+}
+
 // list lists the stream's shards.
 func (s *Source) list(ctx context.Context, cl *awskinesis.Client, r *streamRead) error {
 	listed := map[string]types.Shard{}
@@ -1272,6 +1283,9 @@ func (sr *shardRead) getRecords(ctx context.Context) (bool, error) {
 			case ctx.Err() != nil:
 				return false, nil
 			case apiCode(err) == "ExpiredIteratorException":
+				if err := sr.retained(ctx, sr.st); err != nil {
+					return false, err
+				}
 				if it, err = sr.iterator(ctx); err != nil {
 					return false, err
 				}
