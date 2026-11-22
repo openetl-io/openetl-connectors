@@ -386,9 +386,9 @@ type loadError struct {
 }
 
 // logged is the first row the COPY of key logged, found by the file's
-// name in SYS_LOAD_ERROR_DETAIL or, where that view is missing, as on
-// provisioned clusters before it, in STL_LOAD_ERRORS; nil if neither has
-// one. A Parquet COPY logs only some of its errors.
+// name in SYS_LOAD_ERROR_DETAIL or else, as on provisioned clusters before
+// that view, in STL_LOAD_ERRORS; nil if neither has one. A Parquet COPY
+// logs only some of its errors.
 func (w *writer) logged(ctx context.Context, key string) *loadError {
 	like := w.lit("%" + key + "%")
 	for _, q := range []string{
@@ -413,6 +413,7 @@ func copyError(err error, row *loadError, cols []column) error {
 		for i, c := range cols {
 			if loadName(i) == col {
 				col = c.name
+				break
 			}
 		}
 		return sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_DATA_INVALID, fmt.Errorf("redshift: load column %q, line %d: %s: %w", col, row.line, row.reason, err))

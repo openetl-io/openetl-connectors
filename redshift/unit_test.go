@@ -490,6 +490,11 @@ func TestCopyError(t *testing.T) {
 	if err := copyError(copyErr, nil, cols); err != copyErr {
 		t.Errorf("no row and no context: %v", err)
 	}
+	// A stream's column may have a load column's name.
+	err = copyError(copyErr, &loadError{column: "c0", line: 1, reason: "r"}, []column{{name: "c1"}, {name: "price"}})
+	if !strings.Contains(err.Error(), `column "c1", line 1`) {
+		t.Errorf("a stream column named c1: %v", err)
+	}
 }
 
 // Each load's object is its own, though another deployment of a pipeline of
