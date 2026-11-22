@@ -411,3 +411,40 @@ func TestStartsDespiteClockSkew(t *testing.T) {
 		t.Errorf("enhanced fan-out: over %v, %v", over, err)
 	}
 }
+
+// Streams are listed by NextToken, or after the last name where a page says
+// there are more but has no token, as emulators answer: for discovery, and
+// for the streams teardown deregisters the consumer from.
+func TestListsEveryStream(t *testing.T) {
+	_, c := newFake(t, func(op string, in map[string]any) (int, any) {
+		switch {
+		case op != "ListStreams":
+			return apiError("UnknownOperationException", op)
+		case in["NextToken"] == "t":
+			return http.StatusOK, map[string]any{"StreamNames": []string{"c"}, "HasMoreStreams": true}
+		case in["ExclusiveStartStreamName"] == "c":
+			return http.StatusOK, map[string]any{"StreamNames": []string{"d"}, "HasMoreStreams": false}
+		}
+		return http.StatusOK, map[string]any{"StreamNames": []string{"a", "b"}, "HasMoreStreams": true, "NextToken": "t"}
+	})
+	s := &Source{cfg: SourceConfig{Connection: c}, values: records.NewDecoder(records.JSON, nil)}
+	cat, err := s.Discover(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, st := range cat.Streams {
+		got = append(got, st.Name)
+	}
+	want := []string{"a", "b", "c", "d"}
+	if !slices.Equal(got, want) {
+		t.Errorf("discovered %v, want %v", got, want)
+	}
+	cl, err := c.client(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := s.streams(t.Context(), cl, 0); err != nil || !slices.Equal(got, want) {
+		t.Errorf("listed %v, %v; want %v", got, err, want)
+	}
+}

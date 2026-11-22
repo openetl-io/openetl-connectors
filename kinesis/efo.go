@@ -143,12 +143,14 @@ func (s *Source) deregister(ctx context.Context, cl *awskinesis.Client, streamAR
 	}
 }
 
-// streams lists the streams the source offers, up to limit; 0: all.
+// streams lists the streams the source offers, up to limit; 0: all. Pages
+// follow NextToken, or the last name where a page says there are more but
+// has no token, as emulators answer.
 func (s *Source) streams(ctx context.Context, cl *awskinesis.Client, limit int) ([]string, error) {
 	var out []string
-	p := awskinesis.NewListStreamsPaginator(cl, &awskinesis.ListStreamsInput{})
-	for p.HasMorePages() {
-		page, err := p.NextPage(ctx)
+	in := &awskinesis.ListStreamsInput{}
+	for {
+		page, err := cl.ListStreams(ctx, in)
 		if err != nil {
 			return nil, classify(fmt.Errorf("kinesis: list streams: %w", err))
 		}
@@ -160,8 +162,15 @@ func (s *Source) streams(ctx context.Context, cl *awskinesis.Client, limit int) 
 				}
 			}
 		}
+		switch n := len(page.StreamNames); {
+		case page.NextToken != nil:
+			in = &awskinesis.ListStreamsInput{NextToken: page.NextToken}
+		case aws.ToBool(page.HasMoreStreams) && n > 0:
+			in = &awskinesis.ListStreamsInput{ExclusiveStartStreamName: aws.String(page.StreamNames[n-1])}
+		default:
+			return out, nil
+		}
 	}
-	return out, nil
 }
 
 // eventStream is a SubscribeToShard subscription's events.

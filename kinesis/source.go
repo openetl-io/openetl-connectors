@@ -253,26 +253,20 @@ func (s *Source) Discover(ctx context.Context) (source.Catalog, error) {
 	if err != nil {
 		return source.Catalog{}, err
 	}
+	names, err := s.streams(ctx, cl, 0)
+	if err != nil {
+		return source.Catalog{}, err
+	}
 	var cat source.Catalog
-	p := awskinesis.NewListStreamsPaginator(cl, &awskinesis.ListStreamsInput{})
-	for p.HasMorePages() {
-		page, err := p.NextPage(ctx)
+	for _, name := range names {
+		sc, err := s.declared(ctx, name)
 		if err != nil {
-			return source.Catalog{}, classify(fmt.Errorf("kinesis: list streams: %w", err))
+			return source.Catalog{}, err
 		}
-		for _, name := range page.StreamNames {
-			if !s.offered(name) {
-				continue
-			}
-			sc, err := s.declared(ctx, name)
-			if err != nil {
-				return source.Catalog{}, err
-			}
-			cat.Streams = append(cat.Streams, source.CatalogStream{
-				Name: name, CursorField: sequenceColumn, Replay: source.Exact, Schema: sc,
-				SyncModes: []source.SyncMode{source.Stream},
-			})
-		}
+		cat.Streams = append(cat.Streams, source.CatalogStream{
+			Name: name, CursorField: sequenceColumn, Replay: source.Exact, Schema: sc,
+			SyncModes: []source.SyncMode{source.Stream},
+		})
 	}
 	return cat, nil
 }
