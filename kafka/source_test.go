@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/twmb/franz-go/pkg/kadm"
+	"github.com/twmb/franz-go/pkg/kerr"
 	"github.com/twmb/franz-go/pkg/kgo"
 	"github.com/twmb/franz-go/pkg/kmsg"
 
@@ -770,5 +771,74 @@ func TestARedoOfAReadFromLatestStartsWhereItDid(t *testing.T) {
 		if !lastIs(got, "complete "+topicIDField.ReplaceAllString(string(end), "")) {
 			t.Errorf("a read to %s ended with %v", end, got)
 		}
+	}
+}
+
+// A bounded read that doesn't learn where a partition ends, because the
+// brokers answer for it with an error or not at all, fails as a transient
+// failure that OpenETL tries again, rather than complete the partition
+// unread.
+func TestAPartitionWhoseEndIsUnknownFailsTheRead(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		// The answer for partition 1, false for none.
+		answer func(*kmsg.ListOffsetsResponseTopicPartition) bool
+	}{
+		{"with an error", func(p *kmsg.ListOffsetsResponseTopicPartition) bool {
+			p.ErrorCode = kerr.OffsetNotAvailable.Code
+			return true
+		}},
+		{"with no answer", func(*kmsg.ListOffsetsResponseTopicPartition) bool { return false }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := fakeCluster(t)
+			addrs := c.ListenAddrs()
+			topic := "events"
+			produceRecords(t, addrs, topic, 2, 5, 5)
+			// Where the read starts is listed as usual; where it ends, read
+			// committed, isn't for partition 1.
+			c.ControlKey(int16(kmsg.ListOffsets), func(req kmsg.Request) (kmsg.Response, error, bool) {
+				c.KeepControl()
+				r := req.(*kmsg.ListOffsetsRequest)
+				if r.IsolationLevel != 1 {
+					return nil, nil, false
+				}
+				resp := r.ResponseKind().(*kmsg.ListOffsetsResponse)
+				for _, rt := range r.Topics {
+					t := kmsg.NewListOffsetsResponseTopic()
+					t.Topic = rt.Topic
+					for _, rp := range rt.Partitions {
+						p := kmsg.NewListOffsetsResponseTopicPartition()
+						p.Partition, p.Offset, p.Timestamp = rp.Partition, 5, -1
+						if rp.Partition != 1 || tc.answer(&p) {
+							t.Partitions = append(t.Partitions, p)
+						}
+					}
+					resp.Topics = append(resp.Topics, t)
+				}
+				return resp, nil, true
+			})
+			s, err := NewSource(fakeConfig(t, addrs, map[string]any{"topics": []string{topic}}))
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, cs := range []source.ConfiguredStream{
+				{Name: topic},
+				{Name: topic, Splits: []source.Split{{ID: "p0", State: encodeOffset(0, "")}, {ID: "p1", State: encodeOffset(0, "")}}},
+			} {
+				out := &splitEvents{events: map[string][]string{}}
+				ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+				err := s.Read(ctx, source.ReadRequest{Streams: []source.ConfiguredStream{cs}, Pipeline: "p", Lanes: 1}, out)
+				cancel()
+				if codeOf(err) != "ERROR_CODE_TRANSIENT" {
+					t.Errorf("a read (in splits %v) whose partition 1's end is unknown: %v", cs.Splits != nil, err)
+				}
+				for id, ev := range out.events {
+					if slices.ContainsFunc(ev, func(e string) bool { return strings.HasPrefix(e, "complete") }) {
+						t.Errorf("split %q completed: %v", id, ev)
+					}
+				}
+			}
+		})
 	}
 }

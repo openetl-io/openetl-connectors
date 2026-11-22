@@ -51,7 +51,7 @@ Each topic is a stream, read with the `stream` sync mode: every topic the creden
 
 The source reads each partition from its next offset, as the last checkpoint recorded it, with `read_committed` isolation, so records of aborted transactions are never read. A topic it hasn't read before starts at `startOffset`: `earliest` (the default) or `latest`.
 
-- A **scheduled** pipeline reads each partition up to the end it had when the sync started, then stops.
+- A **scheduled** pipeline reads each partition up to the end it had when the sync started, then stops. From 0.2.0, a read that the brokers don't tell where one of its partitions ends fails as transient, and OpenETL tries it again. Before 0.2.0, that partition completed with nothing read, and its records waited for the next sync.
 - A **continuous** pipeline keeps reading, and picks up partitions added to its topics within 30 seconds. From 0.2.0, where a topic's partitions are read on [several workers](#jobs-on-several-workers), only the worker that reads partition 0 picks them up, so each is read once. Before 0.2.0, every worker also took the partitions the others read, and read them again from their start. A continuous pipeline that resumes from a checkpoint written before 0.2.0 still does that once, on the worker that reads partition 0: until then, the checkpoint doesn't say which partitions the others have.
 
 Once a checkpoint is committed, the source commits its offsets to the consumer group `group` (`openetl-<pipeline>` unless set), so Kafka's tools show the read's lag. The checkpoint, not the group, is where the next read starts.

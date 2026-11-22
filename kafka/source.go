@@ -452,13 +452,10 @@ func (s *Source) Read(ctx context.Context, req source.ReadRequest, out source.Em
 		if err != nil {
 			return classify(fmt.Errorf("kafka: list end offsets: %w", err))
 		}
-		ends.Each(func(o kadm.ListedOffset) {
-			if r := reads[o.Topic]; r != nil && o.Err == nil {
-				r.end[o.Partition] = o.Offset
-			}
-		})
 		for _, r := range reads {
-			maps.Copy(r.end, r.until)
+			if err := r.ends(ends); err != nil {
+				return err
+			}
 		}
 	}
 	consume := map[string]map[int32]kgo.Offset{}
@@ -635,6 +632,27 @@ func (r *topicRead) readSplits(st source.ConfiguredStream, out source.Emitter, c
 			// As the read that reached the stop had it.
 			r.count = u.Partitions
 		}
+	}
+	return nil
+}
+
+// ends gives each partition of a bounded read its end: its until, or else
+// the end listed, read committed. A partition the brokers didn't list an
+// end for fails the read, rather than complete with nothing read.
+func (r *topicRead) ends(listed kadm.ListedOffsets) error {
+	for p := range r.next {
+		if u, ok := r.until[p]; ok {
+			r.end[p] = u
+			continue
+		}
+		o, ok := listed.Lookup(r.name, p)
+		switch {
+		case !ok:
+			return sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_TRANSIENT, fmt.Errorf("kafka: the brokers listed no end for %s partition %d", r.name, p))
+		case o.Err != nil:
+			return classify(fmt.Errorf("kafka: %s partition %d's end: %w", r.name, p, o.Err))
+		}
+		r.end[p] = o.Offset
 	}
 	return nil
 }
