@@ -692,12 +692,9 @@ func (w *writer) stage(ctx context.Context, parts map[uint64]map[string]*epochFi
 		byStream[stream] = ef
 	}
 	if ef.open != nil && ef.open.schemaID != tbl.Schema().ID {
-		files, err := ef.open.finish()
-		ef.open = nil
-		if err != nil {
+		if _, err := ef.finish(); err != nil {
 			return nil, err
 		}
-		ef.files = append(ef.files, files...)
 	}
 	if ef.open == nil {
 		if ef.open, err = w.startPart(tbl, e, stream, ef.n, patch); err != nil {
@@ -725,28 +722,28 @@ func without(batch arrow.RecordBatch, refused []destination.RefusedColumn) arrow
 	return array.NewRecordBatch(arrow.NewSchema(fields, &md), cols, batch.NumRows())
 }
 
-// finish closes the files' last part, and returns all of them.
+// finish closes the files' last part, and returns all of them. If it fails,
+// the files it closed are still among ef.files, to be dropped.
 func (ef *epochFiles) finish() ([]string, error) {
 	if ef == nil {
 		return nil, nil
 	}
-	files := ef.files
 	if ef.open != nil {
 		more, err := ef.open.finish()
 		ef.open = nil
+		ef.files = append(ef.files, more...)
 		if err != nil {
 			return nil, err
 		}
-		files = append(files, more...)
 	}
-	return files, nil
+	return ef.files, nil
 }
 
 // PreCommit closes the epoch's data files. They are durable once closed,
 // and invisible until Commit adds them to their tables. A lane with a read in
 // progress describes it in every epoch, with rows or not, as the epoch it ends
 // in can be one the lane knows nothing of.
-func (w *writer) PreCommit(ctx context.Context, e destination.Epoch) (destination.Staged, error) {
+func (w *writer) PreCommit(ctx context.Context, e destination.Epoch) (_ destination.Staged, err error) {
 	if err := w.checkDropped(ctx); err != nil {
 		return nil, err
 	}
@@ -754,6 +751,12 @@ func (w *writer) PreCommit(ctx context.Context, e destination.Epoch) (destinatio
 	byStream, patches := w.parts[e.N], w.patches[e.N]
 	delete(w.parts, e.N)
 	delete(w.patches, e.N)
+	defer func() {
+		if err != nil {
+			w.drop(byStream)
+			w.drop(patches)
+		}
+	}()
 	ended := w.ended[e.N]
 	delete(w.ended, e.N)
 	for _, s := range w.cfg.Streams {
@@ -1481,16 +1484,17 @@ func (w *writer) removeFiles(tbl *table.Table, paths []string) {
 func (w *writer) Close(context.Context) error {
 	for _, parts := range []map[uint64]map[string]*epochFiles{w.parts, w.patches} {
 		for _, byStream := range parts {
-			for stream, ef := range byStream {
-				files := ef.files
-				if ef.open != nil {
-					more, _ := ef.open.finish()
-					files = append(files, more...)
-				}
-				w.dropFiles(w.ns, w.name(stream), files)
-			}
+			w.drop(byStream)
 		}
 	}
 	w.cancel()
 	return nil
+}
+
+// drop drops an epoch's files, by stream, closing its open ones first.
+func (w *writer) drop(byStream map[string]*epochFiles) {
+	for stream, ef := range byStream {
+		_, _ = ef.finish()
+		w.dropFiles(w.ns, w.name(stream), ef.files)
+	}
 }

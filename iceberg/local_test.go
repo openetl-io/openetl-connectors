@@ -3,6 +3,9 @@ package iceberg
 import (
 	"context"
 	"errors"
+	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -41,18 +44,37 @@ func localWriter(t *testing.T, cat catalog.Catalog, gen uint64, streams ...desti
 
 var localFields = []arrow.Field{{Name: "id", Type: arrow.PrimitiveTypes.Int64, Nullable: true}, {Name: "name", Type: arrow.BinaryTypes.String, Nullable: true}}
 
-// localWrite writes rows, a JSON array of objects of localFields, to stream
-// in epoch e.
-func localWrite(t *testing.T, w *writer, e destination.Epoch, stream, rows string) {
+// localBatch is rows, a JSON array of objects of localFields.
+func localBatch(t *testing.T, rows string) arrow.RecordBatch {
 	t.Helper()
 	b, _, err := array.RecordFromJSON(memory.DefaultAllocator, arrow.NewSchema(localFields, nil), strings.NewReader(rows))
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer b.Release()
-	if err := w.Write(t.Context(), e, stream, b); err != nil {
+	t.Cleanup(b.Release)
+	return b
+}
+
+// localWrite writes rows, as localBatch takes them, to stream in epoch e.
+func localWrite(t *testing.T, w *writer, e destination.Epoch, stream, rows string) {
+	t.Helper()
+	if err := w.Write(t.Context(), e, stream, localBatch(t, rows)); err != nil {
 		t.Fatalf("write %s: %v", stream, err)
 	}
+}
+
+// localDataDir is the table's data directory.
+func localDataDir(t *testing.T, cat catalog.Catalog, name string) string {
+	t.Helper()
+	tbl, err := cat.LoadTable(t.Context(), table.Identifier{"default", name})
+	if err != nil {
+		t.Fatal(err)
+	}
+	u, err := url.Parse(tbl.Location())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return filepath.Join(u.Path, "data")
 }
 
 // localRows is the table's rows, by id: each one's name.
@@ -152,5 +174,39 @@ func TestRecoverIsLostOnlyBehindItsOwnFence(t *testing.T) {
 	}
 	if got := localRows(t, cat, "a"); len(got) != 1 || got[1] != "a1" {
 		t.Errorf("a holds %v; want 1: a1", got)
+	}
+}
+
+// A PreCommit that fails on one stream's files leaves the epoch's other
+// files to Close, which drops them, as it does an epoch's that was never
+// pre-committed.
+func TestCloseDropsAFailedPreCommitsFiles(t *testing.T) {
+	cat := localCatalog(t)
+	w := localWriter(t, cat, 1, destination.Stream{Name: "a", Mode: destination.Append}, destination.Stream{Name: "b", Mode: destination.Append})
+	e1, e2 := destination.Epoch{Generation: 1, N: 1}, destination.Epoch{Generation: 1, N: 2}
+	localWrite(t, w, e1, "a", `[{"id": 1, "name": "a1"}]`)
+	localWrite(t, w, e1, "b", `[{"id": 1, "name": "b1"}]`)
+	st, err := w.PreCommit(t.Context(), e1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Commit(t.Context(), e1, []destination.Staged{st}); err != nil {
+		t.Fatal(err)
+	}
+	dir := localDataDir(t, cat, "a")
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+	_ = w.Write(t.Context(), e2, "a", localBatch(t, `[{"id": 2, "name": "a2"}]`))
+	localWrite(t, w, e2, "b", `[{"id": 2, "name": "b2"}]`)
+	if _, err := w.PreCommit(t.Context(), e2); err == nil {
+		t.Fatal("PreCommit wrote into a directory it can't write to")
+	}
+	if err := w.Close(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := os.ReadDir(localDataDir(t, cat, "b")); err != nil || len(got) != 1 {
+		t.Errorf("b's data files are %v, %v; want only epoch 1's", got, err)
 	}
 }
