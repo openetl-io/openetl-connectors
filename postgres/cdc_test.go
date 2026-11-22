@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/apache/arrow-go/v18/arrow"
+	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/jackc/pglogrepl"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -649,6 +650,55 @@ func TestCDCNewColumnsAndTruncates(t *testing.T) {
 	c = readCDC(t, s, pipeline, map[string]string{"users": f.last("users")})
 	if got := c.column("users", "extra"); !slices.Equal(got, []string{"7"}) {
 		t.Errorf("extra is %q", got)
+	}
+}
+
+// A column whose type changes while CDC reads its table fails the read,
+// retryably, at the first change the log describes with its new type, whose
+// values would land as the type the run declared. The next attempt, which
+// declares the new type, reads on, the changes from before it too. A change
+// that's declared the same, as varchar to text, reads on.
+func TestCDCChangedColumnType(t *testing.T) {
+	for _, c := range []struct {
+		name, from, to, before, after string
+		fails                         bool
+		want                          []string
+	}{
+		{"int to bigint", "int", "bigint", "2", "3000000000", true, []string{"2", "3000000000"}},
+		{"int to text", "int", "text", "2", "'abc'", true, []string{"2", "abc"}},
+		{"numeric scale", "numeric(10,2)", "numeric(12,4)", "2", "1.2345", true, []string{"2.00", "1.2345"}},
+		// abcd is base64 too, so it would land as a binary's three bytes.
+		{"bytea to text", "bytea", "text", "NULL", "'abcd'", true, []string{array.NullValueStr, "abcd"}},
+		{"varchar to text", "varchar(10)", "text", "'b'", "'abc'", false, []string{"b", "abc"}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			e := newSourceEnv(t)
+			e.exec("CREATE TABLE $schema.users (id int PRIMARY KEY, v " + c.from + ")")
+			s, pipeline := e.cdcSource("")
+			state := readCDC(t, s, pipeline, map[string]string{"users": ""}).last("users")
+			f := follow(t, s, pipeline, map[string]string{"users": state})
+			f.await(t, "a resume point", func() bool { return f.last("users") != "" })
+			e.exec("INSERT INTO $schema.users VALUES (1, " + c.before + ")")
+			e.exec("ALTER TABLE $schema.users ALTER COLUMN v TYPE " + c.to)
+			e.exec("INSERT INTO $schema.users VALUES (2, " + c.after + ")")
+			if c.fails {
+				select {
+				case err := <-f.done:
+					if codeOf(err) != protocolv1.ErrorCode_ERROR_CODE_TRANSIENT || !strings.Contains(err.Error(), `"v"`) {
+						t.Fatalf("a read that saw v's new type: %v", err)
+					}
+				case <-time.After(30 * time.Second):
+					t.Fatal("the read didn't end at v's new type")
+				}
+			} else {
+				f.await(t, "the change after", func() bool { return len(f.column("users", "id")) == 2 })
+				f.cancel()
+				<-f.done
+			}
+			if got := readCDC(t, s, pipeline, map[string]string{"users": state}).column("users", "v"); !slices.Equal(got, c.want) {
+				t.Errorf("v is %q", got)
+			}
+		})
 	}
 }
 

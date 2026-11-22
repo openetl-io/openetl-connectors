@@ -848,6 +848,9 @@ func (r *cdcReader) relation(ctx context.Context, m *pglogrepl.RelationMessage) 
 		if j < 0 {
 			return sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_TRANSIENT, fmt.Errorf("postgres: %s has a new column %q; the read starts again to take it", st.t.name, c.Name))
 		}
+		if err := r.sameType(ctx, st.t, st.t.cols[j], m.RelationID, c); err != nil {
+			return err
+		}
 		for k, kc := range st.t.key {
 			if kc == j {
 				rel.key[k] = len(rel.at)
@@ -863,6 +866,31 @@ func (r *cdcReader) relation(ctx context.Context, m *pglogrepl.RelationMessage) 
 		}
 	}
 	return nil
+}
+
+// sameType fails, retryably, where the log describes t's column sc with a
+// type declared otherwise than sc's, as an ALTER COLUMN ... TYPE since the
+// read started leaves it: its values would land as sc's type. The next
+// attempt declares the new type. The log describes the changes before such
+// an ALTER with the old type, which reads on once the table's column has
+// the declared type: the declared type takes the old one's values.
+func (r *cdcReader) sameType(ctx context.Context, t table, sc sourceColumn, relid uint32, c *pglogrepl.RelationMessageColumn) error {
+	if c.DataType == sc.oid && c.TypeModifier == sc.typmod {
+		return nil
+	}
+	declared := declaredType(sc)
+	if arrow.TypeEqual(declaredType(sourceColumn{oid: c.DataType, typmod: c.TypeModifier, dims: sc.dims}), declared) {
+		return nil
+	}
+	now := sourceColumn{dims: sc.dims}
+	err := r.conn.QueryRow(ctx, "SELECT atttypid, atttypmod FROM pg_attribute WHERE attrelid = $1 AND attname = $2 AND NOT attisdropped", relid, sc.name).Scan(&now.oid, &now.typmod)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return classify(err)
+	}
+	if err == nil && arrow.TypeEqual(declaredType(now), declared) {
+		return nil
+	}
+	return sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_TRANSIENT, fmt.Errorf("postgres: %s's column %q changed type; the read starts again to declare it", t.name, sc.name))
 }
 
 func (r *cdcReader) stream(name string) *cdcStream {

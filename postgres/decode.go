@@ -193,6 +193,20 @@ func newColBuilder(mem memory.Allocator, c sourceColumn) (*colBuilder, error) {
 	return cb, nil
 }
 
+// declaredType is the type a column of c's type is declared as; nil if it
+// can't be read.
+func declaredType(c sourceColumn) arrow.DataType {
+	cb, err := newColBuilder(memory.DefaultAllocator, c)
+	if err != nil {
+		return nil
+	}
+	defer cb.b.Release()
+	if cb.declared != nil {
+		return cb.declared
+	}
+	return cb.b.Type()
+}
+
 // numericType is the decimal a numeric column is declared as: its own
 // precision and scale where Decimal128 holds them, otherwise decimal(38, 9).
 func numericType(typmod int32) *arrow.Decimal128Type {
