@@ -525,6 +525,35 @@ func TestHalve(t *testing.T) {
 	}
 }
 
+// A split that a Resplit made starts at a file's hash. Asked again with two
+// files left, it starts the next and gives the last, that file, away: the new
+// split is that file's, not the whole of its own, which would have its ID.
+func TestResplitAtTheRangesFirstFile(t *testing.T) {
+	cfg := map[string]any{"url": "file://" + t.TempDir()}
+	// Read in this order; the range starts at e's hash, which is below a's and d's.
+	put(t, cfg, map[string][]byte{"q/a.jsonl": []byte("{\"id\":1}\n"), "q/d.jsonl": []byte("{\"id\":2}\n"), "q/e.jsonl": []byte("{\"id\":3}\n")})
+	s := newSource(t, cfg, map[string]any{"name": "q", "glob": "q/*", "format": "jsonl"})
+	r := hashRange{keyHash("q/e.jsonl"), wholeRange.Hi}
+	var once sync.Once
+	accepted := false
+	// At a's resume point, with d and e left.
+	e, err := readWith(t, s, func(string) {
+		once.Do(func() { accepted, _ = s.Resplit(t.Context(), "q", r.id()) })
+	}, source.ConfiguredStream{Name: "q", SyncMode: source.FullRefresh, Splits: []source.Split{{ID: r.id()}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !accepted {
+		t.Fatal("the Resplit wasn't accepted")
+	}
+	if len(e.ended) != 2 {
+		t.Errorf("%d splits completed, not the split and the one it gave: %v", len(e.ended), slices.Collect(maps.Keys(e.ended)))
+	}
+	if got := lines(e); len(got) != 3 || len(slices.Compact(got)) != 3 {
+		t.Errorf("read %v", got)
+	}
+}
+
 func mustOpenBucket(t *testing.T, s *Source) *blob.Bucket {
 	t.Helper()
 	b, err := s.store.open(t.Context())

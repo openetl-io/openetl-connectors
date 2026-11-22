@@ -157,7 +157,16 @@ func halve(r hashRange, left []string, at string) (keep, give hashRange, ok bool
 	}
 	if at == "" {
 		m := hashes[len(hashes)/2]
-		return hashRange{r.Lo, m}, hashRange{m, r.Hi}, true
+		if m > r.Lo {
+			return hashRange{r.Lo, m}, hashRange{m, r.Hi}, true
+		}
+		// The range starts at the file's hash, as one a halving gave does:
+		// the files at that hash go, so the new split isn't the whole
+		// range, with its ID.
+		if m+1 < r.Hi {
+			return hashRange{m + 1, r.Hi}, hashRange{r.Lo, m + 1}, true
+		}
+		return r, r, false
 	}
 	a := keyHash(at)
 	var lower, upper []uint64
