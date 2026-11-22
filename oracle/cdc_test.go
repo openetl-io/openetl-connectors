@@ -373,32 +373,22 @@ func TestCDCKeyChanged(t *testing.T) {
 	}
 }
 
-// A table's LOB the run didn't declare, such as one added since Discover,
-// isn't read from the table for a change.
-func TestCDCUndeclaredLOB(t *testing.T) {
+// A column the run didn't declare, such as one added since Discover, fails
+// the read retryably, so the next attempt declares it, rather than leave
+// its values out.
+func TestCDCUndeclaredColumn(t *testing.T) {
 	db := testDB(t)
-	cdcTable(t, db, "CDC_ULOB", `(id NUMBER(10) PRIMARY KEY, v VARCHAR2(20), cl CLOB)`)
-	exec(t, db, `INSERT INTO cdc_ulob VALUES (1, 'a', 'lob')`)
+	cdcTable(t, db, "CDC_UCOL", `(id NUMBER(10) PRIMARY KEY, v VARCHAR2(20))`)
+	exec(t, db, `INSERT INTO cdc_ucol VALUES (1, 'a')`)
 	s := cdcSource(t, "")
-	read := func(state []byte) *cdcOut {
-		t.Helper()
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-		defer cancel()
-		out := newCDCOut()
-		cs := source.ConfiguredStream{Name: "CDC_ULOB", SyncMode: source.CDC, State: state, Columns: []string{"ID", "V"}}
-		if err := s.Read(ctx, source.ReadRequest{Lanes: 1, Streams: []source.ConfiguredStream{cs}}, out); err != nil {
-			t.Fatal(err)
-		}
-		return out
-	}
-	first := read(nil)
-	exec(t, db, `UPDATE cdc_ulob SET v = 'b' WHERE id = 1`)
-	second := read(first.state("CDC_ULOB"))
-	if got, want := cdcChanges(second.records("CDC_ULOB"), "ID", "V"), []string{"update 1 b"}; !slices.Equal(got, want) {
-		t.Fatalf("changes: got %q, want %q", got, want)
-	}
-	if _, ok := second.records("CDC_ULOB")[0]["CL"]; ok {
-		t.Error("the undeclared LOB was sent")
+	first := mustRead(t, s, nil, "CDC_UCOL")
+	exec(t, db, `ALTER TABLE cdc_ucol ADD (cl CLOB)`, `UPDATE cdc_ucol SET v = 'b', cl = 'lob' WHERE id = 1`)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	cs := source.ConfiguredStream{Name: "CDC_UCOL", SyncMode: source.CDC, State: first.state("CDC_UCOL"), Columns: []string{"ID", "V"}}
+	err := s.Read(ctx, source.ReadRequest{Lanes: 1, Streams: []source.ConfiguredStream{cs}}, newCDCOut())
+	if cdcCode(err) != protocolv1.ErrorCode_ERROR_CODE_TRANSIENT || !strings.Contains(err.Error(), `"CL"`) {
+		t.Errorf("a column added since Discover: got %v, want TRANSIENT naming it", err)
 	}
 }
 
@@ -443,6 +433,38 @@ func TestCDCPositionLost(t *testing.T) {
 	exec(t, db, `TRUNCATE TABLE cdc_lost`)
 	if _, err := readCDCOnce(t, s, map[string][]byte{"CDC_LOST": first.state("CDC_LOST")}, "CDC_LOST"); cdcCode(err) != protocolv1.ErrorCode_ERROR_CODE_POSITION_LOST {
 		t.Errorf("a truncated table: got %v, want POSITION_LOST", err)
+	}
+}
+
+// Truncating a partition deletes rows the redo log doesn't name: the read
+// fails as lost rather than keep them.
+func TestCDCPartitionTruncated(t *testing.T) {
+	db := testDB(t)
+	cdcTable(t, db, "CDC_PART", `(id NUMBER(10) PRIMARY KEY, v VARCHAR2(10)) PARTITION BY RANGE (id) (PARTITION p1 VALUES LESS THAN (10), PARTITION p2 VALUES LESS THAN (MAXVALUE))`)
+	exec(t, db, `INSERT INTO cdc_part VALUES (1, 'a')`, `INSERT INTO cdc_part VALUES (20, 'b')`)
+	s := cdcSource(t, "")
+	first := mustRead(t, s, nil, "CDC_PART")
+	exec(t, db, `INSERT INTO cdc_part VALUES (2, 'c')`, `ALTER TABLE cdc_part TRUNCATE PARTITION p1`)
+	if _, err := readCDCOnce(t, s, map[string][]byte{"CDC_PART": first.state("CDC_PART")}, "CDC_PART"); cdcCode(err) != protocolv1.ErrorCode_ERROR_CODE_POSITION_LOST {
+		t.Errorf("a truncated partition: got %v, want POSITION_LOST", err)
+	}
+}
+
+// Exchanging another table's partition with a table read swaps the table's
+// rows, which the redo log doesn't name either.
+func TestCDCPartitionExchangedIn(t *testing.T) {
+	db := testDB(t)
+	cdcTable(t, db, "CDC_XIN", `(id NUMBER(10), v VARCHAR2(10), CONSTRAINT cdc_xin_pk PRIMARY KEY (id))`)
+	dropTable(t, db, "CDC_XOTHER")
+	exec(t, db, `CREATE TABLE cdc_xother (id NUMBER(10), v VARCHAR2(10), CONSTRAINT cdc_xother_pk PRIMARY KEY (id) USING INDEX LOCAL)
+	  PARTITION BY RANGE (id) (PARTITION p1 VALUES LESS THAN (100), PARTITION p2 VALUES LESS THAN (MAXVALUE))`)
+	t.Cleanup(func() { dropTable(t, db, "CDC_XOTHER") })
+	exec(t, db, `INSERT INTO cdc_xin VALUES (1, 'a')`, `INSERT INTO cdc_xother VALUES (50, 'other')`)
+	s := cdcSource(t, "")
+	first := mustRead(t, s, nil, "CDC_XIN")
+	exec(t, db, `INSERT INTO cdc_xin VALUES (2, 'b')`, `ALTER TABLE cdc_xother EXCHANGE PARTITION p1 WITH TABLE cdc_xin INCLUDING INDEXES`)
+	if _, err := readCDCOnce(t, s, map[string][]byte{"CDC_XIN": first.state("CDC_XIN")}, "CDC_XIN"); cdcCode(err) != protocolv1.ErrorCode_ERROR_CODE_POSITION_LOST {
+		t.Errorf("a partition exchanged in: got %v, want POSITION_LOST", err)
 	}
 }
 
@@ -511,5 +533,44 @@ func TestCDCRetention(t *testing.T) {
 	ps, err = s.Retention(ctx, "p", map[string][]byte{"CDC_RET": state, "OTHER": []byte(`{"scn":5,"from":5,"db":"1:1"}`)}, nil)
 	if err != nil || len(ps) != 1 || ps[0].LagBytes == nil || ps[0].RetentionLeft != nil {
 		t.Errorf("a position beside another database's: got %+v, %v", ps, err)
+	}
+}
+
+// Commits whose redo LGWR writes when it likes, made while a read runs,
+// are each sent once.
+func TestCDCNoWaitCommits(t *testing.T) {
+	db := testDB(t)
+	cdcTable(t, db, "CDC_NOWAIT", `(id NUMBER(10) PRIMARY KEY)`)
+	s := cdcSource(t, "")
+	first := mustRead(t, s, nil, "CDC_NOWAIT")
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	out := newCDCOut()
+	done := make(chan error, 1)
+	go func() {
+		done <- s.Read(ctx, source.ReadRequest{Continuous: true, Lanes: 1, Streams: []source.ConfiguredStream{{Name: "CDC_NOWAIT", SyncMode: source.CDC, State: first.state("CDC_NOWAIT")}}}, out)
+	}()
+	exec(t, db, `BEGIN
+	  FOR i IN 1..200 LOOP
+	    INSERT INTO cdc_nowait VALUES (i);
+	    COMMIT WRITE BATCH NOWAIT;
+	    IF MOD(i, 20) = 0 THEN DBMS_SESSION.SLEEP(0.3); END IF;
+	  END LOOP;
+	END;`)
+	for deadline := time.Now().Add(30 * time.Second); len(out.records("CDC_NOWAIT")) < 200 && time.Now().Before(deadline); {
+		time.Sleep(200 * time.Millisecond)
+	}
+	cancel()
+	<-done
+	var got []string
+	for _, row := range out.records("CDC_NOWAIT") {
+		got = append(got, row["ID"])
+	}
+	want := make([]string, 200)
+	for i := range want {
+		want[i] = fmt.Sprint(i + 1)
+	}
+	if !slices.Equal(got, want) {
+		t.Errorf("sent %d rows, want 1 to 200 once each, in order: %v", len(got), got)
 	}
 }

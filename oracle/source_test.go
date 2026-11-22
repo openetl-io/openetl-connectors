@@ -216,34 +216,63 @@ func fullRefresh(name string) source.ConfiguredStream {
 	return source.ConfiguredStream{Name: name, SyncMode: source.FullRefresh}
 }
 
-const typesTable = `(id NUMBER(10) PRIMARY KEY,
-	n4 NUMBER(4), n9 NUMBER(9), n18 NUMBER(18), n38 NUMBER(38), nn NUMBER, n102 NUMBER(10, 2),
-	fl FLOAT, bf BINARY_FLOAT, bd BINARY_DOUBLE, bo BOOLEAN,
-	v VARCHAR2(40), nv NVARCHAR2(20), c CHAR(5), nc NCHAR(4), cl CLOB, ncl NCLOB, lg LONG, rid ROWID, urid UROWID,
-	x XMLTYPE, j JSON, r RAW(16), bl BLOB,
-	d DATE, ts TIMESTAMP(6), ts9 TIMESTAMP(9), tz TIMESTAMP(6) WITH TIME ZONE, tz9 TIMESTAMP(9) WITH TIME ZONE,
-	ltz TIMESTAMP(6) WITH LOCAL TIME ZONE, ym INTERVAL YEAR(9) TO MONTH, ds INTERVAL DAY(9) TO SECOND(9))`
-
 // Every type the source reads, at its extremes, as NULL and as the values
 // Oracle treats specially, comes as its value.
 func TestSourceReadsEveryType(t *testing.T) {
 	db := testDB(t)
-	srcTable(t, db, "ST_TYPES", typesTable,
-		`INSERT INTO ST_TYPES VALUES (1, 9999, 999999999, 999999999999999999, 99999999999999999999999999999999999999, 1e125, 99999999.99,
-		  1e125, BINARY_FLOAT_NAN, BINARY_DOUBLE_INFINITY, TRUE,
-		  'héllo ✓', N'日本語 ✓𝄞', 'ab', N'日本', NULL, N'ñ ✓', 'long text', CHARTOROWID('AAAR3sAAEAAAACXAAA'), CHARTOROWID('AAAR3sAAEAAAACXAAA'),
-		  XMLTYPE('<a>1</a>'), JSON('{"a":[1,2.5,"x"],"b":null}'), HEXTORAW('00FF10'), NULL,
-		  TO_DATE('9999-12-31 23:59:59', 'YYYY-MM-DD HH24:MI:SS'), TIMESTAMP '9999-12-31 23:59:59.999999', TIMESTAMP '9999-12-31 23:59:59.999999999',
-		  TIMESTAMP '2026-07-01 12:00:00.123456 America/New_York', TIMESTAMP '9999-12-31 23:59:59.999999999 +00:00',
-		  TIMESTAMP '2026-01-01 00:00:00.5 +02:00', INTERVAL '178956970-07' YEAR(9) TO MONTH, INTERVAL '999999999 23:59:59.999999999' DAY(9) TO SECOND(9))`,
-		`INSERT INTO ST_TYPES VALUES (2, -9999, -999999999, -999999999999999999, -99999999999999999999999999999999999999, -1e-130, -0.01,
-		  -1.5, -BINARY_FLOAT_INFINITY, BINARY_DOUBLE_NAN, FALSE,
-		  '', N'', 'x', N'a', EMPTY_CLOB(), NULL, NULL, NULL, NULL,
-		  NULL, NULL, NULL, EMPTY_BLOB(),
-		  TO_DATE('-4712-01-01', 'SYYYY-MM-DD'), TO_TIMESTAMP('-4712-01-01 00:00:00.000001', 'SYYYY-MM-DD HH24:MI:SS.FF'),
-		  TO_TIMESTAMP('0001-01-01 00:00:00.000000001', 'YYYY-MM-DD HH24:MI:SS.FF'),
-		  TO_TIMESTAMP_TZ('-4712-01-01 00:00:00 +00:00', 'SYYYY-MM-DD HH24:MI:SS TZH:TZM'), TIMESTAMP '2026-01-01 05:30:00.000000001 Asia/Kolkata',
-		  TIMESTAMP '1970-01-01 00:00:00 +00:00', INTERVAL '-178956970-07' YEAR(9) TO MONTH, INTERVAL '-999999999 23:59:59.999999999' DAY(9) TO SECOND(9))`,
+	_, ver, compat, err := server(t.Context(), db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hasBool, hasJSON := major(compat) >= 23, major(ver) >= 21
+	cols := []string{
+		"id NUMBER(10) PRIMARY KEY",
+		"n4 NUMBER(4)", "n9 NUMBER(9)", "n18 NUMBER(18)", "n38 NUMBER(38)", "nn NUMBER", "n102 NUMBER(10, 2)",
+		"fl FLOAT", "bf BINARY_FLOAT", "bd BINARY_DOUBLE",
+		"v VARCHAR2(40)", "nv NVARCHAR2(20)", "c CHAR(5)", "nc NCHAR(4)", "cl CLOB", "ncl NCLOB", "lg LONG", "rid ROWID", "urid UROWID",
+		"x XMLTYPE", "r RAW(16)", "bl BLOB",
+		"d DATE", "ts TIMESTAMP(6)", "ts9 TIMESTAMP(9)", "tz TIMESTAMP(6) WITH TIME ZONE", "tz9 TIMESTAMP(9) WITH TIME ZONE",
+		"ltz TIMESTAMP(6) WITH LOCAL TIME ZONE", "ym INTERVAL YEAR(9) TO MONTH", "ds INTERVAL DAY(9) TO SECOND(9)",
+	}
+	names := []string{
+		"id", "n4", "n9", "n18", "n38", "nn", "n102", "fl", "bf", "bd",
+		"v", "nv", "c", "nc", "cl", "ncl", "lg", "rid", "urid", "x", "r", "bl",
+		"d", "ts", "ts9", "tz", "tz9", "ltz", "ym", "ds",
+	}
+	row1 := []string{
+		"1", "9999", "999999999", "999999999999999999", "99999999999999999999999999999999999999", "1e125", "99999999.99",
+		"1e125", "BINARY_FLOAT_NAN", "BINARY_DOUBLE_INFINITY",
+		"'héllo ✓'", "N'日本語 ✓𝄞'", "'ab'", "N'日本'", "NULL", "N'ñ ✓'", "'long text'", "CHARTOROWID('AAAR3sAAEAAAACXAAA')", "CHARTOROWID('AAAR3sAAEAAAACXAAA')",
+		"XMLTYPE('<a>1</a>')", "HEXTORAW('00FF10')", "NULL",
+		"TO_DATE('9999-12-31 23:59:59', 'YYYY-MM-DD HH24:MI:SS')", "TIMESTAMP '9999-12-31 23:59:59.999999'", "TIMESTAMP '9999-12-31 23:59:59.999999999'",
+		"TIMESTAMP '2026-07-01 12:00:00.123456 America/New_York'", "TIMESTAMP '9999-12-31 23:59:59.999999999 +00:00'",
+		"TIMESTAMP '2026-01-01 00:00:00.5 +02:00'", "INTERVAL '178956970-07' YEAR(9) TO MONTH", "INTERVAL '999999999 23:59:59.999999999' DAY(9) TO SECOND(9)",
+	}
+	row2 := []string{
+		"2", "-9999", "-999999999", "-999999999999999999", "-99999999999999999999999999999999999999", "-1e-130", "-0.01",
+		"-1.5", "-BINARY_FLOAT_INFINITY", "BINARY_DOUBLE_NAN",
+		"''", "N''", "'x'", "N'a'", "EMPTY_CLOB()", "NULL", "NULL", "NULL", "NULL",
+		"NULL", "NULL", "EMPTY_BLOB()",
+		"TO_DATE('-4712-01-01', 'SYYYY-MM-DD')", "TO_TIMESTAMP('-4712-01-01 00:00:00.000001', 'SYYYY-MM-DD HH24:MI:SS.FF')",
+		"TO_TIMESTAMP('0001-01-01 00:00:00.000000001', 'YYYY-MM-DD HH24:MI:SS.FF')",
+		"TO_TIMESTAMP_TZ('-4712-01-01 00:00:00 +00:00', 'SYYYY-MM-DD HH24:MI:SS TZH:TZM')", "TIMESTAMP '2026-01-01 05:30:00.000000001 Asia/Kolkata'",
+		"TIMESTAMP '1970-01-01 00:00:00 +00:00'", "INTERVAL '-178956970-07' YEAR(9) TO MONTH", "INTERVAL '-999999999 23:59:59.999999999' DAY(9) TO SECOND(9)",
+	}
+	if hasBool {
+		cols = append(cols, "bo BOOLEAN")
+		names = append(names, "bo")
+		row1 = append(row1, "TRUE")
+		row2 = append(row2, "FALSE")
+	}
+	if hasJSON {
+		cols = append(cols, "j JSON")
+		names = append(names, "j")
+		row1 = append(row1, `JSON('{"a":[1,2.5,"x"],"b":null}')`)
+		row2 = append(row2, "NULL")
+	}
+	srcTable(t, db, "ST_TYPES", "("+strings.Join(cols, ", ")+")",
+		"INSERT INTO ST_TYPES ("+strings.Join(names, ", ")+") VALUES ("+strings.Join(row1, ", ")+")",
+		"INSERT INTO ST_TYPES ("+strings.Join(names, ", ")+") VALUES ("+strings.Join(row2, ", ")+")",
 		`INSERT INTO ST_TYPES (id) VALUES (3)`,
 		`INSERT INTO ST_TYPES (id, nn, n102, fl, bf, bd, d, ts, tz, ym, ds) VALUES (4, 0, 0, 0.1, 3.40282347E+38F, 1.7976931348623157E+308D,
 		  TO_DATE('-0001-12-31 23:00:00', 'SYYYY-MM-DD HH24:MI:SS'), TIMESTAMP '1582-10-15 00:00:00', TO_TIMESTAMP_TZ('-0001-12-31 23:00:00 -05:00', 'SYYYY-MM-DD HH24:MI:SS TZH:TZM'),
@@ -272,11 +301,15 @@ func TestSourceReadsEveryType(t *testing.T) {
 	for _, f := range cs.Schema.Fields() {
 		declared[f.Name] = f.Type.String()
 	}
-	for col, want := range map[string]string{
+	wantDeclared := map[string]string{
 		"ID": "int64", "N4": "int16", "N18": "int64", "N38": "decimal(38, 0)", "NN": "decimal(38, 9)", "N102": "decimal(10, 2)",
-		"FL": "float64", "BF": "float32", "BO": "bool", "BL": "binary", "D": "timestamp[us]", "TS9": "timestamp[us]",
+		"FL": "float64", "BF": "float32", "BL": "binary", "D": "timestamp[us]", "TS9": "timestamp[us]",
 		"TZ": "timestamp[us, tz=UTC]", "TZ9": "timestamp[us, tz=UTC]", "LTZ": "timestamp[us, tz=UTC]", "YM": "month_day_nano_interval",
-	} {
+	}
+	if hasBool {
+		wantDeclared["BO"] = "bool"
+	}
+	for col, want := range wantDeclared {
 		if declared[col] != want {
 			t.Errorf("%s is declared %s, want %s", col, declared[col], want)
 		}
@@ -291,26 +324,26 @@ func TestSourceReadsEveryType(t *testing.T) {
 	bigBlob := strings.Repeat("deadbeef", 300_000)
 	want := []map[string]string{{
 		"ID": "1", "N4": "9999", "N9": "999999999", "N18": "999999999999999999", "N38": strings.Repeat("9", 38),
-		"NN": "1" + strings.Repeat("0", 125), "N102": "99999999.99", "FL": "1e+125", "BF": "NaN", "BD": "+Inf", "BO": "true",
+		"NN": "1" + strings.Repeat("0", 125), "N102": "99999999.99", "FL": "1e+125", "BF": "NaN", "BD": "+Inf",
 		"V": "héllo ✓", "NV": "日本語 ✓𝄞", "C": "ab   ", "NC": "日本  ", "CL": bigClob, "NCL": "ñ ✓", "LG": "long text",
-		"RID": "AAAR3sAAEAAAACXAAA", "URID": "AAAR3sAAEAAAACXAAA", "X": "<a>1</a>", "J": `{"a":[1,2.5,"x"],"b":null}`,
+		"RID": "AAAR3sAAEAAAACXAAA", "URID": "AAAR3sAAEAAAACXAAA", "X": "<a>1</a>",
 		"R": "00ff10", "BL": bigBlob,
 		"D": "9999-12-31 23:59:59.000000000", "TS": "9999-12-31 23:59:59.999999000", "TS9": "9999-12-31 23:59:59.999999999",
 		"TZ": "2026-07-01 16:00:00.123456000", "TZ9": "9999-12-31 23:59:59.999999999Z", "LTZ": "2025-12-31 22:00:00.500000000",
 		"YM": "2147483647m 0d 0ns", "DS": "0m 999999999d 86399999999999ns",
 	}, {
 		"ID": "2", "N4": "-9999", "N9": "-999999999", "N18": "-999999999999999999", "N38": "-" + strings.Repeat("9", 38),
-		"NN": "-0." + strings.Repeat("0", 129) + "1", "N102": "-0.01", "FL": "-1.5", "BF": "-Inf", "BD": "NaN", "BO": "false",
+		"NN": "-0." + strings.Repeat("0", 129) + "1", "N102": "-0.01", "FL": "-1.5", "BF": "-Inf", "BD": "NaN",
 		// Oracle stores an empty string as NULL. go-ora reads an empty LOB,
 		// which isn't NULL to Oracle, as NULL.
 		"V": "NULL", "NV": "NULL", "C": "x    ", "NC": "a   ", "CL": "NULL", "NCL": "NULL", "LG": "NULL",
-		"RID": "NULL", "URID": "NULL", "X": "NULL", "J": "NULL", "R": "NULL", "BL": "NULL",
+		"RID": "NULL", "URID": "NULL", "X": "NULL", "R": "NULL", "BL": "NULL",
 		// Oracle's -4712 is 4712 BC, which Go numbers -4711.
 		"D": "-4711-01-01 00:00:00.000000000", "TS": "-4711-01-01 00:00:00.000001000", "TS9": "0001-01-01 00:00:00.000000001",
 		"TZ": "-4711-01-01 00:00:00.000000000", "TZ9": "2026-01-01 00:00:00.000000001Z", "LTZ": "1970-01-01 00:00:00.000000000",
 		"YM": "-2147483647m 0d 0ns", "DS": "0m -999999999d -86399999999999ns",
 	}, {
-		"ID": "3", "NN": "NULL", "TS9": "NULL", "TZ9": "NULL", "CL": "NULL", "BL": "NULL", "BO": "NULL", "YM": "NULL", "DS": "NULL",
+		"ID": "3", "NN": "NULL", "TS9": "NULL", "TZ9": "NULL", "CL": "NULL", "BL": "NULL", "YM": "NULL", "DS": "NULL",
 	}, {
 		"ID": "4", "NN": "0", "N102": "0", "FL": "0.1", "BF": "3.4028235e+38", "BD": "1.7976931348623157e+308",
 		// 1 BC, which Go numbers 0. Oracle holds 23:00 at -05:00 on its last
@@ -318,6 +351,15 @@ func TestSourceReadsEveryType(t *testing.T) {
 		"D": "0-12-31 23:00:00.000000000", "TS": "1582-10-15 00:00:00.000000000", "TZ": "0-01-01 04:00:00.000000000",
 		"YM": "0m 0d 0ns", "DS": "0m 0d 1ns",
 	}}
+	if hasBool {
+		want[0]["BO"] = "true"
+		want[1]["BO"] = "false"
+		want[2]["BO"] = "NULL"
+	}
+	if hasJSON {
+		want[0]["J"] = `{"a":[1,2.5,"x"],"b":null}`
+		want[1]["J"] = "NULL"
+	}
 	for i, w := range want {
 		for col, v := range w {
 			got, ok := rows[i][col]
@@ -389,19 +431,17 @@ func TestSourceSkipsTablesWithoutReadableColumns(t *testing.T) {
 // it, by keys of every orderable kind.
 func TestSourceChunksAndResumesExactly(t *testing.T) {
 	db := testDB(t)
-	var vals []string
+	var stmts []string
 	for i := range 30 {
-		vals = append(vals, fmt.Sprintf("('k%d', HEXTORAW('%02X'), TO_TIMESTAMP('2026-01-01 00:00:%02d.%09d', 'YYYY-MM-DD HH24:MI:SS.FF9'), %d.25, %d)", i%3, i%5, i, i, i, i))
+		stmts = append(stmts, fmt.Sprintf("INSERT INTO ST_CHUNK VALUES ('k%d', HEXTORAW('%02X'), TO_TIMESTAMP('2026-01-01 00:00:%02d.%09d', 'YYYY-MM-DD HH24:MI:SS.FF9'), %d.25, %d)", i%3, i%5, i, i, i, i))
 	}
-	srcTable(t, db, "ST_CHUNK", "(a VARCHAR2(10), b RAW(4), c TIMESTAMP(9), d NUMBER(10, 2), v NUMBER, PRIMARY KEY (a, b, c, d))",
-		"INSERT INTO ST_CHUNK VALUES "+strings.Join(vals, ", "))
-	vals = vals[:0]
+	srcTable(t, db, "ST_CHUNK", "(a VARCHAR2(10), b RAW(4), c TIMESTAMP(9), d NUMBER(10, 2), v NUMBER, PRIMARY KEY (a, b, c, d))", stmts...)
+	stmts = stmts[:0]
 	for i := range 20 {
-		vals = append(vals, fmt.Sprintf("(N'é%d', TO_DATE('%d-%02d-28 23:59:59', 'SYYYY-MM-DD HH24:MI:SS'), TIMESTAMP '2026-01-01 00:00:00.123 +00:00' + NUMTODSINTERVAL(%d, 'SECOND'), %d)",
+		stmts = append(stmts, fmt.Sprintf("INSERT INTO ST_CHUNK2 VALUES (N'é%d', TO_DATE('%d-%02d-28 23:59:59', 'SYYYY-MM-DD HH24:MI:SS'), TIMESTAMP '2026-01-01 00:00:00.123 +00:00' + NUMTODSINTERVAL(%d, 'SECOND'), %d)",
 			i%2, []int{-4712, -1, 1, 1582, 9999}[i%5], 1+i%12, i, i))
 	}
-	srcTable(t, db, "ST_CHUNK2", "(n NCHAR(3), dt DATE, lt TIMESTAMP(3) WITH LOCAL TIME ZONE, v NUMBER, PRIMARY KEY (n, dt, lt))",
-		"INSERT INTO ST_CHUNK2 VALUES "+strings.Join(vals, ", "))
+	srcTable(t, db, "ST_CHUNK2", "(n NCHAR(3), dt DATE, lt TIMESTAMP(3) WITH LOCAL TIME ZONE, v NUMBER, PRIMARY KEY (n, dt, lt))", stmts...)
 	s := srcSource(t, testDSN(), `, "tables": ["ST_CHUNK", "ST_CHUNK2"], "chunkRows": 4`)
 	for name, n := range map[string]int{"ST_CHUNK": 30, "ST_CHUNK2": 20} {
 		first := srcRead(t, s, 1, fullRefresh(name))
@@ -431,9 +471,10 @@ func TestSourceChunksAndResumesExactly(t *testing.T) {
 func TestSourceReadsIncrementally(t *testing.T) {
 	db := testDB(t)
 	srcTable(t, db, "ST_INC", "(id NUMBER(10) PRIMARY KEY, at TIMESTAMP(6) WITH TIME ZONE, amount NUMBER(38), name NVARCHAR2(10), d DATE)",
-		`INSERT INTO ST_INC VALUES (1, TIMESTAMP '2026-01-01 00:00:00 +00:00', 1, N'a', DATE '2026-01-01'),
-		  (2, TIMESTAMP '2026-01-01 12:00:00 America/New_York', 99999999999999999999999999999999999999, N'é', DATE '2026-01-01'),
-		  (3, NULL, 3, NULL, DATE '2026-01-02'), (4, TIMESTAMP '2026-01-01 10:00:00 +00:00', 3, N'b', DATE '2026-01-02')`)
+		`INSERT INTO ST_INC VALUES (1, TIMESTAMP '2026-01-01 00:00:00 +00:00', 1, N'a', DATE '2026-01-01')`,
+		`INSERT INTO ST_INC VALUES (2, TIMESTAMP '2026-01-01 12:00:00 America/New_York', 99999999999999999999999999999999999999, N'é', DATE '2026-01-01')`,
+		`INSERT INTO ST_INC VALUES (3, NULL, 3, NULL, DATE '2026-01-02')`,
+		`INSERT INTO ST_INC VALUES (4, TIMESTAMP '2026-01-01 10:00:00 +00:00', 3, N'b', DATE '2026-01-02')`)
 	s := srcSource(t, testDSN(), `, "tables": ["ST_INC"], "chunkRows": 1`)
 	for _, c := range []struct {
 		cursor          string
@@ -479,7 +520,8 @@ func TestSplitsReadEveryRowOnce(t *testing.T) {
 	db := testDB(t)
 	srcTable(t, db, "ST_SPLIT", "(id NUMBER(38) PRIMARY KEY, v NUMBER)",
 		"INSERT INTO ST_SPLIT SELECT level * 7, level FROM dual CONNECT BY level <= 2000",
-		"INSERT INTO ST_SPLIT VALUES (99999999999999999999999999999999999999, 0), (-99999999999999999999999999999999999999, 0)",
+		"INSERT INTO ST_SPLIT VALUES (99999999999999999999999999999999999999, 0)",
+		"INSERT INTO ST_SPLIT VALUES (-99999999999999999999999999999999999999, 0)",
 		"BEGIN DBMS_STATS.GATHER_TABLE_STATS(USER, 'ST_SPLIT'); END;")
 	srcTable(t, db, "ST_SPLITD", "(id NUMBER(10, 2) PRIMARY KEY, v NUMBER)",
 		"INSERT INTO ST_SPLITD SELECT level / 2 - 500.25, level FROM dual CONNECT BY level <= 2000")
@@ -883,7 +925,10 @@ func TestSourcePreflight(t *testing.T) {
 func TestReadChunk(t *testing.T) {
 	db := testDB(t)
 	srcTable(t, db, "ST_RC", "(a NUMBER(10), b VARCHAR2(5), PRIMARY KEY (a, b))",
-		"INSERT INTO ST_RC VALUES (1, 'x'), (1, 'y'), (2, 'x'), (3, 'z')")
+		"INSERT INTO ST_RC VALUES (1, 'x')",
+		"INSERT INTO ST_RC VALUES (1, 'y')",
+		"INSERT INTO ST_RC VALUES (2, 'x')",
+		"INSERT INTO ST_RC VALUES (3, 'z')")
 	tables, err := describe(t.Context(), db, "OPENETL", []string{"ST_RC"})
 	if err != nil {
 		t.Fatal(err)
