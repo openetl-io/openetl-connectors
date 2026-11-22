@@ -218,7 +218,7 @@ func (s *Source) readCDC(ctx context.Context, req source.ReadRequest, cfgs []sou
 // step reads a chunk of the table's snapshot, or its changes up to the
 // database's latest position. It reports whether it emitted anything.
 func (r *cdcReader) step(ctx context.Context, ct *cdcTable) (bool, error) {
-	if ct.reached() {
+	if r.reached(ct) {
 		return false, r.complete(ct)
 	}
 	if ct.st.Snapshot != nil {
@@ -252,7 +252,7 @@ func (r *cdcReader) step(ctx context.Context, ct *cdcTable) (bool, error) {
 		return false, err
 	}
 	switch {
-	case ct.reached():
+	case r.reached(ct):
 		return n > 0, r.complete(ct)
 	case n > 0 || time.Since(ct.resumedAt) >= quietEvery:
 		return n > 0, r.resume(ct)
@@ -317,19 +317,27 @@ func (r *cdcReader) chunk(ctx context.Context, ct *cdcTable) error {
 }
 
 // reached reports whether the table's read is at its stop.
-func (ct *cdcTable) reached() bool {
-	if ct.stop == nil {
+func (r *cdcReader) reached(ct *cdcTable) bool {
+	return ct.stop != nil && r.samePlace(ct.st, *ct.stop)
+}
+
+// samePlace reports whether two states are at the same place in a read: the
+// same position, and the same key of the same snapshot or poll. When a
+// position was the database's latest doesn't count.
+func (r *cdcReader) samePlace(a, b cdcState) bool {
+	if a.Method != b.Method || r.m.compare(a.Position, b.Position) != 0 || (a.Snapshot == nil) != (b.Snapshot == nil) || (a.Poll == nil) != (b.Poll == nil) {
 		return false
 	}
-	a, err1 := json.Marshal(ct.st)
-	b, err2 := json.Marshal(ct.stop)
-	return err1 == nil && err2 == nil && bytes.Equal(a, b)
+	if a.Snapshot != nil && !slices.Equal(a.Snapshot.After, b.Snapshot.After) {
+		return false
+	}
+	return a.Poll == nil || r.m.compare(a.Poll.To, b.Poll.To) == 0 && slices.Equal(a.Poll.After, b.Poll.After)
 }
 
 // state is the table's state, spelled as the request spelled its until if
 // it's there.
-func (ct *cdcTable) state() ([]byte, error) {
-	if ct.reached() {
+func (r *cdcReader) state(ct *cdcTable) ([]byte, error) {
+	if r.reached(ct) {
 		return ct.until, nil
 	}
 	return json.Marshal(ct.st)
@@ -341,7 +349,7 @@ func (r *cdcReader) resume(ct *cdcTable) error {
 	if err := ct.b.flush(ct.out); err != nil {
 		return err
 	}
-	b, err := ct.state()
+	b, err := r.state(ct)
 	if err != nil {
 		return err
 	}
@@ -555,7 +563,7 @@ func (m *tracking) poll(ctx context.Context, r *cdcReader, ct *cdcTable, to stri
 			if err := r.resume(ct); err != nil {
 				return total, err
 			}
-			if ct.reached() {
+			if r.reached(ct) {
 				return total, nil
 			}
 		case bounded:
