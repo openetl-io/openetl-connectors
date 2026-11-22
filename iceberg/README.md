@@ -16,7 +16,7 @@ A table that already exists keeps its own settings: the destination writes with 
 All three write modes work:
 
 - **Append** adds each epoch's data files to the table.
-- **Overwrite** keeps a read's files out of the table until the read ends, then replaces the table's files with them.
+- **Overwrite** keeps a read's files out of the table until the read ends, then replaces the table's files with them. From 0.2.0, a stream paused in the middle of a read goes on with it once it's resumed: the read's end replaces the table's files with those written before the pause too.
 - **Merge** writes equality deletes for the keys an epoch changes, with the keys' new rows, so the table holds each key's latest version. Query engines that read Iceberg v2 apply the deletes.
 
 Each epoch is one snapshot per table, with the epoch's marker in the snapshot's summary and in a table property. The commit checks the fence and the marker on the snapshot it builds on, and the catalog refuses it if another commit landed first, so a replaced attempt can't commit and no epoch lands twice.
@@ -156,7 +156,7 @@ A delete written in a table's current partitioning doesn't reach files of an ear
 
 Each commit adds a snapshot, and a metadata file, to each table it writes, and the destination neither expires snapshots, nor compacts data files, nor deletes old metadata files. Run them in an engine that can, such as Spark's `expire_snapshots` and `rewrite_data_files` procedures, and set a table's `write.metadata.delete-after-commit.enabled` to `true` to keep only its `write.metadata.previous-versions-max` newest metadata files.
 
-An epoch's data files are in its tables' locations from when they're written until the epoch commits, which can be long after for a pipeline that stops with an epoch staged, and a table's catalog knows nothing of them until then. A `remove_orphan_files` that runs with an `older_than` shorter than that deletes them, and the epoch can't commit: its recovery reports it lost. Keep `older_than` longer than a pipeline may stay stopped.
+An epoch's data files are in its tables' locations from when they're written until the epoch commits, which can be long after for a pipeline that stops with an epoch staged, and a table's catalog knows nothing of them until then. A `remove_orphan_files` that runs with an `older_than` shorter than that deletes them, and the epoch can't commit: its recovery reports it lost. An overwrite read's files are there too, out of the table, until the read ends, with its manifests under the table's `_openetl/reads`; from 0.2.0, a paused stream's read goes on once the stream is resumed. Keep `older_than` longer than a pipeline may stay stopped or a stream paused, and longer than an overwrite read takes.
 
 ## Limits
 
@@ -167,3 +167,4 @@ An epoch's data files are in its tables' locations from when they're written unt
 - The destination writes; it doesn't read tables back as a source.
 - Glue commits one table at a time, so a pipeline into Glue needs stream scope, and an epoch's tables may land a few moments apart.
 - From 0.2.0, an epoch that can't be recovered, as some of its staged files are gone, leaves the rest in its tables' locations as orphan files, which no snapshot holds.
+- From 0.2.0, the destination can't tell a stream removed from the pipeline from a paused one, so an overwrite read that a removed stream left unfinished keeps its files in the table's location, out of the table, until the stream is added back or the table is dropped.

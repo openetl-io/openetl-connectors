@@ -263,6 +263,104 @@ func TestOverwriteDropsAnAbandonedRead(t *testing.T) {
 	}
 }
 
+// A read of a stream that attempts don't write, as they don't a paused one's,
+// goes on in lane 0's descriptors until the stream is back: with the same
+// start, its end replaces the table's files with every file of the read, and
+// with another, its files go.
+func TestOverwriteReadGoesOnThroughAPause(t *testing.T) {
+	env := newEnv(t)
+	all := append(overwrites("items", "gone"), appends("other")...)
+	start := time.UnixMicro(1000)
+	ws, _ := env.openLanes(1, 2, destination.Epoch{}, nil, all...)
+	for _, w := range ws {
+		if err := w.(destination.ReadTracker).StartReads(t.Context(), map[string]time.Time{"items": start, "gone": start, "other": start}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	e := destination.Epoch{Generation: 1, N: 1}
+	write(t, ws[0], e, "items", 1)
+	write(t, ws[1], e, "items", 2)
+	write(t, ws[0], e, "gone", 10)
+	st := precommitAll(t, e, ws)
+	commitAll(t, ws[0], e, st)
+	var goneFiles []string
+	for _, s := range st {
+		var d staged
+		if err := json.Unmarshal(s, &d); err != nil {
+			t.Fatal(err)
+		}
+		for _, ss := range d.Streams {
+			if ss.Name == "gone" {
+				goneFiles = append(goneFiles, ss.Files...)
+			}
+		}
+	}
+
+	// Two attempts with items and gone paused, each committing other.
+	for gen := uint64(2); gen <= 3; gen++ {
+		paused, _ := env.openLanes(gen, 2, e, st, appends("other")...)
+		startLanes(t, paused, "other", start)
+		e = destination.Epoch{Generation: gen, N: e.N + 1}
+		write(t, paused[1], e, "other", int64(gen))
+		st = precommitAll(t, e, paused)
+		commitAll(t, paused[0], e, st)
+	}
+	env.wantIDs("items")
+	env.wantIDs("other", 2, 3)
+
+	resumed, _ := env.openLanes(4, 2, e, st, all...)
+	for _, w := range resumed {
+		if err := w.(destination.ReadTracker).StartReads(t.Context(), map[string]time.Time{"items": start, "gone": time.UnixMicro(2000), "other": start}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(goneFiles) == 0 {
+		t.Fatal("gone staged no files")
+	}
+	for _, f := range goneFiles {
+		if resumed[0].(*writer).allExist(t.Context(), env.table("gone"), []string{f}) {
+			t.Errorf("the abandoned read's %s is left", f)
+		}
+	}
+	end := destination.Epoch{Generation: 4, N: e.N + 1}
+	write(t, resumed[1], end, "items", 3)
+	write(t, resumed[1], end, "gone", 20)
+	for _, s := range []string{"items", "gone"} {
+		if err := resumed[1].(destination.ReadTracker).EndRead(t.Context(), end, s); err != nil {
+			t.Fatal(err)
+		}
+	}
+	commitAll(t, resumed[0], end, precommitAll(t, end, resumed))
+	env.wantIDs("items", 1, 2, 3)
+	env.wantIDs("gone", 20)
+}
+
+// A read of a stream the attempt doesn't write, whose table is gone, as a
+// removed stream's may be, stops: it fails no PreCommit.
+func TestOverwriteReadOfADroppedTableStops(t *testing.T) {
+	env := newEnv(t)
+	ws, _ := env.openLanes(1, 1, destination.Epoch{}, nil, append(overwrites("items"), appends("other")...)...)
+	startLanes(t, ws, "items", time.UnixMicro(1000))
+	e1, e2 := destination.Epoch{Generation: 1, N: 1}, destination.Epoch{Generation: 2, N: 2}
+	write(t, ws[0], e1, "items", 1)
+	st := precommitAll(t, e1, ws)
+	commitAll(t, ws[0], e1, st)
+	c, err := env.d.catalog(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.DropTable(t.Context(), table.Identifier{env.ns, "items"}); err != nil {
+		t.Fatal(err)
+	}
+
+	next, _ := env.openLanes(2, 1, e1, st, appends("other")...)
+	startLanes(t, next, "other", time.UnixMicro(1000))
+	write(t, next[0], e2, "other", 2)
+	if d := describe(t, precommit(t, next[0], e2)); d.Name != "other" {
+		t.Errorf("the descriptor describes %+v", d)
+	}
+}
+
 // oldDescriptor is a descriptor from before manifests: it lists the read's
 // earlier files.
 func (e *env) oldDescriptor(gen, epoch uint64, start int64, earlier, files []string, ended bool) destination.Staged {

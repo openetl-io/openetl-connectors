@@ -502,7 +502,13 @@ func (w *writer) StartReads(ctx context.Context, starts map[string]time.Time) (e
 	defer func() { err = classifyRun(err) }()
 	w.starts = starts
 	for name, r := range w.reads {
-		if start, ok := starts[name]; ok && start.UnixMicro() == r.start {
+		start, ok := starts[name]
+		if !ok {
+			// The attempt doesn't read the stream, as it doesn't a paused
+			// one: the read goes on once it does.
+			continue
+		}
+		if start.UnixMicro() == r.start {
 			r.restored = false
 			continue
 		}
@@ -790,24 +796,59 @@ func (w *writer) PreCommit(ctx context.Context, e destination.Epoch) (_ destinat
 			}
 		}
 		if s.Mode == destination.Overwrite {
-			if r == nil {
-				r = &read{start: w.starts[s.Name].UnixMicro(), table: ss.Table}
-				w.reads[s.Name] = r
-			}
-			ss.Table = cmp.Or(ss.Table, r.table)
-			r.table = ss.Table
-			if err := w.saveEarlier(ctx, s.Name, r); err != nil {
+			if err := w.describeRead(ctx, &ss, files, isEnd); err != nil {
 				return nil, err
-			}
-			ss.Mode, ss.Read, ss.Manifests, ss.Ended = modeOverwrite, r.start, slices.Clone(r.manifests), isEnd
-			r.files = files
-			if isEnd {
-				delete(w.reads, s.Name)
 			}
 		}
 		desc.Streams = append(desc.Streams, ss)
 	}
+	if err := w.carryReads(ctx, &desc); err != nil {
+		return nil, err
+	}
 	return json.Marshal(desc)
+}
+
+// describeRead describes the stream's read in ss, with the epoch's files of
+// it, and ends it with end.
+func (w *writer) describeRead(ctx context.Context, ss *stagedStream, files []string, end bool) error {
+	r := w.reads[ss.Name]
+	if r == nil {
+		r = &read{start: w.starts[ss.Name].UnixMicro(), table: ss.Table}
+		w.reads[ss.Name] = r
+	}
+	ss.Table = cmp.Or(ss.Table, r.table)
+	r.table = ss.Table
+	if err := w.saveEarlier(ctx, ss.Name, r); err != nil {
+		return err
+	}
+	ss.Mode, ss.Read, ss.Manifests, ss.Ended = modeOverwrite, r.start, slices.Clone(r.manifests), end
+	r.files = files
+	if end {
+		delete(w.reads, ss.Name)
+	}
+	return nil
+}
+
+// carryReads describes the reads Recover restored of streams the attempt
+// doesn't write, as it doesn't a paused one's, so that each goes on once its
+// stream is back. A read whose table is gone, with what it wrote there, stops.
+func (w *writer) carryReads(ctx context.Context, desc *staged) error {
+	for _, name := range slices.Sorted(maps.Keys(w.reads)) {
+		if _, ok := w.streams[name]; ok {
+			continue
+		}
+		ss := stagedStream{Name: name}
+		err := w.describeRead(ctx, &ss, nil, false)
+		if errors.Is(err, catalog.ErrNoSuchTable) {
+			delete(w.reads, name)
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		desc.Streams = append(desc.Streams, ss)
+	}
+	return nil
 }
 
 // checkDropped stops an epoch whose values a lane left out, if the table has
