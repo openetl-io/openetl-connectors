@@ -407,8 +407,9 @@ func TestCDCReadsSavepointsAndXA(t *testing.T) {
 
 // TestCDCRefusesRolledBackXA reads an XA transaction's rows at its prepare,
 // and fails at its XA ROLLBACK, whether the same read or a later one gets
-// there: the rows it read never committed. One that commits, and one that
-// changed no table read, are read.
+// there, as a lost position, which a new read of the table resets: the rows
+// it read never committed. One that commits, and one that changed no table
+// read, are read.
 func TestCDCRefusesRolledBackXA(t *testing.T) {
 	eachServer(t, func(t *testing.T, srv testServer) {
 		e := newSourceEnv(t, srv)
@@ -445,9 +446,13 @@ func TestCDCRefusesRolledBackXA(t *testing.T) {
 			next := &capture{}
 			t.Cleanup(next.release)
 			err := s.Read(t.Context(), cdc("xa", map[string]string{"items": from.state("items")}, "items"), next)
-			if code := codeOf(err); code != protocolv1.ErrorCode_ERROR_CODE_CONFIG_INVALID || !strings.Contains(err.Error(), "items") {
+			if code := codeOf(err); code != protocolv1.ErrorCode_ERROR_CODE_POSITION_LOST || !strings.Contains(err.Error(), "items") {
 				t.Fatalf("a read of a rolled back XA: %v (%v), rows %v", err, code, next.rows("items"))
 			}
+		}
+		// A reset reads the table again, without the old state's XA.
+		if again := read(t, s, cdc("xa", nil, "items")); strings.Contains(again.state("items"), "X'7231'") {
+			t.Fatalf("state after a reset %s", again.state("items"))
 		}
 	})
 }

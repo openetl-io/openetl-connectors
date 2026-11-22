@@ -839,7 +839,7 @@ func (r *cdcReader) event(ctx context.Context, ev *replication.BinlogEvent) erro
 			switch {
 			case st.finished || r.txn != nil && r.txn.skip[st]:
 			case rolledBack && slices.Contains(st.xa, xaRollback):
-				return configInvalid("mysql: binlog: XA transaction %s changed %s and was prepared, when its changes were read, and then rolled back: "+
+				return positionLost("mysql: binlog: XA transaction %s changed %s and was prepared, when its changes were read, and then rolled back: "+
 					"the destination has changes that never committed; read %[2]s again", xaRollback, st.t.name)
 			case committed && slices.Contains(st.xa, xaCommit):
 				st.xa = slices.DeleteFunc(st.xa, func(x string) bool { return x == xaCommit })
