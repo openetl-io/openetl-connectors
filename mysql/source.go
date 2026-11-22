@@ -760,7 +760,7 @@ func cursorColumn(t table, cursor string) (int, error) {
 	case ci < 0:
 		return 0, configInvalid("mysql: %s has no column %q for a cursor", t.name, cursor)
 	case !cursorKinds[t.cols[ci].kind]:
-		return 0, configInvalid("mysql: %s.%s can't be a cursor: that takes an integer, decimal, date, datetime, timestamp, year, char or varchar column", t.name, cursor)
+		return 0, configInvalid("mysql: %s.%s can't be a cursor: that takes an integer, decimal, date, datetime, timestamp, year, char, varchar or text column", t.name, cursor)
 	}
 	return ci, nil
 }
@@ -842,8 +842,8 @@ func scan(ctx context.Context, conn interface {
 	return classify(rows.Err())
 }
 
-// batcher builds one table's Arrow batches; a changelog's carry an op and a
-// seq column after the table's.
+// batcher builds one table's Arrow batches; a changelog's carry an op, a
+// seq and an unchanged column after the table's.
 type batcher struct {
 	rb    *array.RecordBuilder
 	adds  []adder
@@ -863,7 +863,7 @@ func newBatcher(mem memory.Allocator, cols []sourceColumn, cdc bool) (*batcher, 
 		fields = append(fields, arrow.Field{Name: c.name, Type: sent, Nullable: true})
 	}
 	if cdc {
-		fields = append(fields, source.OpField(), source.SeqField(seqType))
+		fields = append(fields, source.OpField(), source.SeqField(seqType), source.UnchangedField())
 	}
 	b := &batcher{rb: array.NewRecordBuilder(mem, arrow.NewSchema(fields, nil)), cdc: cdc}
 	for i, c := range cols {

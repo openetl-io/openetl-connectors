@@ -8,6 +8,7 @@ import (
 	"database/sql/driver"
 	endian "encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"slices"
@@ -974,8 +975,13 @@ func classify(err error) error {
 		return sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_PERMISSION_DENIED, err)
 	case 1049:
 		return sdk.WithCode(configInvalidCode, err)
-	case 1236:
-		// The binlog the read would continue from is gone.
+	case 1236, 4052:
+		// The server ended the dump for another replica's with its server
+		// ID, as MariaDB does, or else the binlog the read would continue
+		// from is gone.
+		if n == 4052 || strings.Contains(err.Error(), "with the same server_") {
+			return sdk.WithCode(configInvalidCode, fmt.Errorf("%w: another replica or read of the server has the binlog connection's server ID; set serverId to one of its own", err))
+		}
 		return sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_POSITION_LOST, err)
 	case 1040, 1053, 1203, 1205, 1213, 1226, 1927, 2006, 2013, 3024:
 		return sdk.WithCode(transientCode, err)

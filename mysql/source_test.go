@@ -369,6 +369,176 @@ func TestCDCSnapshotsThenReadsChanges(t *testing.T) {
 	})
 }
 
+// TestCDCReadsSavepointsAndXA reads a transaction with a savepoint in it,
+// which MariaDB logs without a BEGIN, and XA transactions committed in two
+// phases and in one.
+func TestCDCReadsSavepointsAndXA(t *testing.T) {
+	eachServer(t, func(t *testing.T, srv testServer) {
+		e := newSourceEnv(t, srv)
+		e.exec("CREATE TABLE $db.items (id int PRIMARY KEY, v varchar(20))")
+		s := e.source("")
+		first := read(t, s, cdc("savepoints", nil, "items"))
+		conn, err := e.db.Conn(t.Context())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = conn.Close() }()
+		items := quoteIdent(e.database) + ".items"
+		for _, q := range []string{
+			"BEGIN", "INSERT INTO " + items + " VALUES (1, 'a')", "SAVEPOINT s1", "INSERT INTO " + items + " VALUES (2, 'b')", "COMMIT",
+			"XA START 'x1'", "INSERT INTO " + items + " VALUES (3, 'c')", "XA END 'x1'", "XA PREPARE 'x1'", "XA COMMIT 'x1'",
+			"XA START 'x2'", "INSERT INTO " + items + " VALUES (4, 'd')", "XA END 'x2'", "XA COMMIT 'x2' ONE PHASE",
+			"INSERT INTO " + items + " VALUES (5, 'e')",
+		} {
+			if _, err := conn.ExecContext(t.Context(), q); err != nil {
+				t.Fatalf("%s: %v", q, err)
+			}
+		}
+		next := read(t, s, cdc("savepoints", map[string]string{"items": first.state("items")}, "items"))
+		var log []string
+		for _, r := range next.rows("items") {
+			log = append(log, r["openetl.op"]+" "+r["id"])
+		}
+		if want := []string{"insert 1", "insert 2", "insert 3", "insert 4", "insert 5"}; !slices.Equal(log, want) {
+			t.Fatalf("changes %q, want %q", log, want)
+		}
+	})
+}
+
+// TestCDCRefusesRolledBackXA reads an XA transaction's rows at its prepare,
+// and fails at its XA ROLLBACK, whether the same read or a later one gets
+// there, as a lost position, which a new read of the table resets: the rows
+// it read never committed. One that commits, and one that changed no table
+// read, are read.
+func TestCDCRefusesRolledBackXA(t *testing.T) {
+	eachServer(t, func(t *testing.T, srv testServer) {
+		e := newSourceEnv(t, srv)
+		e.exec("CREATE TABLE $db.items (id int PRIMARY KEY, v varchar(20))")
+		e.exec("CREATE TABLE $db.other (id int PRIMARY KEY)")
+		s := e.source("")
+		first := read(t, s, cdc("xa", nil, "items"))
+		items, other := quoteIdent(e.database)+".items", quoteIdent(e.database)+".other"
+		for _, x := range []struct{ id, insert, end string }{
+			{"'c1'", "INSERT INTO " + items + " VALUES (1, 'a')", "COMMIT"},
+			{"'o1'", "INSERT INTO " + other + " VALUES (1)", "ROLLBACK"},
+			{"X'7231',X'62',7", "INSERT INTO " + items + " VALUES (2, 'b')", ""},
+		} {
+			conn, err := e.db.Conn(t.Context())
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, q := range []string{"XA START " + x.id, x.insert, "XA END " + x.id, "XA PREPARE " + x.id} {
+				if _, err := conn.ExecContext(t.Context(), q); err != nil {
+					t.Fatalf("%s: %v", q, err)
+				}
+			}
+			_ = conn.Close()
+			if x.end != "" {
+				e.exec("XA " + x.end + " " + x.id)
+			}
+		}
+		prepared := read(t, s, cdc("xa", map[string]string{"items": first.state("items")}, "items"))
+		if rows := prepared.rows("items"); len(rows) != 2 || strings.Contains(prepared.state("items"), "X'6331'") {
+			t.Fatalf("rows %v, state %s", rows, prepared.state("items"))
+		}
+		e.exec("XA ROLLBACK X'7231',X'62',7")
+		for _, from := range []*capture{prepared, first} {
+			next := &capture{}
+			t.Cleanup(next.release)
+			err := s.Read(t.Context(), cdc("xa", map[string]string{"items": from.state("items")}, "items"), next)
+			if code := codeOf(err); code != protocolv1.ErrorCode_ERROR_CODE_POSITION_LOST || !strings.Contains(err.Error(), "items") {
+				t.Fatalf("a read of a rolled back XA: %v (%v), rows %v", err, code, next.rows("items"))
+			}
+		}
+		// A reset reads the table again, without the old state's XA.
+		if again := read(t, s, cdc("xa", nil, "items")); strings.Contains(again.state("items"), "X'7231'") {
+			t.Fatalf("state after a reset %s", again.state("items"))
+		}
+	})
+}
+
+// TestCDCRefusesPartialRowImages reads a session's changes logged with
+// binlog_row_image = MINIMAL: its delete has the key it needs, its update
+// hasn't the columns it left alone and fails the read.
+func TestCDCRefusesPartialRowImages(t *testing.T) {
+	eachServer(t, func(t *testing.T, srv testServer) {
+		e := newSourceEnv(t, srv)
+		e.exec("CREATE TABLE $db.items (id int PRIMARY KEY, v varchar(20), w varchar(20))")
+		e.exec("INSERT INTO $db.items VALUES (1, 'a', 'x'), (2, 'b', 'y')")
+		s := e.source("")
+		first := read(t, s, cdc("minimal", nil, "items"))
+		conn, err := e.db.Conn(t.Context())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = conn.Close() }()
+		items := quoteIdent(e.database) + ".items"
+		for _, q := range []string{"SET SESSION binlog_row_image = 'MINIMAL'", "DELETE FROM " + items + " WHERE id = 2", "UPDATE " + items + " SET v = 'z' WHERE id = 1"} {
+			if _, err := conn.ExecContext(t.Context(), q); err != nil {
+				t.Fatalf("%s: %v", q, err)
+			}
+		}
+		next := &capture{}
+		t.Cleanup(next.release)
+		err = s.Read(t.Context(), cdc("minimal", map[string]string{"items": first.state("items")}, "items"), next)
+		if codeOf(err) != protocolv1.ErrorCode_ERROR_CODE_CONFIG_INVALID || !strings.Contains(err.Error(), "binlog_row_image") {
+			t.Fatalf("an update without w: %v", err)
+		}
+	})
+}
+
+// TestCDCColumnsChangedBehindTheRead reads a change from before a column
+// was renamed, one added with a default and one dropped, which the read
+// reaches after: the renamed and the added column are unchanged in it, not
+// null, and the dropped one is left out.
+func TestCDCColumnsChangedBehindTheRead(t *testing.T) {
+	eachServer(t, func(t *testing.T, srv testServer) {
+		e := newSourceEnv(t, srv)
+		e.exec("CREATE TABLE $db.items (id int PRIMARY KEY, a varchar(20), d varchar(20))")
+		e.exec("INSERT INTO $db.items VALUES (1, 'x', 'p')")
+		s := e.source("")
+		first := read(t, s, cdc("columns", nil, "items"))
+		e.exec("UPDATE $db.items SET a = 'y', d = 'q' WHERE id = 1")
+		e.exec("ALTER TABLE $db.items RENAME COLUMN a TO b")
+		e.exec("ALTER TABLE $db.items ADD COLUMN w int DEFAULT 5")
+		e.exec("ALTER TABLE $db.items DROP COLUMN d")
+		e.exec("INSERT INTO $db.items (id, b) VALUES (2, 'z')")
+		rows := read(t, s, cdc("columns", map[string]string{"items": first.state("items")}, "items")).rows("items")
+		if len(rows) != 2 || rows[0]["openetl.unchanged"] != `["b","w"]` || rows[0]["d"] != "" ||
+			rows[1]["b"] != "z" || rows[1]["w"] != "5" || rows[1]["openetl.unchanged"] != array.NullValueStr {
+			t.Fatalf("rows %v", rows)
+		}
+	})
+}
+
+// TestCDCRefusesStatementChanges reads a session's change logged with
+// binlog_format = STATEMENT, which has no rows: it fails the read rather
+// than go unread.
+func TestCDCRefusesStatementChanges(t *testing.T) {
+	eachServer(t, func(t *testing.T, srv testServer) {
+		e := newSourceEnv(t, srv)
+		e.exec("CREATE TABLE $db.items (id int PRIMARY KEY, v varchar(20))")
+		s := e.source("")
+		first := read(t, s, cdc("statement", nil, "items"))
+		conn, err := e.db.Conn(t.Context())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = conn.Close() }()
+		for _, q := range []string{"SET SESSION binlog_format = 'STATEMENT'", "INSERT INTO " + quoteIdent(e.database) + ".items VALUES (1, 'a')"} {
+			if _, err := conn.ExecContext(t.Context(), q); err != nil {
+				t.Fatalf("%s: %v", q, err)
+			}
+		}
+		next := &capture{}
+		t.Cleanup(next.release)
+		err = s.Read(t.Context(), cdc("statement", map[string]string{"items": first.state("items")}, "items"), next)
+		if codeOf(err) != protocolv1.ErrorCode_ERROR_CODE_CONFIG_INVALID || !strings.Contains(err.Error(), "binlog_format") {
+			t.Fatalf("a change logged as a statement: %v (%v), rows %v", err, codeOf(err), next.rows("items"))
+		}
+	})
+}
+
 func TestCDCNewColumnRestartsTheRead(t *testing.T) {
 	eachServer(t, func(t *testing.T, srv testServer) {
 		e := newSourceEnv(t, srv)
@@ -863,8 +1033,76 @@ func TestCDCContinuesOnAnotherServerByGTID(t *testing.T) {
 	})
 }
 
+// TestCDCServerIDTakenIsConfig reads the binlog continuously while another
+// read connects with the same server ID, which MariaDB takes for the same
+// replica and so ends the first's dump: the first fails as invalid config,
+// naming serverId, not as a lost position.
+func TestCDCServerIDTakenIsConfig(t *testing.T) {
+	eachServer(t, func(t *testing.T, srv testServer) {
+		e := newSourceEnv(t, srv)
+		e.exec("CREATE TABLE $db.items (id int PRIMARY KEY)")
+		s := e.source(`, "serverId": 3000000001`)
+		first := read(t, s, cdc("taken", nil, "items"))
+		req := cdc("taken", map[string]string{"items": first.state("items")}, "items")
+		req.Continuous = true
+		ctx, cancel := context.WithCancel(t.Context())
+		var wg sync.WaitGroup
+		defer wg.Wait()
+		defer cancel()
+		done := make(chan error, 1)
+		wg.Go(func() { done <- s.Read(ctx, req, &capture{}) })
+		time.Sleep(2 * time.Second)
+		wg.Go(func() { _ = e.source(`, "serverId": 3000000001`).Read(ctx, req, &capture{}) })
+		select {
+		case err := <-done:
+			if codeOf(err) != protocolv1.ErrorCode_ERROR_CODE_CONFIG_INVALID || !strings.Contains(err.Error(), "serverId") {
+				t.Fatalf("the first read: %v (%v)", err, codeOf(err))
+			}
+		case <-time.After(5 * time.Second):
+			if srv.name == "mariadb" {
+				t.Fatal("MariaDB didn't end the first read's dump")
+			}
+		}
+	})
+}
+
+// TestCDCKeepsTaggedGTIDs reads a transaction with a tagged GTID, then
+// reads on from its state on another server, as after a failover: the
+// transaction isn't read again.
+func TestCDCKeepsTaggedGTIDs(t *testing.T) {
+	e := newSourceEnv(t, servers()[0])
+	e.exec("CREATE TABLE $db.items (id int PRIMARY KEY)")
+	s := e.source("")
+	first := read(t, s, cdc("tagged", nil, "items"))
+	conn, err := e.db.Conn(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close() }()
+	if _, err := conn.ExecContext(t.Context(), "SET gtid_next = 'AUTOMATIC:openetl'"); err != nil {
+		t.Skipf("no tagged GTIDs: %v", err)
+	}
+	if _, err := conn.ExecContext(t.Context(), "INSERT INTO "+quoteIdent(e.database)+".items VALUES (1)"); err != nil {
+		t.Fatal(err)
+	}
+	next := read(t, s, cdc("tagged", map[string]string{"items": first.state("items")}, "items"))
+	if rows := next.rows("items"); len(rows) != 1 {
+		t.Fatalf("the tagged transaction's rows: %v", rows)
+	}
+	var st map[string]any
+	if err := json.Unmarshal([]byte(next.state("items")), &st); err != nil {
+		t.Fatal(err)
+	}
+	st["server"] = "another"
+	moved, _ := json.Marshal(st)
+	if rows := read(t, s, cdc("tagged", map[string]string{"items": string(moved)}, "items")).rows("items"); len(rows) != 0 {
+		t.Fatalf("on another server, read again: %v", rows)
+	}
+}
+
 // TestCDCReadsCompressedTransactions reads changes MySQL wrote to the binlog
-// compressed, in one Transaction_payload event.
+// compressed, two transactions each in a Transaction_payload event: the
+// second's update of a key comes after the first's.
 func TestCDCReadsCompressedTransactions(t *testing.T) {
 	e := newSourceEnv(t, servers()[0])
 	e.exec("CREATE TABLE $db.items (id int PRIMARY KEY, v varchar(20))")
@@ -880,7 +1118,8 @@ func TestCDCReadsCompressedTransactions(t *testing.T) {
 	for _, q := range []string{
 		"SET SESSION binlog_transaction_compression = ON", "BEGIN",
 		"INSERT INTO " + db + ".items VALUES (3, 'c')", "UPDATE " + db + ".items SET v = 'z' WHERE id = 1", "DELETE FROM " + db + ".items WHERE id = 2",
-		"COMMIT", "SET SESSION binlog_transaction_compression = OFF",
+		"COMMIT", "BEGIN", "UPDATE " + db + ".items SET v = 'y' WHERE id = 1", "COMMIT",
+		"SET SESSION binlog_transaction_compression = OFF",
 	} {
 		if _, err := conn.ExecContext(t.Context(), q); err != nil {
 			t.Fatalf("%s: %v", q, err)
@@ -891,8 +1130,11 @@ func TestCDCReadsCompressedTransactions(t *testing.T) {
 	for _, r := range next.rows("items") {
 		log = append(log, r["openetl.op"]+" "+r["id"]+" "+r["v"])
 	}
-	if want := []string{"insert 3 c", "update 1 z", "delete 2 b"}; !slices.Equal(log, want) {
+	if want := []string{"insert 3 c", "update 1 z", "delete 2 b", "update 1 y"}; !slices.Equal(log, want) {
 		t.Fatalf("changes %q, want %q", log, want)
+	}
+	if got := merged(t, next.rows("items"), "id")["1"]["v"]; got != "y" {
+		t.Fatalf("key 1's latest version by seq has v %q, want y", got)
 	}
 	var st struct{ File string }
 	if err := json.Unmarshal([]byte(next.state("items")), &st); err != nil {

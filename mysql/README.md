@@ -18,18 +18,18 @@ A stream can be read three ways, which the pipeline picks with each stream's `sy
 | Sync mode | Offered for | How it reads |
 |---|---|---|
 | `full_refresh` | Every table | The whole table each time. A table whose primary key's columns are integers, decimals, strings, binary strings, dates, date-times, times, years or MariaDB UUIDs is read in key order, `chunkRows` rows a query, and a stopped read resumes after its last chunk. Another table is read in a single query. |
-| `incremental` | Tables with an integer, `decimal`, `date`, `datetime`, `timestamp`, `year`, `char`, `varchar` or `text` column | The rows whose `cursor` column is at or above where the last read got to, up to the column's highest value when this read starts, in chunks ordered by the cursor, then the key. |
+| `incremental` | Tables with an integer, `decimal`, `date`, `datetime`, `timestamp`, `year`, `char`, `varchar` or `text` column, or MariaDB's `inet4` or `inet6` | The rows whose `cursor` column is at or above where the last read got to, up to the column's highest value when this read starts, in chunks ordered by the cursor, then the key. |
 | `cdc` | Tables with a primary key read in chunks, as above | First a snapshot of the table, in chunks of `snapshotChunkRows`, then every change from the binlog, which the source reads as a replica does. |
 
 An incremental read starts at the last read's highest cursor value, not after it, so the rows that had that value are read again. Rows whose cursor is `NULL` are never read, and deleted rows aren't seen: CDC is the mode that sees deletes.
 
-A table whose key starts with an integer column is read in up to 32 key ranges at once, between the column's least and greatest values, as many as the optimizer's estimate of its rows fills at `chunkRows` a range. A range that falls behind is divided again at the midpoint of what it has left. A read holds up to `maxConnections` connections, one for each lane it runs, and CDC holds one binlog connection besides.
+A table read in key order whose key starts with an integer column other than `year` is read in up to 32 key ranges at once, between the column's least and greatest values, as many as the optimizer's estimate of its rows fills at `chunkRows` a range. A range that falls behind is divided again at the midpoint of what it has left. A read holds up to `maxConnections` connections, one for each lane it runs, and CDC holds one binlog connection besides.
 
 ### How CDC hands over from the snapshot
 
 Each chunk of a table's snapshot is read with a locking read (`LOCK IN SHARE MODE`), which waits for the transactions writing its rows to commit and holds back new writes to them until it has noted where the binlog ends. The chunk then holds exactly the changes before that position. The source holds the chunk until it has read the binlog up to it, emits it there, and emits the changes after it, so nothing is lost or repeated. Writes to the chunk's rows wait while it's read, as they would for any locking read; `snapshotChunkRows` bounds how many rows that is.
 
-Transactions MySQL compresses in the binlog (`binlog_transaction_compression`) are read as any other. Every change carries a sequence number made of the binlog file's number, the position its transaction starts at and its place in the transaction, so the destination applies a key's versions in order.
+Transactions MySQL compresses in the binlog (`binlog_transaction_compression`) are read as any other. An XA transaction's changes are in the binlog from its `XA PREPARE`, and are read from there, before it commits. Its `XA ROLLBACK` then fails the read as lost (`POSITION_LOST`), as the destination has changes that never committed, also where a later read gets to it: a stream's state keeps the XA transactions it read prepared until their `XA COMMIT`. Resetting each table the transaction changed reads it again, without them, and brings the destination back in step. MariaDB and MySQL log `XA COMMIT ... ONE PHASE` as one transaction, which is read as any other. Every change carries a sequence number made of the read's epoch, which goes up each time a read continues on another server, the binlog file's number, the position its transaction starts at and its place in the transaction, so the destination applies a key's versions in order.
 
 ### Set it up
 
@@ -56,10 +56,14 @@ The server needs these settings, which a CDC read checks before it starts; it re
 | `binlog_row_metadata` | `FULL` | the default is `MINIMAL`; `FULL` puts the columns' names in the binlog |
 | `binlog_row_value_options` | not `PARTIAL_JSON` | MySQL only |
 
-The binlog connection presents a server ID, which must differ from every replica's: `serverId`, or else one derived from the pipeline's name, at or above 2147483648.
+A session can set its own `binlog_format`, `binlog_row_image` or `binlog_row_value_options`. A change it logs as a statement, under `STATEMENT` or `MIXED`, has no rows to read; one that writes a table the read has fails the read rather than go unread. A multi-table `UPDATE` writes the tables its `SET` names, by name or alias, and may write any of its tables that has a column the `SET` names alone; a multi-table `DELETE` writes the tables it lists before `FROM`, or before `USING`. An `UPDATE` or `DELETE` after a `WITH` is checked the same way. A change it logs without a column the stream reads, other than a delete's or an old row's columns outside the key, or with a partial update of a JSON column, fails the read rather than set the column null. Either way the stream has to be read again.
+
+The binlog connection presents a server ID, which must differ from every replica's: `serverId`, or else one derived from the pipeline's name, at or above 2147483648. MariaDB ends a binlog connection when another connects with its server ID, as a replica or another pipeline of the same name can, and the read then fails as invalid config, naming `serverId`.
 
 > [!WARNING]
 > MySQL and MariaDB keep binlog files for `binlog_expire_logs_seconds`, whatever a pipeline has read. A pipeline that's paused or failing for longer finds its position purged: its read fails, and its tables have to be read again from a new snapshot. OpenETL reports how long the server keeps the file the pipeline's position is in, so it can warn before that happens, and a pipeline's preflight fails if the server keeps them for less than the time between its scheduled syncs.
+>
+> Amazon RDS and Aurora keep binlog files for their `binlog retention hours` instead, which is unset by default, so the files go as soon as they can, whatever `binlog_expire_logs_seconds` says, and what OpenETL reports and checks from it doesn't hold there. Set it: `CALL mysql.rds_set_configuration('binlog retention hours', 168);`.
 
 With GTIDs (`gtid_mode = ON` on MySQL; MariaDB always has them), a stream's state keeps the GTIDs it has read too, and after a failover to another server of the same replication topology the read continues from them on the new server. Without them, a read of another server fails as lost, and the check and a CDC pipeline's preflight warn.
 
@@ -120,9 +124,9 @@ spec:
   destination: { ref: warehouse }
 ```
 
-`dsn` is a DSN as the Go MySQL driver spells it, `USER:PASSWORD@tcp(HOST:3306)/DATABASE`, or a URL, `mysql://USER:PASSWORD@HOST:3306/DATABASE`. It's a secret: store it with `openetl secret set app-db-dsn`.
+`dsn` is a DSN as the Go MySQL driver spells it, `USER:PASSWORD@tcp(HOST:3306)/DATABASE`, or a URL, `mysql://USER:PASSWORD@HOST:3306/DATABASE` or `mariadb://…`. It's a secret: store it with `openetl secret set app-db-dsn`.
 
-The connector's sessions are in `utf8mb4`, in UTC, and in the SQL mode `STRICT_ALL_TABLES,NO_ENGINE_SUBSTITUTION`, whatever the DSN or the server set: each connection sets them last. The DSN's `collation` is the sessions' if it's one of `utf8mb4`'s, any the server has, and is left out otherwise, as its `charset`, `time_zone`, `sql_mode` and character set variables are. Each other parameter the driver doesn't take must set a session variable, such as `wait_timeout=60` or `@@session.wait_timeout=60`; the connector refuses a DSN with one that doesn't, such as a global or a user variable.
+The connector's sessions are in `utf8mb4`, in UTC, in the SQL mode `STRICT_ALL_TABLES,NO_ENGINE_SUBSTITUTION`, without a `sql_select_limit`, and with `autocommit` on, whatever the DSN or the server set: each connection sets them last. The DSN's `collation` is the sessions' if it's one of `utf8mb4`'s, any the server has, and is left out otherwise, as its `charset`, `time_zone`, `sql_mode` and character set variables are. Each other parameter the driver doesn't take must set a session variable, such as `wait_timeout=60` or `@@session.wait_timeout=60`; the connector refuses a DSN with one that doesn't, such as a global or a user variable.
 
 ### TLS
 
@@ -178,13 +182,13 @@ A zero date, `0000-00-00`, or one with a zero month or day, which MySQL keeps wh
 
 ### Schema changes
 
-A column added to a table read with CDC fails the read once, retryably, and the next attempt declares it. A column that was added and dropped again before the read reached it is left out. A column whose type changed so that the binlog's values no longer fit the type the read declared fails the read the same way. `TRUNCATE` isn't in the binlog as rows: the source logs a warning, and the destination keeps the rows; a new snapshot of the table brings it back in step.
+A column added to a table read with CDC fails the read once, retryably, and the next attempt declares it. A column that was added and dropped again before the read reached it is left out. A column whose type changed so that the binlog's values no longer fit the type the read declared fails the read the same way. The binlog names columns as they were: a change from before a column was renamed, or added, that the read reaches after it, doesn't have it, and sends it as unchanged, so a merge keeps the value the destination has rather than setting it null. No change carries what the rename or the add did to existing rows, such as an added column's default: the destination has it once the row changes again, or a new snapshot of the table brings it. `TRUNCATE` isn't in the binlog as rows: the source logs a warning, and the destination keeps the rows; a new snapshot of the table brings it back in step.
 
 ### Delivery
 
 Full refresh and CDC streams replay exactly: a read resumed from a checkpoint yields the same rows in the same order. OpenETL counts incremental streams as ones that may repeat rows, because of the rows at the cursor's last value, and the destination's capabilities decide what guarantee that leaves.
 
-A read OpenETL asks to end at an earlier resume point (`until`), to read a part again, sends nothing past it, then that resume point, and completes there. A full refresh or incremental read sends the rows between the two resume points again, as the table has them now. A CDC read from the same server sends the binlog's changes again as they were, with the same sequence numbers; the snapshot's rows of that part come as the table has them now, after those changes and before any later one, so the stream lands as it did. From another server, by GTIDs, it sends the same changes with the new server's sequence numbers, which are above every one the first read sent, and the snapshot's rows after them.
+A read OpenETL asks to end at an earlier resume point (`until`), to read a part again, sends nothing past it, then that resume point, and completes there. A full refresh or incremental read sends the rows between the two resume points again, as the table has them now. A CDC read from the same server sends the binlog's changes again as they were, with the same sequence numbers; the snapshot's rows of that part come as the table has them now, after those changes and before any later one, so a merged stream lands as it did, and an appended one has the rows as they are now. From another server, by GTIDs, it sends the same changes with the new server's sequence numbers, which are above every one the first read sent, and the snapshot's rows after them.
 
 ### Limits
 
@@ -204,7 +208,7 @@ All three write modes work:
 
 - **Append** inserts each epoch's rows.
 - **Overwrite** writes a read's rows to a table of its own, which replaces the target's rows when the read ends, so the target keeps its old rows until then.
-- **Merge** upserts each key's latest version, ordered by `_openetl_seq`, so an older version never overwrites a newer one. Deletes are soft unless the pipeline sets `destination.deletes: hard`: the row stays, with `_openetl_deleted` true. Merge adds a unique index on the key's columns if the table has none; it fails, saying so, if the table has two rows with one key.
+- **Merge** upserts each key's latest version, ordered by `_openetl_seq`, so an older version never overwrites a newer one. A column a version didn't send, which a source lists in `_openetl_unchanged`, takes its value from the key's latest earlier version in the epoch that sent it, unless the target's row is newer than that version, or else keeps the target's. Among an epoch's versions of a key, one without `_openetl_seq` ranks below one with it. Deletes are soft unless the pipeline sets `destination.deletes: hard`: the row stays, with `_openetl_deleted` true, and the values it had before the epoch, so an update in the delete's own epoch doesn't land; a key that's new in the epoch takes the delete's values. A hard delete leaves nothing of the row to order by, so a version older than the delete that comes in a later epoch puts the row back. Merge adds a unique index on the key's columns if the table has none; it fails, saying so, if the table has two rows with one key.
 
 Each epoch is staged into tables of its own, one per stream and writer lane. MySQL commits before each DDL statement, so the destination makes every table, column and index an epoch needs first, then applies its rows in one transaction that only changes rows: it checks the fence row in `_openetl_fence`, applies each stream, and writes a marker per stream in `_openetl_loads`, all or nothing. A replaced attempt can't apply, and an epoch is never applied twice. Append and overwrite also skip rows a source sends again, by their `_openetl_id`, and merge keeps each key's latest version. So a stream lands exactly once, or effectively once when it's merged from a source that may repeat rows, unless the pipeline asks for less. Leave `_openetl_fence` and `_openetl_loads` in place.
 
@@ -250,7 +254,7 @@ spec:
 | string | `longtext` |
 | binary | `longblob` |
 | date | `date` |
-| time of day | `time(6)` |
+| time of day | `time(6)`; nanoseconds are cut to microseconds |
 | timestamp | `datetime(6)` in UTC, with or without a time zone, since `timestamp` ends in 2038; nanoseconds are cut to microseconds |
 | UUID | `char(36)` |
 | JSON, intervals, lists, structs and maps | `json`; on MariaDB `longtext` checked by `json_valid` |
@@ -270,3 +274,7 @@ ALTER TABLE `raw`.`orders` MODIFY COLUMN `amount` decimal(20,2) NOT NULL DEFAULT
 Run it, then release the hold. Or let the destination make such changes itself with the pipeline's `destination.typeChanges: allow`, for every stream or one. It then widens integers to wider integers, an unsigned one to a wider signed one, `float` to `double`, integers to `double` and the small ones to `float`, integers and decimals to a `decimal` that holds them, a `varchar` or `varbinary` to a longer one, binary to `longblob`, and anything else to `longtext`. A change that isn't a widening is refused either way.
 
 A schema change waits up to 5 seconds for its table's metadata lock, and tries up to 5 times in all, so queries on the table don't queue behind it.
+
+### Limits
+
+A row too long for the server's `max_allowed_packet` can't be written: it fails the write with `DATA_INVALID`, naming the stream and the limit. Raise `max_allowed_packet` to write it.

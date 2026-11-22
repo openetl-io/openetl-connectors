@@ -17,6 +17,7 @@ import (
 	gomysql "github.com/go-mysql-org/go-mysql/mysql"
 	"github.com/go-sql-driver/mysql"
 
+	"github.com/openetl-io/openetl-connectors/connectortest"
 	sdk "github.com/openetl-io/openetl/sdk/go"
 	protocolv1 "github.com/openetl-io/openetl/sdk/go/protocol/v1"
 )
@@ -199,6 +200,10 @@ func TestParseDSN(t *testing.T) {
 	if err != nil || c.User != "u" || c.Passwd != "p@ss" || c.Addr != "db.example:3307" || c.DBName != "app" || c.TLSConfig != "skip-verify" {
 		t.Fatalf("%+v %v", c, err)
 	}
+	c, err = parseDSN("mariadb://u:p%40ss@db.example/app")
+	if err != nil || c.User != "u" || c.Passwd != "p@ss" || c.Addr != "db.example:3306" || c.DBName != "app" {
+		t.Fatalf("%+v %v", c, err)
+	}
 	c, err = parseDSN("u:p@tcp(h)/d")
 	if err != nil || c.Addr != "h:3306" || c.DBName != "d" {
 		t.Fatalf("%+v %v", c, err)
@@ -208,10 +213,35 @@ func TestParseDSN(t *testing.T) {
 	}
 }
 
+// A cursor is a column of a kind the error lists: text and MariaDB's inet
+// types are, a boolean and JSON aren't.
+func TestCursorColumn(t *testing.T) {
+	cols := []sourceColumn{
+		{name: "body", dataType: "text", columnType: "text"},
+		{name: "ip", dataType: "inet6", columnType: "inet6"},
+		{name: "flag", dataType: "tinyint", columnType: "tinyint(1)"},
+		{name: "doc", dataType: "json", columnType: "json"},
+	}
+	for i := range cols {
+		cols[i].kind = kindOf(cols[i])
+	}
+	tb := table{name: "t", cols: cols}
+	for i, c := range cols[:2] {
+		if got, err := cursorColumn(tb, c.name); err != nil || got != i {
+			t.Errorf("%s: %d %v", c.name, got, err)
+		}
+	}
+	for _, c := range cols[2:] {
+		if _, err := cursorColumn(tb, c.name); err == nil || !strings.Contains(err.Error(), "char, varchar or text column") {
+			t.Errorf("%s: %v", c.name, err)
+		}
+	}
+}
+
 // quoteIdent's, quoteLiteral's and the driver's escapes hold only in a
 // session in utf8mb4 that keeps backslash escapes, whatever the DSN asks.
 func TestSessionsAreUTF8WithBackslashEscapes(t *testing.T) {
-	const session = "SET NAMES utf8mb4 COLLATE utf8mb4_general_ci, time_zone = '+00:00', sql_mode = 'STRICT_ALL_TABLES,NO_ENGINE_SUBSTITUTION'"
+	const session = "SET NAMES utf8mb4 COLLATE utf8mb4_general_ci, time_zone = '+00:00', sql_mode = 'STRICT_ALL_TABLES,NO_ENGINE_SUBSTITUTION', sql_select_limit = 18446744073709551615, autocommit = 1"
 	c, err := parseDSN("u:p@tcp(h)/d?charset=gbk&SQL_MODE='NO_BACKSLASH_ESCAPES'&@@session.character_set_client=sjis&Time_Zone='+05:30'" +
 		"&SESSION character_set_results=latin1&LOCAL\tsql_mode=''&@@LOCAL.collation_connection=latin1_bin&WAIT_TIMEOUT=60, sql_mode=''&@@net_read_timeout=30")
 	if err != nil {
@@ -328,10 +358,43 @@ func TestTooManyConnectionsIsTransient(t *testing.T) {
 	}
 }
 
+// A binlog connection that another with its server ID ended fails as
+// invalid config, which a new server ID fixes, and a purged position as lost.
+func TestServerIDTakenIsConfig(t *testing.T) {
+	for err, want := range map[error]protocolv1.ErrorCode{
+		&gomysql.MyError{Code: 4052, Message: "A slave with the same server_id is already connected; the first event 'mariadb-bin.000002' at 4"}:            protocolv1.ErrorCode_ERROR_CODE_CONFIG_INVALID,
+		&gomysql.MyError{Code: 1236, Message: "A slave with the same server_uuid/server_id as this slave has connected to the master; the first event"}:     protocolv1.ErrorCode_ERROR_CODE_CONFIG_INVALID,
+		&gomysql.MyError{Code: 1236, Message: "A replica with the same server_uuid/server_id as this replica has connected to the source; the first event"}: protocolv1.ErrorCode_ERROR_CODE_CONFIG_INVALID,
+		&gomysql.MyError{Code: 1236, Message: "Could not find first log file name in binary log index file"}:                                                protocolv1.ErrorCode_ERROR_CODE_POSITION_LOST,
+	} {
+		got := classify(fmt.Errorf("mysql: binlog: %w", err))
+		if code := connectortest.CodeOf(got); code != want || (want == protocolv1.ErrorCode_ERROR_CODE_CONFIG_INVALID && !strings.Contains(got.Error(), "serverId")) {
+			t.Errorf("%v: %v (%v)", err, got, code)
+		}
+	}
+}
+
 func TestStateTimesAreUTC(t *testing.T) {
 	r := &cdcReader{server: "s", pos: binlogPos{File: "binlog.000001", Pos: 4}, lastCommit: time.Date(2026, 11, 16, 19, 0, 0, 0, time.FixedZone("IST", 19800))}
 	b, err := r.state(&cdcStream{})
 	if err != nil || !strings.Contains(string(b), `"at":"2026-11-16T13:30:00Z"`) {
 		t.Fatalf("%s %v", b, err)
+	}
+}
+
+// Of two patch columns that fill one held column, the first's UPDATE leaves
+// it held for the second's to match, and the second's takes it out.
+func TestPatchSharedHeldColumn(t *testing.T) {
+	w := &writer{schema: "s"}
+	s := stagedStream{Table: "t", Mode: modeMerge, Key: []string{"id"}, Fills: map[string]string{"price__v2": "price"}}
+	stmts := w.PatchSQL(s, prepared{patch: []string{"id", "price__v2", "price", idColumn, heldColumn}, patches: "`s`.`p`"})
+	if len(stmts) != 2 {
+		t.Fatalf("%d statements: %q", len(stmts), stmts)
+	}
+	unhold := "t.`" + heldColumn + "` = NULLIF("
+	for i, want := range []bool{false, true} {
+		if got := strings.Contains(stmts[i], unhold); got != want {
+			t.Errorf("statement %d takes the held column out: %v, want %v\n%s", i, got, want, stmts[i])
+		}
 	}
 }

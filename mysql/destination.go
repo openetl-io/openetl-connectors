@@ -103,14 +103,15 @@ func (d *Destination) Open(ctx context.Context, cfg destination.OpenConfig) (des
 		return nil, classify(fmt.Errorf("mysql: connect: %w", err))
 	}
 	w := &writer{
-		db:      db,
-		srv:     srv,
-		packet:  min(packet/4, 4<<20),
-		cfg:     cfg,
-		schema:  cmp.Or(cfg.Namespace, d.cfg.Database),
-		Epochs:  sqlstage.NewEpochs[*stagingTable](),
-		streams: map[string]destination.Stream{},
-		indexed: map[string]bool{},
+		db:        db,
+		srv:       srv,
+		packet:    min(packet/4, 4<<20),
+		maxPacket: packet,
+		cfg:       cfg,
+		schema:    cmp.Or(cfg.Namespace, d.cfg.Database),
+		Epochs:    sqlstage.NewEpochs[*stagingTable](),
+		streams:   map[string]destination.Stream{},
+		indexed:   map[string]bool{},
 	}
 	for _, s := range cfg.Streams {
 		w.streams[s.Name] = s
@@ -130,11 +131,12 @@ func (d *Destination) Open(ctx context.Context, cfg destination.OpenConfig) (des
 type writer struct {
 	db  *sql.DB
 	srv server
-	// Bytes of values in one INSERT statement.
-	packet  int
-	cfg     destination.OpenConfig
-	schema  string
-	streams map[string]destination.Stream
+	// Bytes of values in one INSERT statement, and the server's
+	// max_allowed_packet.
+	packet, maxPacket int
+	cfg               destination.OpenConfig
+	schema            string
+	streams           map[string]destination.Stream
 	sqlstage.Epochs[*stagingTable]
 	sqlstage.Own
 	// Only Commit and Recover use it: tables with an _openetl_id index, or
@@ -212,6 +214,12 @@ func (w *writer) Stage(ctx context.Context, tables map[uint64]map[string]*stagin
 		st.cols = wider
 	}
 	if err := w.insertRows(ctx, st, cols, batch); err != nil {
+		// Other rows fill less than a quarter of a statement, so this row
+		// is at least three quarters as long as max_allowed_packet.
+		if n, _ := serverError(err); n == 1153 || n == 1105 && strings.Contains(err.Error(), "max_allowed_packet") {
+			return nil, sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_DATA_INVALID,
+				fmt.Errorf("mysql: stage %s: a row too long for the server's max_allowed_packet of %d bytes: %w", stream, w.maxPacket, err))
+		}
 		return nil, classify(fmt.Errorf("mysql: stage %s: %w", stream, err))
 	}
 	st.Rows += uint64(batch.NumRows())
@@ -544,16 +552,30 @@ func (w *writer) PatchSQL(s stagedStream, p prepared) []string {
 	} else {
 		match = []string{"t." + q(idColumn) + " = p." + q(idColumn)}
 	}
+	heldOf := func(c string) string {
+		if f, ok := s.Fills[c]; ok {
+			return f
+		}
+		return c
+	}
+	// The last column that fills each held column, whose UPDATE takes it out
+	// of the target's _openetl_held: an UPDATE before it needs it there.
+	last := map[string]string{}
+	for _, c := range cols {
+		if !slices.Contains(metadataColumns, c) && !slices.Contains(s.Key, c) {
+			last[heldOf(c)] = c
+		}
+	}
 	var out []string
 	for _, c := range cols {
 		if slices.Contains(metadataColumns, c) || slices.Contains(s.Key, c) {
 			continue
 		}
-		held := c
-		if f, ok := s.Fills[c]; ok {
-			held = f
+		held := heldOf(c)
+		set := "t." + q(c) + " = p." + q(c)
+		if last[held] == c {
+			set += ", t." + q(heldColumn) + " = NULLIF(JSON_REMOVE(t." + q(heldColumn) + ", " + jsonPath(held) + "), JSON_OBJECT())"
 		}
-		set := "t." + q(c) + " = p." + q(c) + ", t." + q(heldColumn) + " = NULLIF(JSON_REMOVE(t." + q(heldColumn) + ", " + jsonPath(held) + "), JSON_OBJECT())"
 		if slices.Contains(cols, syncedColumn) {
 			set += ", t." + q(syncedColumn) + " = p." + q(syncedColumn)
 		}
@@ -568,7 +590,8 @@ func (w *writer) PatchSQL(s stagedStream, p prepared) []string {
 // other columns as they were, with its metadata columns updated, or with
 // hard deletes removes the row. A column in unchanged that the latest
 // version didn't send takes its value from the key's latest staged version
-// that did, or else keeps the target's.
+// that did, unless the target's row is newer than that version, or else
+// keeps the target's.
 //
 // Each row's values are worked out in the SELECT, against the target's row
 // joined as cur, and ON DUPLICATE KEY UPDATE only takes them: its
@@ -648,7 +671,8 @@ func (w *writer) MergeSQL(s stagedStream, p prepared) []string {
 
 // latest is merge's derived table of each key's latest staged version. With
 // unchanged columns, each comes from the key's latest earlier version that
-// sent it, if any; its _openetl_unchanged then leaves it out.
+// sent it and isn't older than the target's row, if any; its
+// _openetl_unchanged then leaves it out.
 func (w *writer) latest(s stagedStream, p prepared, hasSeq bool) string {
 	cols := p.cols
 	q := quoteIdent
@@ -664,7 +688,17 @@ func (w *writer) latest(s stagedStream, p prepared, hasSeq bool) string {
 	}
 	before := "e." + q(ordColumn) + " < l." + q(ordColumn)
 	if hasSeq {
-		before = "(e." + q(seqColumn) + ", e." + q(ordColumn) + ") < (l." + q(seqColumn) + ", l." + q(ordColumn) + ")"
+		// e was staged before l as l was picked, where a null seq is below
+		// every other: a row comparison with a null in it is unknown.
+		es, ls := "e."+q(seqColumn), "l."+q(seqColumn)
+		before = "(" + es + " < " + ls + " OR (" + es + " IS NULL AND " + ls + " IS NOT NULL) OR (" + es + " <=> " + ls + " AND " + before + "))"
+		// Nor older than the target's row, whose value is newer; a missing
+		// seq doesn't stop it, as in MergeSQL.
+		target := make([]string, len(s.Key))
+		for i, k := range s.Key {
+			target[i] = "tgt." + q(k) + " = l." + q(k)
+		}
+		before += " AND NOT EXISTS (SELECT 1 FROM " + w.ident(s.Table) + " tgt WHERE " + strings.Join(target, " AND ") + " AND tgt." + q(seqColumn) + " > " + es + ")"
 	}
 	// sent is where e is a version of l's key before it that sent c.
 	sent := func(c string) string {
@@ -1309,9 +1343,16 @@ func (w *writer) ddlOnce(ctx context.Context, stmt string) error {
 }
 
 // columnTypes returns a table's columns in order, or none if it doesn't
-// exist.
+// exist, with the types that make them as they are: MariaDB's JSON, which it
+// lists as longtext with a json_valid check, is json, whose collation differs
+// from the table's.
 func (w *writer) columnTypes(ctx context.Context, table string) ([]column, error) {
-	rows, err := w.db.QueryContext(ctx, `SELECT COLUMN_NAME, COLUMN_TYPE FROM information_schema.COLUMNS
+	typ := "COLUMN_TYPE"
+	if w.srv.mariadb {
+		typ = "IF(EXISTS (SELECT 1 FROM information_schema.CHECK_CONSTRAINTS k WHERE k.CONSTRAINT_SCHEMA = c.TABLE_SCHEMA AND k.TABLE_NAME = c.TABLE_NAME" +
+			" AND k.CHECK_CLAUSE = CONCAT('json_valid(`', c.COLUMN_NAME, '`)')), 'json', COLUMN_TYPE)"
+	}
+	rows, err := w.db.QueryContext(ctx, `SELECT COLUMN_NAME, `+typ+` FROM information_schema.COLUMNS c
 		WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND COLUMN_NAME <> ? ORDER BY ORDINAL_POSITION`, w.schema, table, ordColumn)
 	if err != nil {
 		return nil, classify(fmt.Errorf("mysql: read the columns of %s: %w", table, err))
@@ -1437,11 +1478,14 @@ func (w *writer) dropAbandonedReads(ctx context.Context, drop func(l sqlstage.Re
 }
 
 // DropRemovedReads drops the read tables of streams that no longer
-// overwrite, once Recover has raised the fence. Best effort, like
-// dropStaging.
+// overwrite, once Recover has raised the fence, and while it holds it: a
+// newer generation that overwrites such a stream may have raised it since.
+// Best effort, like dropStaging.
 func (w *writer) DropRemovedReads(ctx context.Context) {
-	_ = w.dropAbandonedReads(ctx, func(l sqlstage.ReadLabel, _ string) bool {
-		return w.streams[l.Stream].Mode != destination.Overwrite
+	_ = w.Fenced(ctx, "LOCK IN SHARE MODE", func() error {
+		return w.dropAbandonedReads(ctx, func(l sqlstage.ReadLabel, _ string) bool {
+			return w.streams[l.Stream].Mode != destination.Overwrite
+		})
 	})
 }
 
