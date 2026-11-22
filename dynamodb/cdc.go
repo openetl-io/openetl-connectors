@@ -41,7 +41,8 @@ const (
 	// A bounded read counts an open shard as read once this many
 	// GetRecords in a row return nothing: an empty page doesn't prove
 	// there's nothing after it, but what the read leaves the next one
-	// reads.
+	// reads, and it records nothing after the position only once
+	// AT_TIMESTAMP finds no record since.
 	emptyPages = 3
 	// Pauses between GetRecords: DynamoDB Streams allows five a second per
 	// shard.
@@ -577,7 +578,7 @@ func (r *cdcRead) poll(ctx context.Context, id string) (ended bool, err error) {
 	b := r.s.newBatcher(r.cs, r.t, true)
 	defer b.Release()
 	b.gone = r.gone(ctx)
-	empty := 0
+	empty, probed := 0, time.Time{}
 	for {
 		at, polled := r.awsNow(), time.Now()
 		if it == nil {
@@ -631,7 +632,9 @@ func (r *cdcRead) poll(ctx context.Context, id string) (ended bool, err error) {
 			}
 			horizon, retries = false, 0
 			st.After = aws.ToString(rec.Dynamodb.SequenceNumber)
-			if c := aws.ToTime(rec.Dynamodb.ApproximateCreationDateTime); c.After(st.Since) {
+			// A record created before a time empty pages had nothing until
+			// shows they missed it: Since goes back to it.
+			if c := aws.ToTime(rec.Dynamodb.ApproximateCreationDateTime); c.After(st.Since) || st.Checked {
 				st.Since, st.Checked = c, false
 			}
 		}
@@ -642,8 +645,11 @@ func (r *cdcRead) poll(ctx context.Context, id string) (ended bool, err error) {
 			// it records, with a resume point, unless a read recorded so
 			// within the last minute: so a read again soon after completes
 			// where this one did, and Since lags by at most the minute.
-			if empty >= emptyPages && at.After(st.Since) && (!st.Checked || at.Sub(st.Since) > checkEvery) {
-				st.Since, st.Checked, checked = at, true, true
+			if empty >= emptyPages && at.After(st.Since) && (!st.Checked || at.Sub(st.Since) > checkEvery) && at.Sub(probed) > checkEvery {
+				probed = at
+				if r.nothingSince(ctx, id, st, at) {
+					st.Since, st.Checked, checked = at, true, true
+				}
 			}
 		} else {
 			empty = 0
@@ -675,6 +681,33 @@ func (r *cdcRead) poll(ctx context.Context, id string) (ended bool, err error) {
 		case <-time.After(wait):
 		}
 	}
+}
+
+// nothingSince says whether a shard has no record after st's position
+// created before at, which empty pages don't prove: it looks for the first
+// record created since Since with an AT_TIMESTAMP iterator, from the second
+// after the position's record's where Since is its time. An endpoint that
+// refuses AT_TIMESTAMP, as one without it does, has the empty pages stand.
+func (r *cdcRead) nothingSince(ctx context.Context, id string, st shardState, at time.Time) bool {
+	from := st.Since
+	if st.After != "" && !st.Checked {
+		from = from.Truncate(time.Second).Add(time.Second)
+	}
+	if !from.Before(at) {
+		return false
+	}
+	once := func(o *dynamodbstreams.Options) { o.RetryMaxAttempts = 1 }
+	it, err := r.streams.GetShardIterator(ctx, &dynamodbstreams.GetShardIteratorInput{
+		StreamArn: aws.String(r.st.Stream), ShardId: aws.String(id), ShardIteratorType: streamtypes.ShardIteratorTypeAtTimestamp, Timestamp: aws.Time(from),
+	}, once)
+	if apiCode(err) == "ValidationException" {
+		return true
+	}
+	if err != nil {
+		return false
+	}
+	res, err := r.streams.GetRecords(ctx, &dynamodbstreams.GetRecordsInput{ShardIterator: it.ShardIterator, Limit: aws.Int32(1)}, once)
+	return err == nil && (len(res.Records) == 0 || res.Records[0].Dynamodb != nil && !aws.ToTime(res.Records[0].Dynamodb.ApproximateCreationDateTime).Before(at))
 }
 
 // trimmed says the stream refused a read of records it has trimmed.

@@ -108,6 +108,11 @@ type fakeStream struct {
 	// DescribeStream's calls, and whether it refuses a ShardFilter.
 	describes int
 	noFilter  bool
+	// How many empty pages each shard's GetRecords returns before its
+	// records, to an iterator not AT_TIMESTAMP; and whether GetShardIterator
+	// refuses AT_TIMESTAMP.
+	blind       map[string]int
+	noTimestamp bool
 }
 
 func (f *fakeStream) DescribeStream(_ context.Context, in *dynamodbstreams.DescribeStreamInput, _ ...func(*dynamodbstreams.Options)) (*dynamodbstreams.DescribeStreamOutput, error) {
@@ -133,13 +138,23 @@ func (f *fakeStream) DescribeStream(_ context.Context, in *dynamodbstreams.Descr
 	return &dynamodbstreams.DescribeStreamOutput{StreamDescription: d}, nil
 }
 
-// An iterator is SHARD/POSITION.
+// An iterator is SHARD/POSITION, and /t after an AT_TIMESTAMP one.
 func (f *fakeStream) GetShardIterator(_ context.Context, in *dynamodbstreams.GetShardIteratorInput, _ ...func(*dynamodbstreams.Options)) (*dynamodbstreams.GetShardIteratorOutput, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	id := *in.ShardId
-	f.started = append(f.started, id)
 	pos := f.trim[id]
+	if in.ShardIteratorType == streamtypes.ShardIteratorTypeAtTimestamp {
+		if f.noTimestamp || in.Timestamp.After(now()) {
+			return nil, &smithy.GenericAPIError{Code: "ValidationException", Message: "AT_TIMESTAMP"}
+		}
+		recs := f.records[id]
+		pos = max(pos, len(recs)-len(slices.DeleteFunc(slices.Clone(recs), func(r streamtypes.Record) bool {
+			return r.Dynamodb.ApproximateCreationDateTime.Before(*in.Timestamp)
+		})))
+		return &dynamodbstreams.GetShardIteratorOutput{ShardIterator: aws.String(fmt.Sprintf("%s/%d/t", id, pos))}, nil
+	}
+	f.started = append(f.started, id)
 	if in.ShardIteratorType == streamtypes.ShardIteratorTypeAfterSequenceNumber {
 		pos = slices.IndexFunc(f.records[id], func(r streamtypes.Record) bool { return *r.Dynamodb.SequenceNumber == *in.SequenceNumber }) + 1
 		if pos <= f.trim[id] {
@@ -162,6 +177,10 @@ func (f *fakeStream) GetRecords(_ context.Context, in *dynamodbstreams.GetRecord
 	}
 	if pos < f.trim[id] {
 		return nil, &smithy.GenericAPIError{Code: "TrimmedDataAccessException", Message: "trimmed"}
+	}
+	if f.blind[id] > 0 && !strings.HasSuffix(*in.ShardIterator, "/t") {
+		f.blind[id]--
+		return &dynamodbstreams.GetRecordsOutput{NextShardIterator: in.ShardIterator}, nil
 	}
 	recs := f.records[id]
 	out := &dynamodbstreams.GetRecordsOutput{}
@@ -542,22 +561,7 @@ func TestIdleShardsAcrossSyncs(t *testing.T) {
 		shards:  []streamtypes.Shard{shard("a", "", false), shard("b", "", false)},
 		records: map[string][]streamtypes.Record{"a": {insert(1, 1, t0)}},
 	}
-	read := func(st cdcState) (cdcState, error) {
-		f.trimBefore(clock.Add(-retention))
-		rec := &connectortest.Recorder{}
-		if err := lineageRead(f, rec, st).follow(t.Context()); err != nil {
-			return st, err
-		}
-		state, complete := rec.Last("t")
-		if !complete {
-			t.Fatal("the read didn't complete")
-		}
-		var next cdcState
-		if err := json.Unmarshal(state, &next); err != nil {
-			t.Fatal(err)
-		}
-		return next, nil
-	}
+	read := func(st cdcState) (cdcState, error) { return syncRead(t, f, st) }
 	st := cdcState{Stream: "arn", G: 1, Skip: t0, Shards: map[string]shardState{"a": {Since: t0}, "b": {Since: t0}}}
 	// The first sync ends with Since 11.9 hours old, the rest come 12.2
 	// hours apart.
@@ -578,5 +582,75 @@ func TestIdleShardsAcrossSyncs(t *testing.T) {
 	clock = clock.Add(25*time.Hour + 30*time.Minute)
 	if _, err := read(st); connectortest.CodeOf(err) != protocolv1.ErrorCode_ERROR_CODE_POSITION_LOST {
 		t.Errorf("a read 25.5 hours after the last, of a record written between that the stream trimmed: %v (%v), want POSITION_LOST", err, connectortest.CodeOf(err))
+	}
+}
+
+// syncRead is a bounded read of f from st, once the stream has trimmed what
+// is older than 24 hours, and the state it completes with.
+func syncRead(t *testing.T, f *fakeStream, st cdcState) (cdcState, error) {
+	t.Helper()
+	f.trimBefore(now().Add(-retention))
+	rec := &connectortest.Recorder{}
+	if err := lineageRead(f, rec, st).follow(t.Context()); err != nil {
+		return st, err
+	}
+	state, complete := rec.Last("t")
+	if !complete {
+		t.Fatal("the read didn't complete")
+	}
+	var next cdcState
+	if err := json.Unmarshal(state, &next); err != nil {
+		t.Fatal(err)
+	}
+	return next, nil
+}
+
+// Empty pages don't prove a shard has nothing after them. A read that
+// finds them while the shard has a record after them doesn't record that
+// it has none, so that the record, trimmed unread, is lost, not skipped.
+// An endpoint without AT_TIMESTAMP has the pages taken as proof.
+func TestEmptyPagesBeforeRecord(t *testing.T) {
+	t0 := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	clock := t0.Add(time.Minute)
+	defer func(n func() time.Time) { now = n }(now)
+	now = func() time.Time { return clock }
+	f := &fakeStream{shards: []streamtypes.Shard{shard("a", "", false)}, records: map[string][]streamtypes.Record{"a": {insert(1, 1, t0)}}}
+	st, err := syncRead(t, f, cdcState{Stream: "arn", G: 1, Skip: t0.Add(-time.Minute), Shards: map[string]shardState{"a": {Since: t0.Add(-time.Minute)}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sh := st.Shards["a"]; !sh.Checked || !sh.Since.Equal(clock) {
+		t.Errorf("after a's record and empty pages: %+v, want nothing after it until %v", sh, clock)
+	}
+	f.mu.Lock()
+	f.records["a"] = append(f.records["a"], insert(2, 2, t0.Add(time.Hour)))
+	f.blind = map[string]int{"a": emptyPages}
+	f.mu.Unlock()
+	clock = t0.Add(2 * time.Hour)
+	if st, err = syncRead(t, f, st); err != nil {
+		t.Fatal(err)
+	}
+	clock = t0.Add(25*time.Hour + 30*time.Minute)
+	if _, err := syncRead(t, f, st); connectortest.CodeOf(err) != protocolv1.ErrorCode_ERROR_CODE_POSITION_LOST {
+		t.Errorf("a record behind empty pages, trimmed unread: %v (%v), want POSITION_LOST", err, connectortest.CodeOf(err))
+	}
+	f = &fakeStream{shards: []streamtypes.Shard{shard("a", "", false)}, records: map[string][]streamtypes.Record{"a": {insert(1, 1, t0)}}, noTimestamp: true}
+	clock = t0.Add(time.Minute)
+	st, err = syncRead(t, f, cdcState{Stream: "arn", G: 1, Skip: t0.Add(-time.Minute), Shards: map[string]shardState{"a": {Since: t0.Add(-time.Minute)}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sh := st.Shards["a"]; !sh.Checked || !sh.Since.Equal(clock) {
+		t.Errorf("without AT_TIMESTAMP, after a's record and empty pages: %+v, want nothing after it until %v", sh, clock)
+	}
+	// So taken, the pages hid a record from an hour before them: once read,
+	// Since goes back to it.
+	f.records["a"] = append(f.records["a"], insert(2, 2, t0.Add(time.Hour)), insert(3, 3, t0.Add(3*time.Hour)))
+	clock = t0.Add(2*time.Hour + 30*time.Minute)
+	if st, err = syncRead(t, f, cdcState{Stream: "arn", G: 1, Skip: t0, Shards: map[string]shardState{"a": {After: fmt.Sprintf("%021d", 1), Since: t0.Add(2 * time.Hour), Checked: true}}}); err != nil {
+		t.Fatal(err)
+	}
+	if sh := st.Shards["a"]; sh.Checked || !sh.Since.Equal(t0.Add(time.Hour)) {
+		t.Errorf("after reading a record from before the empty pages' time: %+v, want Since %v", sh, t0.Add(time.Hour))
 	}
 }
