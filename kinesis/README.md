@@ -128,6 +128,10 @@ spec:
 
 Reads replay exactly within the stream's retention period: a read resumed from a checkpoint yields the same records in the same order.
 
+From 0.2.0, a redo that OpenETL asks for reads each shard up to the sequence number where the recorded read sent its resume point, or completed, and no further. It reads no shard the recorded read hadn't reached by then, adds no shards, and ends with a resume point there and completes there. If retention has removed that record, the redo fails with `POSITION_LOST`, as it can't read the same records again.
+
+A bounded read that finds a shard caught up records when it did, unless it recorded that within the last minute. So a read again from where one stopped, within that minute, completes where it did.
+
 ## Destination
 
 ### What it writes

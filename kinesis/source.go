@@ -310,6 +310,10 @@ type shardState struct {
 	// Nothing after the position arrived before this: the last record's
 	// arrival, or when the read last caught up.
 	Since time.Time `json:"since,omitzero"`
+	// Since is when the read last caught up. A bounded read moves it again
+	// only once it's a minute old, so a read again from where one stopped
+	// soon after completes where that one did.
+	Checked bool `json:"checked,omitempty"`
 }
 
 // state is the resume point of a stream read whole: each shard's position. A
@@ -369,6 +373,35 @@ func cmpSeq(a, b string) int {
 	return strings.Compare(a, b)
 }
 
+// upTo is how many of recs, what a fetch returned after the sequence number
+// after, a read that stops at end keeps, and whether it reaches end with
+// them. A record past end that doesn't follow end itself shows that end is
+// gone: lost.
+func upTo(recs []types.Record, after, end string) (keep int, reached, lost bool) {
+	i := slices.IndexFunc(recs, func(rec types.Record) bool { return cmpSeq(aws.ToString(rec.SequenceNumber), end) > 0 })
+	if i < 0 {
+		n := len(recs)
+		return n, n > 0 && aws.ToString(recs[n-1].SequenceNumber) == end, false
+	}
+	if i > 0 {
+		after = aws.ToString(recs[i-1].SequenceNumber)
+	}
+	if after != end {
+		return 0, false, true
+	}
+	return i, true, false
+}
+
+// stopOf is where a read that isn't continuous stops: its until, or its
+// complete_at, which is never set with it. Both are states this source
+// emitted, at a resume point or a completion. Nil: where the read would end.
+func stopOf(until, completeAt []byte) []byte {
+	if until != nil {
+		return until
+	}
+	return completeAt
+}
+
 func positionLost(err error) error {
 	return sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_POSITION_LOST, err)
 }
@@ -396,6 +429,15 @@ type streamRead struct {
 	stopped map[string]bool
 	// Each running shard's last MillisBehindLatest.
 	behind map[string]time.Duration
+	// Where a bounded read stops, where the request says: each shard's
+	// position, read up to and including its After. A stream read whole
+	// reads nothing of a shard its stop doesn't have. Nil: where the read
+	// catches up.
+	until map[string]shardState
+	// The stops as the request gave them, which the read completes at: the
+	// whole stream's, or each split's by ID.
+	untilWhole []byte
+	untilSplit map[string][]byte
 }
 
 // reading is one Read: what its shards' goroutines share.
@@ -437,6 +479,11 @@ func (s *Source) Read(ctx context.Context, req source.ReadRequest, out source.Em
 		}
 		if err != nil {
 			return err
+		}
+		if rd.bounded {
+			if err := r.stops(st); err != nil {
+				return err
+			}
 		}
 		if err := s.position(ctx, cl, r, rd.start); err != nil {
 			return err
@@ -495,6 +542,38 @@ func (s *Source) Read(ctx context.Context, req source.ReadRequest, out source.Em
 			return ctx.Err()
 		}
 	}
+}
+
+// stops takes where a bounded read stops from the request.
+func (r *streamRead) stops(st source.ConfiguredStream) error {
+	if r.splits == nil {
+		stop := stopOf(st.Until, st.CompleteAt)
+		if stop == nil {
+			return nil
+		}
+		shards, err := parseState(stop)
+		if err != nil {
+			return err
+		}
+		r.until, r.untilWhole = map[string]shardState{}, stop
+		maps.Copy(r.until, shards)
+		return nil
+	}
+	for _, sp := range st.Splits {
+		stop := stopOf(sp.Until, sp.CompleteAt)
+		if stop == nil {
+			continue
+		}
+		var u shardState
+		if err := json.Unmarshal(stop, &u); err != nil {
+			return fmt.Errorf("kinesis: where split %s stops: %w", sp.ID, err)
+		}
+		if r.until == nil {
+			r.until, r.untilSplit = map[string]shardState{}, map[string][]byte{}
+		}
+		r.until[sp.ID], r.untilSplit[sp.ID] = u, stop
+	}
+	return nil
 }
 
 // begin starts the shards the read can start with: the splits to read now,
@@ -588,6 +667,7 @@ func (rd *reading) finish(ctx context.Context, r *streamRead, shard string, st s
 			return err
 		}
 	}
+	stop := r.untilSplit[shard]
 	r.mu.Lock()
 	r.shards[shard] = st
 	delete(r.running, shard)
@@ -595,7 +675,17 @@ func (rd *reading) finish(ctx context.Context, r *streamRead, shard string, st s
 	r.stopped[shard] = true
 	var start []string
 	var added []source.Split
-	if ended {
+	switch {
+	case ended && stop != nil:
+		// A split that stops where the request says adds no splits: only
+		// the read's own start.
+		for _, id := range r.runnable() {
+			if r.splits[id] {
+				r.running[id] = true
+				start = append(start, id)
+			}
+		}
+	case ended:
 		start, added = r.take()
 	}
 	state := r.stateOf(shard)
@@ -603,9 +693,12 @@ func (rd *reading) finish(ctx context.Context, r *streamRead, shard string, st s
 	r.mu.Unlock()
 	em := rd.emitter(r, shard)
 	var err error
-	if r.splits == nil {
+	switch {
+	case stop != nil:
+		err = completeAt(em, stop)
+	case r.splits == nil:
 		err = em.ResumePoint(state)
-	} else {
+	default:
 		err = em.Complete(state, added...)
 	}
 	if err != nil {
@@ -627,7 +720,11 @@ func (rd *reading) finish(ctx context.Context, r *streamRead, shard string, st s
 // started, their parents not read to their ends, which keep their states.
 func (rd *reading) complete(r *streamRead) error {
 	if r.splits == nil {
-		return rd.out.Split(r.name, source.WholeStream).Complete(encodeState(r.shards))
+		em := rd.out.Split(r.name, source.WholeStream)
+		if r.untilWhole != nil {
+			return completeAt(em, r.untilWhole)
+		}
+		return em.Complete(encodeState(r.shards))
 	}
 	for _, id := range slices.Sorted(maps.Keys(r.splits)) {
 		if !r.stopped[id] {
@@ -637,6 +734,15 @@ func (rd *reading) complete(r *streamRead) error {
 		}
 	}
 	return nil
+}
+
+// completeAt completes a read at the stop its request gave, after a resume
+// point there.
+func completeAt(em source.SplitEmitter, stop []byte) error {
+	if err := em.ResumePoint(stop); err != nil {
+		return err
+	}
+	return em.Complete(stop)
 }
 
 // listChildren lists the stream's shards. A closed shard's children exist
@@ -835,7 +941,10 @@ func (s *Source) position(ctx context.Context, cl *awskinesis.Client, r *streamR
 			continue
 		}
 		st := shardState{Since: start}
-		if fresh {
+		if u, ok := r.until[id]; ok {
+			// Where the read that reached the stop started the shard.
+			st.From = u.From
+		} else if fresh {
 			switch s.cfg.StartPosition {
 			case startLatest:
 				if sh.SequenceNumberRange != nil && sh.SequenceNumberRange.EndingSequenceNumber != nil {
@@ -925,6 +1034,9 @@ func (r *streamRead) runnable() []string {
 		if st.Done || r.running[id] || r.stopped[id] {
 			continue
 		}
+		if _, ok := r.until[id]; r.untilWhole != nil && !ok {
+			continue
+		}
 		sh := r.listed[id]
 		if !r.parentDone(sh.ParentShardId) || !r.parentDone(sh.AdjacentParentShardId) {
 			continue
@@ -1002,6 +1114,11 @@ func (rd *reading) poll(ctx context.Context, r *streamRead, shard string) error 
 	if st.Done {
 		return rd.finish(ctx, r, shard, st, true)
 	}
+	// The read is at its stop, or the read that set it read nothing of the
+	// shard.
+	if u, ok := r.until[shard]; ok && (u.After == "" || st.After != "" && cmpSeq(st.After, u.After) >= 0) {
+		return rd.finish(ctx, r, shard, st, u.Done)
+	}
 	sr := &shardRead{
 		rd: rd, r: r, shard: shard, em: rd.emitter(r, shard), st: st,
 		closed: sh.SequenceNumberRange != nil && sh.SequenceNumberRange.EndingSequenceNumber != nil,
@@ -1048,13 +1165,22 @@ func (sr *shardRead) failed(err error) error {
 func (sr *shardRead) batch(ctx context.Context, at time.Time, recs []types.Record, behind time.Duration, ended bool) (bool, error) {
 	rd := sr.rd
 	stop := false
-	if rd.bounded {
+	u, stops := sr.r.until[sr.shard]
+	switch {
+	case stops:
+		keep, reached, lost := upTo(recs, sr.st.After, u.After)
+		if lost || !reached && (ended || !sr.closed && behind == 0 && len(recs) == 0) {
+			return false, positionLost(fmt.Errorf("kinesis: %s's shard %s no longer holds record %s, where the read stops: retention removed it", sr.r.name, sr.shard, u.After))
+		}
+		recs, stop = recs[:keep], reached
+		ended = reached && u.Done
+	case rd.bounded:
 		if i := slices.IndexFunc(recs, func(rec types.Record) bool { return aws.ToTime(rec.ApproximateArrivalTimestamp).After(rd.start) }); i >= 0 {
 			recs, stop, ended = recs[:i], true, false
 		}
-	}
-	if !stop {
-		stop = rd.bounded && !sr.closed && behind == 0 && len(recs) == 0
+		if !stop {
+			stop = !sr.closed && behind == 0 && len(recs) == 0
+		}
 	}
 	rows, err := rd.s.rows(ctx, sr.shard, recs)
 	if err != nil {
@@ -1065,11 +1191,11 @@ func (sr *shardRead) batch(ctx context.Context, at time.Time, recs []types.Recor
 		last := recs[n-1]
 		st.After = aws.ToString(last.SequenceNumber)
 		if a := aws.ToTime(last.ApproximateArrivalTimestamp); a.After(st.Since) {
-			st.Since = a
+			st.Since, st.Checked = a, false
 		}
 	}
-	if behind == 0 && len(recs) == 0 && at.After(st.Since) {
-		st.Since = at
+	if behind == 0 && len(recs) == 0 && at.After(st.Since) && (!rd.bounded || !st.Checked || at.Sub(st.Since) > idleResumeEvery) {
+		st.Since, st.Checked = at, true
 		sr.sinceChanged = true
 	}
 	resume := !ended && !stop && (len(recs) > 0 || sr.sinceChanged && time.Since(sr.lastResume) > idleResumeEvery)
