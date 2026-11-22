@@ -227,6 +227,24 @@ func TestTokens(t *testing.T) {
 	}
 }
 
+// A position moved to a post-batch resume token at the cluster time of the
+// last change read, as one within a transaction is, keeps that change's
+// place, so that a change after it at that time, read from the state, takes
+// the next; at a later time, a change takes the first.
+func TestMoveToKeepsPlace(t *testing.T) {
+	tok := func(data string) *value { return &value{raw(t, bson.D{{Key: "_data", Value: data}})} }
+	last := bson.Timestamp{T: 0x6A1B2C3D, I: 2}
+	r := &cdcReader{st: cdcState{Token: tok("826A1B2C3D000000022B042C0100296E5A1004"), Place: 2}}
+	r.moveTo(tok("826A1B2C3D000000022B042C0100296E5A1009"), last, 2)
+	if r.st.Place != 2 {
+		t.Errorf("moved within the last change's cluster time: place %d, want 2", r.st.Place)
+	}
+	r.moveTo(tok("826A1B2C3D000000032B042C0100296E5A1004"), last, 2)
+	if r.st.Place != 0 {
+		t.Errorf("moved past the last change's cluster time: place %d, want 0", r.st.Place)
+	}
+}
+
 func TestDecimalValue(t *testing.T) {
 	small, _ := new(big.Int).SetString("-1250", 10)
 	v, err := decimalValue(small, 2)
