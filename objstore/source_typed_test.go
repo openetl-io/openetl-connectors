@@ -2,6 +2,7 @@ package objstore
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -625,5 +626,18 @@ func TestInferExactNumbers(t *testing.T) {
 	nan.text("NaN")
 	if got := nan.field("n").Type.String(); got != "float64" {
 		t.Errorf("NaN: %s", got)
+	}
+}
+
+// A file named .bz2 is decompressed with bzip2.
+func TestBzip2(t *testing.T) {
+	cfg := map[string]any{"url": "file://" + t.TempDir()}
+	// "id,name\n1,a\n2,b\n", from bzip2 -9.
+	bz, _ := base64.StdEncoding.DecodeString("QlpoOTFBWSZTWaAwe34AAAbZAAAQAAQwADYjIAAxANNNBAMQIEFFl0b17fi7kinChIUBg9vw")
+	put(t, cfg, map[string][]byte{"c/a.csv.bz2": bz})
+	s := newSource(t, cfg, map[string]any{"name": "c", "glob": "c/*", "format": "csv"})
+	r := mustRead(t, s, "c", source.FullRefresh, nil).rows["c/"]
+	if got := values(r, "name"); !slices.Equal(got, []string{"a", "b"}) {
+		t.Errorf("names %v", got)
 	}
 }

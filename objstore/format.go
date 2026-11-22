@@ -1,6 +1,7 @@
 package objstore
 
 import (
+	"compress/bzip2"
 	"compress/gzip"
 	"context"
 	"encoding/json"
@@ -263,7 +264,7 @@ func (t *textWriter) close() error {
 // compressionOf is the compression name's extension says, and the name
 // without it.
 func compressionOf(name string) (compression, base string) {
-	for ext, c := range map[string]string{".gz": "gzip", ".gzip": "gzip", ".zst": "zstd", ".zstd": "zstd", ".sz": "snappy", ".snappy": "snappy"} {
+	for ext, c := range map[string]string{".gz": "gzip", ".gzip": "gzip", ".zst": "zstd", ".zstd": "zstd", ".sz": "snappy", ".snappy": "snappy", ".bz2": "bzip2"} {
 		if strings.HasSuffix(name, ext) {
 			return c, strings.TrimSuffix(name, ext)
 		}
@@ -271,7 +272,7 @@ func compressionOf(name string) (compression, base string) {
 	return "none", name
 }
 
-// decompress reads r decompressed with compression: gzip, zstd, snappy's
+// decompress reads r decompressed with compression: gzip, zstd, bzip2, snappy's
 // framing format, or none.
 func decompress(compression string, r io.Reader) (io.ReadCloser, error) {
 	switch compression {
@@ -283,6 +284,8 @@ func decompress(compression string, r io.Reader) (io.ReadCloser, error) {
 			return nil, err
 		}
 		return z.IOReadCloser(), nil
+	case "bzip2":
+		return io.NopCloser(bzip2.NewReader(r)), nil
 	case "snappy":
 		return io.NopCloser(snappy.NewReader(r)), nil
 	}
