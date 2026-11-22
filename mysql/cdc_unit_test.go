@@ -125,6 +125,18 @@ func TestStatementChangesFail(t *testing.T) {
 		{"app", "REPLACE INTO other.checksums SELECT COUNT(*) FROM app.items", false},
 		{"app", "INSERT INTO audit VALUES ('items')", false},
 		{"other", "UPDATE log JOIN app.items USING (id) SET n = 1", false},
+		{"app", "UPDATE log JOIN app.items USING (id) SET app.items.v = 'x'", true},
+		{"app", "UPDATE log l JOIN items AS i ON l.id = i.id SET l.n = 1, i.v = 'it''s'", true},
+		{"app", "UPDATE log JOIN `items` USING (id) SET v = 'x'", true},
+		{"app", "UPDATE log, items SET log.n = 1, items.v = 'x' WHERE log.id = items.id", true},
+		{"app", "UPDATE items i JOIN log l USING (id) SET l.n = 1", false},
+		{"app", "UPDATE log SET n = (SELECT count(*) FROM items) WHERE v = 'items'", false},
+		{"app", "DELETE log, items FROM log JOIN items USING (id)", true},
+		{"app", "DELETE log, i FROM log JOIN items AS i USING (id)", true},
+		{"app", "DELETE FROM log.*, app.items.* USING log JOIN app.items USING (id)", true},
+		{"app", "DELETE FROM items AS i WHERE i.id = 1", true},
+		{"app", "DELETE log FROM log JOIN items USING (id)", false},
+		{"app", "DELETE i FROM items AS l JOIN log AS i USING (id)", false},
 	} {
 		r, _ := binlogReader(t, false)
 		err := feed(t, r, at(100, replication.QUERY_EVENT, query("BEGIN")), at(200, replication.QUERY_EVENT, &replication.QueryEvent{Schema: []byte(c.schema), Query: []byte(c.q)}))

@@ -842,9 +842,15 @@ func (r *cdcReader) event(ctx context.Context, ev *replication.BinlogEvent) erro
 				st.dirty = true
 			}
 		}
-		if schema, name, ok := statementTarget(q); ok && cmp.Or(schema, strings.ToUpper(string(e.Schema))) == strings.ToUpper(r.s.cfg.Database) {
+		if written, cols, refs, ok := statementWrites(q); ok {
+			is := func(st *cdcStream) func(tableName) bool {
+				return func(t tableName) bool {
+					return cmp.Or(t.schema, strings.ToUpper(string(e.Schema))) == strings.ToUpper(r.s.cfg.Database) && t.name == strings.ToUpper(st.t.name)
+				}
+			}
 			for _, st := range r.streams {
-				if !st.finished && (r.txn == nil || !r.txn.skip[st]) && name == strings.ToUpper(st.t.name) {
+				hasCol := slices.ContainsFunc(st.t.cols, func(c sourceColumn) bool { return slices.Contains(cols, strings.ToUpper(c.name)) })
+				if !st.finished && (r.txn == nil || !r.txn.skip[st]) && (slices.ContainsFunc(written, is(st)) || hasCol && slices.ContainsFunc(refs, is(st))) {
 					return configInvalid("mysql: binlog: a change to %s logged as a statement, which has no rows to read: a session set binlog_format to STATEMENT or MIXED; "+
 						"log changes with binlog_format = ROW, and read %[1]s again", st.t.name)
 				}
@@ -903,35 +909,202 @@ func (r *cdcReader) event(ctx context.Context, ev *replication.BinlogEvent) erro
 	return nil
 }
 
-// statementTarget is the table that q, a statement in upper case that
-// changes rows, writes, which in the binlog means a session logged it as a
-// statement: the first table it names after INSERT, REPLACE, UPDATE or
-// DELETE and their modifiers, with its schema if q names one. ok is false
-// for another statement. A multi-table UPDATE or DELETE writes more.
-func statementTarget(q string) (schema, name string, ok bool) {
-	for strings.HasPrefix(q, "/*") {
-		_, q, _ = strings.Cut(q, "*/")
-		q = strings.TrimSpace(q)
+// tableName is a table a statement names, with its schema if it names one.
+type tableName struct{ schema, name string }
+
+// statementWrites is what q, a statement in upper case that changes rows,
+// writes, which in the binlog means a session logged it as a statement: the
+// tables it writes, and the columns an UPDATE of more than one table sets
+// without naming their table, which may be of any table in refs. ok is
+// false for another statement.
+func statementWrites(q string) (written []tableName, cols []string, refs []tableName, ok bool) {
+	ts := sqlTokens(q)
+	if len(ts) == 0 {
+		return nil, nil, nil, false
 	}
-	verb, rest := nextName(q)
-	switch verb {
-	case "INSERT", "REPLACE", "UPDATE", "DELETE":
-	default:
-		return "", "", false
-	}
-	for {
-		name, rest = nextName(rest)
-		switch name {
-		case "LOW_PRIORITY", "DELAYED", "HIGH_PRIORITY", "IGNORE", "QUICK", "INTO", "FROM":
-			continue
+	i := 1
+	skip := func(words ...string) {
+		for i < len(ts) && slices.Contains(words, ts[i]) {
+			i++
 		}
-		break
 	}
-	if strings.HasPrefix(rest, ".") {
-		schema = name
-		name, _ = nextName(rest[1:])
+	switch ts[0] {
+	case "INSERT", "REPLACE":
+		skip("LOW_PRIORITY", "DELAYED", "HIGH_PRIORITY", "IGNORE", "INTO")
+		list, _ := tableList(ts, i)
+		return list[:min(len(list), 1)], nil, nil, len(list) > 0
+	case "UPDATE":
+		skip("LOW_PRIORITY", "IGNORE")
+		var aliases map[string]tableName
+		refs, aliases, i = references(ts, i, "SET")
+		if len(refs) == 1 {
+			return refs, nil, nil, true
+		}
+		// Each assignment's [[schema.]table.]column, to WHERE, ORDER or LIMIT.
+		depth, start := 0, true
+		for i++; i < len(ts); i++ {
+			switch t := ts[i]; {
+			case t == "(":
+				depth++
+			case t == ")":
+				depth--
+			case depth > 0:
+			case t == ",":
+				start = true
+				continue
+			case t == "WHERE" || t == "ORDER" || t == "LIMIT":
+				return written, cols, refs, true
+			case start:
+				n, j := dotted(ts, i)
+				switch i = j - 1; len(n) {
+				case 1:
+					cols = append(cols, n[0])
+				case 2:
+					written = append(written, cmp.Or(aliases[n[0]], tableName{name: n[0]}))
+				case 3:
+					written = append(written, tableName{n[0], n[1]})
+				}
+			}
+			start = false
+		}
+		return written, cols, refs, true
+	case "DELETE":
+		skip("LOW_PRIORITY", "QUICK", "IGNORE")
+		from := i < len(ts) && ts[i] == "FROM"
+		if from {
+			i++
+		}
+		var list []tableName
+		var aliases map[string]tableName
+		list, i = tableList(ts, i)
+		switch {
+		case from && i < len(ts) && ts[i] == "USING":
+			_, aliases, _ = references(ts, i+1, "WHERE")
+		case from:
+			return list[:min(len(list), 1)], nil, nil, len(list) > 0
+		case i < len(ts) && ts[i] == "FROM":
+			_, aliases, _ = references(ts, i+1, "WHERE")
+		}
+		for j, t := range list {
+			if a, ok := aliases[t.name]; ok && t.schema == "" {
+				list[j] = a
+			}
+		}
+		return list, nil, nil, true
 	}
-	return schema, name, name != ""
+	return nil, nil, nil, false
+}
+
+// tableList reads a list of [schema.]table[.*] from ts[i:], and returns where
+// it ends.
+func tableList(ts []string, i int) ([]tableName, int) {
+	var list []tableName
+	for i < len(ts) && isName(ts[i]) {
+		n, j := dotted(ts, i)
+		list, i = append(list, tableOf(n)), j
+		if i >= len(ts) || ts[i] != "," {
+			break
+		}
+		i++
+	}
+	return list, i
+}
+
+// references reads table references from ts[i:] to the first of stop: each
+// table, and by each one's alias and name, the table. It returns where they
+// end.
+func references(ts []string, i int, stop ...string) ([]tableName, map[string]tableName, int) {
+	var refs []tableName
+	aliases := map[string]tableName{}
+	expect := true
+	for ; i < len(ts) && !slices.Contains(stop, ts[i]); i++ {
+		switch t := ts[i]; {
+		case t == "," || t == "JOIN" || t == "STRAIGHT_JOIN":
+			expect = true
+		case expect && isName(t):
+			n, j := dotted(ts, i)
+			ref := tableOf(n)
+			refs, aliases[ref.name], i, expect = append(refs, ref), ref, j, false
+			if i < len(ts) && ts[i] == "AS" {
+				i++
+			}
+			if i < len(ts) && isName(ts[i]) && !slices.Contains(afterTable, ts[i]) {
+				aliases[strings.TrimPrefix(ts[i], "`")] = ref
+			} else {
+				i--
+			}
+		}
+	}
+	return refs, aliases, i
+}
+
+// afterTable are the words that may follow a table reference that aren't
+// its alias.
+var afterTable = []string{"ON", "USING", "JOIN", "INNER", "LEFT", "RIGHT", "CROSS", "NATURAL", "OUTER", "STRAIGHT_JOIN", "SET", "WHERE",
+	"USE", "FORCE", "IGNORE", "PARTITION", "ORDER", "LIMIT"}
+
+// dotted reads a name and the names it's qualified by, a.b.c, from ts[i:],
+// with a trailing .* left out, and returns where it ends.
+func dotted(ts []string, i int) ([]string, int) {
+	n := []string{strings.TrimPrefix(ts[i], "`")}
+	for i++; i+1 < len(ts) && ts[i] == "."; i += 2 {
+		if ts[i+1] == "*" {
+			return n, i + 2
+		}
+		n = append(n, strings.TrimPrefix(ts[i+1], "`"))
+	}
+	return n, i
+}
+
+// tableOf is the table that a dotted name names.
+func tableOf(n []string) tableName {
+	t := tableName{name: n[len(n)-1]}
+	if len(n) > 1 {
+		t.schema = n[len(n)-2]
+	}
+	return t
+}
+
+func isName(t string) bool { return t != "" && (t[0] == '`' || nameChar(t[0])) }
+
+// sqlTokens splits q into words, names quoted with backticks, as a backtick
+// and the name, and other characters one by one, leaving out strings,
+// whose place a ' takes, and comments.
+func sqlTokens(q string) []string {
+	var ts []string
+	for i := 0; i < len(q); {
+		c := q[i]
+		switch {
+		case c == '`':
+			n, rest := nextName(q[i:])
+			ts, i = append(ts, "`"+n), len(q)-len(rest)
+		case c == '\'' || c == '"':
+			j := i + 1
+			for ; j < len(q) && (q[j] != c || j+1 < len(q) && q[j+1] == c); j++ {
+				if q[j] == '\\' || q[j] == c {
+					j++
+				}
+			}
+			ts, i = append(ts, "'"), j+1
+		case strings.HasPrefix(q[i:], "/*"):
+			_, rest, _ := strings.Cut(q[i+2:], "*/")
+			i = len(q) - len(rest)
+		case c == '#' || strings.HasPrefix(q[i:], "-- "):
+			_, rest, _ := strings.Cut(q[i:], "\n")
+			i = len(q) - len(rest)
+		case nameChar(c):
+			j := i
+			for j < len(q) && nameChar(q[j]) {
+				j++
+			}
+			ts, i = append(ts, q[i:j]), j
+		case c > ' ':
+			ts, i = append(ts, string(c)), i+1
+		default:
+			i++
+		}
+	}
+	return ts
 }
 
 // nextName is the name s starts with, after spaces, bare or quoted with
