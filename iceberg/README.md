@@ -134,3 +134,4 @@ A delete written in a table's current partitioning doesn't reach files of an ear
 - Deduping holds every `_openetl_id` of the epoch in memory, and of the whole read for an overwrite, and a staged file that loses rows is read whole to be written again.
 - The destination writes; it doesn't read tables back as a source.
 - Glue commits one table at a time, so a pipeline into Glue needs stream scope, and an epoch's tables may land a few moments apart.
+- From 0.2.0, an epoch that can't be recovered, as some of its staged files are gone, leaves the rest in its tables' locations as orphan files, which no snapshot holds.

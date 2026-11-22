@@ -89,6 +89,10 @@ func (d *Destination) Open(ctx context.Context, cfg destination.OpenConfig) (des
 	if err != nil {
 		return nil, err
 	}
+	return d.newWriter(ctx, c, cfg), nil
+}
+
+func (d *Destination) newWriter(ctx context.Context, c catalog.Catalog, cfg destination.OpenConfig) *writer {
 	wctx, cancel := context.WithCancel(context.WithoutCancel(ctx))
 	w := &writer{
 		d: d, cat: c, cfg: cfg, ns: d.namespace(cfg.Namespace),
@@ -105,7 +109,7 @@ func (d *Destination) Open(ctx context.Context, cfg destination.OpenConfig) (des
 	for _, s := range cfg.Streams {
 		w.streams[s.Name] = s
 	}
-	return w, nil
+	return w
 }
 
 type writer struct {
@@ -1370,12 +1374,16 @@ func (w *writer) Recover(ctx context.Context, gen uint64, e destination.Epoch, c
 		}
 		r = destination.Redone
 	case len(missing) == applying:
-		// Nothing of it is visible, and some lane's files are gone.
-		r = destination.Lost
-		for _, st := range desc.Streams {
-			w.dropFiles(desc.Namespace, st.Table, st.Files)
-			w.dropFiles(desc.Namespace, st.Table, st.Patches)
+		// Nothing of it is visible, and some lane's files are gone, unless a
+		// newer generation has since raised the fence, applied the epoch and
+		// dropped a merge's files. The rest stay, as orphans: an older
+		// generation that read the fence before can lower it again, as
+		// Iceberg sets a property unconditionally, so they may be an
+		// append's that is its table's now.
+		if _, err := w.raiseFence(ctx, desc.Namespace, names, gen); err != nil {
+			return 0, err
 		}
+		r = destination.Lost
 	default:
 		return 0, fmt.Errorf("iceberg: epoch %d-g%d is partly applied and the staged files for the rest are gone", desc.Epoch, desc.Generation)
 	}

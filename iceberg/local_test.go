@@ -1,0 +1,156 @@
+package iceberg
+
+import (
+	"context"
+	"errors"
+	"strings"
+	"sync"
+	"testing"
+
+	"github.com/apache/arrow-go/v18/arrow"
+	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/memory"
+	"github.com/apache/iceberg-go/catalog"
+	"github.com/apache/iceberg-go/catalog/hadoop"
+	"github.com/apache/iceberg-go/table"
+
+	"github.com/openetl-io/openetl/sdk/go/destination"
+)
+
+// The tests in this file run against a Hadoop catalog in a temporary
+// directory, whose tables keep their files on local disk.
+
+func localCatalog(t *testing.T) catalog.Catalog {
+	t.Helper()
+	cat, err := hadoop.NewCatalog("local", t.TempDir(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return cat
+}
+
+// localWriter opens a writer of pipeline p on cat, with stream scope.
+func localWriter(t *testing.T, cat catalog.Catalog, gen uint64, streams ...destination.Stream) *writer {
+	t.Helper()
+	d := &Destination{cfg: DestinationConfig{CatalogConfig: defaultCatalogConfig()}}
+	d.conn = &conn{cfg: d.cfg.CatalogConfig}
+	w := d.newWriter(t.Context(), cat, destination.OpenConfig{Pipeline: "p", Generation: gen, Scope: destination.ScopeStream, Streams: streams})
+	t.Cleanup(func() { _ = w.Close(context.Background()) })
+	return w
+}
+
+var localFields = []arrow.Field{{Name: "id", Type: arrow.PrimitiveTypes.Int64, Nullable: true}, {Name: "name", Type: arrow.BinaryTypes.String, Nullable: true}}
+
+// localWrite writes rows, a JSON array of objects of localFields, to stream
+// in epoch e.
+func localWrite(t *testing.T, w *writer, e destination.Epoch, stream, rows string) {
+	t.Helper()
+	b, _, err := array.RecordFromJSON(memory.DefaultAllocator, arrow.NewSchema(localFields, nil), strings.NewReader(rows))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Release()
+	if err := w.Write(t.Context(), e, stream, b); err != nil {
+		t.Fatalf("write %s: %v", stream, err)
+	}
+}
+
+// localRows is the table's rows, by id: each one's name.
+func localRows(t *testing.T, cat catalog.Catalog, name string) map[int64]string {
+	t.Helper()
+	tbl, err := cat.LoadTable(t.Context(), table.Identifier{"default", name})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, it, err := tbl.Scan().ToArrowRecords(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := map[int64]string{}
+	for b, err := range it {
+		if err != nil {
+			t.Fatalf("scan %s: %v", name, err)
+		}
+		ids, names := b.Column(b.Schema().FieldIndices("id")[0]), b.Column(b.Schema().FieldIndices("name")[0])
+		for r := range int(b.NumRows()) {
+			out[ids.(*array.Int64).Value(r)] = names.ValueStr(r)
+		}
+		b.Release()
+	}
+	return out
+}
+
+func TestLocalCommit(t *testing.T) {
+	cat := localCatalog(t)
+	w := localWriter(t, cat, 1, destination.Stream{Name: "users", Mode: destination.Append})
+	e := destination.Epoch{Generation: 1, N: 1}
+	localWrite(t, w, e, "users", `[{"id": 1, "name": "a"}, {"id": 2, "name": "b"}]`)
+	st, err := w.PreCommit(t.Context(), e)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Commit(t.Context(), e, []destination.Staged{st}); err != nil {
+		t.Fatal(err)
+	}
+	if got := localRows(t, cat, "users"); len(got) != 2 || got[1] != "a" || got[2] != "b" {
+		t.Errorf("users holds %v", got)
+	}
+}
+
+// hookCatalog runs hook once, once the at-th LoadTable has read its table.
+// The tables it loads commit through cat itself.
+type hookCatalog struct {
+	catalog.Catalog
+	mu        sync.Mutex
+	loads, at int
+	hook      func()
+}
+
+func (c *hookCatalog) LoadTable(ctx context.Context, ident table.Identifier) (*table.Table, error) {
+	tbl, err := c.Catalog.LoadTable(ctx, ident)
+	c.mu.Lock()
+	c.loads++
+	run := c.loads == c.at
+	c.mu.Unlock()
+	if run {
+		c.hook()
+	}
+	return tbl, err
+}
+
+// A newer generation can raise the fence, redo the epoch and drop a merge's
+// staged files while an older one recovers it. The older one then finds
+// those files gone, and is fenced: the epoch isn't lost, and the files it
+// staged for an append, which are the table's now, stay.
+func TestRecoverIsLostOnlyBehindItsOwnFence(t *testing.T) {
+	cat := localCatalog(t)
+	streams := []destination.Stream{{Name: "a", Mode: destination.Append}, {Name: "m", Mode: destination.Merge, PrimaryKey: []string{"id"}}}
+	e := destination.Epoch{Generation: 1, N: 1}
+	w1 := localWriter(t, cat, 1, streams...)
+	localWrite(t, w1, e, "a", `[{"id": 1, "name": "a1"}]`)
+	localWrite(t, w1, e, "m", `[{"id": 1, "name": "m1"}]`)
+	st, err := w1.PreCommit(t.Context(), e)
+	if err != nil {
+		t.Fatal(err)
+	}
+	staged := []destination.Staged{st}
+
+	hc := &hookCatalog{Catalog: cat}
+	w2 := localWriter(t, hc, 2, streams...)
+	if _, err := w2.raiseFence(t.Context(), w2.ns, []string{"a", "m"}, 2); err != nil {
+		t.Fatal(err)
+	}
+	hc.at = hc.loads + 2
+	hc.hook = func() {
+		w3 := localWriter(t, cat, 3, streams...)
+		if r, err := w3.Recover(t.Context(), 3, e, staged); err != nil || r != destination.Redone {
+			t.Errorf("the newer generation's recovery is %v, %v; want redone", r, err)
+		}
+	}
+	if r, err := w2.Recover(t.Context(), 2, e, staged); !errors.Is(err, destination.ErrFenced) {
+		t.Errorf("the older generation's recovery is %v, %v; want fenced", r, err)
+	}
+	if got := localRows(t, cat, "a"); len(got) != 1 || got[1] != "a1" {
+		t.Errorf("a holds %v; want 1: a1", got)
+	}
+}
