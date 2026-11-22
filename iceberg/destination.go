@@ -480,14 +480,8 @@ func (w *writer) ApplySchema(ctx context.Context, streams []destination.StreamSc
 			return destination.SchemaApplied{}, err
 		}
 		w.setTable(s.Name, tbl, ensured{schema: s.Schema, refused: refused}, false)
-		w.mu.Lock()
-		dropped := w.dropped[s.Name]
-		delete(w.dropped, s.Name)
-		w.mu.Unlock()
-		for col := range dropped {
-			if !slices.ContainsFunc(refused, func(r destination.RefusedColumn) bool { return r.Column == col }) {
-				return destination.SchemaApplied{}, fmt.Errorf("iceberg: %s's column %q changed type while the epoch was written, and its values were left out; read the epoch again", s.Name, col)
-			}
+		if err := w.checkLeftOut(s.Name, tbl.Schema(), refused); err != nil {
+			return destination.SchemaApplied{}, err
 		}
 		for _, r := range refused {
 			r.Stream = s.Name
@@ -496,6 +490,40 @@ func (w *writer) ApplySchema(ctx context.Context, streams []destination.StreamSc
 		out.Limits[s.Name] = limits(tbl)
 	}
 	return out, nil
+}
+
+// checkLeftOut fails if the table, of schema sc, takes by now the type of a
+// column whose values the stream's writes left out, which ApplySchema
+// doesn't refuse. ApplySchema can't tell which epoch it applies for, so it
+// forgets only the columns it refuses, which the platform then holds: a
+// failure fails each retry too. An epoch's schema holds the type of each of
+// its rows' columns, so ApplySchema refuses the epoch's own left-out columns
+// while the table can't take them; one it doesn't refuse, of a type the
+// table still has, is a later epoch's, and waits for that epoch's.
+func (w *writer) checkLeftOut(stream string, sc *ice.Schema, refused []destination.RefusedColumn) error {
+	isRefused := func(col string) bool {
+		return slices.ContainsFunc(refused, func(r destination.RefusedColumn) bool { return r.Column == col })
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	cols := w.dropped[stream]
+	for col, typ := range cols {
+		if !isRefused(col) && changedType(sc, col, typ) {
+			return leftOut(stream, col)
+		}
+	}
+	maps.DeleteFunc(cols, func(col, _ string) bool { return isRefused(col) })
+	return nil
+}
+
+// changedType reports whether sc's column col isn't of type typ, or is gone.
+func changedType(sc *ice.Schema, col, typ string) bool {
+	f, ok := sc.FindFieldByName(col)
+	return !ok || f.Type.String() != typ
+}
+
+func leftOut(stream, col string) error {
+	return fmt.Errorf("iceberg: %s's column %q changed type while the epoch was written, and its values were left out; read the epoch again", stream, col)
 }
 
 func (w *writer) StartReads(ctx context.Context, starts map[string]time.Time) (err error) {
@@ -867,8 +895,8 @@ func (w *writer) checkDropped(ctx context.Context) error {
 			return fmt.Errorf("iceberg: load %s: %w", w.name(stream), err)
 		}
 		for col, typ := range cols {
-			if f, ok := tbl.Schema().FindFieldByName(col); !ok || f.Type.String() != typ {
-				return fmt.Errorf("iceberg: %s's column %q changed type while the epoch was written, and its values were left out; read the epoch again", stream, col)
+			if changedType(tbl.Schema(), col, typ) {
+				return leftOut(stream, col)
 			}
 		}
 	}
