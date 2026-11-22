@@ -1193,20 +1193,25 @@ func decodeFailed(rec *kgo.Record, part string, err error) error {
 
 // Committed commits the checkpoint's offsets to the consumer group, so
 // Kafka's tools show the read's lag. The checkpoint, not the group, is
-// where reads resume.
+// where reads resume. Without a group set, a source that hasn't read, as
+// the SDK makes when no read is running, doesn't know the pipeline whose
+// group it is, and commits nothing.
 func (s *Source) Committed(ctx context.Context, states map[string][]byte, splits map[string][]source.Split) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	group := s.cfg.Group
+	if group == "" {
+		if s.pipeline == "" {
+			return nil
+		}
+		group = "openetl-" + s.pipeline
+	}
 	if s.acker == nil {
 		cl, err := s.cfg.client()
 		if err != nil {
 			return err
 		}
 		s.acker = cl
-	}
-	group := s.cfg.Group
-	if group == "" {
-		group = "openetl-" + s.pipeline
 	}
 	offsets := kadm.Offsets{}
 	add := func(t string, next map[int32]int64) {

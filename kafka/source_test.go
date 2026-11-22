@@ -842,3 +842,59 @@ func TestAPartitionWhoseEndIsUnknownFailsTheRead(t *testing.T) {
 		})
 	}
 }
+
+// A source that hasn't read, as the SDK makes to acknowledge a checkpoint
+// while no read is running, doesn't know the pipeline, so without a group
+// set it commits no offsets, rather than commit them to the group
+// "openetl-", which every pipeline would share. With a group set, or once
+// it has read, it commits them.
+func TestACommitWithoutAPipelineCommitsToNoSharedGroup(t *testing.T) {
+	addrs := fake(t)
+	topic := "events"
+	produceRecords(t, addrs, topic, 1, 5, 5)
+	cl, err := kgo.NewClient(kgo.SeedBrokers(addrs...))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cl.Close()
+	committed := func(group string) (int64, bool) {
+		t.Helper()
+		got, err := kadm.NewClient(cl).FetchOffsets(t.Context(), group)
+		if errors.Is(err, kerr.GroupIDNotFound) {
+			return 0, false
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		o, ok := got.Lookup(topic, 0)
+		return o.At, ok && o.Err == nil && o.At >= 0
+	}
+	states := map[string][]byte{topic: encodeState(map[int32]int64{0: 3}, "")}
+	acknowledge := func(extra map[string]any) *Source {
+		t.Helper()
+		s, err := NewSource(fakeConfig(t, addrs, extra))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := s.Committed(t.Context(), states, nil); err != nil {
+			t.Fatal(err)
+		}
+		return s
+	}
+
+	s := acknowledge(map[string]any{"topics": []string{topic}})
+	if o, ok := committed("openetl-"); ok {
+		t.Errorf("a source that hasn't read committed offset %d to the group openetl-", o)
+	}
+	acknowledge(map[string]any{"topics": []string{topic}, "group": "mine"})
+	if o, ok := committed("mine"); !ok || o != 3 {
+		t.Errorf("the group set has offset %d (%v), want 3", o, ok)
+	}
+	readEvents(t, s, source.ConfiguredStream{Name: topic})
+	if err := s.Committed(t.Context(), states, nil); err != nil {
+		t.Fatal(err)
+	}
+	if o, ok := committed("openetl-p"); !ok || o != 3 {
+		t.Errorf("after a read of pipeline p, its group has offset %d (%v), want 3", o, ok)
+	}
+}

@@ -49,6 +49,6 @@
       {"const": "earliest", "title": "Earliest", "description": "The oldest record the partition keeps."},
       {"const": "latest", "title": "Latest", "description": "Records written after the first read starts. From 0.2.0, a read again of its first epoch, as OpenETL does to recover on several workers, starts where that read did."}
     ]},
-    "group": {"type": "string", "title": "Consumer group", "x-group": "reading", "x-advanced": true, "description": "The consumer group the read's offsets are committed to once checkpointed, for Kafka's tools. Default: openetl-<pipeline>."}
+    "group": {"type": "string", "title": "Consumer group", "x-group": "reading", "x-advanced": true, "description": "The consumer group the read's offsets are committed to once checkpointed, for Kafka's tools. Default: openetl-<pipeline>; from 0.2.0, without it, a checkpoint committed when no read is running commits nothing, as the pipeline isn't known then."}
   }
 }
