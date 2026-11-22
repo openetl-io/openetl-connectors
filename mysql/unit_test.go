@@ -17,6 +17,7 @@ import (
 	gomysql "github.com/go-mysql-org/go-mysql/mysql"
 	"github.com/go-sql-driver/mysql"
 
+	"github.com/openetl-io/openetl-connectors/connectortest"
 	sdk "github.com/openetl-io/openetl/sdk/go"
 	protocolv1 "github.com/openetl-io/openetl/sdk/go/protocol/v1"
 )
@@ -324,6 +325,22 @@ func TestTooManyConnectionsIsTransient(t *testing.T) {
 	for _, err := range []error{&mysql.MySQLError{Number: 1040, Message: "Too many connections"}, &gomysql.MyError{Code: 1040}, &mysql.MySQLError{Number: 1226}} {
 		if code := classify(fmt.Errorf("mysql: connect: %w", err)).(interface{ ErrorCode() protocolv1.ErrorCode }).ErrorCode(); code != protocolv1.ErrorCode_ERROR_CODE_TRANSIENT {
 			t.Errorf("%v: %v", err, code)
+		}
+	}
+}
+
+// A binlog connection that another with its server ID ended fails as
+// invalid config, which a new server ID fixes, and a purged position as lost.
+func TestServerIDTakenIsConfig(t *testing.T) {
+	for err, want := range map[error]protocolv1.ErrorCode{
+		&gomysql.MyError{Code: 4052, Message: "A slave with the same server_id is already connected; the first event 'mariadb-bin.000002' at 4"}:            protocolv1.ErrorCode_ERROR_CODE_CONFIG_INVALID,
+		&gomysql.MyError{Code: 1236, Message: "A slave with the same server_uuid/server_id as this slave has connected to the master; the first event"}:     protocolv1.ErrorCode_ERROR_CODE_CONFIG_INVALID,
+		&gomysql.MyError{Code: 1236, Message: "A replica with the same server_uuid/server_id as this replica has connected to the source; the first event"}: protocolv1.ErrorCode_ERROR_CODE_CONFIG_INVALID,
+		&gomysql.MyError{Code: 1236, Message: "Could not find first log file name in binary log index file"}:                                                protocolv1.ErrorCode_ERROR_CODE_POSITION_LOST,
+	} {
+		got := classify(fmt.Errorf("mysql: binlog: %w", err))
+		if code := connectortest.CodeOf(got); code != want || (want == protocolv1.ErrorCode_ERROR_CODE_CONFIG_INVALID && !strings.Contains(got.Error(), "serverId")) {
+			t.Errorf("%v: %v (%v)", err, got, code)
 		}
 	}
 }

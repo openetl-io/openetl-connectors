@@ -929,6 +929,39 @@ func TestCDCContinuesOnAnotherServerByGTID(t *testing.T) {
 	})
 }
 
+// TestCDCServerIDTakenIsConfig reads the binlog continuously while another
+// read connects with the same server ID, which MariaDB takes for the same
+// replica and so ends the first's dump: the first fails as invalid config,
+// naming serverId, not as a lost position.
+func TestCDCServerIDTakenIsConfig(t *testing.T) {
+	eachServer(t, func(t *testing.T, srv testServer) {
+		e := newSourceEnv(t, srv)
+		e.exec("CREATE TABLE $db.items (id int PRIMARY KEY)")
+		s := e.source(`, "serverId": 3000000001`)
+		first := read(t, s, cdc("taken", nil, "items"))
+		req := cdc("taken", map[string]string{"items": first.state("items")}, "items")
+		req.Continuous = true
+		ctx, cancel := context.WithCancel(t.Context())
+		var wg sync.WaitGroup
+		defer wg.Wait()
+		defer cancel()
+		done := make(chan error, 1)
+		wg.Go(func() { done <- s.Read(ctx, req, &capture{}) })
+		time.Sleep(2 * time.Second)
+		wg.Go(func() { _ = e.source(`, "serverId": 3000000001`).Read(ctx, req, &capture{}) })
+		select {
+		case err := <-done:
+			if codeOf(err) != protocolv1.ErrorCode_ERROR_CODE_CONFIG_INVALID || !strings.Contains(err.Error(), "serverId") {
+				t.Fatalf("the first read: %v (%v)", err, codeOf(err))
+			}
+		case <-time.After(5 * time.Second):
+			if srv.name == "mariadb" {
+				t.Fatal("MariaDB didn't end the first read's dump")
+			}
+		}
+	})
+}
+
 // TestCDCKeepsTaggedGTIDs reads a transaction with a tagged GTID, then
 // reads on from its state on another server, as after a failover: the
 // transaction isn't read again.
