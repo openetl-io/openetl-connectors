@@ -107,6 +107,16 @@ func (t table) keyCols() []sourceColumn {
 	return out
 }
 
+// keyNames are the names of the table's key's columns, in key order; nil
+// without a key.
+func (t table) keyNames() []string {
+	var out []string
+	for _, k := range t.key {
+		out = append(out, t.cols[k].name)
+	}
+	return out
+}
+
 func (s *Source) Discover(ctx context.Context) (source.Catalog, error) {
 	tables, err := s.tables(ctx, s.db)
 	if err != nil {
@@ -246,6 +256,9 @@ type sourceState struct {
 	// The primary key of the last row read, spelled as text; in an
 	// incremental read, its cursor value first.
 	After []string `json:"after,omitempty"`
+	// The names of the primary key's columns, in key order, that After and
+	// the key range are of. None in a state from before they were kept.
+	Key []string `json:"key,omitempty"`
 	// Set once a table without a primary key has been read.
 	Done bool `json:"done,omitempty"`
 	// An incremental read's cursor floor, inclusive but for a rowversion's,
@@ -313,11 +326,33 @@ func (s *Source) readSplit(ctx context.Context, tables []table, cs source.Config
 	if err != nil {
 		return err
 	}
+	if err := sameOrder(t, st); err != nil {
+		return err
+	}
+	if err := sameOrder(t, until); err != nil {
+		return err
+	}
 	r := &tableRead{s: s, t: t, id: sp.ID, out: out, until: sp.Until, stop: until, completeAt: sp.CompleteAt}
 	if cs.SyncMode == source.Incremental {
 		return r.incremental(ctx, cs.Cursor, st)
 	}
 	return r.full(ctx, st)
+}
+
+// sameOrder fails a read resumed in another order than its state was read
+// in, which only a read from the start carries on from: a state at a key, or
+// in a range of one, of a table without a primary key now, or whose primary
+// key's columns aren't those the state names. A split's range is of the
+// key's first column, so it holds before its first row.
+func sameOrder(t table, st sourceState) error {
+	if st.After == nil && st.Lo == nil && st.Hi == nil {
+		return nil
+	}
+	if len(t.key) == 0 || st.Key != nil && !slices.Equal(st.Key, t.keyNames()) {
+		return positionLost("sqlserver: %s was read in the order of its primary key's columns %q, and its primary key's columns are now %q; "+
+			"the read can't go on from where it was, and the stream needs a reset to read it from the start", t.name, st.Key, t.keyNames())
+	}
+	return nil
 }
 
 func unmarshalState(stream string, b []byte, v any) error {
@@ -438,7 +473,11 @@ func (r *tableRead) full(ctx context.Context, st sourceState) error {
 	if st.After != nil && len(st.After) != len(keys) {
 		return fmt.Errorf("sqlserver: %s state has %d key columns, the table has %d", r.t.name, len(st.After), len(keys))
 	}
-	st = sourceState{After: st.After, keyRange: st.keyRange}
+	if st.Done {
+		// A read from before the table had a primary key, which ended.
+		return r.complete(nil)
+	}
+	st = sourceState{After: st.After, Key: r.t.keyNames(), keyRange: st.keyRange}
 	reading := r.s.Start(r.t.name, r.id, true)
 	defer r.s.End(r.t.name, r.id)
 	for {
@@ -592,6 +631,11 @@ func (r *tableRead) incremental(ctx context.Context, cursor string, st sourceSta
 	if st.After != nil && len(st.After) != len(order) {
 		return fmt.Errorf("sqlserver: %s state has %d cursor and key columns, the read has %d", r.t.name, len(st.After), len(order))
 	}
+	if st.Done {
+		// A read from before the table had a primary key, which ended.
+		return r.complete(&sourceState{Since: st.Until})
+	}
+	st.Key = r.t.keyNames()
 	first := r.t.cols[r.t.key[0]]
 	reading := r.s.Start(r.t.name, r.id, true)
 	defer r.s.End(r.t.name, r.id)
