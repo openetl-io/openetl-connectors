@@ -4,12 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
@@ -17,6 +19,7 @@ import (
 	"github.com/apache/iceberg-go/catalog"
 	"github.com/apache/iceberg-go/catalog/hadoop"
 	"github.com/apache/iceberg-go/catalog/rest"
+	iceio "github.com/apache/iceberg-go/io"
 	"github.com/apache/iceberg-go/table"
 
 	"github.com/openetl-io/openetl/sdk/go/destination"
@@ -255,5 +258,77 @@ func TestWriterErrorsHaveCodes(t *testing.T) {
 	}
 	if _, err := denied.Recover(t.Context(), 2, e, []destination.Staged{st}); code(err) != protocolv1.ErrorCode_ERROR_CODE_PERMISSION_DENIED {
 		t.Errorf("recover: %v, coded %v; want permission denied", err, code(err))
+	}
+}
+
+// stuckCatalog loads tables whose files, once created, take no writes until
+// the writing context ends, as a store that stops answering does.
+type stuckCatalog struct{ catalog.Catalog }
+
+func (c stuckCatalog) LoadTable(ctx context.Context, ident table.Identifier) (*table.Table, error) {
+	tbl, err := c.Catalog.LoadTable(ctx, ident)
+	if err != nil {
+		return nil, err
+	}
+	fs := func(ctx context.Context) (iceio.IO, error) { return stuckFS{ctx: ctx}, nil }
+	return table.New(tbl.Identifier(), tbl.Metadata(), tbl.MetadataLocation(), fs, c.Catalog), nil
+}
+
+type stuckFS struct {
+	iceio.LocalFS
+	ctx context.Context
+}
+
+func (s stuckFS) Create(name string) (iceio.FileWriter, error) {
+	f, err := s.LocalFS.Create(name)
+	if err != nil {
+		return nil, err
+	}
+	return stuckFile{f, s.ctx}, nil
+}
+
+type stuckFile struct {
+	iceio.FileWriter
+	ctx context.Context
+}
+
+func (f stuckFile) Write([]byte) (int, error) {
+	<-f.ctx.Done()
+	return 0, f.ctx.Err()
+}
+
+func (f stuckFile) ReadFrom(io.Reader) (int64, error) {
+	<-f.ctx.Done()
+	return 0, f.ctx.Err()
+}
+
+// Close drops an epoch's open files without waiting for a store that
+// doesn't answer to take them.
+func TestCloseDoesntWaitForTheStore(t *testing.T) {
+	cat := localCatalog(t)
+	streams := []destination.Stream{{Name: "users", Mode: destination.Append}}
+	w1 := localWriter(t, cat, 1, streams...)
+	e1 := destination.Epoch{Generation: 1, N: 1}
+	localWrite(t, w1, e1, "users", `[{"id": 1, "name": "a"}]`)
+	st, err := w1.PreCommit(t.Context(), e1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w1.Commit(t.Context(), e1, []destination.Staged{st}); err != nil {
+		t.Fatal(err)
+	}
+	w := localWriter(t, stuckCatalog{cat}, 2, streams...)
+	localWrite(t, w, destination.Epoch{Generation: 2, N: 2}, "users", `[{"id": 2, "name": "b"}]`)
+	closed := make(chan error, 1)
+	go func() { closed <- w.Close(t.Context()) }()
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(20 * time.Second):
+		w.cancel()
+		<-closed
+		t.Fatal("Close is waiting for the store")
 	}
 }

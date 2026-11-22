@@ -758,8 +758,8 @@ func (w *writer) PreCommit(ctx context.Context, e destination.Epoch) (_ destinat
 	delete(w.patches, e.N)
 	defer func() {
 		if err != nil {
-			w.drop(byStream)
-			w.drop(patches)
+			w.drop(w.ctx, byStream)
+			w.drop(w.ctx, patches)
 		}
 	}()
 	ended := w.ended[e.N]
@@ -919,12 +919,12 @@ type pending struct {
 
 func (w *writer) discard(ps []pending) {
 	for _, p := range ps {
-		w.removeFiles(p.tbl, p.written)
+		w.removeFiles(w.ctx, p.tbl, p.written)
 	}
 }
 
 func (w *writer) committed(p pending) {
-	w.removeFiles(p.tbl, p.staged)
+	w.removeFiles(w.ctx, p.tbl, p.staged)
 	w.removeManifests(p.tbl, p.readsDir)
 }
 
@@ -1097,7 +1097,7 @@ func (w *writer) prepareStream(ctx context.Context, desc staged, s stagedStream,
 	}
 	tx, res, err := w.transaction(ctx, tbl, desc, s, paths)
 	if err != nil {
-		w.removeFiles(tbl, res.written)
+		w.removeFiles(w.ctx, tbl, res.written)
 		return nil, fmt.Errorf("iceberg: %s: %w", strings.Join(ident, "."), err)
 	}
 	p := &pending{stream: s.Name, tx: tx, tbl: tbl, written: res.written, staged: append(slices.Clone(s.Patches), res.replaced...), collapsed: res.collapsed}
@@ -1350,9 +1350,9 @@ func (w *writer) Recover(ctx context.Context, gen uint64, e destination.Epoch, c
 		if tbl != nil && applied(tbl.Properties(), w.cfg.Pipeline, desc) {
 			cleanup.Go(func() error {
 				if st.Mode == modeMerge {
-					w.removeFiles(tbl, st.Files)
+					w.removeFiles(w.ctx, tbl, st.Files)
 				}
-				w.removeFiles(tbl, st.Patches)
+				w.removeFiles(w.ctx, tbl, st.Patches)
 				if st.Mode == modeOverwrite {
 					w.removeManifests(tbl, w.readsDir(tbl, st.Name))
 				}
@@ -1462,23 +1462,23 @@ func (w *writer) allExist(ctx context.Context, tbl *table.Table, paths []string)
 
 // dropFiles deletes data files that no table holds. Best effort: whatever
 // stays behind is an orphan, which Iceberg's orphan-file cleanup removes.
-func (w *writer) dropFiles(ns []string, name string, paths []string) {
+func (w *writer) dropFiles(ctx context.Context, ns []string, name string, paths []string) {
 	if len(paths) == 0 || name == "" {
 		return
 	}
-	tbl, err := w.cat.LoadTable(w.ctx, w.ident(ns, name))
+	tbl, err := w.cat.LoadTable(ctx, w.ident(ns, name))
 	if err != nil {
 		return
 	}
-	w.removeFiles(tbl, paths)
+	w.removeFiles(ctx, tbl, paths)
 }
 
 // removeFiles is dropFiles on a table already loaded.
-func (w *writer) removeFiles(tbl *table.Table, paths []string) {
+func (w *writer) removeFiles(ctx context.Context, tbl *table.Table, paths []string) {
 	if len(paths) == 0 {
 		return
 	}
-	fs, err := tbl.FS(w.ctx)
+	fs, err := tbl.FS(ctx)
 	if err != nil {
 		return
 	}
@@ -1487,22 +1487,24 @@ func (w *writer) removeFiles(tbl *table.Table, paths []string) {
 	}
 }
 
-// Close drops the files of epochs that were never pre-committed.
-func (w *writer) Close(context.Context) error {
+// Close drops the files of epochs that were never pre-committed. It stops
+// the files still being written first, rather than finish them, so a store
+// that doesn't answer can't hold it up.
+func (w *writer) Close(ctx context.Context) error {
+	w.cancel()
 	for _, parts := range []map[uint64]map[string]*epochFiles{w.parts, w.patches} {
 		for _, byStream := range parts {
-			w.drop(byStream)
+			w.drop(ctx, byStream)
 		}
 	}
-	w.cancel()
 	return nil
 }
 
 // drop drops an epoch's files, by stream, closing its open ones first.
-func (w *writer) drop(byStream map[string]*epochFiles) {
+func (w *writer) drop(ctx context.Context, byStream map[string]*epochFiles) {
 	for stream, ef := range byStream {
 		_, _ = ef.finish()
-		w.dropFiles(w.ns, w.name(stream), ef.files)
+		w.dropFiles(ctx, w.ns, w.name(stream), ef.files)
 	}
 }
 
