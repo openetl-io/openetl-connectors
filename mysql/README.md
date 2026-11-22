@@ -277,4 +277,4 @@ A schema change waits up to 5 seconds for its table's metadata lock, and tries u
 
 ### Limits
 
-A value longer than the server's `max_allowed_packet` can't be written: it fails the write with `DATA_INVALID`, naming the stream and the limit. Raise `max_allowed_packet` to write it.
+A row too long for the server's `max_allowed_packet` can't be written: it fails the write with `DATA_INVALID`, naming the stream and the limit. Raise `max_allowed_packet` to write it.

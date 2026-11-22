@@ -214,11 +214,11 @@ func (w *writer) Stage(ctx context.Context, tables map[uint64]map[string]*stagin
 		st.cols = wider
 	}
 	if err := w.insertRows(ctx, st, cols, batch); err != nil {
-		// Statements carry less than max_allowed_packet, and values past
-		// what one can carry go on their own, so this is one value.
+		// Other rows fill less than a quarter of a statement, so this row
+		// is at least three quarters as long as max_allowed_packet.
 		if n, _ := serverError(err); n == 1153 || n == 1105 && strings.Contains(err.Error(), "max_allowed_packet") {
 			return nil, sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_DATA_INVALID,
-				fmt.Errorf("mysql: stage %s: a value longer than the server's max_allowed_packet of %d bytes: %w", stream, w.maxPacket, err))
+				fmt.Errorf("mysql: stage %s: a row too long for the server's max_allowed_packet of %d bytes: %w", stream, w.maxPacket, err))
 		}
 		return nil, classify(fmt.Errorf("mysql: stage %s: %w", stream, err))
 	}
