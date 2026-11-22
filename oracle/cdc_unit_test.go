@@ -112,3 +112,19 @@ func TestPartitionRowsKeepsRows(t *testing.T) {
 		}
 	}
 }
+
+// A column the run didn't declare, such as one added since Discover, fails
+// the read retryably, so the next attempt declares it, rather than leave
+// its values out.
+func TestCDCDeclaredOnly(t *testing.T) {
+	tb := table{name: "T", cols: []column{{name: "ID"}, {name: "V"}, {name: "CL", dataType: "CLOB"}}, key: []int{0}}
+	if _, err := declaredOnly(tb, nil); err != nil {
+		t.Errorf("no columns: %v", err)
+	}
+	if _, err := declaredOnly(tb, []string{"ID", "V", "CL"}); err != nil {
+		t.Errorf("every column: %v", err)
+	}
+	if _, err := declaredOnly(tb, []string{"ID", "V"}); connectortest.CodeOf(err) != protocolv1.ErrorCode_ERROR_CODE_TRANSIENT {
+		t.Errorf("an undeclared column: got %v, want TRANSIENT", err)
+	}
+}

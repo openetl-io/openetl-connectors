@@ -373,32 +373,22 @@ func TestCDCKeyChanged(t *testing.T) {
 	}
 }
 
-// A table's LOB the run didn't declare, such as one added since Discover,
-// isn't read from the table for a change.
-func TestCDCUndeclaredLOB(t *testing.T) {
+// A column the run didn't declare, such as one added since Discover, fails
+// the read retryably, so the next attempt declares it, rather than leave
+// its values out.
+func TestCDCUndeclaredColumn(t *testing.T) {
 	db := testDB(t)
-	cdcTable(t, db, "CDC_ULOB", `(id NUMBER(10) PRIMARY KEY, v VARCHAR2(20), cl CLOB)`)
-	exec(t, db, `INSERT INTO cdc_ulob VALUES (1, 'a', 'lob')`)
+	cdcTable(t, db, "CDC_UCOL", `(id NUMBER(10) PRIMARY KEY, v VARCHAR2(20))`)
+	exec(t, db, `INSERT INTO cdc_ucol VALUES (1, 'a')`)
 	s := cdcSource(t, "")
-	read := func(state []byte) *cdcOut {
-		t.Helper()
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-		defer cancel()
-		out := newCDCOut()
-		cs := source.ConfiguredStream{Name: "CDC_ULOB", SyncMode: source.CDC, State: state, Columns: []string{"ID", "V"}}
-		if err := s.Read(ctx, source.ReadRequest{Lanes: 1, Streams: []source.ConfiguredStream{cs}}, out); err != nil {
-			t.Fatal(err)
-		}
-		return out
-	}
-	first := read(nil)
-	exec(t, db, `UPDATE cdc_ulob SET v = 'b' WHERE id = 1`)
-	second := read(first.state("CDC_ULOB"))
-	if got, want := cdcChanges(second.records("CDC_ULOB"), "ID", "V"), []string{"update 1 b"}; !slices.Equal(got, want) {
-		t.Fatalf("changes: got %q, want %q", got, want)
-	}
-	if _, ok := second.records("CDC_ULOB")[0]["CL"]; ok {
-		t.Error("the undeclared LOB was sent")
+	first := mustRead(t, s, nil, "CDC_UCOL")
+	exec(t, db, `ALTER TABLE cdc_ucol ADD (cl CLOB)`, `UPDATE cdc_ucol SET v = 'b', cl = 'lob' WHERE id = 1`)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	cs := source.ConfiguredStream{Name: "CDC_UCOL", SyncMode: source.CDC, State: first.state("CDC_UCOL"), Columns: []string{"ID", "V"}}
+	err := s.Read(ctx, source.ReadRequest{Lanes: 1, Streams: []source.ConfiguredStream{cs}}, newCDCOut())
+	if cdcCode(err) != protocolv1.ErrorCode_ERROR_CODE_TRANSIENT || !strings.Contains(err.Error(), `"CL"`) {
+		t.Errorf("a column added since Discover: got %v, want TRANSIENT naming it", err)
 	}
 }
 

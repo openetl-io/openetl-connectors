@@ -201,7 +201,6 @@ func (s *Source) readCDC(ctx context.Context, conns *connPool, req source.ReadRe
 		if st.t, err = declaredOnly(t, cs.Columns); err != nil {
 			return err
 		}
-		// Of the columns sent: a LOB added since Discover isn't.
 		st.lobs = slices.ContainsFunc(st.t.cols, column.lob)
 		if err := r.supplemental(st.t.name); err != nil {
 			return err
@@ -991,30 +990,19 @@ func (r *cdcReader) progress() {
 	}
 }
 
-// declaredOnly narrows t to the columns the run declared. A column added
-// since the run's Discover has no declared type. No columns: the request
+// declaredOnly checks t has only the columns the run declared. A column
+// added since the run's Discover has no declared type: the read fails,
+// retryably, and the next attempt declares it. No columns: the request
 // doesn't say.
 func declaredOnly(t table, columns []string) (table, error) {
 	if len(columns) == 0 {
 		return t, nil
 	}
-	cols := make([]column, 0, len(t.cols))
-	at := make(map[int]int, len(t.cols))
-	for i, c := range t.cols {
-		if slices.Contains(columns, c.name) {
-			at[i] = len(cols)
-			cols = append(cols, c)
+	for _, c := range t.cols {
+		if !slices.Contains(columns, c.name) {
+			return t, transient("oracle: %s has a new column %q; the read starts again to declare it", t.name, c.name)
 		}
 	}
-	key := make([]int, len(t.key))
-	for i, k := range t.key {
-		j, ok := at[k]
-		if !ok {
-			return t, transient("oracle: %s has a new key column %q; the read starts again to take it", t.name, t.cols[k].name)
-		}
-		key[i] = j
-	}
-	t.cols, t.key = cols, key
 	return t, nil
 }
 
