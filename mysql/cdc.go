@@ -821,12 +821,13 @@ func (r *cdcReader) event(ctx context.Context, ev *replication.BinlogEvent) erro
 	case *replication.RowsEvent:
 		return r.rows(h.EventType, e)
 	case *replication.TransactionPayloadEvent:
+		// The events inside have no position: the transaction ends where
+		// the payload does, below.
 		for _, inner := range e.Events {
 			if err := r.event(ctx, inner); err != nil {
 				return err
 			}
 		}
-		return nil
 	case *replication.HeartbeatEvent:
 		if r.txn == nil && e.Filename != "" {
 			r.serverEnd = maxPos(r.serverEnd, binlogPos{File: e.Filename, Pos: h.LogPos})

@@ -864,7 +864,9 @@ func TestCDCContinuesOnAnotherServerByGTID(t *testing.T) {
 }
 
 // TestCDCReadsCompressedTransactions reads changes MySQL wrote to the binlog
-// compressed, in one Transaction_payload event.
+// compressed, two transactions each in a Transaction_payload event, whose
+// events have no position: the second's update of a key comes after the
+// first's.
 func TestCDCReadsCompressedTransactions(t *testing.T) {
 	e := newSourceEnv(t, servers()[0])
 	e.exec("CREATE TABLE $db.items (id int PRIMARY KEY, v varchar(20))")
@@ -880,7 +882,8 @@ func TestCDCReadsCompressedTransactions(t *testing.T) {
 	for _, q := range []string{
 		"SET SESSION binlog_transaction_compression = ON", "BEGIN",
 		"INSERT INTO " + db + ".items VALUES (3, 'c')", "UPDATE " + db + ".items SET v = 'z' WHERE id = 1", "DELETE FROM " + db + ".items WHERE id = 2",
-		"COMMIT", "SET SESSION binlog_transaction_compression = OFF",
+		"COMMIT", "BEGIN", "UPDATE " + db + ".items SET v = 'y' WHERE id = 1", "COMMIT",
+		"SET SESSION binlog_transaction_compression = OFF",
 	} {
 		if _, err := conn.ExecContext(t.Context(), q); err != nil {
 			t.Fatalf("%s: %v", q, err)
@@ -891,8 +894,11 @@ func TestCDCReadsCompressedTransactions(t *testing.T) {
 	for _, r := range next.rows("items") {
 		log = append(log, r["openetl.op"]+" "+r["id"]+" "+r["v"])
 	}
-	if want := []string{"insert 3 c", "update 1 z", "delete 2 b"}; !slices.Equal(log, want) {
+	if want := []string{"insert 3 c", "update 1 z", "delete 2 b", "update 1 y"}; !slices.Equal(log, want) {
 		t.Fatalf("changes %q, want %q", log, want)
+	}
+	if got := merged(t, next.rows("items"), "id")["1"]["v"]; got != "y" {
+		t.Fatalf("key 1's latest version by seq has v %q, want y", got)
 	}
 	var st struct{ File string }
 	if err := json.Unmarshal([]byte(next.state("items")), &st); err != nil {
