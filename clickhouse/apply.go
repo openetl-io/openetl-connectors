@@ -935,31 +935,9 @@ func (w *writer) Recover(ctx context.Context, gen uint64, e destination.Epoch, c
 	if err != nil {
 		return 0, err
 	}
-	var missing []stagedStream
-	needs, present := 0, 0
-	for _, s := range desc.Streams {
-		done, err := w.marked(ctx, desc, s.Name)
-		if err != nil {
-			return 0, err
-		}
-		if done {
-			continue
-		}
-		missing = append(missing, s)
-		ready, err := w.exists(ctx, readyName(w.cfg.Pipeline, s.Name, desc.Generation, desc.Epoch))
-		if err != nil {
-			return 0, err
-		}
-		for _, t := range s.staged() {
-			needs++
-			ok, err := w.exists(ctx, t)
-			if err != nil {
-				return 0, err
-			}
-			if ok || ready {
-				present++
-			}
-		}
+	missing, needs, present, err := w.unapplied(ctx, desc)
+	if err != nil {
+		return 0, err
 	}
 	var r destination.Recovery
 	switch {
@@ -976,7 +954,12 @@ func (w *writer) Recover(ctx context.Context, gen uint64, e destination.Epoch, c
 		}
 		r = destination.Redone
 	case len(missing) == len(desc.Streams):
-		// Nothing of it is visible, and some lane's staging is gone.
+		// Nothing of it is visible, and some lane's staging is gone, unless
+		// a newer generation has raised the fence since, applied the epoch
+		// and dropped its staging.
+		if err := w.fenceAt(ctx, gen); err != nil {
+			return 0, err
+		}
 		r = destination.Lost
 	default:
 		return 0, fmt.Errorf("clickhouse: epoch %d-g%d is partly applied and the staging for the rest is gone", desc.Epoch, desc.Generation)
@@ -987,6 +970,37 @@ func (w *writer) Recover(ctx context.Context, gen uint64, e destination.Epoch, c
 	w.dropStale(ctx, gen)
 	w.dropRemovedReads(ctx, gen)
 	return r, nil
+}
+
+// unapplied returns the streams of desc whose marker is missing, how many
+// staging tables they have, and how many of those are there: a stream's
+// ready table stands in for its staging.
+func (w *writer) unapplied(ctx context.Context, desc staged) (missing []stagedStream, needs, present int, err error) {
+	for _, s := range desc.Streams {
+		done, err := w.marked(ctx, desc, s.Name)
+		if err != nil {
+			return nil, 0, 0, err
+		}
+		if done {
+			continue
+		}
+		missing = append(missing, s)
+		ready, err := w.exists(ctx, readyName(w.cfg.Pipeline, s.Name, desc.Generation, desc.Epoch))
+		if err != nil {
+			return nil, 0, 0, err
+		}
+		for _, t := range s.staged() {
+			needs++
+			ok, err := w.exists(ctx, t)
+			if err != nil {
+				return nil, 0, 0, err
+			}
+			if ok || ready {
+				present++
+			}
+		}
+	}
+	return missing, needs, present, nil
 }
 
 // trimMarkers deletes the pipeline's markers below an applied epoch, which

@@ -15,6 +15,7 @@ import (
 	"time"
 
 	ch "github.com/ClickHouse/clickhouse-go/v2"
+	"github.com/ClickHouse/clickhouse-go/v2/lib/driver"
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/decimal128"
@@ -1079,5 +1080,56 @@ func TestDestinationFencedKeepsNewerReads(t *testing.T) {
 	}
 	if k.exists(read) {
 		t.Error("the fence's generation, which appends, kept the stream's read")
+	}
+}
+
+// raceConn runs race once, before the first query of system.tables, which
+// Recover makes once it has read the epoch's markers.
+type raceConn struct {
+	driver.Conn
+	race func()
+}
+
+func (c *raceConn) QueryRow(ctx context.Context, query string, args ...any) driver.Row {
+	if race := c.race; race != nil && strings.HasPrefix(query, "SELECT count() FROM system.tables") {
+		c.race = nil
+		race()
+	}
+	return c.Conn.QueryRow(ctx, query, args...)
+}
+
+// A Recover that finds an epoch's markers missing and its staging gone
+// reports it lost, unless a newer generation has raised the fence since,
+// and may have applied the epoch and dropped its staging: then it's fenced.
+func TestDestinationRecoverLostOnlyBehindItsOwnFence(t *testing.T) {
+	for _, newer := range []bool{false, true} {
+		t.Run(fmt.Sprint("newer=", newer), func(t *testing.T) {
+			k := newKit(t)
+			s := schemaOf("a", idCol, vCol)
+			streams := []destination.Stream{{Name: "a", Mode: destination.Append}}
+			w1, _ := k.open(1, streams, destination.Epoch{}, nil)
+			k.apply(w1, s)
+			e := epoch(1, 1)
+			st := k.stage(w1, e, batchOf(s, ins(1, int64(1), "a")))
+			w2 := k.writer(2, streams)
+			race := func() {
+				w1.drop(t.Context(), k.tablesLeft()...)
+			}
+			if newer {
+				race = func() {
+					if _, r := k.open(3, streams, e, []destination.Staged{st}); r != destination.Redone {
+						t.Errorf("generation 3 recovered %v, not redone", r)
+					}
+				}
+			}
+			w2.conn = &raceConn{Conn: w2.conn, race: race}
+			r, err := w2.Recover(t.Context(), 2, e, []destination.Staged{st})
+			switch {
+			case !newer && (err != nil || r != destination.Lost):
+				t.Errorf("with its staging gone, recovered %v, %v; want lost", r, err)
+			case newer && !errorsIsFenced(err):
+				t.Errorf("after generation 3 applied the epoch meanwhile, recovered %v, %v; want fenced", r, err)
+			}
+		})
 	}
 }
