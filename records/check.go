@@ -66,8 +66,8 @@ func (c *Config) RegistryChecks(timeout time.Duration) []check.Check {
 					}
 					return check.Unknown.Wrap(answered)
 				}
-				if answered == nil && c.sendsCredentialsInTheClear() {
-					return check.Warn(clearCredentials.Fail())
+				if answered == nil {
+					return c.ClearCredentials()
 				}
 				return answered
 			},
@@ -81,10 +81,14 @@ var clearCredentials = check.Reason{
 	Fix:     "Use the registry's https URL.",
 }
 
-// sendsCredentialsInTheClear: credentials for a registry reached over http.
-func (c *Config) sendsCredentialsInTheClear() bool {
+// ClearCredentials is a check's warning if credentials for the registry,
+// from the settings or the URL, go over http; else nil.
+func (c *Config) ClearCredentials() error {
 	u, err := url.Parse(c.SchemaRegistryURL)
-	return err == nil && u.Scheme == "http" && (c.SchemaRegistryUsername != "" || u.User != nil)
+	if err != nil || u.Scheme != "http" || (c.SchemaRegistryUsername == "" && u.User == nil) {
+		return nil
+	}
+	return check.Warn(clearCredentials.Fail())
 }
 
 // ShownURL is raw without its userinfo, query and fragment, which can hold

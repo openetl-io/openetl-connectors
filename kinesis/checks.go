@@ -259,7 +259,7 @@ func registryCheck(c *records.Config) (check.Check, bool) {
 			}
 			p.Param("subjects", len(subjects))
 			p.Found("The registry answers, with {subjects} subjects.")
-			return nil
+			return c.ClearCredentials()
 		},
 	}, true
 }

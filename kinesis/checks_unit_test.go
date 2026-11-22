@@ -2,11 +2,13 @@ package kinesis
 
 import (
 	"crypto/md5"
+	"encoding/base64"
 	"encoding/json"
 	"maps"
 	"math"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"slices"
 	"strings"
 	"sync"
@@ -17,6 +19,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/kinesis/types"
 	"github.com/twmb/franz-go/pkg/sr"
+	"github.com/twmb/franz-go/pkg/sr/srfake"
 	"google.golang.org/protobuf/encoding/protowire"
 
 	"github.com/openetl-io/openetl-connectors/records"
@@ -714,6 +717,35 @@ func TestAggregatesWhateverTheFormat(t *testing.T) {
 	rows, err := s.rows(t.Context(), "shard-0", recs)
 	if err != nil || len(rows) != 2 || !strings.Contains(string(rows[1]), `"two"`) {
 		t.Errorf("string, deaggregated: %s, %v", rows, err)
+	}
+}
+
+// Credentials for a registry reached over http, from the settings or the
+// URL, pass the registry's check with a warning.
+func TestRegistryCredentialsOverHTTPWarn(t *testing.T) {
+	fake := srfake.New(srfake.WithAuth("Basic " + base64.StdEncoding.EncodeToString([]byte("alice:s3cret"))))
+	defer fake.Close()
+	open := srfake.New()
+	defer open.Close()
+	u, _ := url.Parse(fake.URL())
+	u.User = url.UserPassword("alice", "s3cret")
+	for _, tc := range []struct {
+		c    records.Config
+		want string
+	}{
+		{records.Config{Format: records.Avro, SchemaRegistryURL: fake.URL(), SchemaRegistryUsername: "alice", SchemaRegistryPassword: sdk.NewSecret("s3cret")}, "warning:credentials_unencrypted"},
+		{records.Config{Format: records.Avro, SchemaRegistryURL: u.String()}, "warning:credentials_unencrypted"},
+		{records.Config{Format: records.Avro, SchemaRegistryURL: open.URL()}, "passed"},
+	} {
+		c, _ := registryCheck(&tc.c)
+		it := itemsOf(check.Run(t.Context(), []check.Check{c}))["registry.reach"]
+		got := it.Status.String()
+		if it.Failure != nil {
+			got += ":" + it.Failure.Reason
+		}
+		if got != tc.want {
+			t.Errorf("%s with user %q: %s, want %s", records.ShownURL(tc.c.SchemaRegistryURL), tc.c.SchemaRegistryUsername, got, tc.want)
+		}
 	}
 }
 
