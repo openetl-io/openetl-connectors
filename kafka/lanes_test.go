@@ -393,6 +393,8 @@ type splitEvents struct {
 	// Each split's last state; events show states without their topic
 	// IDs, which a fake cluster makes up.
 	states map[string][]byte
+	// The IDs of the splits the read added, in order.
+	added []string
 }
 
 func (c *splitEvents) add(id string, events ...string) {
@@ -446,8 +448,13 @@ func (s splitLog) Rows(rows []json.RawMessage) error {
 	return nil
 }
 func (s splitLog) Records(arrow.RecordBatch) error { return errors.New("records") }
-func (s splitLog) ResumePoint(state []byte, _ ...source.Split) error {
+func (s splitLog) ResumePoint(state []byte, added ...source.Split) error {
 	s.c.state(s.id, "resume", state)
+	s.c.mu.Lock()
+	for _, a := range added {
+		s.c.added = append(s.c.added, a.ID)
+	}
+	s.c.mu.Unlock()
 	return nil
 }
 func (s splitLog) Complete(next []byte, _ ...source.Split) error {

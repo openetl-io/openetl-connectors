@@ -362,6 +362,13 @@ func TestARedoEndsWithTheStateItWasGiven(t *testing.T) {
 	if id == "" {
 		t.Fatal("a read's state has no topic ID")
 	}
+	counted := func(o int64, tid string, n int32) []byte {
+		b, err := json.Marshal(splitState{Offset: o, TopicID: tid, Partitions: n})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return b
+	}
 	for _, tid := range []string{"", id} {
 		from, stop := encodeState(map[int32]int64{0: 2}, tid), encodeState(map[int32]int64{0: 8}, tid)
 		fromP0, stopP0 := encodeOffset(2, tid), encodeOffset(8, tid)
@@ -370,10 +377,15 @@ func TestARedoEndsWithTheStateItWasGiven(t *testing.T) {
 			{Name: topic, State: from, CompleteAt: stop},
 			{Name: topic, Splits: []source.Split{{ID: "p0", State: fromP0, Until: stopP0}}},
 			{Name: topic, Splits: []source.Split{{ID: "p0", State: fromP0, CompleteAt: stopP0}}},
+			// Partition 0's count of the partitions with splits, which a
+			// continuous read raises, is the stop's.
+			{Name: topic, Splits: []source.Split{{ID: "p0", State: counted(2, tid, 1), Until: counted(8, tid, 3)}}},
+			{Name: topic, Splits: []source.Split{{ID: "p0", State: counted(2, tid, 1), CompleteAt: counted(8, tid, 3)}}},
+			{Name: topic, Splits: []source.Split{{ID: "p0", State: counted(2, tid, 1), Until: stopP0}}},
 		} {
 			split, want := source.WholeStream, stop
 			if cs.Splits != nil {
-				split, want = "p0", stopP0
+				split, want = "p0", stopOf(cs.Splits[0].Until, cs.Splits[0].CompleteAt)
 			}
 			if got := read(cs)[split]; string(got) != string(want) {
 				t.Errorf("a read to %s ended with %s", want, got)
@@ -522,5 +534,169 @@ func TestAStopIsReachedOnlyWhenTheBrokerShowsIt(t *testing.T) {
 	got := readEvents(t, s, source.ConfiguredStream{Name: topic, Splits: []source.Split{{ID: "p0", State: encodeOffset(0, ""), CompleteAt: encodeOffset(30, "")}}})
 	if r := rowsIn(got["p0"]); !slices.Equal(r, rowsIn(at(0, 0, 30))) || !lastIs(got["p0"], "complete "+string(encodeOffset(30, ""))) {
 		t.Errorf("once the broker answered, the split read %v, and ended with %v", r, got["p0"])
+	}
+}
+
+// shortChecks makes a continuous read look for new partitions every d.
+func shortChecks(t *testing.T, d time.Duration) {
+	every := partitionsEvery
+	partitionsEvery = d
+	t.Cleanup(func() { partitionsEvery = every })
+}
+
+// waitFor fails t unless ok holds within 20 seconds.
+func waitFor(t *testing.T, what string, ok func() bool) {
+	t.Helper()
+	for deadline := time.Now().Add(20 * time.Second); !ok(); time.Sleep(20 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatalf("waiting for %s", what)
+		}
+	}
+}
+
+// follow reads splits of topic on continuous reads, one each, as an
+// attempt's workers do. during runs once every read has rows, and the
+// reads end once ready says so of their rows, and they have looked for new
+// partitions a few times more.
+func follow(t *testing.T, s *Source, topic string, splits [][]source.Split, ready func(rows func(id string) int) bool, during func(outs []*splitEvents)) []*splitEvents {
+	t.Helper()
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	outs := make([]*splitEvents, len(splits))
+	done := make(chan error, len(splits))
+	for i, ss := range splits {
+		outs[i] = &splitEvents{events: map[string][]string{}}
+		go func() {
+			done <- s.Read(ctx, source.ReadRequest{Streams: []source.ConfiguredStream{{Name: topic, Splits: ss}}, Pipeline: "p", Lanes: 1, Continuous: true}, outs[i])
+		}()
+	}
+	rows := func(id string) int {
+		n := 0
+		for _, out := range outs {
+			out.mu.Lock()
+			n += len(rowsIn(out.events[id]))
+			out.mu.Unlock()
+		}
+		return n
+	}
+	waitFor(t, "the partitions' first records", func() bool { return rows("p0") > 0 && rows("p1") > 0 })
+	during(outs)
+	waitFor(t, "the new partition's records", func() bool { return ready(rows) })
+	time.Sleep(5 * partitionsEvery)
+	cancel()
+	for range splits {
+		if err := <-done; !errors.Is(err, context.Canceled) {
+			t.Errorf("a read ended with %v", err)
+		}
+	}
+	return outs
+}
+
+// growTopic adds n partitions to topic, and 4 records to each of them.
+func growTopic(t *testing.T, addrs []string, topic string, n int) {
+	t.Helper()
+	cl, err := kgo.NewClient(kgo.SeedBrokers(addrs...))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cl.Close()
+	tds, err := kadm.NewClient(cl).ListTopics(t.Context(), topic)
+	if err != nil {
+		t.Fatal(err)
+	}
+	had := len(tds[topic].Partitions)
+	if _, err := kadm.NewClient(cl).CreatePartitions(t.Context(), n, topic); err != nil {
+		t.Fatal(err)
+	}
+	for p := had; p < had+n; p++ {
+		produceMore(t, addrs, topic, int32(p), 4)
+	}
+}
+
+// rowsOf are partition p's rows that any of outs read, sorted.
+func rowsOf(outs []*splitEvents, p int32) []string {
+	var got []string
+	for _, out := range outs {
+		got = append(got, rowsIn(out.events[splitID(p)])...)
+	}
+	slices.Sort(got)
+	return got
+}
+
+// The splits of a stream's read can be spread over several reads, each of
+// which has only its own: a partition that has no split, whether added to
+// the topic during the reads or before they began, joins exactly one of
+// them, the read of partition 0's split, and no read takes another's
+// partitions, so every record is read once.
+func TestAPartitionWithoutASplitJoinsOneRead(t *testing.T) {
+	shortChecks(t, 100*time.Millisecond)
+	for _, during := range []bool{true, false} {
+		t.Run(fmt.Sprintf("added during the reads %v", during), func(t *testing.T) {
+			addrs := fake(t)
+			topic := "events"
+			produceRecords(t, addrs, topic, 3, 5, 5)
+			s, err := NewSource(fakeConfig(t, addrs, map[string]any{"topics": []string{topic}}))
+			if err != nil {
+				t.Fatal(err)
+			}
+			splits, err := s.Splits(t.Context(), source.ConfiguredStream{Name: topic}, nil)
+			if err != nil || len(splits) != 3 {
+				t.Fatalf("splits %v, %v", splits, err)
+			}
+			add := func([]*splitEvents) { growTopic(t, addrs, topic, 1) }
+			if !during {
+				add(nil)
+				add = func([]*splitEvents) {}
+			}
+			outs := follow(t, s, topic, [][]source.Split{{splits[0], splits[2]}, {splits[1]}}, func(rows func(string) int) bool { return rows("p3") >= 4 }, add)
+			if a, b := outs[0].added, outs[1].added; !slices.Equal(a, []string{"p3"}) || len(b) > 0 {
+				t.Errorf("the read of p0 and p2 added %v, the read of p1 %v", a, b)
+			}
+			for p, n := range map[int32]int64{0: 5, 1: 5, 2: 5, 3: 4} {
+				if got := rowsOf(outs, p); !slices.Equal(got, rowsIn(at(p, 0, n))) {
+					t.Errorf("partition %d's rows: %v", p, got)
+				}
+			}
+			if n := partitionsOf(outs[0].states["p0"]); n != 4 {
+				t.Errorf("partition 0's split counts %d partitions, of 4", n)
+			}
+		})
+	}
+}
+
+// Partition 0's split, as 0.1.0 wrote it, holds no count of the partitions
+// with splits, so its read takes every partition it wasn't given, as
+// 0.1.0's did, and holds their count from then on.
+func TestAReadFromSplitsBefore020TakesThePartitionsItWasntGiven(t *testing.T) {
+	shortChecks(t, 100*time.Millisecond)
+	addrs := fake(t)
+	topic := "events"
+	produceRecords(t, addrs, topic, 2, 5, 5)
+	s, err := NewSource(fakeConfig(t, addrs, map[string]any{"topics": []string{topic}}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := []source.Split{{ID: "p0", State: []byte(`{"offset":0}`)}, {ID: "p1", State: []byte(`{"offset":0}`)}}
+	counted := func(outs []*splitEvents, n int32) func() bool {
+		return func() bool {
+			outs[0].mu.Lock()
+			defer outs[0].mu.Unlock()
+			return partitionsOf(outs[0].states["p0"]) == n
+		}
+	}
+	outs := follow(t, s, topic, [][]source.Split{old}, func(rows func(string) int) bool { return rows("p2") >= 4 }, func(outs []*splitEvents) {
+		waitFor(t, "a count of the partitions read", counted(outs, 2))
+		growTopic(t, addrs, topic, 1)
+	})
+	if !slices.Equal(outs[0].added, []string{"p2"}) {
+		t.Errorf("the read added %v", outs[0].added)
+	}
+	for p, n := range map[int32]int64{0: 5, 1: 5, 2: 4} {
+		if got := rowsOf(outs, p); !slices.Equal(got, rowsIn(at(p, 0, n))) {
+			t.Errorf("partition %d's rows: %v", p, got)
+		}
+	}
+	if !counted(outs, 3)() {
+		t.Errorf("partition 0's split ended at %s", outs[0].states["p0"])
 	}
 }
