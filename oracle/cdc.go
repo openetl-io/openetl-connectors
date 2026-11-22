@@ -25,8 +25,10 @@ const (
 	resumeEvery   = time.Second
 	quietEvery    = 10 * time.Second
 	progressEvery = 10 * time.Second
-	// How long ago a redo log must have begun for the redo before it to be
-	// taken as in the log files.
+	// How long redo stays in the log buffer before LGWR writes it, as a
+	// rule: a window mines again at least what was this new when the last
+	// one started, and a redo log that began this long ago is taken as
+	// holding the redo before it.
 	flushLag = 5 * time.Second
 	// How long LogMiner can miss a redo log the database lists before the
 	// read takes it as gone: one being switched or archived is back sooner.
@@ -150,7 +152,8 @@ type cdcReader struct {
 	// What's handled before a row is read: the streams' first position.
 	start uint64
 	// Where the next window starts.
-	lo uint64
+	lo      uint64
+	samples []scnSample
 	// Since when LogMiner has missed a redo log; zero if it hasn't.
 	missingSince time.Time
 	// The first SCN of the redo log that changes still in the log buffer
@@ -165,6 +168,11 @@ type cdcReader struct {
 	// The window's changes of tables' definitions, by table, once looked
 	// ahead at: whether each drops a column, by the object version it makes.
 	ddls map[string]map[uint64]bool
+}
+
+type scnSample struct {
+	at  time.Time
+	scn uint64
 }
 
 // readCDC reads the cdc streams: each table's snapshot, as of one SCN by a
@@ -432,6 +440,7 @@ func (r *cdcReader) mine() error {
 		if err != nil {
 			return err
 		}
+		r.samples = append(r.samples, scnSample{started, e})
 		if e >= r.lo {
 			if err := r.missing(r.window(r.lo, e), started); err != nil {
 				return err
@@ -443,8 +452,15 @@ func (r *cdcReader) mine() error {
 		if r.mark, r.markAt, err = logMark(r.ctx, r.conn); err != nil {
 			return err
 		}
-		// Redo still in the log buffer comes after what's handled.
-		r.lo = max(r.lo, r.handled()+1)
+		// The next window starts where this one may have missed changes
+		// still in the log buffer: after what's handled, and no later than
+		// the end of a window that started flushLag ago.
+		for len(r.samples) > 1 && started.Sub(r.samples[1].at) >= flushLag {
+			r.samples = r.samples[1:]
+		}
+		if started.Sub(r.samples[0].at) >= flushLag {
+			r.lo = max(r.lo, min(r.samples[0].scn, r.handled()+1))
+		}
 		if r.restart != "" {
 			for _, st := range r.order {
 				if st.until == nil && !st.finished {
