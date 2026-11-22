@@ -19,7 +19,7 @@ The source and the destination share their connection settings. Keep keys in sec
 
 With none of them, the connector uses Azure's default credentials (`DefaultAzureCredential`) for `accountName`. `endpoint` sets the blob service's URL, such as Azurite's `http://127.0.0.1:10000/devstoreaccount1`; without it, the URL is `https://ACCOUNT.blob.core.windows.net`. A connection string names the URL itself, so the connector refuses `endpoint` with one.
 
-A SAS, in `sasToken` or a connection string, goes in each request's URL as it is, so the connector refuses it with an `http` endpoint. An account's key signs each request rather than going in it, so it works over `http`, as Azurite takes it.
+A SAS, in `sasToken` or a connection string, goes in each request's URL as it is, so the connector refuses it with an `http` endpoint. It refuses one with a line break or other control character too, which no request's URL can carry. An account's key signs each request rather than going in it, so it works over `http`, as Azurite takes it.
 
 ### Checks and preflights
 

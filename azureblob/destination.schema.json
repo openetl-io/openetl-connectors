@@ -62,7 +62,7 @@
       "type": "string",
       "x-secret": true,
       "title": "SAS token",
-      "description": "A shared access signature for the container, the query string it is. It goes in each request's URL, so it needs an https endpoint.",
+      "description": "A shared access signature for the container, the query string it is. It goes in each request's URL, so it needs an https endpoint, and no line break or other control character.",
       "x-group": "azure"
     },
     "connectionString": {

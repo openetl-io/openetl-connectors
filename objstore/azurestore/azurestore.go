@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
@@ -51,6 +52,9 @@ func New(cfg Config) (*Store, error) {
 		return nil, errors.New("azureblob: set accountName, a connectionString or an endpoint")
 	case cfg.Endpoint != "" && !cfg.ConnectionString.IsZero():
 		return nil, errors.New("azureblob: set endpoint or connectionString, not both: a connection string names its endpoint")
+	// A request's URL with one fails to parse, in an error that shows it.
+	case strings.ContainsFunc(cfg.SASToken.Reveal()+cfg.ConnectionString.Reveal(), unicode.IsControl):
+		return nil, errors.New("azureblob: sasToken and connectionString can't have a line break or other control character")
 	}
 	s := &Store{cfg: cfg}
 	// A SAS goes in each request's URL, as it is; an account's key signs
