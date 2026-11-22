@@ -74,6 +74,31 @@ With `avro` or `protobuf`, the catalog declares the value's fields as the latest
 
 A value that doesn't decode in the configured format stops the read, with an error naming its topic, partition and offset. From 0.2.0, a value or key whose schema the registry doesn't serve for now, as when it doesn't answer, answers with a server error or refuses the credentials, stops the read with the registry's error, as a transient failure that OpenETL tries again, or as refused credentials. Before 0.2.0, such a key landed in `_kafka_key` as its encoded bytes.
 
+### Types
+
+With `avro` or `protobuf`, each value is decoded with the schema whose ID it carries, and each field of the latest schema is declared as:
+
+| Avro | Protobuf | Declared as |
+|---|---|---|
+| `boolean` | `bool` | boolean |
+| `int` | `int32`, `sint32`, `sfixed32` | 32-bit integer |
+| `long` | `int64`, `sint64`, `sfixed64`, `uint32`, `fixed32` | 64-bit integer |
+| | `uint64`, `fixed64` | decimal(20, 0) |
+| `float`, `double` | `float`, `double` | 32-bit or 64-bit float, NaN and the infinities kept |
+| `string`, `enum` | `string`, `enum` | text; a Protobuf enum value the schema doesn't name is its number |
+| `bytes`, `fixed` | `bytes` | binary |
+| `decimal` | | decimal of its precision and scale, up to precision 38; wider, text |
+| `date` | | date |
+| `time-millis`, `time-micros` | | time of day, in microseconds |
+| `timestamp-millis`, `-micros`, `-nanos` | `google.protobuf.Timestamp` | timestamp in UTC, in microseconds |
+| `local-timestamp-millis`, `-micros`, `-nanos` | | timestamp without a time zone, in microseconds |
+| `uuid` on a `string`, or from 0.2.0 on a `fixed` of 16 | | UUID |
+| `duration` (from 0.2.0) | | JSON: `months`, `days` and `milliseconds` |
+| a union of `null` and one type, in either order | | that type |
+| other unions, `array`, `map`, `record` | `repeated`, `map`, messages, other well-known types | JSON, as Protobuf's JSON mapping spells it for Protobuf |
+
+Before 0.2.0, a `uuid` on a `fixed` and a `duration` were declared binary, which their values didn't fit. A Protobuf `google.protobuf.Any` decodes when its message is in the schema or a file it imports, from 0.2.0; one of a message neither has stops the read, as every `Any` did before.
+
 ### Example
 
 The [config schema](./source.schema.json) has every setting.
