@@ -3,6 +3,7 @@ package iceberg
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -15,9 +16,11 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/apache/iceberg-go/catalog"
 	"github.com/apache/iceberg-go/catalog/hadoop"
+	"github.com/apache/iceberg-go/catalog/rest"
 	"github.com/apache/iceberg-go/table"
 
 	"github.com/openetl-io/openetl/sdk/go/destination"
+	protocolv1 "github.com/openetl-io/openetl/sdk/go/protocol/v1"
 )
 
 // The tests in this file run against a Hadoop catalog in a temporary
@@ -181,6 +184,9 @@ func TestRecoverIsLostOnlyBehindItsOwnFence(t *testing.T) {
 // files to Close, which drops them, as it does an epoch's that was never
 // pre-committed.
 func TestCloseDropsAFailedPreCommitsFiles(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root writes into a directory it can't write to")
+	}
 	cat := localCatalog(t)
 	w := localWriter(t, cat, 1, destination.Stream{Name: "a", Mode: destination.Append}, destination.Stream{Name: "b", Mode: destination.Append})
 	e1, e2 := destination.Epoch{Generation: 1, N: 1}, destination.Epoch{Generation: 1, N: 2}
@@ -208,5 +214,46 @@ func TestCloseDropsAFailedPreCommitsFiles(t *testing.T) {
 	}
 	if got, err := os.ReadDir(localDataDir(t, cat, "b")); err != nil || len(got) != 1 {
 		t.Errorf("b's data files are %v, %v; want only epoch 1's", got, err)
+	}
+}
+
+// deniedCatalog refuses to load a table, as a REST catalog does a principal
+// without the privilege.
+type deniedCatalog struct{ catalog.Catalog }
+
+func (deniedCatalog) LoadTable(context.Context, table.Identifier) (*table.Table, error) {
+	return nil, fmt.Errorf("%w: the principal can't read the table", rest.ErrForbidden)
+}
+
+// A writer's refusals carry their codes, so a run fails at once rather than
+// retrying what can't succeed.
+func TestWriterErrorsHaveCodes(t *testing.T) {
+	cat := localCatalog(t)
+	streams := []destination.Stream{{Name: "users", Mode: destination.Append}}
+	e := destination.Epoch{Generation: 1, N: 1}
+	w := localWriter(t, cat, 1, streams...)
+	localWrite(t, w, e, "users", `[{"id": 1, "name": "a"}]`)
+	st, err := w.PreCommit(t.Context(), e)
+	if err != nil {
+		t.Fatal(err)
+	}
+	code := func(err error) protocolv1.ErrorCode {
+		if c, ok := errors.AsType[interface {
+			error
+			ErrorCode() protocolv1.ErrorCode
+		}](err); ok {
+			return c.ErrorCode()
+		}
+		return protocolv1.ErrorCode_ERROR_CODE_UNSPECIFIED
+	}
+	denied := localWriter(t, deniedCatalog{cat}, 2, streams...)
+	if err := denied.Write(t.Context(), destination.Epoch{Generation: 2, N: 2}, "users", localBatch(t, `[{"id": 2, "name": "b"}]`)); code(err) != protocolv1.ErrorCode_ERROR_CODE_PERMISSION_DENIED {
+		t.Errorf("write: %v, coded %v; want permission denied", err, code(err))
+	}
+	if _, err := denied.Commit(t.Context(), e, []destination.Staged{st}); code(err) != protocolv1.ErrorCode_ERROR_CODE_PERMISSION_DENIED {
+		t.Errorf("commit: %v, coded %v; want permission denied", err, code(err))
+	}
+	if _, err := denied.Recover(t.Context(), 2, e, []destination.Staged{st}); code(err) != protocolv1.ErrorCode_ERROR_CODE_PERMISSION_DENIED {
+		t.Errorf("recover: %v, coded %v; want permission denied", err, code(err))
 	}
 }

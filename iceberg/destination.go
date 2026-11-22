@@ -470,7 +470,8 @@ func (w *writer) create(ctx context.Context, ident table.Identifier, sc *ice.Sch
 // never changes a column's type: it refuses a column whose type changed,
 // even where Iceberg could promote it, and the platform holds the column
 // until the user changes it. It reports what each table can't take.
-func (w *writer) ApplySchema(ctx context.Context, streams []destination.StreamSchema) (destination.SchemaApplied, error) {
+func (w *writer) ApplySchema(ctx context.Context, streams []destination.StreamSchema) (_ destination.SchemaApplied, err error) {
+	defer func() { err = classifyRun(err) }()
 	out := destination.SchemaApplied{Limits: make(map[string]destination.TableLimits, len(streams))}
 	for _, s := range streams {
 		// Not from the cache: the user may have changed the table.
@@ -497,7 +498,8 @@ func (w *writer) ApplySchema(ctx context.Context, streams []destination.StreamSc
 	return out, nil
 }
 
-func (w *writer) StartReads(ctx context.Context, starts map[string]time.Time) error {
+func (w *writer) StartReads(ctx context.Context, starts map[string]time.Time) (err error) {
+	defer func() { err = classifyRun(err) }()
 	w.starts = starts
 	for name, r := range w.reads {
 		if start, ok := starts[name]; ok && start.UnixMicro() == r.start {
@@ -592,7 +594,8 @@ func (p *part) finish() ([]string, error) {
 	return p.files, p.err
 }
 
-func (w *writer) Write(ctx context.Context, e destination.Epoch, stream string, batch arrow.RecordBatch) error {
+func (w *writer) Write(ctx context.Context, e destination.Epoch, stream string, batch arrow.RecordBatch) (err error) {
+	defer func() { err = classifyRun(err) }()
 	cfg, ok := w.streams[stream]
 	if !ok {
 		return fmt.Errorf("iceberg: unknown stream %q", stream)
@@ -624,7 +627,8 @@ func (w *writer) Write(ctx context.Context, e destination.Epoch, stream string, 
 
 // Patch stages patches in files of their own, which Commit reads back and
 // applies after the epoch's rows, in the same snapshot.
-func (w *writer) Patch(ctx context.Context, e destination.Epoch, stream string, batch arrow.RecordBatch) error {
+func (w *writer) Patch(ctx context.Context, e destination.Epoch, stream string, batch arrow.RecordBatch) (err error) {
+	defer func() { err = classifyRun(err) }()
 	cfg, ok := w.streams[stream]
 	switch {
 	case !ok:
@@ -744,6 +748,7 @@ func (ef *epochFiles) finish() ([]string, error) {
 // progress describes it in every epoch, with rows or not, as the epoch it ends
 // in can be one the lane knows nothing of.
 func (w *writer) PreCommit(ctx context.Context, e destination.Epoch) (_ destination.Staged, err error) {
+	defer func() { err = classifyRun(err) }()
 	if err := w.checkDropped(ctx); err != nil {
 		return nil, err
 	}
@@ -829,7 +834,8 @@ func (w *writer) checkDropped(ctx context.Context) error {
 	return nil
 }
 
-func (w *writer) Commit(ctx context.Context, _ destination.Epoch, committables []destination.Staged) (destination.Committed, error) {
+func (w *writer) Commit(ctx context.Context, _ destination.Epoch, committables []destination.Staged) (_ destination.Committed, err error) {
+	defer func() { err = classifyRun(err) }()
 	desc, err := w.mergeLanes(committables)
 	if err != nil {
 		return destination.Committed{}, err
@@ -1296,7 +1302,8 @@ func (w *writer) fenceTable(ctx context.Context, ident table.Identifier, gen uin
 	}
 }
 
-func (w *writer) Recover(ctx context.Context, gen uint64, e destination.Epoch, committables []destination.Staged) (destination.Recovery, error) {
+func (w *writer) Recover(ctx context.Context, gen uint64, e destination.Epoch, committables []destination.Staged) (_ destination.Recovery, err error) {
+	defer func() { err = classifyRun(err) }()
 	var desc staged
 	if !e.IsZero() {
 		var err error
@@ -1497,4 +1504,13 @@ func (w *writer) drop(byStream map[string]*epochFiles) {
 		_, _ = ef.finish()
 		w.dropFiles(w.ns, w.name(stream), ef.files)
 	}
+}
+
+// classifyRun is classify for a writer's errors, but for a table or
+// namespace that's missing, which the next attempt creates.
+func classifyRun(err error) error {
+	if errors.Is(err, catalog.ErrNoSuchTable) || errors.Is(err, catalog.ErrNoSuchNamespace) {
+		return err
+	}
+	return classify(err)
 }
