@@ -174,7 +174,7 @@ func parseStream(sc StreamConfig) (*streamSpec, error) {
 		}
 	}
 	for _, name := range sortedKeys(sc.Columns) {
-		if name == fileColumn || name == lineColumn || name == modifiedColumn {
+		if controlColumn(name) {
 			return nil, fmt.Errorf("objstore: stream %q: columns can't name %s, a column the source adds", sc.Name, name)
 		}
 		f, err := declaredField(name, sc.Columns[name])
@@ -245,7 +245,7 @@ func (s *Source) discover(ctx context.Context, b *blob.Bucket, spec *streamSpec)
 	var fields []arrow.Field
 	at := map[string]int{}
 	add := func(f arrow.Field) {
-		if _, ok := at[f.Name]; ok || f.Name == fileColumn || f.Name == lineColumn || f.Name == modifiedColumn {
+		if _, ok := at[f.Name]; ok || controlColumn(f.Name) {
 			return
 		}
 		at[f.Name] = len(fields)

@@ -215,6 +215,11 @@ func (s *Source) readParquet(ctx context.Context, b *blob.Bucket, o object, at f
 	stream := make([]*column, sc.NumFields())
 	convs := make([]conversion, sc.NumFields())
 	for i, f := range sc.Fields() {
+		if controlColumn(f.Name) {
+			// The source's own takes its place.
+			fields = append(fields, f)
+			continue
+		}
 		if declared != nil && !declared[f.Name] {
 			return undeclared(o.Key, f.Name)
 		}
@@ -251,6 +256,9 @@ func (s *Source) readParquet(ctx context.Context, b *blob.Bucket, o object, at f
 			arrs := make([]arrow.Array, 0, len(fields)+3)
 			batchFields := make([]arrow.Field, 0, len(fields)+3)
 			for i, f := range fields {
+				if stream[i] == nil {
+					continue
+				}
 				c, err := convert(ctx, rec.Column(i), f, convs[i])
 				if err == nil && stream[i].text {
 					t, terr := textOf(ctx, c, f, stream[i].field)
@@ -429,6 +437,9 @@ func (s *Source) readCSV(ctx context.Context, b *blob.Bucket, spec *streamSpec, 
 			return sb, nil
 		}
 		for _, n := range names {
+			if controlColumn(n) {
+				continue
+			}
 			if _, err := builder(n); err != nil {
 				return err
 			}
@@ -445,6 +456,10 @@ func (s *Source) readCSV(ctx context.Context, b *blob.Bucket, spec *streamSpec, 
 					name = names[i]
 				case spec.csvHeader || len(spec.cfg.CSV.ColumnNames) > 0:
 					return fmt.Errorf("objstore: %s: record %d has %d fields, and the header %d", o.Key, line, len(fields), len(names))
+				}
+				if controlColumn(name) {
+					// The source's own takes its place.
+					continue
 				}
 				sb, err := builder(name)
 				if err != nil {

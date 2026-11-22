@@ -33,7 +33,7 @@ type columns struct {
 }
 
 func (c *columns) add(f arrow.Field) {
-	if f.Name == fileColumn || f.Name == lineColumn || f.Name == modifiedColumn {
+	if controlColumn(f.Name) {
 		return
 	}
 	if c.by == nil {

@@ -32,6 +32,10 @@ var (
 	jsonMeta    = arrow.NewMetadata([]string{records.ExtensionNameKey, "ARROW:extension:metadata"}, []string{records.JSONExtension, ""})
 )
 
+func controlColumn(name string) bool {
+	return name == fileColumn || name == lineColumn || name == modifiedColumn
+}
+
 func controlFields() []arrow.Field {
 	return []arrow.Field{
 		{Name: fileColumn, Type: arrow.BinaryTypes.String},

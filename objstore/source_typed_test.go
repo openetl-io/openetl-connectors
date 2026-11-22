@@ -629,6 +629,54 @@ func TestInferExactNumbers(t *testing.T) {
 	}
 }
 
+// A file's own _file, _line or _modified column, as a file the destination
+// wrote from a files source has, gives way to the source's: each format's
+// read sends one column of each name, with the source's values.
+func TestControlColumnsOfFiles(t *testing.T) {
+	cfg := map[string]any{"url": "file://" + t.TempDir()}
+	own := arrow.NewSchema([]arrow.Field{
+		{Name: "id", Type: arrow.PrimitiveTypes.Int64},
+		{Name: "_file", Type: arrow.BinaryTypes.String, Nullable: true},
+		{Name: "_line", Type: arrow.PrimitiveTypes.Int64, Nullable: true},
+	}, nil)
+	put(t, cfg, map[string][]byte{
+		"p/a.parquet": parquetOf(t, own, `[{"id":1,"_file":"elsewhere","_line":7}]`, 1),
+		"c/a.csv":     []byte("id,_file,_line\n1,elsewhere,7\n"),
+		"j/a.jsonl":   []byte(`{"id":1,"_file":"elsewhere","_line":7}` + "\n"),
+	})
+	s := newSource(t, cfg,
+		map[string]any{"name": "p", "glob": "p/*", "format": "parquet"},
+		map[string]any{"name": "c", "glob": "c/*", "format": "csv"},
+		map[string]any{"name": "j", "glob": "j/*", "format": "jsonl"},
+	)
+	cat, err := s.Discover(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, stream := range []string{"p", "c", "j"} {
+		e, err := read(t, s, stream, source.FullRefresh, nil)
+		if err != nil {
+			t.Errorf("%s: %v", stream, err)
+			continue
+		}
+		checkBatches(t, cat, e)
+		for _, b := range e.batches[stream+"/"] {
+			names := map[string]bool{}
+			for _, f := range b.Schema().Fields() {
+				if names[f.Name] {
+					t.Errorf("%s: two columns %q", stream, f.Name)
+				}
+				names[f.Name] = true
+			}
+		}
+		r := e.rows[stream+"/"]
+		if len(r) != 1 || !strings.HasSuffix(fmt.Sprint(r[0][fileColumn]), stream+"/a."+map[string]string{"p": "parquet", "c": "csv", "j": "jsonl"}[stream]) ||
+			fmt.Sprint(r[0][lineColumn]) != "1" {
+			t.Errorf("%s: %v", stream, r)
+		}
+	}
+}
+
 // A file named .bz2 is decompressed with bzip2.
 func TestBzip2(t *testing.T) {
 	cfg := map[string]any{"url": "file://" + t.TempDir()}

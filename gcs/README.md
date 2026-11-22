@@ -62,6 +62,8 @@ Each record gets three more columns:
 | `_line` | The record's number in the file, from 1: its row in a Parquet file, its record in a CSV file (not counting the header), or its non-blank line in a JSON Lines file. |
 | `_modified` | When the store last modified the file, in UTC. |
 
+A file's own column of one of these names, as a file written from another files source has, gives way to the source's.
+
 A stream's primary key is `_file` and `_line` unless `primaryKey` names other columns, and its cursor is `_modified`.
 
 ```yaml
