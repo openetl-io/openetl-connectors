@@ -541,7 +541,7 @@ func TestSourceChunksSkipGranules(t *testing.T) {
 	if got := c.ids("k"); !slices.Equal(got, span(1, 50000)) {
 		t.Fatalf("read %d rows, not ids 1 to 50000 once", len(got))
 	}
-	if n := read.Load(); n > 3*50000 {
+	if n := read.Load(); n < 50000 || n > 3*50000 {
 		t.Errorf("the read's 100 chunks read %d rows of a table of 50000", n)
 	}
 }
