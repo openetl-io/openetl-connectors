@@ -43,6 +43,12 @@ Deduping costs reads, since Iceberg has no index to look IDs up in: the commit r
 
 Set `uri`, and `warehouse` if the catalog serves more than one. For authentication, give a bearer `token`, or OAuth2 client credentials as `credential`, in the form `CLIENT_ID:CLIENT_SECRET`.
 
+From 0.2.0, these `properties` apply from the first request, for the catalog's config, so a catalog that needs them can be signed in to:
+
+- `scope`: the scope a token is asked for, `catalog` unless set. Polaris takes `PRINCIPAL_ROLE:ALL`.
+- `oauth2-server-uri`: the token endpoint of an identity provider of the catalog's own, such as Keycloak's, which `credential` goes to instead of the catalog's `v1/oauth/tokens`. `audience` and `resource` go with the token request.
+- `rest.sigv4-enabled: "true"`: requests are signed with the AWS credentials, for the service `rest.signing-name` names, such as `glue` for Glue's Iceberg REST endpoint, in `rest.signing-region`, or else `region`.
+
 The destination writes data files to the tables' locations itself. If the catalog doesn't hand out storage credentials, give them: for S3, `region`, and `accessKeyId` and `secretAccessKey` or the AWS default credentials; for another S3-compatible store, `s3Endpoint` too, which uses path-style addressing. Any other catalog or file IO property, by the name Iceberg gives it, goes in `properties`.
 
 ```yaml
