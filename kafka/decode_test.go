@@ -61,7 +61,7 @@ func readRows(t *testing.T, s *Source, topic string) ([]map[string]any, error) {
 	out := &rawRows{}
 	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
 	defer cancel()
-	err := s.Read(ctx, source.ReadRequest{Streams: []source.ConfiguredStream{{Name: topic, State: encodeState(map[int32]int64{0: 0})}}, Pipeline: "p", Lanes: 1}, out)
+	err := s.Read(ctx, source.ReadRequest{Streams: []source.ConfiguredStream{{Name: topic, State: encodeState(map[int32]int64{0: 0}, "")}}, Pipeline: "p", Lanes: 1}, out)
 	return out.rows, err
 }
 

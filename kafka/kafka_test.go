@@ -639,6 +639,42 @@ func TestSourcePositionLostWithTheTopic(t *testing.T) {
 	}
 }
 
+// A topic deleted and created again that has grown past the read's offset
+// has lost the read's position too: its ID isn't the state's.
+func TestSourcePositionLostWithATopicGrownPast(t *testing.T) {
+	topic := uniq("regrown")
+	createTopic(t, topic, 1)
+	produce(t, topic, 0, 10)
+	s := newSource(t, map[string]any{"topics": []string{topic}})
+	c := newCapture()
+	if err := s.Read(t.Context(), source.ReadRequest{Pipeline: "p", Streams: []source.ConfiguredStream{{Name: topic, SyncMode: source.Stream}}}, c); err != nil {
+		t.Fatal(err)
+	}
+	st := c.complete[topic]
+	if topicIDOf(st) == "" {
+		t.Fatalf("the state %s has no topic ID", st)
+	}
+	cl, _ := kgo.NewClient(kgo.SeedBrokers(brokers()))
+	defer cl.Close()
+	if _, err := kadm.NewClient(cl).DeleteTopic(t.Context(), topic); err != nil {
+		t.Fatal(err)
+	}
+	awaitFor(t, "the topic to be created again", 30*time.Second, func() bool {
+		_, err := kadm.NewClient(cl).CreateTopic(t.Context(), 1, 1, nil, topic)
+		return err == nil
+	})
+	produce(t, topic, 0, 15)
+	for _, continuous := range []bool{false, true} {
+		ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+		c := newCapture()
+		err := s.Read(ctx, source.ReadRequest{Pipeline: "p", Continuous: continuous, Streams: []source.ConfiguredStream{{Name: topic, SyncMode: source.Stream, State: st}}}, c)
+		cancel()
+		if codeOf(err) != "ERROR_CODE_POSITION_LOST" || len(c.rows[topic]) > 0 {
+			t.Errorf("Read (continuous %v) = %v with %d rows, want POSITION_LOST", continuous, err, len(c.rows[topic]))
+		}
+	}
+}
+
 // What the destination writes in Avro and Protobuf, the source reads back
 // with the registry's schemas, and declares their types.
 func TestRegistryFormats(t *testing.T) {
@@ -1005,7 +1041,7 @@ func TestSourceResumesAMixOfSplits(t *testing.T) {
 			want[int64(r["id"].(float64))]++
 		}
 	}
-	c := readSplits(t, s, topic, []source.Split{{ID: "p1", State: encodeOffset(mid)}, {ID: "p2"}})
+	c := readSplits(t, s, topic, []source.Split{{ID: "p1", State: encodeOffset(mid, "")}, {ID: "p2"}})
 	if c.has(topic, "p0") {
 		t.Error("read a split that had completed")
 	}
@@ -1075,7 +1111,7 @@ func TestSourceSplitsGainNewPartitions(t *testing.T) {
 	added := append(slices.Clone(c.splits[topic]["p0"].added), c.splits[topic]["p1"].added...)
 	nrows := len(rec.rows)
 	c.mu.Unlock()
-	if len(added) != 1 || added[0].ID != "p2" || string(added[0].State) != string(encodeOffset(0)) {
+	if len(added) != 1 || added[0].ID != "p2" || string(added[0].State) != string(encodeOffset(0, topicIDOf(splits[0].State))) {
 		t.Errorf("added %v", added)
 	}
 	if nrows != 5 {
@@ -1210,7 +1246,7 @@ func TestSourceSplitPositionLost(t *testing.T) {
 		t.Fatal(err)
 	}
 	s := newSource(t, map[string]any{"topics": []string{topic}})
-	lost := []source.Split{{ID: "p0", State: encodeOffset(3)}}
+	lost := []source.Split{{ID: "p0", State: encodeOffset(3, "")}}
 	wantLost := func(err error) {
 		t.Helper()
 		var coded interface{ ErrorCode() protocolv1.ErrorCode }

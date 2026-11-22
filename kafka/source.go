@@ -180,15 +180,40 @@ func (s *Source) declared(ctx context.Context, topic string) (*arrow.Schema, err
 }
 
 // state is the resume point of a stream read whole: each partition's next
-// offset.
+// offset, and the topic's ID, which a topic created again doesn't have.
+// Brokers without topic IDs, and states from before 0.2.0, have none.
 type state struct {
 	Offsets map[string]int64 `json:"offsets"`
+	TopicID string           `json:"topicId,omitempty"`
 }
 
 // splitState is the resume point of a partition read as a split: its next
-// offset.
+// offset, and the topic's ID, as state has it.
 type splitState struct {
-	Offset int64 `json:"offset"`
+	Offset  int64  `json:"offset"`
+	TopicID string `json:"topicId,omitempty"`
+}
+
+// topicIDOf is the topic ID that the first of states to hold one holds,
+// whole streams' and splits' alike.
+func topicIDOf(states ...[]byte) string {
+	for _, b := range states {
+		var st struct {
+			TopicID string `json:"topicId"`
+		}
+		if json.Unmarshal(b, &st) == nil && st.TopicID != "" {
+			return st.TopicID
+		}
+	}
+	return ""
+}
+
+func splitStates(splits []source.Split) [][]byte {
+	out := make([][]byte, len(splits))
+	for i, sp := range splits {
+		out[i] = sp.State
+	}
+	return out
 }
 
 func splitID(p int32) string { return "p" + strconv.Itoa(int(p)) }
@@ -205,8 +230,8 @@ func parsePartition(id string) (int32, error) {
 	return int32(p), nil
 }
 
-func encodeOffset(o int64) []byte {
-	b, _ := json.Marshal(splitState{Offset: o})
+func encodeOffset(o int64, topicID string) []byte {
+	b, _ := json.Marshal(splitState{Offset: o, TopicID: topicID})
 	return b
 }
 
@@ -258,8 +283,8 @@ func parseState(b []byte) (map[int32]int64, error) {
 	return out, nil
 }
 
-func encodeState(next map[int32]int64) []byte {
-	st := state{Offsets: make(map[string]int64, len(next))}
+func encodeState(next map[int32]int64, topicID string) []byte {
+	st := state{Offsets: make(map[string]int64, len(next)), TopicID: topicID}
 	for p, o := range next {
 		st.Offsets[strconv.Itoa(int(p))] = o
 	}
@@ -270,6 +295,8 @@ func encodeState(next map[int32]int64) []byte {
 // topicRead is one stream's read.
 type topicRead struct {
 	name string
+	// The topic's ID: the state's, then the brokers', if they have IDs.
+	id string
 	// Where it's read whole, its emitter; else its partitions' splits. Only
 	// splits' partitions are read.
 	whole  source.SplitEmitter
@@ -326,7 +353,7 @@ func (s *Source) Read(ctx context.Context, req source.ReadRequest, out source.Em
 	for _, st := range req.Streams {
 		r := &topicRead{name: st.Name, end: map[int32]int64{}, done: map[int32]bool{}, moved: map[int32]time.Time{}, hwm: map[int32]int64{}}
 		if len(st.Splits) == 0 {
-			r.whole = out.Split(st.Name, source.WholeStream)
+			r.whole, r.id = out.Split(st.Name, source.WholeStream), topicIDOf(st.State)
 			if r.next, err = parseState(st.State); err != nil {
 				return err
 			}
@@ -339,6 +366,7 @@ func (s *Source) Read(ctx context.Context, req source.ReadRequest, out source.Em
 			if r.next, err = splitOffsets(st.Splits); err != nil {
 				return err
 			}
+			r.id = topicIDOf(splitStates(st.Splits)...)
 			r.splits = make(map[int32]source.SplitEmitter, len(st.Splits))
 			for _, sp := range st.Splits {
 				p, err := parsePartition(sp.ID)
@@ -530,9 +558,9 @@ func (r *topicRead) batchKey(p int32) batchKey {
 // resumePoint is the emitter and state of a batchKey, at the offsets reached.
 func (r *topicRead) resumePoint(p int32) (source.SplitEmitter, []byte) {
 	if r.splits == nil {
-		return r.whole, encodeState(r.next)
+		return r.whole, encodeState(r.next, r.id)
 	}
-	return r.splits[p], encodeOffset(r.next[p])
+	return r.splits[p], encodeOffset(r.next[p], r.id)
 }
 
 // emit decodes one poll's records of a split, or of a topic read whole, and
@@ -589,7 +617,7 @@ func (r *topicRead) finish(consumer *kgo.Client, reached func(p int32, from, u i
 		r.done[p] = true
 		pause = append(pause, p)
 		if r.splits != nil {
-			if err := completeAt(r.splits[p], encodeOffset(r.next[p]), until); err != nil {
+			if err := completeAt(r.splits[p], encodeOffset(r.next[p], r.id), until); err != nil {
 				return err
 			}
 		}
@@ -602,7 +630,7 @@ func (r *topicRead) finish(consumer *kgo.Client, reached func(p int32, from, u i
 	}
 	r.complete = true
 	if r.splits == nil {
-		return completeAt(r.whole, encodeState(r.next), r.until != nil)
+		return completeAt(r.whole, encodeState(r.next, r.id), r.until != nil)
 	}
 	return nil
 }
@@ -700,7 +728,8 @@ func completeAt(em source.SplitEmitter, state []byte, until bool) error {
 // offset below its partition's start means retention deleted records the
 // read never reached; one past its partition's end, or of a partition the
 // topic no longer has, means the topic was deleted and created again, or
-// the brokers lost records the read had read.
+// the brokers lost records the read had read. So does a topic ID other
+// than the state's.
 func (s *Source) position(ctx context.Context, adm *kadm.Client, reads map[string]*topicRead, topics []string) error {
 	tds, err := adm.ListTopics(ctx, topics...)
 	if err != nil {
@@ -725,6 +754,12 @@ func (s *Source) position(ctx context.Context, adm *kadm.Client, reads map[strin
 	}
 	for _, t := range topics {
 		r := reads[t]
+		if id := tds[t].ID; id != (kadm.TopicID{}) {
+			if r.id != "" && r.id != id.String() {
+				return positionLost(fmt.Errorf("kafka: %s has ID %s, and the read was of %s: the topic was deleted and created again; the stream needs a re-sync", t, id, r.id))
+			}
+			r.id = id.String()
+		}
 		fresh := r.splits == nil && len(r.next) == 0
 		r.partitions = tds[t].Partitions.Numbers()
 		for p, o := range r.next {
@@ -776,13 +811,13 @@ func (s *Source) Splits(ctx context.Context, stream source.ConfiguredStream, end
 		return nil, err
 	}
 	defer cl.Close()
-	r := &topicRead{name: stream.Name, next: next}
+	r := &topicRead{name: stream.Name, next: next, id: topicIDOf(splitStates(ended)...)}
 	if err := s.position(ctx, kadm.NewClient(cl), map[string]*topicRead{r.name: r}, []string{r.name}); err != nil {
 		return nil, err
 	}
 	out := make([]source.Split, 0, len(r.partitions))
 	for _, p := range r.partitions {
-		out = append(out, source.Split{ID: splitID(p), State: encodeOffset(r.next[p])})
+		out = append(out, source.Split{ID: splitID(p), State: encodeOffset(r.next[p], r.id)})
 	}
 	return out, nil
 }
@@ -821,7 +856,7 @@ func (s *Source) newPartitions(ctx context.Context, adm *kadm.Client, consumer *
 		var resume []byte
 		if r.splits != nil {
 			p := slices.Min(slices.Collect(maps.Keys(r.splits)))
-			running, resume = r.splits[p], encodeOffset(r.next[p])
+			running, resume = r.splits[p], encodeOffset(r.next[p], r.id)
 		}
 		for _, p := range ps {
 			start, ok := starts.Lookup(t, p)
@@ -833,7 +868,7 @@ func (s *Source) newPartitions(ctx context.Context, adm *kadm.Client, consumer *
 			add[p] = kgo.NewOffset().At(start.Offset)
 			if r.splits != nil {
 				r.splits[p] = out.Split(t, splitID(p))
-				added = append(added, source.Split{ID: splitID(p), State: encodeOffset(start.Offset)})
+				added = append(added, source.Split{ID: splitID(p), State: encodeOffset(start.Offset, r.id)})
 			}
 		}
 		if len(added) > 0 {

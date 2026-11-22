@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"regexp"
 	"slices"
 	"strconv"
 	"sync"
@@ -389,12 +390,27 @@ func TestALaneTakesOnlyItsOwnCommittable(t *testing.T) {
 type splitEvents struct {
 	mu     sync.Mutex
 	events map[string][]string
+	// Each split's last state; events show states without their topic
+	// IDs, which a fake cluster makes up.
+	states map[string][]byte
 }
 
 func (c *splitEvents) add(id string, events ...string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.events[id] = append(c.events[id], events...)
+}
+
+var topicIDField = regexp.MustCompile(`,"topicId":"[^"]*"`)
+
+func (c *splitEvents) state(id, event string, state []byte) {
+	c.mu.Lock()
+	if c.states == nil {
+		c.states = map[string][]byte{}
+	}
+	c.states[id] = state
+	c.mu.Unlock()
+	c.add(id, event+" "+topicIDField.ReplaceAllString(string(state), ""))
 }
 
 func (c *splitEvents) Rows(stream string, rows []json.RawMessage) error {
@@ -431,11 +447,11 @@ func (s splitLog) Rows(rows []json.RawMessage) error {
 }
 func (s splitLog) Records(arrow.RecordBatch) error { return errors.New("records") }
 func (s splitLog) ResumePoint(state []byte, _ ...source.Split) error {
-	s.c.add(s.id, "resume "+string(state))
+	s.c.state(s.id, "resume", state)
 	return nil
 }
 func (s splitLog) Complete(next []byte, _ ...source.Split) error {
-	s.c.add(s.id, "complete "+string(next))
+	s.c.state(s.id, "complete", next)
 	return nil
 }
 
@@ -506,8 +522,8 @@ func TestASourceReadEndsWhereItIsAsked(t *testing.T) {
 	}
 
 	got := read(source.ConfiguredStream{Name: topic, Splits: []source.Split{
-		{ID: "p0", State: encodeOffset(5), Until: encodeOffset(17)},
-		{ID: "p1", State: encodeOffset(0), Until: encodeOffset(10)},
+		{ID: "p0", State: encodeOffset(5, ""), Until: encodeOffset(17, "")},
+		{ID: "p1", State: encodeOffset(0, ""), Until: encodeOffset(10, "")},
 	}})
 	var rows0, rows1 []string
 	for _, e := range got["p0"] {
@@ -525,12 +541,12 @@ func TestASourceReadEndsWhereItIsAsked(t *testing.T) {
 	}
 	for id, end := range map[string]int64{"p0": 17, "p1": 10} {
 		ev := collapse(got[id])
-		if n := len(ev); n < 2 || ev[n-2] != "resume "+string(encodeOffset(end)) || ev[n-1] != "complete "+string(encodeOffset(end)) {
+		if n := len(ev); n < 2 || ev[n-2] != "resume "+string(encodeOffset(end, "")) || ev[n-1] != "complete "+string(encodeOffset(end, "")) {
 			t.Errorf("split %s ended with %v", id, ev)
 		}
 	}
 
-	from, until := encodeState(map[int32]int64{0: 2, 1: 3}), encodeState(map[int32]int64{0: 8, 1: 5})
+	from, until := encodeState(map[int32]int64{0: 2, 1: 3}, ""), encodeState(map[int32]int64{0: 8, 1: 5}, "")
 	got = read(source.ConfiguredStream{Name: topic, State: from, Until: until})
 	ev := got[source.WholeStream]
 	var rows []string
@@ -551,20 +567,20 @@ func TestASourceReadEndsWhereItIsAsked(t *testing.T) {
 
 	// Without an end, the read goes to the topic's, and completes where it
 	// ended. Its completion's state, given as an end, ends a read there too.
-	got = read(source.ConfiguredStream{Name: topic, Splits: []source.Split{{ID: "p0", State: encodeOffset(5)}}})
+	got = read(source.ConfiguredStream{Name: topic, Splits: []source.Split{{ID: "p0", State: encodeOffset(5, "")}}})
 	ev = got["p0"]
-	if ev[len(ev)-1] != "complete "+string(encodeOffset(30)) {
+	if ev[len(ev)-1] != "complete "+string(encodeOffset(30, "")) {
 		t.Errorf("a split without an end ended with %v", ev)
 	}
 	produceMore(t, addrs, topic, 0, 5)
-	got = read(source.ConfiguredStream{Name: topic, Splits: []source.Split{{ID: "p0", State: encodeOffset(5), Until: encodeOffset(30)}}})
+	got = read(source.ConfiguredStream{Name: topic, Splits: []source.Split{{ID: "p0", State: encodeOffset(5, ""), Until: encodeOffset(30, "")}}})
 	rows0 = nil
 	for _, e := range got["p0"] {
 		if e[0] == 'p' {
 			rows0 = append(rows0, e)
 		}
 	}
-	if ev := collapse(got["p0"]); !slices.Equal(rows0, at(0, 5, 30)) || ev[len(ev)-1] != "complete "+string(encodeOffset(30)) {
+	if ev := collapse(got["p0"]); !slices.Equal(rows0, at(0, 5, 30)) || ev[len(ev)-1] != "complete "+string(encodeOffset(30, "")) {
 		t.Errorf("a split read to its completion's state read %v, and ended with %v", rows0, ev)
 	}
 }
