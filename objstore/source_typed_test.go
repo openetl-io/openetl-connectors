@@ -643,17 +643,20 @@ func TestControlColumnsOfFiles(t *testing.T) {
 		"p/a.parquet": parquetOf(t, own, `[{"id":1,"_file":"elsewhere","_line":7}]`, 1),
 		"c/a.csv":     []byte("id,_file,_line\n1,elsewhere,7\n"),
 		"j/a.jsonl":   []byte(`{"id":1,"_file":"elsewhere","_line":7}` + "\n"),
+		"a/a.avro": avroFile(t, `{"type": "record", "name": "R", "fields": [{"name": "id", "type": "long"}, {"name": "_file", "type": "string"}, {"name": "_line", "type": "long"}]}`,
+			map[string]any{"id": int64(1), "_file": "elsewhere", "_line": int64(7)}),
 	})
 	s := newSource(t, cfg,
 		map[string]any{"name": "p", "glob": "p/*", "format": "parquet"},
 		map[string]any{"name": "c", "glob": "c/*", "format": "csv"},
 		map[string]any{"name": "j", "glob": "j/*", "format": "jsonl"},
+		map[string]any{"name": "a", "glob": "a/*", "format": "avro"},
 	)
 	cat, err := s.Discover(t.Context())
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, stream := range []string{"p", "c", "j"} {
+	for _, stream := range []string{"p", "c", "j", "a"} {
 		e, err := read(t, s, stream, source.FullRefresh, nil)
 		if err != nil {
 			t.Errorf("%s: %v", stream, err)
@@ -670,7 +673,7 @@ func TestControlColumnsOfFiles(t *testing.T) {
 			}
 		}
 		r := e.rows[stream+"/"]
-		if len(r) != 1 || !strings.HasSuffix(fmt.Sprint(r[0][fileColumn]), stream+"/a."+map[string]string{"p": "parquet", "c": "csv", "j": "jsonl"}[stream]) ||
+		if len(r) != 1 || !strings.HasSuffix(fmt.Sprint(r[0][fileColumn]), stream+"/a."+map[string]string{"p": "parquet", "c": "csv", "j": "jsonl", "a": "avro"}[stream]) ||
 			fmt.Sprint(r[0][lineColumn]) != "1" {
 			t.Errorf("%s: %v", stream, r)
 		}

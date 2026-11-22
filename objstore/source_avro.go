@@ -277,6 +277,10 @@ func (s *Source) readAvro(ctx context.Context, b *blob.Bucket, o object, at file
 	}
 	stream := make([]*column, len(fs))
 	for i, f := range fs {
+		if controlColumn(f.Name) {
+			// The source's own takes its place.
+			continue
+		}
 		if declared != nil && !declared[f.Name] {
 			return undeclared(o.Key, f.Name)
 		}
@@ -315,6 +319,9 @@ func (s *Source) readAvro(ctx context.Context, b *blob.Bucket, o object, at file
 			}
 			obj := make(map[string]json.RawMessage, len(fs)+3)
 			for i, f := range fs {
+				if stream[i] == nil {
+					continue
+				}
 				v, verr := avroJSON(&fs[i].Type, rec[f.Name], stream[i].field)
 				if verr != nil {
 					return fmt.Errorf("objstore: %s: record %d: field %q: %w", o.Key, line, f.Name, verr)
