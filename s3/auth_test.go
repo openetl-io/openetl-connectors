@@ -102,6 +102,45 @@ func TestKeysNotShown(t *testing.T) {
 	}
 }
 
+// A bucket in another region than region fails the check, and the read or
+// write, with CONFIG_INVALID, naming the bucket's region to set: S3 answers
+// with a redirect, whose body a HEAD hasn't, or, to a request signed for
+// another region, AuthorizationHeaderMalformed.
+func TestWrongRegion(t *testing.T) {
+	noAWS(t)
+	for name, answer := range map[string]func(w http.ResponseWriter){
+		"redirect": func(w http.ResponseWriter) {
+			w.Header().Set("X-Amz-Bucket-Region", "eu-west-1")
+			w.WriteHeader(http.StatusMovedPermanently)
+			_, _ = fmt.Fprint(w, `<Error><Code>PermanentRedirect</Code><Message>The bucket you are attempting to access must be addressed using the specified endpoint.</Message>`+
+				`<Endpoint>lake.s3.eu-west-1.amazonaws.com</Endpoint><Bucket>lake</Bucket></Error>`)
+		},
+		"redirect without a body": func(w http.ResponseWriter) {
+			w.Header().Set("X-Amz-Bucket-Region", "eu-west-1")
+			w.WriteHeader(http.StatusMovedPermanently)
+		},
+		"signed for another region": func(w http.ResponseWriter) {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = fmt.Fprint(w, `<Error><Code>AuthorizationHeaderMalformed</Code><Message>The authorization header is malformed; the region 'us-east-1' is wrong; expecting 'eu-west-1'</Message>`+
+				`<Region>eu-west-1</Region></Error>`)
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { answer(w) }))
+			t.Cleanup(srv.Close)
+			b, _ := json.Marshal(map[string]any{"url": "s3://lake/files", "region": "us-east-1", "endpoint": srv.URL, "accessKeyId": "a", "secretAccessKey": "b"})
+			d, err := NewDestination(b)
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = check.Run(t.Context(), d.Checks()).Err()
+			if codeOf(err) != protocolv1.ErrorCode_ERROR_CODE_CONFIG_INVALID || err == nil || !strings.Contains(err.Error(), "set region to eu-west-1") {
+				t.Errorf("Check: %s (%v)", codeOf(err), err)
+			}
+		})
+	}
+}
+
 // The check's write to an endpoint carries no checksum the store didn't ask
 // for, as some S3-compatible stores refuse S3's.
 func TestNoChecksumOnAnEndpoint(t *testing.T) {

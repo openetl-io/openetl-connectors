@@ -3,11 +3,13 @@
 package s3store
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
 	"net"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
 
@@ -18,6 +20,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/feature/s3/transfermanager"
 	awss3 "github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/smithy-go"
+	"github.com/aws/smithy-go/middleware"
 	"gocloud.dev/blob"
 	"gocloud.dev/blob/s3blob"
 
@@ -67,6 +70,18 @@ func (s *Store) Open(ctx context.Context, bucket string) (*blob.Bucket, error) {
 	}
 	ac.Credentials = credentialsSource{ac.Credentials}
 	client := awss3.NewFromConfig(ac, func(o *awss3.Options) {
+		o.APIOptions = append(o.APIOptions, func(st *middleware.Stack) error {
+			return st.Initialize.Add(middleware.InitializeMiddlewareFunc("bucketRegion", func(ctx context.Context, in middleware.InitializeInput, next middleware.InitializeHandler) (middleware.InitializeOutput, middleware.Metadata, error) {
+				out, md, err := next.HandleInitialize(ctx, in)
+				if r := bucketRegion(err); r != "" && r != ac.Region {
+					// In place of S3's answer, as gocloud takes a redirect for a
+					// bucket that doesn't exist.
+					err = sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_CONFIG_INVALID,
+						fmt.Errorf("the bucket is in the region %s, not %s: set region to %s", r, cmp.Or(ac.Region, "none"), r))
+				}
+				return out, md, err
+			}), middleware.Before)
+		})
 		// Ranged reads have no checksum to validate, which it would log.
 		o.DisableLogOutputChecksumValidationSkipped = true
 		if s.cfg.Endpoint != "" {
@@ -93,6 +108,30 @@ func (c credentialsSource) Retrieve(ctx context.Context) (aws.Credentials, error
 			fmt.Errorf("no AWS credentials: set accessKeyId and secretAccessKey, or name a role in the connector's aws.role: %w", err))
 	}
 	return creds, nil
+}
+
+var expecting = regexp.MustCompile(`expecting '([a-z0-9-]+)'`)
+
+// bucketRegion is the bucket's region where err is S3's answer that the
+// bucket is in another region than the request's: a redirect, or a refusal
+// of a request signed for another; empty otherwise.
+func bucketRegion(err error) string {
+	re, ok := errors.AsType[*awshttp.ResponseError](err)
+	if !ok {
+		return ""
+	}
+	ae, _ := errors.AsType[smithy.APIError](err)
+	malformed := ae != nil && ae.ErrorCode() == "AuthorizationHeaderMalformed"
+	if re.HTTPStatusCode() != http.StatusMovedPermanently && !malformed {
+		return ""
+	}
+	if r := re.Response.Header.Get("X-Amz-Bucket-Region"); r != "" {
+		return r
+	}
+	if m := expecting.FindStringSubmatch(err.Error()); malformed && m != nil {
+		return m[1]
+	}
+	return ""
 }
 
 // serverError: an AWS service answered err with a server error.

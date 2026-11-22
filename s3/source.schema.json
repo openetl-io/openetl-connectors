@@ -25,7 +25,7 @@
     "region": {
       "type": "string",
       "title": "Region",
-      "description": "The bucket's AWS region.",
+      "description": "The bucket's AWS region. From 0.2.0, a bucket in another region fails with CONFIG_INVALID, and the error names the bucket's region.",
       "x-group": "s3"
     },
     "accessKeyId": {

@@ -62,7 +62,7 @@ A destination's preflight has these items:
 
 ### Errors
 
-Credentials that the store refuses fail the check and the sync with `AUTH_INVALID`, `AUTH_EXPIRED` or `PERMISSION_DENIED`, and OpenETL retries only `AUTH_EXPIRED`. A store that doesn't answer, rate limits the connector or returns a server error fails with `TRANSIENT` or `RATE_LIMITED`, which OpenETL retries. Without AWS credentials, the connector fails with `AUTH_INVALID`; when what gives it credentials, such as STS or the runner's endpoint of a role's, doesn't answer or returns a server error, with `TRANSIENT`.
+Credentials that the store refuses fail the check and the sync with `AUTH_INVALID`, `AUTH_EXPIRED` or `PERMISSION_DENIED`, and OpenETL retries only `AUTH_EXPIRED`. A store that doesn't answer, rate limits the connector or returns a server error fails with `TRANSIENT` or `RATE_LIMITED`, which OpenETL retries. Without AWS credentials, the connector fails with `AUTH_INVALID`; when what gives it credentials, such as STS or the runner's endpoint of a role's, doesn't answer or returns a server error, with `TRANSIENT`. From 0.2.0, a bucket in another region than `region` fails the check and the sync with `CONFIG_INVALID`, and the error names the bucket's region to set; before, the check said the bucket didn't exist.
 
 ## Source
 
