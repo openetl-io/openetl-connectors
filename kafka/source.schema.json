@@ -19,7 +19,7 @@
     "tlsServerName": {"type": "string", "title": "Server name", "x-group": "tls", "x-advanced": true, "description": "The name to verify the brokers' certificates against, if not their host."},
     "tlsInsecureSkipVerify": {"type": "boolean", "default": false, "title": "Skip verification", "x-group": "tls", "x-advanced": true, "description": "Don't verify the brokers' certificates."},
     "saslMechanism": {"type": "string", "title": "SASL mechanism", "x-group": "auth", "description": "SASL authentication. Unset: none.", "oneOf": [
-      {"const": "plain", "title": "PLAIN", "description": "A user and password, sent as they are: use it over TLS."},
+      {"const": "plain", "title": "PLAIN", "description": "A user and password, sent as they are: use it over TLS. From 0.2.0, the check warns without TLS."},
       {"const": "scram-sha-256", "title": "SCRAM-SHA-256", "description": "A user and password, never sent."},
       {"const": "scram-sha-512", "title": "SCRAM-SHA-512", "description": "A user and password, never sent."},
       {"const": "oauthbearer", "title": "OAUTHBEARER", "description": "From 0.2.0. A token from an OAuth client-credentials grant."},
