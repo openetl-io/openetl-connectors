@@ -443,11 +443,14 @@ func TestCaptureHandoffWindow(t *testing.T) {
 	e.exec("INSERT INTO $schema.t VALUES (1, 1), (2, 2), (3, 3), (4, 4)")
 	e.capture("t")
 	e.harvested()
-	// The capture job is the database's: it runs again whatever happens here.
+	// The capture job is the database's: it runs again whatever happens here,
+	// or the tests after this one wait for it in vain.
 	t.Cleanup(func() {
-		_, _ = e.db.ExecContext(context.Background(), "EXEC sys.sp_cdc_start_job @job_type = N'capture'")
+		if err := startCapture(context.Background(), e.db); err != nil {
+			t.Error(err)
+		}
 	})
-	e.exec("EXEC sys.sp_cdc_stop_job @job_type = N'capture'")
+	e.stopCapture()
 	e.exec("UPDATE $schema.t SET v = 10 WHERE id = 1")
 	e.exec("DELETE FROM $schema.t WHERE id = 2")
 	e.exec("INSERT INTO $schema.t VALUES (5, 5)")
@@ -458,8 +461,9 @@ func TestCaptureHandoffWindow(t *testing.T) {
 	if got := changes(snap, "t", "id", "v"); !slices.Equal(got, []string{"insert,1,10", "insert,3,3", "insert,4,41", "insert,5,5"}) {
 		t.Fatalf("snapshot %v", got)
 	}
-	e.exec("EXEC sys.sp_cdc_start_job @job_type = N'capture'")
-	e.harvested()
+	if err := startCapture(t.Context(), e.db); err != nil {
+		t.Fatal(err)
+	}
 	after := read(t, s, source.CDC, map[string]string{"t": snap.last("t")})
 	if got := changes(after, "t", "id", "v"); !slices.Equal(got, []string{"update,1,10", "delete,2,2", "insert,5,5", "update,4,40", "update,4,41"}) {
 		t.Fatalf("changes %v", got)

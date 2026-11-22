@@ -109,6 +109,10 @@ func (e *sourceEnv) harvested() {
 // waitHarvested waits until the capture job has harvested the changes
 // committed so far, by writing one to a table of its own and waiting for it.
 func waitHarvested(ctx context.Context, db *sql.DB) error {
+	return harvestedWithin(ctx, db, time.Minute)
+}
+
+func harvestedWithin(ctx context.Context, db *sql.DB, wait time.Duration) error {
 	var n int64
 	if err := db.QueryRowContext(ctx, `IF OBJECT_ID(N'dbo.openetl_tick') IS NULL BEGIN
 			CREATE TABLE dbo.openetl_tick (id int PRIMARY KEY, n bigint);
@@ -119,7 +123,7 @@ func waitHarvested(ctx context.Context, db *sql.DB) error {
 		SELECT n FROM dbo.openetl_tick`).Scan(&n); err != nil {
 		return err
 	}
-	deadline := time.Now().Add(time.Minute)
+	deadline := time.Now().Add(wait)
 	for time.Now().Before(deadline) {
 		var got *int64
 		if err := db.QueryRowContext(ctx, "SELECT max(n) FROM cdc.dbo_openetl_tick_CT").Scan(&got); err != nil {
@@ -130,7 +134,55 @@ func waitHarvested(ctx context.Context, db *sql.DB) error {
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
-	return fmt.Errorf("the capture job didn't harvest a change in a minute")
+	return fmt.Errorf("the capture job didn't harvest a change in %s", wait)
+}
+
+// captureRunning reports whether the database's capture job is running, as
+// SQL Server Agent's current session has it.
+func captureRunning(ctx context.Context, db *sql.DB) (bool, error) {
+	var n int
+	err := db.QueryRowContext(ctx, `SELECT count(*) FROM msdb.dbo.sysjobactivity a JOIN msdb.dbo.sysjobs j ON j.job_id = a.job_id
+		WHERE j.name = N'cdc.' + DB_NAME() + N'_capture' AND a.session_id = (SELECT max(session_id) FROM msdb.dbo.syssessions)
+		AND a.start_execution_date IS NOT NULL AND a.stop_execution_date IS NULL`).Scan(&n)
+	return n > 0, err
+}
+
+// stopCapture stops the capture job, and waits until it has: SQL Server
+// Agent stops a job a while after it's asked.
+func (e *sourceEnv) stopCapture() {
+	e.t.Helper()
+	e.exec("EXEC sys.sp_cdc_stop_job @job_type = N'capture'")
+	for deadline := time.Now().Add(time.Minute); ; time.Sleep(200 * time.Millisecond) {
+		running, err := captureRunning(context.Background(), e.db)
+		if err != nil {
+			e.t.Fatal(err)
+		}
+		if !running {
+			return
+		}
+		if time.Now().After(deadline) {
+			e.t.Fatal("the capture job didn't stop in a minute")
+		}
+	}
+}
+
+// startCapture starts the capture job, and waits until it harvests. SQL
+// Server Agent refuses to start a job that runs, or is still stopping, so
+// while it refuses, a harvest tells which, and it's asked again.
+func startCapture(ctx context.Context, db *sql.DB) error {
+	for deadline := time.Now().Add(2 * time.Minute); ; {
+		_, err := db.ExecContext(ctx, "EXEC sys.sp_cdc_start_job @job_type = N'capture'")
+		if err == nil {
+			return waitHarvested(ctx, db)
+		}
+		// The capture job scans every 5 seconds.
+		if harvestedWithin(ctx, db, 12*time.Second) == nil {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("the capture job didn't start in 2 minutes: %w", err)
+		}
+	}
 }
 
 func (e *sourceEnv) source(extra string) *Source {
