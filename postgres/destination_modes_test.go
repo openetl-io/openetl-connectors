@@ -504,3 +504,29 @@ func TestMergeUnchangedOlderThanTarget(t *testing.T) {
 		t.Errorf("users = %s", got)
 	}
 }
+
+// An older generation, for which the stream appends, doesn't drop the read
+// table of a newer one that overwrites it once the newer has raised the
+// fence.
+func TestFencedKeepsNewerReads(t *testing.T) {
+	env := newEnv(t)
+	old := env.openStreams(1, destination.ScopePipeline, destination.Stream{Name: "users", Mode: destination.Append})
+	recov(t, old, 1, destination.Epoch{}, nil)
+	newer := env.openStreams(2, destination.ScopePipeline, destination.Stream{Name: "users", Mode: destination.Overwrite})
+	recov(t, newer, 2, destination.Epoch{}, nil)
+	startReads(t, newer, map[string]time.Time{"users": time.UnixMicro(1000)})
+	e := destination.Epoch{Generation: 2, N: 1}
+	write(t, newer, e, "users", batch(t, []arrow.Field{idField}, `[{"id": 1}]`))
+	commit(t, newer, e)
+	read := sqlstage.ReadName("p1", "users", time.UnixMicro(1000))
+	exists := func() bool {
+		return env.count("SELECT count(*) FROM pg_tables WHERE schemaname = '"+env.schema+"' AND tablename = '"+read+"'") == 1
+	}
+	if !exists() {
+		t.Fatal("the newer generation's read has no table")
+	}
+	old.(*writer).DropRemovedReads(t.Context())
+	if !exists() {
+		t.Error("the fenced generation dropped the newer one's read")
+	}
+}

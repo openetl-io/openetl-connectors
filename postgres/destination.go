@@ -1485,11 +1485,22 @@ func (w *writer) dropAbandonedReads(ctx context.Context, q querier, drop func(l 
 }
 
 // DropRemovedReads drops the read tables of streams that no longer
-// overwrite, once Recover has raised the fence. Best effort, like
-// dropStaging.
+// overwrite, once Recover has raised the fence, and while it holds it: a
+// newer generation that overwrites such a stream may have raised it since.
+// Best effort, like dropStaging.
 func (w *writer) DropRemovedReads(ctx context.Context) {
-	_ = w.dropAbandonedReads(ctx, w.pool, func(l sqlstage.ReadLabel, _ string) bool {
-		return w.streams[l.Stream].Mode != destination.Overwrite
+	_ = pgx.BeginFunc(ctx, w.pool, func(tx pgx.Tx) error {
+		var fence uint64
+		err := tx.QueryRow(ctx, "SELECT generation FROM "+w.ident("_openetl_fence")+" WHERE pipeline = $1 FOR SHARE", w.cfg.Pipeline).Scan(&fence)
+		if err != nil {
+			return err
+		}
+		if fence > w.cfg.Generation {
+			return destination.ErrFenced
+		}
+		return w.dropAbandonedReads(ctx, tx, func(l sqlstage.ReadLabel, _ string) bool {
+			return w.streams[l.Stream].Mode != destination.Overwrite
+		})
 	})
 }
 
