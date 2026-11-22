@@ -690,6 +690,28 @@ func TestDedupeNeedsRowIDs(t *testing.T) {
 	}
 }
 
+// A generation that a newer one's Recover applied the epoch of learns it's
+// fenced when it commits the epoch, though nothing's left to apply.
+func TestCommitAfterANewerRecoverIsFenced(t *testing.T) {
+	env := newEnv(t)
+	stream := destination.Stream{Name: "users", Mode: destination.Append}
+	old := env.openStreams(1, destination.ScopePipeline, stream)
+	recov(t, old, 1, destination.Epoch{}, nil)
+	e := destination.Epoch{Generation: 1, N: 1}
+	write(t, old, e, "users", batch(t, []arrow.Field{idField}, `[{"id": 1}]`))
+	st := precommit(t, old, e)
+	newer := env.openStreams(2, destination.ScopePipeline, stream)
+	if r := recov(t, newer, 2, e, st); r != destination.Redone {
+		t.Fatalf("Recover = %v", r)
+	}
+	if _, err := old.Commit(t.Context(), e, []destination.Staged{st}); !errors.Is(err, destination.ErrFenced) {
+		t.Errorf("the fenced generation's Commit = %v", err)
+	}
+	if n := env.count("SELECT count(*) FROM $schema.users"); n != 1 {
+		t.Errorf("users has %d rows", n)
+	}
+}
+
 // A string or JSON value Postgres can't hold, with a NUL or with bytes that
 // aren't UTF-8, fails the write with DATA_INVALID, naming its stream and
 // column.

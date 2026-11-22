@@ -406,8 +406,13 @@ func (r lanesRows) latestFirst(rel string) string {
 // It adds the rows each deduped stream skipped to collapsed.
 func (w *writer) Apply(ctx context.Context, desc staged, streams []stagedStream, collapsed map[string]uint64) error {
 	todo, err := w.Unapplied(ctx, desc, streams)
-	if err != nil || len(todo) == 0 {
+	if err != nil {
 		return err
+	}
+	if len(todo) == 0 {
+		// Applied, maybe by a newer generation's Recover: this one is then
+		// fenced, and says so.
+		return w.unfenced(ctx, w.pool, "")
 	}
 	prep := make(map[string]prepared, len(todo))
 	for _, s := range todo {
@@ -1524,18 +1529,28 @@ func (w *writer) dropAbandonedReads(ctx context.Context, q querier, drop func(l 
 // Best effort, like dropStaging.
 func (w *writer) DropRemovedReads(ctx context.Context) {
 	_ = pgx.BeginFunc(ctx, w.pool, func(tx pgx.Tx) error {
-		var fence uint64
-		err := tx.QueryRow(ctx, "SELECT generation FROM "+w.ident("_openetl_fence")+" WHERE pipeline = $1 FOR SHARE", w.cfg.Pipeline).Scan(&fence)
-		if err != nil {
+		if err := w.unfenced(ctx, tx, "FOR SHARE"); err != nil {
 			return err
-		}
-		if fence > w.cfg.Generation {
-			return destination.ErrFenced
 		}
 		return w.dropAbandonedReads(ctx, tx, func(l sqlstage.ReadLabel, _ string) bool {
 			return w.streams[l.Stream].Mode != destination.Overwrite
 		})
 	})
+}
+
+// unfenced fails with destination.ErrFenced if a newer generation has
+// raised the fence, which q reads with lock: "" or a lock that holds it.
+func (w *writer) unfenced(ctx context.Context, q interface {
+	QueryRow(context.Context, string, ...any) pgx.Row
+}, lock string) error {
+	var fence uint64
+	if err := q.QueryRow(ctx, "SELECT generation FROM "+w.ident("_openetl_fence")+" WHERE pipeline = $1 "+lock, w.cfg.Pipeline).Scan(&fence); err != nil {
+		return err
+	}
+	if fence > w.cfg.Generation {
+		return fmt.Errorf("%w: fence is %d, applier is %d", destination.ErrFenced, fence, w.cfg.Generation)
+	}
+	return nil
 }
 
 func (w *writer) Close(context.Context) error {
