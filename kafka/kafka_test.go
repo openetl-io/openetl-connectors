@@ -233,6 +233,30 @@ func TestDestinationCommitsEpochs(t *testing.T) {
 	wantIDs(t, ids(t, committed(t, table)), 0, 80)
 }
 
+// A transaction the brokers abort on its timeout fails its epoch as
+// transient, not as a fence, at the pre-commit or the commit, whichever
+// meets the abort first: the brokers look for such transactions every 10
+// seconds by default.
+func TestDestinationTransactionTimedOut(t *testing.T) {
+	defer func(s time.Duration) { txnSlack = s }(txnSlack)
+	txnSlack = 3 * time.Second
+	d := newDest(t, nil)
+	pipeline, table := uniq("p"), uniq("items")
+	createTopic(t, table, 1)
+	w := openWriter(t, d, pipeline, 1, table)
+	e := destination.Epoch{Generation: 1, N: 1}
+	write(t, w, e, table, 0, 20)
+	st, err := w.PreCommit(t.Context(), e)
+	if err == nil {
+		time.Sleep(timeout(time.Second) + 12*time.Second)
+		_, err = w.Commit(t.Context(), e, []destination.Staged{st})
+	}
+	if errors.Is(err, destination.ErrFenced) || codeOf(err) != "ERROR_CODE_TRANSIENT" {
+		t.Errorf("%s %v", codeOf(err), err)
+	}
+	wantIDs(t, ids(t, committed(t, table)), 0, 0)
+}
+
 // A replacement's Open fences the old attempt's producers: the epoch the
 // old one had pre-committed is aborted and reported lost, and the old
 // attempt can't commit it.

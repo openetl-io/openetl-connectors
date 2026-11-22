@@ -149,7 +149,7 @@ Each epoch is one Kafka transaction across all its topics, on one of three trans
 
 Streams whose source replays exactly land exactly once. A stream that may repeat rows, such as a Postgres table read incrementally, gets at least once: the destination has no way to drop the rows sent again.
 
-A transaction must stay open for less than the brokers' `transaction.max.timeout.ms`, 15 minutes by default, so a pipeline's commit interval can be at most 7 minutes. The destination reads the brokers' setting when it opens, and from 0.2.0 in its check too, if the credentials may describe their configs. A continuous pipeline commits every 10 seconds unless it sets its own `delivery.commit.interval`.
+A transaction must stay open for less than the brokers' `transaction.max.timeout.ms`, 15 minutes by default, so a pipeline's commit interval can be at most 7 minutes. The destination reads the brokers' setting when it opens, and from 0.2.0 in its check too, if the credentials may describe their configs. A continuous pipeline commits every 10 seconds unless it sets its own `delivery.commit.interval`. Each transaction's timeout is twice the commit interval and a minute. The brokers abort a transaction open longer, as when a commit is held up, and answer its producer as they do a fenced one: from 0.2.0, the attempt fails as transient rather than fenced, and the next attempt writes the epoch again.
 
 ### Jobs on several workers
 
