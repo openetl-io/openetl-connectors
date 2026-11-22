@@ -886,3 +886,33 @@ func TestDestinationManyPartitions(t *testing.T) {
 	k.commit(w, epoch(1, 1), batchOf(s, rows...))
 	wantRows(t, "p's rows and partitions", k.query("SELECT concat(toString(count()), ' ', toString(uniqExact(_partition_id))) FROM $db.p"), "150 150")
 }
+
+// An overwrite's replace that comes after another applier finished the
+// epoch, as one paused past its checks would, leaves the table as that
+// applier made it: the read's table is gone because the epoch is applied,
+// not because the read was empty.
+func TestDestinationReplaceAfterApplied(t *testing.T) {
+	k := newKit(t)
+	s := schemaOf("o", idCol, vCol)
+	w, _ := k.open(1, []destination.Stream{{Name: "o", Mode: destination.Overwrite}}, destination.Epoch{}, nil)
+	k.apply(w, s)
+	if err := w.StartReads(t.Context(), map[string]time.Time{"o": time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.EndRead(t.Context(), epoch(1, 1), "o"); err != nil {
+		t.Fatal(err)
+	}
+	st := k.stage(w, epoch(1, 1), batchOf(s, ins(1, int64(1), "a")))
+	if _, err := w.Commit(t.Context(), epoch(1, 1), []destination.Staged{st}); err != nil {
+		t.Fatal(err)
+	}
+	wantRows(t, "o", k.rows("o", "id", "v"), "1|a")
+	desc, err := w.mergeLanes([]destination.Staged{st})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.replace(t.Context(), desc, desc.Streams[0]); err != nil {
+		t.Fatal(err)
+	}
+	wantRows(t, "o after a late replace", k.rows("o", "id", "v"), "1|a")
+}

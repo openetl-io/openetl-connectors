@@ -682,7 +682,7 @@ func (w *writer) apply(ctx context.Context, desc staged, s stagedStream) (uint64
 			return 0, err
 		}
 		if s.Ended {
-			if err := w.replace(ctx, s); err != nil {
+			if err := w.replace(ctx, desc, s); err != nil {
 				return 0, fmt.Errorf("clickhouse: replace %s: %w", s.Name, err)
 			}
 		}
