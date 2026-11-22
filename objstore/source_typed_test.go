@@ -480,3 +480,36 @@ func TestPreflightNames(t *testing.T) {
 		t.Error(err)
 	}
 }
+
+// A text or JSON column of numbers that a 64-bit float can't hold exactly,
+// such as IDs past int64's range, is text, which keeps their digits, not
+// number, which would round them.
+func TestInferExactNumbers(t *testing.T) {
+	for _, c := range []struct {
+		values []string
+		want   string
+	}{
+		{[]string{"1", "2.5", "1e3", "-0.125", "0.1"}, "float64"},
+		{[]string{"1", "9223372036854775807"}, "int64"},
+		{[]string{"1", "12345678901234567890"}, "utf8"},
+		{[]string{"0.1", "9007199254740993"}, "utf8"},
+		{[]string{"1.5", "1234567890.123456789"}, "utf8"},
+	} {
+		text, js := &inferred{}, &inferred{}
+		for _, v := range c.values {
+			text.text(v)
+			js.json(json.RawMessage(v))
+		}
+		for name, in := range map[string]*inferred{"text": text, "json": js} {
+			if got := in.field("n").Type.String(); got != c.want {
+				t.Errorf("%s %v: %s, want %s", name, c.values, got, c.want)
+			}
+		}
+	}
+	nan := &inferred{}
+	nan.text("1.5")
+	nan.text("NaN")
+	if got := nan.field("n").Type.String(); got != "float64" {
+		t.Errorf("NaN: %s", got)
+	}
+}

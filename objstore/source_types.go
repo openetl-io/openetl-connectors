@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"math/big"
 	"regexp"
 	"strconv"
 	"strings"
@@ -283,7 +284,7 @@ func (in *inferred) text(s string) {
 	if _, err := strconv.ParseInt(s, 10, 64); err != nil {
 		in.notInt = true
 	}
-	if _, err := strconv.ParseFloat(s, 64); err != nil || strings.ContainsAny(s, "xXpP_") {
+	if !exactFloat(s) || strings.ContainsAny(s, "xXpP_") {
 		in.notFloat = true
 	}
 	if _, err := time.Parse(time.DateOnly, s); err != nil || !dateText.MatchString(s) {
@@ -320,7 +321,25 @@ func (in *inferred) json(raw json.RawMessage) {
 		if _, err := strconv.ParseInt(string(raw), 10, 64); err != nil {
 			in.notInt = true
 		}
+		if !exactFloat(string(raw)) {
+			in.notFloat = true
+		}
 	}
+}
+
+// exactFloat: s is a number that a 64-bit float holds as s says it, to the
+// digits the float's shortest text has, or NaN or an infinity.
+func exactFloat(s string) bool {
+	f, err := strconv.ParseFloat(s, 64)
+	if err != nil {
+		return false
+	}
+	want, ok := new(big.Rat).SetString(s)
+	if !ok {
+		return true
+	}
+	got, _ := new(big.Rat).SetString(strconv.FormatFloat(f, 'g', -1, 64))
+	return want.Cmp(got) == 0
 }
 
 // field is the column's inferred type: text for one with no values.
