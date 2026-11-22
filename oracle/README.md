@@ -33,7 +33,7 @@ Every second, the source starts a LogMiner session over the redo written since t
 
 Connected to a pluggable database, LogMiner finds the logs that hold the redo itself, and returns only that PDB's changes. Connected to a database that isn't a container database (or to `CDB$ROOT`), the source finds the archived and online logs in `V$ARCHIVED_LOG` and `V$LOG` and adds them to each session.
 
-The source doesn't use `CONTINUOUS_MINE`, which Oracle removed in 19c, nor `COMMITTED_DATA_ONLY`. Changes that are still in the log buffer when a session reads its window aren't in it; the next window starts 5 seconds back from the end of the last, so they're read when they reach the log file, and a change read twice is kept once.
+The source doesn't use `CONTINUOUS_MINE`, which Oracle removed in 19c, nor `COMMITTED_DATA_ONLY`. Changes that are still in the log buffer when a session reads its window aren't in it; the next window starts 5 seconds back from the end of the last, so they're read when they reach the log file, a commit among them too, and a change or a commit read twice is sent once.
 
 Every change carries a sequence number: its commit's SCN times 10¹² plus its place in the transaction, so the destination applies a key's versions in order.
 
@@ -181,7 +181,7 @@ A read OpenETL asks to end at an earlier resume point (`until`), to read a part 
 - A transaction's changes to the tables read are held in memory until it commits.
 - A LOB or `XMLTYPE` value is read from the table as of its change's commit, not from the redo log; it's sent as unchanged when the undo for that is gone.
 - A table's rows written with direct-path loads (`INSERT /*+ APPEND */` into a table with `NOLOGGING`, or SQL\*Loader's direct path without logging) aren't in the redo log, and CDC doesn't see them.
-- Commits made with `COMMIT WRITE NOWAIT` or `BATCH` may reach the redo log after a window that should have read them has ended; the source reads them only from the log files, so such a commit can be missed.
+- A commit that reaches the log file more than 5 seconds after its SCN, as one made with `COMMIT WRITE NOWAIT` or `BATCH` can, can be missed. So can one that reaches it after a later commit to the same table, if the read stops in between: the next read starts after the later one.
 - Dates before the Gregorian calendar's start, 15 October 1582, are read through go-ora, which counts them in the Gregorian calendar, while Oracle counts them in the Julian: they're days off, and a key or cursor that has such a date can resume a read at the wrong row. Years before 1 AD arrive as the proleptic Gregorian calendar counts them (Oracle's year -1 is year 0).
 - A change made before a change of its table's columns, which LogMiner gives in Oracle's internal format, is read assuming the database's character set is `AL32UTF8` and its national one `AL16UTF16`, the defaults.
 - An empty LOB, `EMPTY_CLOB()` or `EMPTY_BLOB()`, which Oracle doesn't count as `NULL`, arrives as null: go-ora reads it so.

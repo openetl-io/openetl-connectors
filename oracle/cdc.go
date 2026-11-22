@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"slices"
 	"strconv"
 	"strings"
@@ -133,7 +134,11 @@ type cdcReader struct {
 	continuous bool
 
 	txns map[string]*txn
-	// Every commit at or before done is handled.
+	// The commits handled, by transaction, while a window can read them
+	// again: a commit is sent once, though a later window reads it too.
+	sent map[string]uint64
+	// Every row at or before done is handled, but a commit whose redo
+	// reaches the log file after its window: the next reads it again.
 	done uint64
 	// Where the next window starts.
 	lo      uint64
@@ -174,7 +179,7 @@ func (s *Source) readCDC(ctx context.Context, conns *connPool, req source.ReadRe
 			return err
 		}
 	}
-	r := &cdcReader{ctx: ctx, s: s, out: out, conn: conn, schema: schema, streams: map[string]*cdcStream{}, continuous: req.Continuous, txns: map[string]*txn{}, done: ^uint64(0)}
+	r := &cdcReader{ctx: ctx, s: s, out: out, conn: conn, schema: schema, streams: map[string]*cdcStream{}, continuous: req.Continuous, txns: map[string]*txn{}, sent: map[string]uint64{}, done: ^uint64(0)}
 	if err := conn.QueryRowContext(ctx, `SELECT dbid || ':' || resetlogs_change# FROM v$database`).Scan(&r.db); err != nil {
 		return classify(fmt.Errorf("oracle: read the database's identity: %w", err))
 	}
@@ -472,6 +477,7 @@ func (r *cdcReader) mine() error {
 // window mines the redo from SCN lo to SCN e.
 func (r *cdcReader) window(lo, e uint64) error {
 	r.ddls = map[string]map[uint64]bool{}
+	maps.DeleteFunc(r.sent, func(_ string, scn uint64) bool { return scn < lo })
 	for {
 		err := r.mineRange(lo, e)
 		la, ok := errors.AsType[*lookahead](err)
@@ -600,10 +606,13 @@ func (r *cdcReader) row(x logRow) error {
 	case 7:
 		tx := r.txns[x.xid()]
 		delete(r.txns, x.xid())
-		if tx == nil || x.scn <= r.done {
+		if tx == nil || r.sent[x.xid()] == x.scn {
 			return nil
 		}
-		return r.commit(tx, x.scn, x.at)
+		if err := r.commit(tx, x.scn, x.at); err != nil {
+			return err
+		}
+		r.sent[x.xid()] = x.scn
 	case 36:
 		delete(r.txns, x.xid())
 		if x.sqn == 0xFFFFFFFF {
@@ -678,7 +687,10 @@ func (r *cdcReader) commit(tx *txn, scn uint64, at time.Time) error {
 		if err := st.b.change(vals, row.op, seq, unchanged); err != nil {
 			return fmt.Errorf("oracle: %s: %w", st.t.name, err)
 		}
-		st.dirty, st.last, st.lastAt = true, scn, at
+		st.dirty = true
+		if scn > st.last {
+			st.last, st.lastAt = scn, at
+		}
 		if st.b.bytes >= r.s.cfg.BatchBytes {
 			if err := st.flush(r.out); err != nil {
 				return err
