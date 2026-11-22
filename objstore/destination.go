@@ -724,15 +724,22 @@ func (w *writer) dropGenerations(ctx context.Context, gen uint64) {
 	}
 }
 
-// Close drops the files of epochs that were never pre-committed.
-func (w *writer) Close(context.Context) error {
+// The longest Close deletes files for, whose context OpenETL gives no end.
+const closeTimeout = 30 * time.Second
+
+// Close drops the files of epochs that were never pre-committed, within
+// ctx and closeTimeout: those a store that stops answering keeps stay for a
+// later Recover or DropStale, as after a crash.
+func (w *writer) Close(ctx context.Context) error {
+	ctx, cancel := context.WithTimeout(ctx, closeTimeout)
+	defer cancel()
 	for _, byStream := range w.parts {
 		for _, ef := range byStream {
 			if ef.open != nil {
 				ef.open.abort()
 			}
 			for _, f := range ef.files {
-				_ = w.b.Delete(w.ctx, f.Staged)
+				_ = w.b.Delete(ctx, f.Staged)
 			}
 		}
 	}

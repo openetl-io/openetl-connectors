@@ -10,6 +10,8 @@ import (
 	"io"
 	"io/fs"
 	"maps"
+	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"slices"
 	"strconv"
@@ -26,6 +28,8 @@ import (
 	"gocloud.dev/blob"
 	"gocloud.dev/gcerrors"
 
+	"github.com/openetl-io/openetl-connectors/objstore/s3store"
+	sdk "github.com/openetl-io/openetl/sdk/go"
 	"github.com/openetl-io/openetl/sdk/go/check"
 	"github.com/openetl-io/openetl/sdk/go/destination"
 )
@@ -754,6 +758,44 @@ func TestFailedPreCommitLeavesItsEpochToClose(t *testing.T) {
 	})
 	if len(left) > 0 {
 		t.Errorf("left %v", left)
+	}
+}
+
+// Close returns within its context's time though the store stops answering
+// its deletes, whose files stay for a later Recover or DropStale.
+func TestCloseOfAStoreThatHangs(t *testing.T) {
+	release := make(chan struct{})
+	deletes := make(chan string, 2)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		deletes <- r.URL.Path
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+	}))
+	t.Cleanup(srv.Close)
+	t.Cleanup(func() { close(release) })
+	st, err := s3store.New(s3store.Config{Endpoint: srv.URL, Region: "us-east-1", AccessKeyID: sdk.NewSecret("a"), SecretAccessKey: sdk.NewSecret("b")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := st.Open(t.Context(), "b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wctx, cancel := context.WithCancel(context.Background())
+	w := &writer{b: b, ctx: wctx, cancel: cancel, parts: map[uint64]map[string]*epochFiles{1: {"a": {files: []stagedFile{{Staged: "x"}, {Staged: "y"}}}}}}
+	ctx, stop := context.WithTimeout(t.Context(), 200*time.Millisecond)
+	defer stop()
+	closed := make(chan error, 1)
+	go func() { closed <- w.Close(ctx) }()
+	select {
+	case <-closed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close waits on the store")
+	}
+	if len(deletes) == 0 {
+		t.Error("Close deleted nothing")
 	}
 }
 
