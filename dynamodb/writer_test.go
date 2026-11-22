@@ -8,6 +8,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/memory"
+	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 
 	"github.com/openetl-io/openetl/sdk/go/destination"
@@ -50,6 +51,46 @@ func TestOverwriteDedupeEpoch(t *testing.T) {
 	got += memCommit(t, w, 2, "t", memBatch(cols, row)).Collapsed["t"]
 	if n := len(db.items("t")); n != 2 || got != 1 {
 		t.Errorf("%d items, %d collapsed; want 2 and 1", n, got)
+	}
+}
+
+// Every refusal of a type change says what makes the table take it, a local
+// secondary index's too.
+func TestRefusalsHaveFixes(t *testing.T) {
+	keyed := func(names ...string) []types.KeySchemaElement {
+		var out []types.KeySchemaElement
+		for i, n := range names {
+			kt := types.KeyTypeHash
+			if i > 0 {
+				kt = types.KeyTypeRange
+			}
+			out = append(out, types.KeySchemaElement{AttributeName: aws.String(n), KeyType: kt})
+		}
+		return out
+	}
+	td := &types.TableDescription{
+		TableName: aws.String("t"), KeySchema: keyed("id", "at"),
+		AttributeDefinitions: []types.AttributeDefinition{
+			{AttributeName: aws.String("id"), AttributeType: types.ScalarAttributeTypeS},
+			{AttributeName: aws.String("at"), AttributeType: types.ScalarAttributeTypeS},
+			{AttributeName: aws.String("g"), AttributeType: types.ScalarAttributeTypeS},
+			{AttributeName: aws.String("l"), AttributeType: types.ScalarAttributeTypeS},
+		},
+		GlobalSecondaryIndexes: []types.GlobalSecondaryIndexDescription{{IndexName: aws.String("by_g"), KeySchema: keyed("g")}},
+		LocalSecondaryIndexes:  []types.LocalSecondaryIndexDescription{{IndexName: aws.String("by_l"), KeySchema: keyed("id", "l")}},
+	}
+	var fields []arrow.Field
+	for _, n := range []string{"id", "at", "g", "l"} {
+		fields = append(fields, arrow.Field{Name: n, Type: arrow.PrimitiveTypes.Int64})
+	}
+	refused, _ := columnLimits(td, "s", arrow.NewSchema(fields, nil))
+	if len(refused) != 4 {
+		t.Fatalf("refused %+v, want each of 4 columns", refused)
+	}
+	for _, r := range refused {
+		if r.Fix == "" {
+			t.Errorf("%s's refusal has no fix: %+v", r.Column, r)
+		}
 	}
 }
 

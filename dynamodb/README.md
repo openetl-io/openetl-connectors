@@ -273,7 +273,7 @@ An item has no column types. A new column is a new attribute, and a widened colu
   aws dynamodb update-table --table-name raw_orders --global-secondary-index-updates '[{"Delete":{"IndexName":"by_customer"}}]'
   ```
 
-A local secondary index can't change without recreating the table.
+- A local secondary index can't change without recreating the table: delete the table, then create it again with the index keyed on the new type, or let the next sync create it without the index.
 
 The table's key attributes take no null, and OpenETL holds no cell there.
 

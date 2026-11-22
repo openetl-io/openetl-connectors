@@ -136,6 +136,9 @@ func columnLimits(t *types.TableDescription, stream string, schema *arrow.Schema
 		if slices.ContainsFunc(t.GlobalSecondaryIndexes, func(g types.GlobalSecondaryIndexDescription) bool { return aws.ToString(g.IndexName) == indexes[name] }) {
 			rc.Fix = fmt.Sprintf(`aws dynamodb update-table --table-name %s --global-secondary-index-updates '[{"Delete":{"IndexName":"%s"}}]', then create the index again with %s as %s`,
 				aws.ToString(t.TableName), indexes[name], name, to)
+		} else {
+			rc.Fix = fmt.Sprintf("a local secondary index can't change: aws dynamodb delete-table --table-name %s, then create it again with %s keyed on %s as %s, or let the next sync create it without the index",
+				aws.ToString(t.TableName), indexes[name], name, to)
 		}
 		refused = append(refused, rc)
 	}
