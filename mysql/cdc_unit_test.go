@@ -9,6 +9,7 @@ import (
 	"github.com/go-mysql-org/go-mysql/replication"
 
 	"github.com/openetl-io/openetl-connectors/connectortest"
+	protocolv1 "github.com/openetl-io/openetl/sdk/go/protocol/v1"
 )
 
 // binlogReader is a cdcReader of app.items (id int primary key, v
@@ -165,6 +166,43 @@ func TestRowsOutsideATransactionFail(t *testing.T) {
 	err := feed(t, r, at(150, replication.TABLE_MAP_EVENT, itemsMap()), at(200, replication.WRITE_ROWS_EVENTv2, itemRows([]any{int32(1), "a"})))
 	if err == nil || !strings.Contains(err.Error(), "outside a transaction") {
 		t.Fatalf("rows outside a transaction: %v", err)
+	}
+}
+
+// TestPartialRowImagesFail reads changes that a session logged with
+// binlog_row_image MINIMAL or NOBLOB, or with a JSON column's partial
+// update: an insert or an update without a column's value fails the read,
+// rather than set the column null, and a delete needs only the key.
+func TestPartialRowImagesFail(t *testing.T) {
+	for name, c := range map[string]struct {
+		typ     replication.EventType
+		rows    [][]any
+		skipped [][]int
+		ok      bool
+	}{
+		"a delete of the key alone":            {replication.DELETE_ROWS_EVENTv2, [][]any{{int32(1), nil}}, [][]int{{1}}, true},
+		"an update's old row of the key alone": {replication.UPDATE_ROWS_EVENTv2, [][]any{{int32(1), nil}, {int32(1), "b"}}, [][]int{{1}, {}}, true},
+		"an update without v":                  {replication.UPDATE_ROWS_EVENTv2, [][]any{{int32(1), nil}, {int32(1), nil}}, [][]int{{1}, {1}}, false},
+		"an insert without v":                  {replication.WRITE_ROWS_EVENTv2, [][]any{{int32(1), nil}}, [][]int{{1}}, false},
+		"a delete without the key":             {replication.DELETE_ROWS_EVENTv2, [][]any{{nil, "a"}}, [][]int{{0}}, false},
+		"a partial JSON update":                {replication.PARTIAL_UPDATE_ROWS_EVENT, [][]any{{int32(1), "a"}, {int32(1), &replication.JsonDiff{}}}, [][]int{{}, {}}, false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			r, rec := binlogReader(t, false)
+			ev := itemRows(c.rows...)
+			ev.SkippedColumns = c.skipped
+			err := feed(t, r, at(100, replication.QUERY_EVENT, query("BEGIN")), at(150, replication.TABLE_MAP_EVENT, itemsMap()), at(200, c.typ, ev))
+			switch {
+			case c.ok && err != nil:
+				t.Fatal(err)
+			case c.ok:
+				if rows := emitted(t, r, rec); len(rows) != 1 || rows[0]["id"] != "1" {
+					t.Fatalf("rows %v", rows)
+				}
+			case connectortest.CodeOf(err) != protocolv1.ErrorCode_ERROR_CODE_CONFIG_INVALID || !strings.Contains(err.Error(), "binlog_row_"):
+				t.Fatalf("%v (%v)", err, connectortest.CodeOf(err))
+			}
+		})
 	}
 }
 

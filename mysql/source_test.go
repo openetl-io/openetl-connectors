@@ -405,6 +405,36 @@ func TestCDCReadsSavepointsAndXA(t *testing.T) {
 	})
 }
 
+// TestCDCRefusesPartialRowImages reads a session's changes logged with
+// binlog_row_image = MINIMAL: its delete has the key it needs, its update
+// hasn't the columns it left alone and fails the read.
+func TestCDCRefusesPartialRowImages(t *testing.T) {
+	eachServer(t, func(t *testing.T, srv testServer) {
+		e := newSourceEnv(t, srv)
+		e.exec("CREATE TABLE $db.items (id int PRIMARY KEY, v varchar(20), w varchar(20))")
+		e.exec("INSERT INTO $db.items VALUES (1, 'a', 'x'), (2, 'b', 'y')")
+		s := e.source("")
+		first := read(t, s, cdc("minimal", nil, "items"))
+		conn, err := e.db.Conn(t.Context())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = conn.Close() }()
+		items := quoteIdent(e.database) + ".items"
+		for _, q := range []string{"SET SESSION binlog_row_image = 'MINIMAL'", "DELETE FROM " + items + " WHERE id = 2", "UPDATE " + items + " SET v = 'z' WHERE id = 1"} {
+			if _, err := conn.ExecContext(t.Context(), q); err != nil {
+				t.Fatalf("%s: %v", q, err)
+			}
+		}
+		next := &capture{}
+		t.Cleanup(next.release)
+		err = s.Read(t.Context(), cdc("minimal", map[string]string{"items": first.state("items")}, "items"), next)
+		if codeOf(err) != protocolv1.ErrorCode_ERROR_CODE_CONFIG_INVALID || !strings.Contains(err.Error(), "binlog_row_image") {
+			t.Fatalf("an update without w: %v", err)
+		}
+	})
+}
+
 func TestCDCNewColumnRestartsTheRead(t *testing.T) {
 	eachServer(t, func(t *testing.T, srv testServer) {
 		e := newSourceEnv(t, srv)

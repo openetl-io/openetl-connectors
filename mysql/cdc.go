@@ -986,8 +986,14 @@ func (r *cdcReader) rows(t replication.EventType, e *replication.RowsEvent) erro
 	default:
 		op = source.OpUpdate
 	}
+	skipped := func(i int) []int {
+		if i < len(e.SkippedColumns) {
+			return e.SkippedColumns[i]
+		}
+		return nil
+	}
 	for i := 0; i < len(e.Rows); i++ {
-		vals, err := rel.values(e.Rows[i])
+		vals, err := rel.values(e.Rows[i], skipped(i), op != source.OpInsert)
 		if err != nil {
 			return err
 		}
@@ -996,7 +1002,7 @@ func (r *cdcReader) rows(t replication.EventType, e *replication.RowsEvent) erro
 			if i == len(e.Rows) {
 				return fmt.Errorf("mysql: binlog: an update of %s without its new row", st.t.name)
 			}
-			after, err := rel.values(e.Rows[i])
+			after, err := rel.values(e.Rows[i], skipped(i), false)
 			if err != nil {
 				return err
 			}
@@ -1024,8 +1030,15 @@ func keyOf(t table, vals []any) string {
 }
 
 // values are a binlog row's values by stream column, as the snapshot reads
-// them.
-func (rel *relation) values(row []any) ([]any, error) {
+// them. skipped are the binlog's columns the row doesn't have, which only
+// the columns not in the key may be if keyOnly.
+func (rel *relation) values(row []any, skipped []int, keyOnly bool) ([]any, error) {
+	for _, i := range skipped {
+		if j := rel.at[i]; j >= 0 && (!keyOnly || slices.Contains(rel.stream.t.key, j)) {
+			return nil, configInvalid("mysql: binlog: a change to %s without %s's value, which a session logged with binlog_row_image MINIMAL or NOBLOB; "+
+				"log changes with binlog_row_image = FULL, and read %[1]s again", rel.stream.t.name, rel.stream.t.cols[j].name)
+		}
+	}
 	vals := make([]any, len(rel.stream.t.cols))
 	for i, v := range row {
 		j := rel.at[i]
@@ -1033,6 +1046,10 @@ func (rel *relation) values(row []any) ([]any, error) {
 			continue
 		}
 		c := rel.stream.t.cols[j]
+		if _, ok := v.(*replication.JsonDiff); ok {
+			return nil, configInvalid("mysql: binlog: a partial update of %s.%s, which a session logged with binlog_row_value_options = PARTIAL_JSON; "+
+				"log changes without it, and read %[1]s again", rel.stream.t.name, c.name)
+		}
 		x, err := binlogValue(c, rel.cols[i], v)
 		if err != nil {
 			return nil, fmt.Errorf("mysql: %s.%s: %w", rel.stream.t.name, c.name, err)
