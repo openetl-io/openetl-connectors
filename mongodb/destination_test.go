@@ -214,6 +214,34 @@ func TestOverwriteSwapAgain(t *testing.T) {
 	}
 }
 
+// An overwrite read whose swap a crash cut short keeps its collection
+// through a StartReads that starts the stream's read over, so that the
+// swap still puts it in the target's place.
+func TestOverwritePendingSwap(t *testing.T) {
+	db := testDB(t)
+	first := time.Now().Add(-time.Hour)
+	w := openWriter(t, db, 1, destination.Stream{Name: "s", Mode: destination.Overwrite})
+	if err := w.StartReads(t.Context(), map[string]time.Time{"s": first}); err != nil {
+		t.Fatal(err)
+	}
+	commit(t, w, 1, "s", rowsBatch(t, row{1, "new", "insert", 1}))
+	// The read ended in epoch 1, and the crash came after its marker, before
+	// the swap.
+	m := marker{Stream: "s", Generation: 1, N: 1, Swap: readName("p", "s", first), Target: "s"}
+	if err := w.SetMarkers(t.Context(), []marker{m}); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.StartReads(t.Context(), map[string]time.Time{"s": time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Swap(t.Context(), m); err != nil {
+		t.Fatal(err)
+	}
+	if got := docs(t, db.Collection("s")); len(got) != 1 || got[1]["v"] != "new" {
+		t.Errorf("the target after the swap: %v, want the read's row", got)
+	}
+}
+
 // An ended read has its target's indexes once applied, before its marker
 // names it, so that the swap is only a rename.
 func TestOverwriteIndexesAtApply(t *testing.T) {

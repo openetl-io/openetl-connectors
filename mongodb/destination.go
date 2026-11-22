@@ -184,17 +184,28 @@ func (w *writer) target(stream string) string {
 	return w.targets[stream]
 }
 
-// StartReads drops the collections of reads that the attempt starts over.
+// StartReads drops the collections of reads that the attempt starts over,
+// but one a marker has yet to swap into its target's place.
 func (w *writer) StartReads(ctx context.Context, starts map[string]time.Time) error {
 	w.starts = starts
 	names, err := w.db.ListCollectionNames(ctx, bson.D{})
 	if err != nil {
 		return classify(fmt.Errorf("mongodb: list collections of %s: %w", w.db.Name(), err))
 	}
+	markers, err := w.Markers(ctx)
+	if err != nil {
+		return err
+	}
+	pending := map[string]bool{}
+	for _, m := range markers {
+		if m.Swap != "" {
+			pending[m.Swap] = true
+		}
+	}
 	for stream, start := range starts {
 		prefix, current := "_openetl_read_"+hash(w.cfg.Pipeline, stream)+"_", readName(w.cfg.Pipeline, stream, start)
 		for _, n := range names {
-			if strings.HasPrefix(n, prefix) && n != current {
+			if strings.HasPrefix(n, prefix) && n != current && !pending[n] {
 				if err := w.db.Collection(n).Drop(ctx); err != nil {
 					return classify(fmt.Errorf("mongodb: drop %s: %w", n, err))
 				}

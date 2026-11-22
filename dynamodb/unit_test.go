@@ -384,6 +384,38 @@ func TestAWSClock(t *testing.T) {
 	}
 }
 
+// A read that begins before the stream has shards, as a stream just
+// enabled may not, completes with a state that has none; a read from that
+// state reads the shards listed since.
+func TestShardsAfterNone(t *testing.T) {
+	f := &fakeStream{}
+	rec := &connectortest.Recorder{}
+	r := lineageRead(f, rec, cdcState{Stream: "arn", G: 1})
+	if err := r.begin(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.follow(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	state, complete := rec.Last("t")
+	if !complete {
+		t.Fatal("the read didn't complete")
+	}
+	st, err := decodeState(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.shards = []streamtypes.Shard{shard("a", "", false)}
+	f.records = map[string][]streamtypes.Record{"a": {insert(1, 1, now().Add(-time.Minute))}}
+	next := &connectortest.Recorder{}
+	if err := lineageRead(f, next, st).follow(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if rows := next.RowsOf("t"); len(rows) != 1 {
+		t.Errorf("a read from a state of no shards, once the stream has one: read %v, want its record", rows)
+	}
+}
+
 func TestSeq(t *testing.T) {
 	r := &cdcRead{st: cdcState{G: 12}}
 	a, err := r.seq("000000000000000000001")

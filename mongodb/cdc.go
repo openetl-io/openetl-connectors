@@ -300,7 +300,7 @@ func (r *cdcReader) follow(ctx context.Context) error {
 			}
 			resumed = time.Now()
 		case r.continuous && time.Since(resumed) >= quietResume && tokenCompare(pbrt, r.st.Token) > 0:
-			r.st.Token, r.st.Place = pbrt, 0
+			r.moveTo(pbrt, last, place)
 			if err := r.resume(); err != nil {
 				return err
 			}
@@ -320,7 +320,7 @@ func (r *cdcReader) follow(ctx context.Context) error {
 		if !r.continuous {
 			if pt, ok := tokenTime(pbrt); !ok || !after(r.end, pt) {
 				if from, ok := r.position(); !read && (!ok || pt.T >= from.T+uint32(staleResume/time.Second)) {
-					r.st.Token, r.st.Place = pbrt, 0
+					r.moveTo(pbrt, last, place)
 				}
 				return r.complete()
 			}
@@ -376,6 +376,17 @@ func (r *cdcReader) fieldGone(ctx context.Context) func(string) (bool, error) {
 		r.gone[field] = t
 		return !after(r.at, t), nil
 	}
+}
+
+// moveTo moves the state's position to a post-batch resume token, pbrt,
+// past no change the read hasn't read. last and place are the cluster time
+// and place of the last change read: at that time, as within a transaction,
+// the place stays, so that a change after pbrt at it takes the next.
+func (r *cdcReader) moveTo(pbrt *value, last bson.Timestamp, place uint32) {
+	if at, ok := tokenTime(pbrt); !ok || at != last {
+		place = 0
+	}
+	r.st.Token, r.st.Place = pbrt, place
 }
 
 // position is the cluster time the state's token is at.
