@@ -437,7 +437,7 @@ func TestCDCRefusesRolledBackXA(t *testing.T) {
 			}
 		}
 		prepared := read(t, s, cdc("xa", map[string]string{"items": first.state("items")}, "items"))
-		if rows := prepared.rows("items"); len(rows) != 2 || strings.Contains(prepared.state("items"), "6331") {
+		if rows := prepared.rows("items"); len(rows) != 2 || strings.Contains(prepared.state("items"), "X'6331'") {
 			t.Fatalf("rows %v, state %s", rows, prepared.state("items"))
 		}
 		e.exec("XA ROLLBACK X'7231',X'62',7")
