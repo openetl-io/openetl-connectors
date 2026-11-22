@@ -44,6 +44,12 @@ func TestWidens(t *testing.T) {
 		{"DateTime64(6, 'UTC')", "DateTime64(3, 'UTC')", false},
 		{"DateTime64(3, 'UTC')", "DateTime64(6, 'Asia/Tokyo')", false},
 		{"Date32", "DateTime64(6, 'UTC')", true},
+		// DateTime64(9) ends at 2262-04-11, Date32 and DateTime64's others at
+		// 2299-12-31.
+		{"Date32", "DateTime64(9, 'UTC')", false},
+		{"DateTime64(6, 'UTC')", "DateTime64(9, 'UTC')", false},
+		{"Nullable(DateTime64(8))", "Nullable(DateTime64(9))", false},
+		{"DateTime64(9, 'UTC')", "DateTime64(9, 'UTC')", true},
 		{"Time64(3)", "Time64(6)", true},
 		{"Array(Nullable(Int32))", "Array(Nullable(Int64))", true},
 		{"Tuple(\n    months Int32,\n    days Int32,\n    nanoseconds Int64)", intervalType, true},
