@@ -42,6 +42,12 @@ var (
 		Message: "{table} has no primary key, and cdc reads only tables with one.",
 		Fix:     "Give {table} a primary key, or read it with full_refresh or incremental.",
 	}
+	variantKey = check.Reason{
+		Name:    "primary_key_variant",
+		Code:    protocolv1.ErrorCode_ERROR_CODE_CONFIG_INVALID,
+		Message: "{table}'s primary key has a sql_variant column, whose values arrive as text, which can't tell 1 from N'1', so the source reads it as a table without a key, and cdc reads only tables with one.",
+		Fix:     "Read {table} with full_refresh or incremental, or give it a primary key of other types.",
+	}
 	notTracked = check.Reason{
 		Name:    "change_tracking_off",
 		Code:    protocolv1.ErrorCode_ERROR_CODE_CONFIG_INVALID,
@@ -394,10 +400,14 @@ func (s *Source) cdcCheck(k *sqlcheck.Kit, name, ident string) check.Check {
 	return k.Check(name, check.Compatibility, title, func(ctx context.Context, p *check.Probe, db *sql.DB) error {
 		var keyed int
 		var ok sql.NullInt64
-		q := "SELECT coalesce(OBJECTPROPERTY(OBJECT_ID(@p1), 'TableHasPrimaryKey'), 0), CHANGE_TRACKING_MIN_VALID_VERSION(OBJECT_ID(@p1))"
+		// 0 without a primary key, 2 with one of a sql_variant column.
+		const key = `CASE WHEN coalesce(OBJECTPROPERTY(OBJECT_ID(@p1), 'TableHasPrimaryKey'), 0) = 0 THEN 0
+			WHEN EXISTS (SELECT 1 FROM sys.indexes i JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id
+				JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id
+				WHERE i.object_id = OBJECT_ID(@p1) AND i.is_primary_key = 1 AND TYPE_NAME(c.system_type_id) = 'sql_variant') THEN 2 ELSE 1 END`
+		q := "SELECT " + key + ", CHANGE_TRACKING_MIN_VALID_VERSION(OBJECT_ID(@p1))"
 		if s.cfg.CDCMethod == methodCapture {
-			q = `SELECT coalesce(OBJECTPROPERTY(OBJECT_ID(@p1), 'TableHasPrimaryKey'), 0),
-				(SELECT TOP (1) 1 FROM cdc.change_tables ct WHERE ct.source_object_id = OBJECT_ID(@p1)
+			q = "SELECT " + key + `, (SELECT TOP (1) 1 FROM cdc.change_tables ct WHERE ct.source_object_id = OBJECT_ID(@p1)
 					AND HAS_PERMS_BY_NAME(N'cdc.' + QUOTENAME(ct.capture_instance + N'_CT'), 'OBJECT', 'SELECT') = 1)`
 		}
 		if err := db.QueryRowContext(ctx, q, ident).Scan(&keyed, &ok); err != nil {
@@ -409,6 +419,8 @@ func (s *Source) cdcCheck(k *sqlcheck.Kit, name, ident string) check.Check {
 		switch {
 		case keyed == 0:
 			return noKey.Fail()
+		case keyed == 2:
+			return variantKey.Fail()
 		case !ok.Valid && s.cfg.CDCMethod == methodCapture:
 			return notCaptured.Fail()
 		case !ok.Valid:

@@ -581,6 +581,39 @@ func TestSourceUndeclaredColumn(t *testing.T) {
 	}
 }
 
+// A primary key with a sql_variant column isn't the stream's: SQL Server
+// compares a variant's type family before its value, so 1 and N'1' are two
+// keys, which arrive as the same text. The table is read as one without a
+// key, whole, which a read in key order by that text couldn't: past a
+// number it read its first chunk again and again, and past a binary it
+// ended.
+func TestVariantKey(t *testing.T) {
+	e := newSourceEnv(t)
+	e.exec("CREATE TABLE $schema.vk (k sql_variant PRIMARY KEY, v int)")
+	e.exec("INSERT INTO $schema.vk VALUES (CONVERT(sql_variant, 1), 1), (CONVERT(sql_variant, N'1'), 2), (CONVERT(sql_variant, 0x01), 3), (CONVERT(sql_variant, 0x02), 4), (CONVERT(sql_variant, 2), 5)")
+	e.exec("ALTER TABLE $schema.vk ENABLE CHANGE_TRACKING")
+	s := e.source(`, "chunkRows": 2`)
+	cat, err := s.Discover(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st := cat.Streams[0]; len(st.PrimaryKey) != 0 || st.SplitsByKey || slices.Contains(st.SyncModes, source.CDC) {
+		t.Errorf("vk: %+v", st)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+	defer cancel()
+	c := &capturer{}
+	t.Cleanup(c.release)
+	err = s.Read(ctx, source.ReadRequest{Streams: []source.ConfiguredStream{{Name: "vk", SyncMode: source.FullRefresh}}}, c)
+	got := c.column("vk", "v")
+	slices.Sort(got)
+	if err != nil || !slices.Equal(got, []string{"1", "2", "3", "4", "5"}) {
+		t.Errorf("read %d rows, %v", len(got), err)
+	}
+	pre := statuses(t, s.Preflight(source.PreflightRequest{Streams: []source.ConfiguredStream{{Name: "vk", SyncMode: source.CDC}}}))
+	wantStatus(t, pre, "stream.vk.change-tracking", "failed: ["+e.schema+"].[vk]'s primary key has a sql_variant column")
+}
+
 // A sql_variant's text and binary arrive whole, past nvarchar(4000).
 func TestSourceLongVariants(t *testing.T) {
 	e := newSourceEnv(t)

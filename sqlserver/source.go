@@ -202,6 +202,12 @@ func (s *Source) tables(ctx context.Context, q queryer) ([]table, error) {
 			}
 			t.key = append(t.key, i)
 		}
+		// A variant compares by its type's family first, so 1 and N'1' are
+		// two keys, with one text: no key the stream can have, nor one a
+		// read can go on from.
+		if slices.ContainsFunc(t.keyCols(), func(c sourceColumn) bool { return c.typ == "sql_variant" }) {
+			t.key = nil
+		}
 	}
 	for rows.Next() {
 		var name string
