@@ -100,6 +100,8 @@ Each record becomes a row, as in the [Kafka source](../kafka/README.md#rows): an
 | `_kinesis_arrival` | When Kinesis received it, in UTC |
 | `_kinesis_partition_key` | Its partition key |
 
+With `avro` or `protobuf`, each record's data is decoded with the schema whose ID it carries, and each field of the latest schema under `<stream>-value` is declared as in the [Kafka source](../kafka/README.md#types). From 0.2.0, a `uuid` on a `fixed` of 16 is declared a UUID, and a `duration` JSON of its `months`, `days` and `milliseconds`; before, both were declared binary, which their values didn't fit. From 0.2.0 too, a Protobuf `google.protobuf.Any` decodes when its message is in the schema or a file it imports; one of a message neither has stops the read, as every `Any` did before.
+
 Data that doesn't decode in the configured `format` stops the read with `DATA_INVALID`, naming its shard and sequence number. From 0.2.0, data whose schema the registry doesn't serve for now, as when it doesn't answer, answers with a server error or too many requests, or refuses the credentials, stops the read with the registry's error instead: `TRANSIENT`, or `AUTH_INVALID` or `PERMISSION_DENIED` for credentials it refuses. Before 0.2.0, that was `DATA_INVALID` too. A schema ID the registry doesn't have is still `DATA_INVALID`.
 
 ### Set it up
