@@ -3,7 +3,6 @@ package postgres
 import (
 	"encoding/binary"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"slices"
 	"strings"
@@ -14,37 +13,24 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/jackc/pglogrepl"
 
-	protocolv1 "github.com/openetl-io/openetl/sdk/go/protocol/v1"
 	"github.com/openetl-io/openetl/sdk/go/source"
 )
 
-func TestDeclaredOnly(t *testing.T) {
+// A column the run didn't declare fails the read, retryably, key or not:
+// a read that left it out would send rows without its values, which the
+// next attempt, declaring it, wouldn't send again.
+func TestUndeclared(t *testing.T) {
 	users := table{name: "users", cols: []sourceColumn{{name: "a"}, {name: "k1"}, {name: "new"}, {name: "k2"}}, key: []int{3, 1}}
-
-	got, err := declaredOnly(users, []string{"a", "k1", "k2"})
-	if err != nil {
-		t.Fatal(err)
+	if err := undeclared(users, []string{"a", "k1", "new", "k2", "dropped"}); err != nil {
+		t.Errorf("every column declared: %v", err)
 	}
-	var names []string
-	for _, c := range got.cols {
-		names = append(names, c.name)
+	if err := undeclared(users, nil); err != nil {
+		t.Errorf("a request that doesn't say: %v", err)
 	}
-	if !slices.Equal(names, []string{"a", "k1", "k2"}) || !slices.Equal(got.key, []int{2, 1}) {
-		t.Errorf("columns %v, key %v", names, got.key)
-	}
-	if len(users.cols) != 4 || !slices.Equal(users.key, []int{3, 1}) {
-		t.Errorf("changed the table it was given: %+v", users)
-	}
-
-	got, err = declaredOnly(users, nil)
-	if err != nil || len(got.cols) != 4 {
-		t.Errorf("a request that doesn't say: %+v, %v", got, err)
-	}
-
-	_, err = declaredOnly(users, []string{"a", "k1"})
-	var coded interface{ ErrorCode() protocolv1.ErrorCode }
-	if !errors.As(err, &coded) || coded.ErrorCode() != protocolv1.ErrorCode_ERROR_CODE_TRANSIENT {
-		t.Errorf("a key column it didn't declare: %v", err)
+	for _, declared := range [][]string{{"a", "k1", "k2"}, {"a", "k1", "new"}} {
+		if err := undeclared(users, declared); !isTransient(err) {
+			t.Errorf("declared %v: %v", declared, err)
+		}
 	}
 }
 

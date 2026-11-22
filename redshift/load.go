@@ -25,6 +25,7 @@ import (
 	"github.com/aws/smithy-go"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/openetl-io/openetl-connectors/sqlstage"
 	sdk "github.com/openetl-io/openetl/sdk/go"
@@ -187,7 +188,10 @@ func newPart(dir, name string, cols []column) (*part, error) {
 	if err != nil {
 		return nil, err
 	}
-	fw, err := pqarrow.NewFileWriter(schema, f, parquet.NewWriterProperties(parquet.WithCompression(compress.Codecs.Snappy)), pqarrow.DefaultWriterProps())
+	// Parquet 1.0, which Redshift documents: for these load types it differs
+	// from 2.x only in the dictionary's encoding and the file's version.
+	props := parquet.NewWriterProperties(parquet.WithCompression(compress.Codecs.Snappy), parquet.WithVersion(parquet.V1_0))
+	fw, err := pqarrow.NewFileWriter(schema, f, props, pqarrow.DefaultWriterProps())
 	if err != nil {
 		_ = f.Close()
 		_ = os.Remove(f.Name())
@@ -357,14 +361,73 @@ func (w *writer) load(ctx context.Context, p *part, label stagingLabel) error {
 		"INSERT INTO " + w.ident(p.name) + " (" + quoteAll(append(names(p.cols), ordColumn)) + ") SELECT " + strings.Join(sel, ", ") + " FROM " + quoteIdent(loadTable),
 		"DROP TABLE " + quoteIdent(loadTable),
 	}
-	return w.inTx(ctx, func(tx pgx.Tx) error {
+	copyFailed := false
+	err = w.inTx(ctx, func(tx pgx.Tx) error {
 		for _, q := range stmts {
 			if _, err := tx.Exec(ctx, q); err != nil {
+				copyFailed = strings.HasPrefix(q, "COPY ")
 				return err
 			}
 		}
 		return nil
 	})
+	if copyFailed {
+		return copyError(err, w.logged(ctx, key), p.cols)
+	}
+	return err
+}
+
+// loadError is a row a failed COPY logged.
+type loadError struct {
+	// The temporary table's column, as loadName names it.
+	column string
+	line   int64
+	reason string
+}
+
+// logged is the first row the COPY of key logged, found by the file's
+// name in SYS_LOAD_ERROR_DETAIL or else, as on provisioned clusters before
+// that view, in STL_LOAD_ERRORS; nil if neither has one. A Parquet COPY
+// logs only some of its errors.
+func (w *writer) logged(ctx context.Context, key string) *loadError {
+	like := w.lit("%" + key + "%")
+	for _, q := range []string{
+		"SELECT COALESCE(TRIM(column_name), ''), COALESCE(line_number, -1), COALESCE(TRIM(error_message), '') FROM sys_load_error_detail WHERE file_name LIKE " + like + " ORDER BY start_time DESC LIMIT 1",
+		"SELECT COALESCE(TRIM(colname), ''), COALESCE(line_number, -1), COALESCE(TRIM(err_reason), '') FROM stl_load_errors WHERE filename LIKE " + like + " ORDER BY starttime DESC LIMIT 1",
+	} {
+		var e loadError
+		if w.pool.QueryRow(ctx, q).Scan(&e.column, &e.line, &e.reason) == nil {
+			return &e
+		}
+	}
+	return nil
+}
+
+// copyError is err, from a failed COPY, with the stream's column, the line
+// and the reason of the row its load logged, as DATA_INVALID; without one,
+// with the context of a Spectrum Scan Error's detail, which says what failed
+// for a Parquet file.
+func copyError(err error, row *loadError, cols []column) error {
+	if row != nil {
+		col := row.column
+		for i, c := range cols {
+			if loadName(i) == col {
+				col = c.name
+				break
+			}
+		}
+		return sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_DATA_INVALID, fmt.Errorf("redshift: load column %q, line %d: %s: %w", col, row.line, row.reason, err))
+	}
+	pe, ok := errors.AsType[*pgconn.PgError](err)
+	if !ok {
+		return err
+	}
+	_, reason, ok := strings.Cut(pe.Detail, "context:")
+	if !ok {
+		return err
+	}
+	reason, _, _ = strings.Cut(reason, "query:")
+	return fmt.Errorf("redshift: load: %s: %w", strings.Join(strings.Fields(reason), " "), err)
 }
 
 // copyAuth is how COPY reads the staged files: as the IAM role, the only
@@ -404,14 +467,17 @@ func (d *Destination) store(ctx context.Context) (*store, error) {
 	return &store{client: client, up: transfermanager.New(client), bucket: d.cfg.Bucket, prefix: strings.Trim(d.cfg.Prefix, "/")}, nil
 }
 
-// key is a staging table's object. COPY reads every object whose key
-// starts with the one it names, so each ends in .parquet: no table's name
-// is another's with more after it.
+// key is a new object for a staging table's file. Its random part keeps it
+// from another deployment's, whose pipeline of the same name stages tables
+// of the same names; COPY reads every object whose key starts with the one
+// it names, and the part's fixed length keeps any key from starting with
+// another.
 func (s *store) key(name string) string {
+	key := name + "." + uuid.NewString() + ".parquet"
 	if s.prefix == "" {
-		return name + ".parquet"
+		return key
 	}
-	return s.prefix + "/" + name + ".parquet"
+	return s.prefix + "/" + key
 }
 
 func (s *store) url(key string) string { return "s3://" + s.bucket + "/" + key }

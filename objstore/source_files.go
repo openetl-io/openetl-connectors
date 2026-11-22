@@ -86,6 +86,12 @@ type object struct {
 	Key      string
 	Modified time.Time
 	Size     int64
+	// The store's version of it, such as its ETag or generation; empty
+	// where the store gives none.
+	Version string
+	// version is a reader's version of it, from the reader's As; nil where
+	// the store gives none.
+	version func(as func(any) bool) string
 }
 
 // list lists the stream's files in split, in the order a read reads them:
@@ -104,7 +110,11 @@ func (s *streamSpec) list(ctx context.Context, b *blob.Bucket, r hashRange, incr
 		if obj.IsDir || !s.glob.MatchString(obj.Key) || !r.has(obj.Key) {
 			continue
 		}
-		out = append(out, object{Key: obj.Key, Modified: obj.ModTime, Size: obj.Size})
+		o := object{Key: obj.Key, Modified: obj.ModTime, Size: obj.Size, version: s.version}
+		if s.version != nil {
+			o.Version = s.version(obj.As)
+		}
+		out = append(out, o)
 	}
 	slices.SortFunc(out, func(a, b object) int {
 		if incremental {
@@ -126,6 +136,9 @@ type readState struct {
 	// Floor, with when, in Unix nanoseconds. A file at the floor's instant
 	// that wasn't there before is read, which a cursor alone would miss.
 	Read map[string]int64 `json:"read,omitempty"`
+	// Incremental: the versions of the files of Read whose store gives them.
+	// A state of before versions has none, and its files match by time.
+	Versions map[string]string `json:"versions,omitempty"`
 	// Full refresh: the last file read, in key order.
 	Last string `json:"last,omitempty"`
 	// The file being read, and how far.
@@ -161,6 +174,7 @@ type filePos struct {
 	Key      string `json:"key"`
 	Modified int64  `json:"modified"`
 	Size     int64  `json:"size"`
+	Version  string `json:"version,omitempty"`
 	// Parquet: the next row group.
 	RowGroup int `json:"rowGroup,omitempty"`
 	// Text formats: the bytes read, decompressed.
@@ -169,6 +183,9 @@ type filePos struct {
 	Records int64 `json:"records,omitempty"`
 }
 
+// sameTag: versions a and b are one, or either is unknown.
+func sameTag(a, b string) bool { return a == "" || b == "" || a == b }
+
 // The most files an incremental state keeps; past it, the floor rises.
 const maxRead = 10000
 
@@ -176,7 +193,7 @@ const maxRead = 10000
 func (st *readState) done(o object, incremental bool) bool {
 	if incremental {
 		m, ok := st.Read[o.Key]
-		return o.Modified.UnixNano() < st.Floor || ok && m == o.Modified.UnixNano()
+		return o.Modified.UnixNano() < st.Floor || ok && m == o.Modified.UnixNano() && sameTag(st.Versions[o.Key], o.Version)
 	}
 	return st.Last != "" && o.Key <= st.Last
 }
@@ -192,6 +209,13 @@ func (st *readState) finish(o object, incremental bool) {
 		st.Read = map[string]int64{}
 	}
 	st.Read[o.Key] = o.Modified.UnixNano()
+	delete(st.Versions, o.Key)
+	if o.Version != "" {
+		if st.Versions == nil {
+			st.Versions = map[string]string{}
+		}
+		st.Versions[o.Key] = o.Version
+	}
 	// Pruned in steps, which a read of many files would otherwise sort at
 	// each.
 	if len(st.Read) > 2*maxRead {
@@ -209,6 +233,7 @@ func (st *readState) keep(n int) {
 	for k, m := range st.Read {
 		if m < st.Floor {
 			delete(st.Read, k)
+			delete(st.Versions, k)
 		}
 	}
 }
@@ -228,6 +253,12 @@ func (st readState) next(lookback time.Duration) readState {
 	for k, m := range st.Read {
 		if m >= out.Floor {
 			out.Read[k] = m
+			if v, ok := st.Versions[k]; ok {
+				if out.Versions == nil {
+					out.Versions = map[string]string{}
+				}
+				out.Versions[k] = v
+			}
 		}
 	}
 	out.keep(maxRead)

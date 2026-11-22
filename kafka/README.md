@@ -14,10 +14,10 @@ The source and the destination share their connection settings:
 - `brokers`: the bootstrap brokers, as `host:port`. The client connects to each broker at the address the cluster advertises for it, so the runner must reach those too.
 - TLS: `tls: true`, and `tlsCa` for your own certificate authority, as PEM text. Setting `tlsCa` or `tlsCert` turns TLS on. For mutual TLS, `tlsCert` and `tlsKey` are the client's certificate and its unencrypted key, also PEM text.
 - SASL: `saslMechanism`, and what it needs:
-  - `plain`, `scram-sha-256` or `scram-sha-512`: `saslUsername` and `saslPassword`. PLAIN sends the password as it is, so use it with TLS.
+  - `plain`, `scram-sha-256` or `scram-sha-512`: `saslUsername` and `saslPassword`. PLAIN sends the password as it is, so use it with TLS; from 0.2.0, the check that signs in warns without it.
   - `oauthbearer` (from 0.2.0): `oauthTokenUrl`, `oauthClientId` and `oauthClientSecret`. The connector gets a token from the token endpoint with the OAuth client-credentials grant, asking for `oauthScopes` if set, and gets a new one before it expires. `oauthExtensions` are SASL extensions sent with the token, such as Confluent Cloud's `logicalCluster` and `identityPoolId`.
   - `aws-msk-iam` (from 0.2.0): Amazon MSK's IAM access control. The connector signs in with `awsAccessKeyId` and `awsSecretAccessKey` if set, or the AWS SDK's default credentials: the environment, a web identity token, a profile or the instance's role. The region is the one in the brokers' host names.
-- `format`: how values and keys are encoded: `json` (the default), `avro` or `protobuf`. Avro and Protobuf use a schema registry's wire format, so they need `schemaRegistryUrl`, and `schemaRegistryUsername` and `schemaRegistryPassword` if it asks for basic authentication.
+- `format`: how values and keys are encoded: `json` (the default), `avro` or `protobuf`. Avro and Protobuf use a schema registry's wire format, so they need `schemaRegistryUrl`, and `schemaRegistryUsername` and `schemaRegistryPassword` if it asks for basic authentication. Basic authentication sends the password as it is, so use an `https` URL: over `http`, the credentials cross the network unencrypted, and from 0.2.0 the check that signs in to the registry warns. Credentials in the URL, as `https://user:password@registry.internal`, sign in the same way; from 0.2.0, errors don't show them.
 
 Keep `tlsKey`, `saslPassword`, `oauthClientSecret`, `awsAccessKeyId`, `awsSecretAccessKey` and `schemaRegistryPassword` in secrets, as `{ secret: NAME }`.
 
@@ -56,23 +56,48 @@ The source reads each partition from its next offset, as the last checkpoint rec
 
 Once a checkpoint is committed, the source commits its offsets to the consumer group `group` (`openetl-<pipeline>` unless set), so Kafka's tools show the read's lag. The checkpoint, not the group, is where the next read starts.
 
-If the topic's retention deleted records the read hadn't reached, the read stops and the pipeline gets an incident: the position it would resume from is gone.
+If the topic's retention deleted records the read hadn't reached, the read stops and the pipeline gets an incident: the position it would resume from is gone. From 0.2.0, so does a read whose position is past its partition's end, or in a partition the topic no longer has: the topic was deleted and created again, or an unclean leader election lost records the read had read. Before 0.2.0, a scheduled read skipped such a partition's records up to the old position. From 0.2.0 too, the read's state holds the topic's ID, so a topic created again stops the read even once it has grown past the read's position. A state from before 0.2.0 has no ID, and takes the topic's at its next read, except in OpenETL's read again of an epoch read before 0.2.0, which keeps the states that read had; a topic created again before then isn't noticed if it has grown past the read's position. Brokers without topic IDs, before Kafka 2.8, give none to check.
 
 ### Rows
 
-Each record becomes a row. A value that decodes to an object gives its fields as columns; any other value goes in a column named `value`. Every row also has:
+Each record becomes a row. A value that decodes to an object gives its fields as columns; any other value goes in a column named `value`. A record with no value, such as a compacted topic's tombstone, is a row of the columns below alone: the source doesn't read it as a delete. Compaction may also have removed a key's earlier records, and the tombstone itself once the topic's `delete.retention.ms` has passed. Every row also has:
 
 | Column | What it holds |
 |---|---|
 | `_kafka_partition` | The record's partition |
 | `_kafka_offset` | Its offset in the partition |
 | `_kafka_timestamp` | Its timestamp, in UTC |
-| `_kafka_key` | Its key as text: a string key's text, or a structured key as JSON |
-| `_kafka_headers` | Its headers, as a JSON object |
+| `_kafka_key` | Its key as text: a string key's text, or a structured key as JSON. A key that isn't in the configured format is its bytes' text, or their base64 if they aren't UTF-8 |
+| `_kafka_headers` | Its headers, as a JSON object of their values' text: from 0.2.0, the base64 of a value that isn't UTF-8, whose bytes that aren't were replaced before. A header key that the record repeats keeps only its last value, and a null value is an empty string |
 
 With `avro` or `protobuf`, the catalog declares the value's fields as the latest schema under `<topic>-value` has them; with `json`, columns and their types come from the records. `format: string` reads each value as text, into `value`.
 
-A value that doesn't decode in the configured format stops the read, with an error naming its topic, partition and offset.
+A value that doesn't decode in the configured format stops the read, with an error naming its topic, partition and offset. From 0.2.0, a value or key whose schema the registry doesn't serve for now, as when it doesn't answer, answers with a server error or refuses the credentials, stops the read with the registry's error, as a transient failure that OpenETL tries again, or as refused credentials. Before 0.2.0, such a key landed in `_kafka_key` as its encoded bytes.
+
+### Types
+
+With `avro` or `protobuf`, each value is decoded with the schema whose ID it carries, and each field of the latest schema is declared as:
+
+| Avro | Protobuf | Declared as |
+|---|---|---|
+| `boolean` | `bool` | boolean |
+| `int` | `int32`, `sint32`, `sfixed32` | 32-bit integer |
+| `long` | `int64`, `sint64`, `sfixed64`, `uint32`, `fixed32` | 64-bit integer |
+| | `uint64`, `fixed64` | decimal(20, 0) |
+| `float`, `double` | `float`, `double` | 32-bit or 64-bit float, NaN and the infinities kept |
+| `string`, `enum` | `string`, `enum` | text; a Protobuf enum value the schema doesn't name is its number |
+| `bytes`, `fixed` | `bytes` | binary |
+| `decimal` | | decimal of its precision and scale, up to precision 38; wider, text |
+| `date` | | date |
+| `time-millis`, `time-micros` | | time of day, in microseconds |
+| `timestamp-millis`, `-micros`, `-nanos` | `google.protobuf.Timestamp` | timestamp in UTC, in microseconds |
+| `local-timestamp-millis`, `-micros`, `-nanos` | | timestamp without a time zone, in microseconds |
+| `uuid` on a `string`, or from 0.2.0 on a `fixed` of 16 | | UUID |
+| `duration` (from 0.2.0) | | JSON: `months`, `days` and `milliseconds` |
+| a union of `null` and one type, in either order | | that type |
+| other unions, `array`, `map`, `record` | `repeated`, `map`, messages, other well-known types | JSON, as Protobuf's JSON mapping spells it for Protobuf |
+
+Before 0.2.0, a `uuid` on a `fixed` and a `duration` were declared binary, which their values didn't fit. A Protobuf `google.protobuf.Any` decodes when its message is in the schema or a file it imports, from 0.2.0; one of a message neither has stops the read, as every `Any` did before.
 
 ### Example
 
@@ -114,6 +139,8 @@ Each row is one record:
 - Its key is the row's primary key, in the same format, if the stream has one.
 - Its header `openetl-id` holds the row's `_openetl_id`.
 
+The client sends a topic batches of records of up to 1,000,012 bytes, which the topic's `max.message.bytes` must take: a topic whose limit is lower refuses batches of rows that each fit. A record, with its key and headers, must fit in 1,000,012 bytes, and raising the topic's limit doesn't raise the client's. Either failure fails its epoch, and the attempt; from 0.2.0 the error names the topic and the limit, and is `DATA_INVALID` for a record over the client's limit, which OpenETL retries as it does other invalid data until someone fixes the row, or `CONFIG_INVALID` for a topic's limit below the client's batches.
+
 With `avro` or `protobuf`, the destination registers each stream's schemas under `<topic>-value` and `<topic>-key`. Only append is supported: deletes from a CDC source arrive as rows whose `_openetl_op` is `delete`. With `tombstones: true`, each delete is followed by a tombstone for its key, so a compacted topic drops the key.
 
 ### Exactly once
@@ -122,7 +149,7 @@ Each epoch is one Kafka transaction across all its topics, on one of three trans
 
 Streams whose source replays exactly land exactly once. A stream that may repeat rows, such as a Postgres table read incrementally, gets at least once: the destination has no way to drop the rows sent again.
 
-A transaction must stay open for less than the brokers' `transaction.max.timeout.ms`, 15 minutes by default, so a pipeline's commit interval can be at most 7 minutes. The destination reads the brokers' setting when it opens, and from 0.2.0 in its check too, if the credentials may describe their configs. A continuous pipeline commits every 10 seconds unless it sets its own `delivery.commit.interval`.
+A transaction must stay open for less than the brokers' `transaction.max.timeout.ms`, 15 minutes by default, so a pipeline's commit interval can be at most 7 minutes. The destination reads the brokers' setting when it opens, and from 0.2.0 in its check too, if the credentials may describe their configs. A continuous pipeline commits every 10 seconds unless it sets its own `delivery.commit.interval`. Each transaction's timeout is twice the commit interval and a minute. The brokers abort a transaction open longer, as when a commit is held up, and answer its producer as they do a fenced one: from 0.2.0, the attempt fails as transient rather than fenced, and the next attempt writes the epoch again.
 
 ### Jobs on several workers
 

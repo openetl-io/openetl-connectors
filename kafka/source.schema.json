@@ -19,7 +19,7 @@
     "tlsServerName": {"type": "string", "title": "Server name", "x-group": "tls", "x-advanced": true, "description": "The name to verify the brokers' certificates against, if not their host."},
     "tlsInsecureSkipVerify": {"type": "boolean", "default": false, "title": "Skip verification", "x-group": "tls", "x-advanced": true, "description": "Don't verify the brokers' certificates."},
     "saslMechanism": {"type": "string", "title": "SASL mechanism", "x-group": "auth", "description": "SASL authentication. Unset: none.", "oneOf": [
-      {"const": "plain", "title": "PLAIN", "description": "A user and password, sent as they are: use it over TLS."},
+      {"const": "plain", "title": "PLAIN", "description": "A user and password, sent as they are: use it over TLS. From 0.2.0, the check warns without TLS."},
       {"const": "scram-sha-256", "title": "SCRAM-SHA-256", "description": "A user and password, never sent."},
       {"const": "scram-sha-512", "title": "SCRAM-SHA-512", "description": "A user and password, never sent."},
       {"const": "oauthbearer", "title": "OAUTHBEARER", "description": "From 0.2.0. A token from an OAuth client-credentials grant."},
@@ -35,7 +35,7 @@
     "awsAccessKeyId": {"type": "string", "x-secret": true, "title": "AWS access key ID", "x-group": "auth", "x-when": {"saslMechanism": "aws-msk-iam"}, "description": "From 0.2.0. For aws-msk-iam, with awsSecretAccessKey. Unset: the AWS SDK's default chain, such as the environment, a web identity or the instance's role. The region is the brokers', from their host names."},
     "awsSecretAccessKey": {"type": "string", "x-secret": true, "title": "AWS secret access key", "x-group": "auth", "x-when": {"saslMechanism": "aws-msk-iam"}, "description": "From 0.2.0. The access key's secret."},
     "schemaRegistryUrl": {"type": "string", "x-format": "uri", "title": "Registry URL", "x-group": "registry", "description": "A Confluent-compatible schema registry. Avro and Protobuf need one."},
-    "schemaRegistryUsername": {"type": "string", "title": "Registry username", "x-group": "registry", "description": "A user for the schema registry's basic authentication. Unset: none."},
+    "schemaRegistryUsername": {"type": "string", "title": "Registry username", "x-group": "registry", "description": "A user for the schema registry's basic authentication, which sends the password as it is: use an https schemaRegistryUrl. Unset: none."},
     "schemaRegistryPassword": {"type": "string", "x-secret": true, "title": "Registry password", "x-group": "registry", "description": "The schema registry user's password."},
     "format": {"type": "string", "default": "json", "title": "Format", "description": "How values and keys are encoded.", "oneOf": [
       {"const": "json", "title": "JSON", "description": "JSON values, whose columns and types come from the records."},

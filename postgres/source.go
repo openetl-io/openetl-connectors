@@ -19,6 +19,7 @@ import (
 
 	"github.com/openetl-io/openetl-connectors/keysplit"
 	sdk "github.com/openetl-io/openetl/sdk/go"
+	protocolv1 "github.com/openetl-io/openetl/sdk/go/protocol/v1"
 	"github.com/openetl-io/openetl/sdk/go/source"
 )
 
@@ -395,6 +396,22 @@ func (s *Source) Read(ctx context.Context, req source.ReadRequest, out source.Em
 	return keysplit.ReadWithCDC(ctx, limit, readRest, readCDC)
 }
 
+// undeclared fails, retryably, on a column of t the run didn't declare, as
+// one added since its Discover: without a declared type, a value sent as
+// text would land as text. The next attempt declares it. No columns: the
+// request doesn't say.
+func undeclared(t table, columns []string) error {
+	if len(columns) == 0 {
+		return nil
+	}
+	for _, c := range t.cols {
+		if !slices.Contains(columns, c.name) {
+			return sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_TRANSIENT, fmt.Errorf("postgres: %s has a new column %q; the read starts again to declare it", t.name, c.name))
+		}
+	}
+	return nil
+}
+
 // readSplit reads one split of a table read in full or incrementally, on a
 // connection of its own.
 func (s *Source) readSplit(ctx context.Context, conns *connPool, tables []table, cs source.ConfiguredStream, sp source.Split, out source.SplitEmitter) error {
@@ -404,15 +421,18 @@ func (s *Source) readSplit(ctx context.Context, conns *connPool, tables []table,
 			return fmt.Errorf("postgres: %s state: %w", cs.Name, err)
 		}
 	}
+	t := tables[slices.IndexFunc(tables, func(t table) bool { return t.name == cs.Name })]
+	if err := undeclared(t, cs.Columns); err != nil {
+		return err
+	}
+	if err := sameOrder(t, st); err != nil {
+		return err
+	}
 	conn, err := conns.get(ctx)
 	if err != nil {
 		return err
 	}
 	defer conns.put(ctx, conn)
-	t := tables[slices.IndexFunc(tables, func(t table) bool { return t.name == cs.Name })]
-	if err := sameOrder(t, st); err != nil {
-		return err
-	}
 	if cs.SyncMode == source.Incremental {
 		return s.readIncremental(ctx, conn, t, sp.ID, cs.Cursor, st, sp.CompleteAt, out)
 	}
@@ -538,6 +558,15 @@ func (s *Source) readIncremental(ctx context.Context, conn *pgx.Conn, t table, i
 	if completeAt != nil {
 		end = func() error { return out.Complete(completeAt) }
 	}
+	only, where := "", ""
+	if f := finite(t.cols[ci], cols[ci]); f != "" {
+		only, where = " AND "+f, " WHERE "+f
+		// A floor at NaN or infinity, as versions before 0.2.0 took, is
+		// above every value read now: the read starts from the beginning.
+		if st.Since != nil && (*st.Since == "NaN" || strings.EqualFold(*st.Since, "infinity")) {
+			st.Since = nil
+		}
+	}
 	if st.Until == nil {
 		var until *string
 		if completeAt != nil {
@@ -546,7 +575,7 @@ func (s *Source) readIncremental(ctx context.Context, conn *pgx.Conn, t table, i
 				return fmt.Errorf("postgres: where %s completes: %w", t.name, err)
 			}
 			until = at.Since
-		} else if err := conn.QueryRow(ctx, "SELECT max("+cols[ci]+")::text FROM "+ident).Scan(&until); err != nil {
+		} else if err := conn.QueryRow(ctx, "SELECT max("+cols[ci]+")::text FROM "+ident+where).Scan(&until); err != nil {
 			return classify(fmt.Errorf("postgres: read %s: %w", t.name, err))
 		}
 		if until == nil {
@@ -564,7 +593,7 @@ func (s *Source) readIncremental(ctx context.Context, conn *pgx.Conn, t table, i
 	}
 	bounds := func() string {
 		args = args[:0]
-		w := cols[ci] + " <= " + arg(*st.Until)
+		w := cols[ci] + " <= " + arg(*st.Until) + only
 		if st.Since != nil {
 			w += " AND " + cols[ci] + " >= " + arg(*st.Since)
 		}
@@ -640,6 +669,21 @@ func (s *Source) readIncremental(ctx context.Context, conn *pgx.Conn, t table, i
 			return end()
 		}
 	}
+}
+
+// finite is the condition that col, a cursor of type c, holds neither NaN
+// nor an infinity, which sort above or below every value and would hold a
+// read's floor there; "" for a type without them. A numeric's v - v is 0
+// only where v is finite, on every version, where 'Infinity' isn't a
+// numeric before Postgres 14.
+func finite(c sourceColumn, col string) string {
+	switch c.oid {
+	case pgtype.NumericOID:
+		return col + " - " + col + " = 0"
+	case pgtype.DateOID, pgtype.TimestampOID, pgtype.TimestamptzOID:
+		return "isfinite(" + col + ")"
+	}
+	return ""
 }
 
 // cursorColumn is the index of a table's column that an incremental read can

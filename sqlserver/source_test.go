@@ -109,6 +109,10 @@ func (e *sourceEnv) harvested() {
 // waitHarvested waits until the capture job has harvested the changes
 // committed so far, by writing one to a table of its own and waiting for it.
 func waitHarvested(ctx context.Context, db *sql.DB) error {
+	return harvestedWithin(ctx, db, time.Minute)
+}
+
+func harvestedWithin(ctx context.Context, db *sql.DB, wait time.Duration) error {
 	var n int64
 	if err := db.QueryRowContext(ctx, `IF OBJECT_ID(N'dbo.openetl_tick') IS NULL BEGIN
 			CREATE TABLE dbo.openetl_tick (id int PRIMARY KEY, n bigint);
@@ -119,7 +123,7 @@ func waitHarvested(ctx context.Context, db *sql.DB) error {
 		SELECT n FROM dbo.openetl_tick`).Scan(&n); err != nil {
 		return err
 	}
-	deadline := time.Now().Add(time.Minute)
+	deadline := time.Now().Add(wait)
 	for time.Now().Before(deadline) {
 		var got *int64
 		if err := db.QueryRowContext(ctx, "SELECT max(n) FROM cdc.dbo_openetl_tick_CT").Scan(&got); err != nil {
@@ -130,7 +134,55 @@ func waitHarvested(ctx context.Context, db *sql.DB) error {
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
-	return fmt.Errorf("the capture job didn't harvest a change in a minute")
+	return fmt.Errorf("the capture job didn't harvest a change in %s", wait)
+}
+
+// captureRunning reports whether the database's capture job is running, as
+// SQL Server Agent's current session has it.
+func captureRunning(ctx context.Context, db *sql.DB) (bool, error) {
+	var n int
+	err := db.QueryRowContext(ctx, `SELECT count(*) FROM msdb.dbo.sysjobactivity a JOIN msdb.dbo.sysjobs j ON j.job_id = a.job_id
+		WHERE j.name = N'cdc.' + DB_NAME() + N'_capture' AND a.session_id = (SELECT max(session_id) FROM msdb.dbo.syssessions)
+		AND a.start_execution_date IS NOT NULL AND a.stop_execution_date IS NULL`).Scan(&n)
+	return n > 0, err
+}
+
+// stopCapture stops the capture job, and waits until it has: SQL Server
+// Agent stops a job a while after it's asked.
+func (e *sourceEnv) stopCapture() {
+	e.t.Helper()
+	e.exec("EXEC sys.sp_cdc_stop_job @job_type = N'capture'")
+	for deadline := time.Now().Add(time.Minute); ; time.Sleep(200 * time.Millisecond) {
+		running, err := captureRunning(context.Background(), e.db)
+		if err != nil {
+			e.t.Fatal(err)
+		}
+		if !running {
+			return
+		}
+		if time.Now().After(deadline) {
+			e.t.Fatal("the capture job didn't stop in a minute")
+		}
+	}
+}
+
+// startCapture starts the capture job, and waits until it harvests. SQL
+// Server Agent refuses to start a job that runs, or is still stopping, so
+// while it refuses, a harvest tells which, and it's asked again.
+func startCapture(ctx context.Context, db *sql.DB) error {
+	for deadline := time.Now().Add(2 * time.Minute); ; {
+		_, err := db.ExecContext(ctx, "EXEC sys.sp_cdc_start_job @job_type = N'capture'")
+		if err == nil {
+			return waitHarvested(ctx, db)
+		}
+		// The capture job scans every 5 seconds.
+		if harvestedWithin(ctx, db, 12*time.Second) == nil {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("the capture job didn't start in 2 minutes: %w", err)
+		}
+	}
 }
 
 func (e *sourceEnv) source(extra string) *Source {
@@ -158,6 +210,8 @@ type capturer struct {
 	// Where each stream's next read starts, once it's complete.
 	next     map[string]string
 	progress []source.Progress
+	// Called after each resume point, if set.
+	resumed func()
 }
 
 func (c *capturer) Rows(stream string, _ []json.RawMessage) error {
@@ -184,6 +238,9 @@ func (c *capturer) ResumePoint(stream string, state []byte) error {
 	}
 	c.states[stream] = append(c.states[stream], string(state))
 	c.log = append(c.log, fmt.Sprintf("%s@%s", stream, state))
+	if c.resumed != nil {
+		c.resumed()
+	}
 	return nil
 }
 
@@ -527,6 +584,39 @@ func TestSourceUndeclaredColumn(t *testing.T) {
 	if v := got.column("t", "id"); !slices.Equal(v, []string{"1"}) {
 		t.Errorf("declared: %v", v)
 	}
+}
+
+// A primary key with a sql_variant column isn't the stream's: SQL Server
+// compares a variant's type family before its value, so 1 and N'1' are two
+// keys, which arrive as the same text. The table is read as one without a
+// key, whole, which a read in key order by that text couldn't: past a
+// number it read its first chunk again and again, and past a binary it
+// ended.
+func TestVariantKey(t *testing.T) {
+	e := newSourceEnv(t)
+	e.exec("CREATE TABLE $schema.vk (k sql_variant PRIMARY KEY, v int)")
+	e.exec("INSERT INTO $schema.vk VALUES (CONVERT(sql_variant, 1), 1), (CONVERT(sql_variant, N'1'), 2), (CONVERT(sql_variant, 0x01), 3), (CONVERT(sql_variant, 0x02), 4), (CONVERT(sql_variant, 2), 5)")
+	e.exec("ALTER TABLE $schema.vk ENABLE CHANGE_TRACKING")
+	s := e.source(`, "chunkRows": 2`)
+	cat, err := s.Discover(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st := cat.Streams[0]; len(st.PrimaryKey) != 0 || st.SplitsByKey || slices.Contains(st.SyncModes, source.CDC) {
+		t.Errorf("vk: %+v", st)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+	defer cancel()
+	c := &capturer{}
+	t.Cleanup(c.release)
+	err = s.Read(ctx, source.ReadRequest{Streams: []source.ConfiguredStream{{Name: "vk", SyncMode: source.FullRefresh}}}, c)
+	got := c.column("vk", "v")
+	slices.Sort(got)
+	if err != nil || !slices.Equal(got, []string{"1", "2", "3", "4", "5"}) {
+		t.Errorf("read %d rows, %v", len(got), err)
+	}
+	pre := statuses(t, s.Preflight(source.PreflightRequest{Streams: []source.ConfiguredStream{{Name: "vk", SyncMode: source.CDC}}}))
+	wantStatus(t, pre, "stream.vk.change-tracking", "failed: ["+e.schema+"].[vk]'s primary key has a sql_variant column")
 }
 
 // A sql_variant's text and binary arrive whole, past nvarchar(4000).

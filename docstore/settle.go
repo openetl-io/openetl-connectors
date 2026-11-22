@@ -120,7 +120,8 @@ func SettleRecorded[S any](ctx context.Context, name string, st Store[S], scope 
 	if err != nil {
 		return 0, err
 	}
-	present, missing, applied, swaps := 0, 0, 0, false
+	// empty counts the unapplied streams that staged nothing in the epoch.
+	present, missing, empty, applied, swaps := 0, 0, 0, 0, false
 	for _, s := range streams {
 		if m, ok := markers[st.Mark(s, e).Stream]; ok && m.Is(e) {
 			applied++
@@ -132,13 +133,12 @@ func SettleRecorded[S any](ctx context.Context, name string, st Store[S], scope 
 			return 0, err
 		}
 		if p+m == 0 {
-			// It staged nothing in the epoch.
-			p = 1
+			empty++
 		}
 		present, missing = present+p, missing+m
 	}
 	switch {
-	case present == 0 && missing == 0:
+	case present == 0 && missing == 0 && empty == 0:
 		if _, err := Settle(ctx, st, scope, e, streams); err != nil {
 			return 0, err
 		}

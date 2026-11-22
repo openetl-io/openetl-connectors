@@ -27,7 +27,7 @@ Set `region`. With `accessKeyId` and `secretAccessKey`, the connector uses those
 
 ### S3-compatible stores
 
-A store with S3's API, such as MinIO, Cloudflare R2 or Ceph, takes the same settings, with `endpoint` set to its S3 API's URL, `region` to one the store takes, and its keys in `accessKeyId` and `secretAccessKey`. With `endpoint`, the connector addresses buckets by path, `ENDPOINT/BUCKET/KEY`, rather than by host name.
+A store with S3's API, such as MinIO, Cloudflare R2 or Ceph, takes the same settings, with `endpoint` set to its S3 API's URL, `region` to one the store takes, and its keys in `accessKeyId` and `secretAccessKey`. With `endpoint`, the connector addresses buckets by path, `ENDPOINT/BUCKET/KEY`, rather than by host name. From 0.2.0, the destination's uploads to an `endpoint` carry a checksum only where the store asks for one, as some S3-compatible stores refuse the CRC32 that Amazon S3 takes with every upload.
 
 Only SeaweedFS's S3 API is tested; the stores named here aren't. Appends need only S3's reads, writes, copies, deletes and listings. Overwrite also needs the store to honor S3's conditional writes, `If-None-Match` and `If-Match`: a pipeline that overwrites runs the destination's `store.conditional-write` preflight, which warns as `conditional_writes_ignored` on a store that ignores them, as [Checks and preflights](#checks-and-preflights) says.
 
@@ -42,8 +42,8 @@ From 0.2.0, a check reports these items, in order, for either role. Each one aft
 | Item | What it checks |
 | --- | --- |
 | `net.dns`, `net.connect`, `net.tls` | The store's API resolves, accepts a connection and, over HTTPS, completes a TLS handshake: `endpoint`, or `s3.REGION.amazonaws.com`. Without `endpoint`, a failure here only warns, since a runner can reach AWS through a proxy that the store's SDK uses and a direct connection doesn't. |
-| `store.auth` | The store accepts the credentials. If the store knows the identity but refuses it access, this item passes, and the items after it show what access is missing. |
-| `store.bucket` | The bucket exists. |
+| `store.auth` | The store accepts the credentials. If the store knows the identity but refuses it access, this item passes, and the items after it show what access is missing. From 0.2.0, it passes too for a bucket in another region than `region`, whose answer doesn't show whether the store takes the credentials, and `store.bucket` fails. |
+| `store.bucket` | The bucket exists. From 0.2.0, a bucket in another region than `region` fails this item, which names the bucket's region. |
 | `store.list` | The identity lists the files under `url`: `s3:ListBucket`. |
 | `store.write`, `store.delete` | The destination's only: it writes a file under `URL/_openetl/` (`s3:PutObject`), then deletes it (`s3:DeleteObject`). |
 
@@ -62,7 +62,7 @@ A destination's preflight has these items:
 
 ### Errors
 
-Credentials that the store refuses fail the check and the sync with `AUTH_INVALID`, `AUTH_EXPIRED` or `PERMISSION_DENIED`, and OpenETL retries only `AUTH_EXPIRED`. A store that doesn't answer, rate limits the connector or returns a server error fails with `TRANSIENT` or `RATE_LIMITED`, which OpenETL retries. Without AWS credentials, the connector fails with `AUTH_INVALID`; when what gives it credentials, such as STS or the runner's endpoint of a role's, doesn't answer or returns a server error, with `TRANSIENT`.
+Credentials that the store refuses fail the check and the sync with `AUTH_INVALID`, `AUTH_EXPIRED` or `PERMISSION_DENIED`, and OpenETL retries only `AUTH_EXPIRED`. A store that doesn't answer, rate limits the connector or returns a server error fails with `TRANSIENT` or `RATE_LIMITED`, which OpenETL retries. Without AWS credentials, the connector fails with `AUTH_INVALID`; when what gives it credentials, such as STS or the runner's endpoint of a role's, doesn't answer or returns a server error, with `TRANSIENT`. From 0.2.0, a bucket in another region than `region` fails the check and the sync with `CONFIG_INVALID`, and the error names the bucket's region to set; before, the check said the bucket didn't exist.
 
 ## Source
 
@@ -74,7 +74,7 @@ Each of `streams` is the set of files under `url` that its `glob` matches, in on
 
 - `*` and `?` match within one path segment. `**` matches any number of segments. `{a,b}` matches either alternative, and `[...]` matches one character of a class, with `[!...]` for its complement.
 - The glob's part before the first of those characters is the prefix the source lists, so a glob that starts with a fixed directory lists only that directory.
-- A file whose name ends in `.gz` or `.gzip`, `.zst` or `.zstd`, or `.sz` or `.snappy` is decompressed with gzip, zstd or framed snappy first. Parquet's and Avro's own compression needs nothing.
+- A file whose name ends in `.gz` or `.gzip`, `.zst` or `.zstd`, `.bz2`, or `.sz` or `.snappy` is decompressed with gzip, zstd, bzip2 or framed snappy first. One ending in `.xz`, `.lz4`, `.br`, `.zip`, `.7z` or `.lzo` fails the read with `DATA_INVALID`, naming the file and its compression, as the source can't decompress it. Parquet's and Avro's own compression needs nothing.
 
 Each record gets three more columns:
 
@@ -83,6 +83,8 @@ Each record gets three more columns:
 | `_file` | The file's URL, such as `s3://my-bucket/raw/2026/01/orders.csv.gz`. |
 | `_line` | The record's number in the file, from 1: its row in a Parquet file, its record in a CSV file (not counting the header), or its non-blank line in a JSON Lines file. |
 | `_modified` | When the store last modified the file, in UTC. |
+
+A file's own column of one of these names, as a file written from another files source has, gives way to the source's.
 
 A stream's primary key is `_file` and `_line` unless `primaryKey` names other columns, and its cursor is `_modified`.
 
@@ -120,7 +122,7 @@ The [config schema](./source.schema.json) has every setting.
 - **Full refresh** reads every matching file, in key order.
 - **Incremental** reads files that weren't read before, in the order of their `_modified`. A file that's written again after it was read is read again, whole.
 
-The state an incremental read leaves records each file it read since `lookback` (1 hour by default) before the newest file it read, with its modification time. The next read takes any file it doesn't list and that's no older than that, so files that share a modification time with ones already read, or that appear late, still get read. Files older than that, and not read, are skipped. S3 dates an object uploaded in parts from when the upload started, so an upload that takes longer than `lookback` can be missed. Raise `lookback` if your uploads run longer. The state lists at most 10,000 files; past that, the oldest ones drop out, and files no newer than them are treated as read. Files that share the oldest modification time the state keeps all stay in it, so when more than 10,000 files share one, the state lists every one of them.
+The state an incremental read leaves records each file it read since `lookback` (1 hour by default) before the newest file it read, with its modification time and, except on a `file://` URL, its ETag. The next read takes any file it doesn't list and that's no older than that, so files that share a modification time with ones already read, or that appear late, still get read. Files older than that, and not read, are skipped. S3 dates an object uploaded in parts from when the upload started, so an upload that takes longer than `lookback` can be missed. Raise `lookback` if your uploads run longer. The state lists at most 10,000 files; past that, the oldest ones drop out, and files no newer than them are treated as read. Files that share the oldest modification time the state keeps all stay in it, so when more than 10,000 files share one, the state lists every one of them.
 
 The source's replay is **superset**: a retried read may send records again, such as those of a file it was partway through, or of a file written again. A pipeline that needs exactly once has to drop repeats by the primary key, `_file` and `_line` by default.
 
@@ -136,7 +138,7 @@ Discovery lists each stream's files, and reads:
 - every CSV file's header, and up to 1,000 records or 1 MiB of each file's values;
 - up to 1,000 objects or 1 MiB of each JSON Lines file.
 
-A text column's type is inferred from those values: `boolean` if every value is `true` or `false`, then integer, number, date (`YYYY-MM-DD`), and a timestamp with or without a UTC offset (`YYYY-MM-DD[T ]HH:MM:SS[.fraction]`, then `Z`, `±HH`, `±HHMM` or `±HH:MM` for one with an offset). Anything else, or a mix, is text. A JSON Lines field whose values are all objects or arrays is JSON. A column with no values in the sample is text.
+A text column's type is inferred from those values: `boolean` if every value is `true` or `false`, then integer, number, date (`YYYY-MM-DD`), and a timestamp with or without a UTC offset (`YYYY-MM-DD[T ]HH:MM:SS[.fraction]`, then `Z`, `±HH`, `±HHMM` or `±HH:MM` for one with an offset). A value is a number only if a 64-bit float holds it exactly, so a column with a value such as an integer past 64 bits, or a decimal of more digits than a float keeps, is text, which keeps every digit: `columns` can declare it `decimal(P,S)`. A value with a leading zero, such as `007`, makes its column text too, which keeps the zero; `0` and decimals such as `0.5` don't. Anything else, or a mix, is text. A JSON Lines field whose values are all objects or arrays is JSON. A column with no values in the sample is text.
 
 `columns` overrides discovered types by name: `string`, `integer`, `number`, `boolean`, `date`, `time`, `timestamp` (without a time zone), `timestamp_tz`, `json`, `binary` (base64 text) or `decimal(P,S)`. Without a header, CSV columns are `f0`, `f1` and so on, unless `columnNames` names them. A Parquet or Avro column that `columns` names is sent as text, which OpenETL parses to the type, quarantining a value that doesn't fit. `columns` can't name `_file`, `_line` or `_modified`, which the source adds.
 
@@ -161,7 +163,7 @@ s3://my-bucket/raw/orders/9af7d67a-fb93-45a8-9061-af62ce29978d-00000000000000000
 
 CSV and JSON Lines files are compressed whole with `compression`: `gzip` (adding `.gz` to the name), `zstd` (adding `.zst`), or `none` (the default).
 
-A file closes at `fileSize` bytes, 256 MiB by default, and the next one starts.
+A file closes at `fileSize` bytes, 256 MiB by default, and the next one starts. `fileSize` is at most 4 GiB (from 0.2.0), as Commit copies each file into place and S3 copies at most 5 GiB in one request.
 
 The destination keeps what it needs besides the tables under `URL/_openetl/`: files being staged, a marker per stream and epoch, and a record of each table's columns. Leave it in place, and point readers at the table directories, or at an overwritten table's manifest, as [Write modes](#write-modes) says.
 
@@ -214,6 +216,8 @@ A continuous pipeline commits every minute unless it sets its own `delivery.comm
 ### Permissions
 
 The credentials need to read, write, copy, delete and list objects under the URL. On Amazon S3 that's `s3:ListBucket` on the bucket, and `s3:GetObject`, `s3:PutObject` and `s3:DeleteObject` on its objects under the URL. Overwrite also needs the store to honor conditional writes, `If-None-Match` and `If-Match`, which the `store.conditional-write` preflight checks. The destination's check writes and deletes an object under `_openetl/`. The source needs to list and read objects under the URL.
+
+A file over 16 MiB is uploaded in parts. From 0.2.0, a staged file whose write stops partway, as when a sync fails, has its parts dropped with `s3:AbortMultipartUpload`, which the credentials need for that; without it, the parts stay, as they do when the store doesn't answer the abort within 30 seconds of the writer's close. A bucket lifecycle rule that aborts incomplete multipart uploads after a day also clears those, and those of a connector that was killed.
 
 ## Types
 
@@ -286,8 +290,8 @@ The destination adds new columns: later files have them, and earlier files don't
 
 - An Avro read that resumes within a file decodes the file from its start again, as the Avro library doesn't give blocks' offsets.
 - Each read, as well as discovery, reads every Parquet file's footer and Avro file's header, 16 at a time, so it takes longer to start with more files.
-- A read checks that a file is the one it listed by the file's size and its modification time to the second, as precise as some stores' reads give it. A file replaced while it's read, by one of the same size within the same second, isn't noticed, and a Parquet file's row groups could then come from both.
-- The source doesn't capture deleted files or deleted rows. A file written again is read again whole, as new records, if its modification time changed: a file rewritten within the store's time resolution, a second on S3, with the same time isn't read again.
+- A read checks that a file is the one it listed by its ETag, size and modification time, so a file replaced while it's read fails the read with `TRANSIENT`, and the next attempt reads it again. A `file://` URL has no ETags: there, a read checks the size and the modification time to the second, so a file replaced while it's read, by one of the same size within the same second, isn't noticed, and a Parquet file's row groups could then come from both.
+- The source doesn't capture deleted files or deleted rows. A file written again is read again whole, as new records, if its modification time changed or its ETag did, so a file rewritten within the same second is read again too; on a `file://` URL, only if its modification time changed.
 - Discovery reads every file's footer or header, so it takes longer with more files.
 - The destination doesn't merge or deduplicate.
 - Overwrite relies on the store's conditional writes. On an S3-compatible store that ignores `If-Match` and `If-None-Match`, a stale attempt could write an older read's manifest over a newer one's.

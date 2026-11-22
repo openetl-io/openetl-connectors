@@ -2,6 +2,7 @@ package objstore
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -274,6 +275,120 @@ func TestAvroNamedTypes(t *testing.T) {
 	}
 }
 
+// A duration logical type is declared as JSON and read as a JSON object of
+// months, days and milliseconds, at the top level, in unions and nested.
+func TestAvroDuration(t *testing.T) {
+	cfg := map[string]any{"url": "file://" + t.TempDir()}
+	d1 := avro.Duration{Months: 1, Days: 2, Milliseconds: 3}
+	d0 := avro.Duration{}
+	raw12 := [12]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}
+	schema := `{"type": "record", "name": "R", "fields": [
+		{"name": "d", "type": {"type": "fixed", "name": "Dur", "size": 12, "logicalType": "duration"}},
+		{"name": "named", "type": "Dur"},
+		{"name": "maybe", "type": ["null", "Dur"]},
+		{"name": "either", "type": ["null", "string", "Dur"]},
+		{"name": "rec", "type": {"type": "record", "name": "In", "fields": [{"name": "d", "type": "Dur"}]}},
+		{"name": "arr", "type": {"type": "array", "items": "Dur"}},
+		{"name": "m", "type": {"type": "map", "values": "Dur"}},
+		{"name": "raw12", "type": {"type": "fixed", "name": "Raw12", "size": 12}}
+	]}`
+	put(t, cfg, map[string][]byte{"dur/a.avro": avroFile(t, schema,
+		map[string]any{
+			"d": d1, "named": d1, "maybe": d1, "either": d1,
+			"rec": map[string]any{"d": d1}, "arr": []any{d1}, "m": map[string]any{"k": d1},
+			"raw12": raw12,
+		},
+		map[string]any{
+			"d": d0, "named": d0, "maybe": nil, "either": "none",
+			"rec": map[string]any{"d": d0}, "arr": []any{d0}, "m": map[string]any{},
+			"raw12": raw12,
+		},
+	)})
+	s := newSource(t, cfg, map[string]any{"name": "dur", "glob": "dur/*", "format": "avro"})
+	cat, err := s.Discover(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotTypes := map[string]string{}
+	for _, f := range cat.Streams[0].Schema.Fields() {
+		gotTypes[f.Name] = f.Type.String()
+		if ext := extName(f); ext != "" {
+			gotTypes[f.Name] = ext
+		}
+	}
+	for _, col := range []string{"d", "named", "maybe", "either", "rec", "arr", "m"} {
+		if gotTypes[col] != jsonExt {
+			t.Errorf("%s: declared %s, want %s", col, gotTypes[col], jsonExt)
+		}
+	}
+	if gotTypes["raw12"] != "binary" {
+		t.Errorf("raw12: declared %s, want binary", gotTypes["raw12"])
+	}
+
+	e := mustRead(t, s, "dur", source.FullRefresh, nil)
+	checkBatches(t, cat, e)
+	r := e.rows["dur/"]
+	if len(r) != 2 {
+		t.Fatalf("%d rows", len(r))
+	}
+	// JSON columns' values are JSON objects/arrays, not text holding them.
+	if _, ok := r[0]["d"].(map[string]any); !ok {
+		t.Fatalf("d is %T, want JSON object", r[0]["d"])
+	}
+	for k, want := range map[string]string{
+		"d":      `{"days":2,"milliseconds":3,"months":1}`,
+		"named":  `{"days":2,"milliseconds":3,"months":1}`,
+		"maybe":  `{"days":2,"milliseconds":3,"months":1}`,
+		"either": `{"days":2,"milliseconds":3,"months":1}`,
+		"rec":    `{"d":{"days":2,"milliseconds":3,"months":1}}`,
+		"arr":    `[{"days":2,"milliseconds":3,"months":1}]`,
+		"m":      `{"k":{"days":2,"milliseconds":3,"months":1}}`,
+	} {
+		if got, _ := json.Marshal(r[0][k]); string(got) != want {
+			t.Errorf("row 0 %s: %s, want %s", k, got, want)
+		}
+	}
+	if got, _ := json.Marshal(r[1]["d"]); string(got) != `{"days":0,"milliseconds":0,"months":0}` {
+		t.Errorf("row 1 d: %s", got)
+	}
+	if v, ok := r[1]["maybe"]; !ok || v != nil {
+		t.Errorf("row 1 maybe: %v (present=%v), want nil", v, ok)
+	}
+	if got, _ := json.Marshal(r[1]["either"]); string(got) != `"none"` {
+		t.Errorf("row 1 either: %s", got)
+	}
+	if got := values(r[:1], "raw12")[0]; got != "AQIDBAUGBwgJCgsM" {
+		t.Errorf("raw12: %q, want AQIDBAUGBwgJCgsM", got)
+	}
+
+	// Declared as string via columns: emitted as JSON text.
+	ss := newSource(t, cfg, map[string]any{"name": "dur", "glob": "dur/*", "format": "avro", "columns": map[string]string{"d": "string"}})
+	sr := mustRead(t, ss, "dur", source.FullRefresh, nil).rows["dur/"]
+	if got, ok := sr[0]["d"].(string); !ok || got != `{"days":2,"milliseconds":3,"months":1}` {
+		t.Errorf("string-declared d: %#v (%T)", sr[0]["d"], sr[0]["d"])
+	}
+
+	// Cross-file widening between duration and string yields utf8 JSON text.
+	put(t, cfg, map[string][]byte{
+		"wide/a.avro": avroFile(t, `{"type": "record", "name": "W", "fields": [{"name": "d", "type": {"type": "fixed", "name": "Dur", "size": 12, "logicalType": "duration"}}]}`, map[string]any{"d": d1}),
+		"wide/b.avro": avroFile(t, `{"type": "record", "name": "W", "fields": [{"name": "d", "type": "string"}]}`, map[string]any{"d": "plain"}),
+	})
+	ws := newSource(t, cfg, map[string]any{"name": "wide", "glob": "wide/*", "format": "avro"})
+	wcat, err := ws.Discover(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	wf := wcat.Streams[0].Schema.Fields()[0]
+	if wf.Type.ID() != arrow.STRING || extName(wf) != "" {
+		t.Errorf("widened d: %s (ext %q), want plain utf8", wf.Type, extName(wf))
+	}
+	we := mustRead(t, ws, "wide", source.FullRefresh, nil)
+	checkBatches(t, wcat, we)
+	if got := values(we.rows["wide/"], "d"); !slices.Equal(got, []string{`{"days":2,"milliseconds":3,"months":1}`, "plain"}) {
+		t.Errorf("widened d rows: %q", got)
+	}
+}
+
 // Resplit halves a running split's files left: every file is read once,
 // a read again up to a resume point past the halving stops there with the
 // first read's records, and the next read goes on from the splits it left.
@@ -410,6 +525,35 @@ func TestHalve(t *testing.T) {
 	}
 }
 
+// A split that a Resplit made starts at a file's hash. Asked again with two
+// files left, it starts the next and gives the last, that file, away: the new
+// split is that file's, not the whole of its own, which would have its ID.
+func TestResplitAtTheRangesFirstFile(t *testing.T) {
+	cfg := map[string]any{"url": "file://" + t.TempDir()}
+	// Read in this order; the range starts at e's hash, which is below a's and d's.
+	put(t, cfg, map[string][]byte{"q/a.jsonl": []byte("{\"id\":1}\n"), "q/d.jsonl": []byte("{\"id\":2}\n"), "q/e.jsonl": []byte("{\"id\":3}\n")})
+	s := newSource(t, cfg, map[string]any{"name": "q", "glob": "q/*", "format": "jsonl"})
+	r := hashRange{keyHash("q/e.jsonl"), wholeRange.Hi}
+	var once sync.Once
+	accepted := false
+	// At a's resume point, with d and e left.
+	e, err := readWith(t, s, func(string) {
+		once.Do(func() { accepted, _ = s.Resplit(t.Context(), "q", r.id()) })
+	}, source.ConfiguredStream{Name: "q", SyncMode: source.FullRefresh, Splits: []source.Split{{ID: r.id()}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !accepted {
+		t.Fatal("the Resplit wasn't accepted")
+	}
+	if len(e.ended) != 2 {
+		t.Errorf("%d splits completed, not the split and the one it gave: %v", len(e.ended), slices.Collect(maps.Keys(e.ended)))
+	}
+	if got := lines(e); len(got) != 3 || len(slices.Compact(got)) != 3 {
+		t.Errorf("read %v", got)
+	}
+}
+
 func mustOpenBucket(t *testing.T, s *Source) *blob.Bucket {
 	t.Helper()
 	b, err := s.store.open(t.Context())
@@ -478,5 +622,143 @@ func TestPreflightNames(t *testing.T) {
 	dreq := destination.PreflightRequest{Streams: []destination.Stream{{Name: "a.b", Mode: destination.Append}, {Name: "a_b", Mode: destination.Overwrite}}}
 	if err := check.Validate(append(d.Checks(), d.Preflight(dreq)...)); err != nil {
 		t.Error(err)
+	}
+}
+
+// A CSV column with a value of a leading zero, as a code like 007 has, is
+// text, which keeps the zero; 0 itself and decimals like 0.5 aren't such.
+func TestInferLeadingZeros(t *testing.T) {
+	for _, c := range []struct {
+		values []string
+		want   string
+	}{
+		{[]string{"1", "007"}, "utf8"},
+		{[]string{"-007", "1"}, "utf8"},
+		{[]string{"00.5", "1.5"}, "utf8"},
+		{[]string{"0", "10", "-3"}, "int64"},
+		{[]string{"0.5", "-0.25", "0"}, "float64"},
+	} {
+		in := &inferred{}
+		for _, v := range c.values {
+			in.text(v)
+		}
+		if got := in.field("n").Type.String(); got != c.want {
+			t.Errorf("%v: %s, want %s", c.values, got, c.want)
+		}
+	}
+}
+
+// A text or JSON column of numbers that a 64-bit float can't hold exactly,
+// such as IDs past int64's range, is text, which keeps their digits, not
+// number, which would round them.
+func TestInferExactNumbers(t *testing.T) {
+	for _, c := range []struct {
+		values []string
+		want   string
+	}{
+		{[]string{"1", "2.5", "1e3", "-0.125", "0.1"}, "float64"},
+		{[]string{"1", "9223372036854775807"}, "int64"},
+		{[]string{"1", "12345678901234567890"}, "utf8"},
+		{[]string{"0.1", "9007199254740993"}, "utf8"},
+		{[]string{"1.5", "1234567890.123456789"}, "utf8"},
+	} {
+		text, js := &inferred{}, &inferred{}
+		for _, v := range c.values {
+			text.text(v)
+			js.json(json.RawMessage(v))
+		}
+		for name, in := range map[string]*inferred{"text": text, "json": js} {
+			if got := in.field("n").Type.String(); got != c.want {
+				t.Errorf("%s %v: %s, want %s", name, c.values, got, c.want)
+			}
+		}
+	}
+	nan := &inferred{}
+	nan.text("1.5")
+	nan.text("NaN")
+	if got := nan.field("n").Type.String(); got != "float64" {
+		t.Errorf("NaN: %s", got)
+	}
+}
+
+// A file's own _file, _line or _modified column, as a file the destination
+// wrote from a files source has, gives way to the source's: each format's
+// read sends one column of each name, with the source's values.
+func TestControlColumnsOfFiles(t *testing.T) {
+	cfg := map[string]any{"url": "file://" + t.TempDir()}
+	own := arrow.NewSchema([]arrow.Field{
+		{Name: "id", Type: arrow.PrimitiveTypes.Int64},
+		{Name: "_file", Type: arrow.BinaryTypes.String, Nullable: true},
+		{Name: "_line", Type: arrow.PrimitiveTypes.Int64, Nullable: true},
+	}, nil)
+	put(t, cfg, map[string][]byte{
+		"p/a.parquet": parquetOf(t, own, `[{"id":1,"_file":"elsewhere","_line":7}]`, 1),
+		"c/a.csv":     []byte("id,_file,_line\n1,elsewhere,7\n"),
+		"j/a.jsonl":   []byte(`{"id":1,"_file":"elsewhere","_line":7}` + "\n"),
+		"a/a.avro": avroFile(t, `{"type": "record", "name": "R", "fields": [{"name": "id", "type": "long"}, {"name": "_file", "type": "string"}, {"name": "_line", "type": "long"}]}`,
+			map[string]any{"id": int64(1), "_file": "elsewhere", "_line": int64(7)}),
+	})
+	s := newSource(t, cfg,
+		map[string]any{"name": "p", "glob": "p/*", "format": "parquet"},
+		map[string]any{"name": "c", "glob": "c/*", "format": "csv"},
+		map[string]any{"name": "j", "glob": "j/*", "format": "jsonl"},
+		map[string]any{"name": "a", "glob": "a/*", "format": "avro"},
+	)
+	cat, err := s.Discover(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, stream := range []string{"p", "c", "j", "a"} {
+		e, err := read(t, s, stream, source.FullRefresh, nil)
+		if err != nil {
+			t.Errorf("%s: %v", stream, err)
+			continue
+		}
+		checkBatches(t, cat, e)
+		for _, b := range e.batches[stream+"/"] {
+			names := map[string]bool{}
+			for _, f := range b.Schema().Fields() {
+				if names[f.Name] {
+					t.Errorf("%s: two columns %q", stream, f.Name)
+				}
+				names[f.Name] = true
+			}
+		}
+		r := e.rows[stream+"/"]
+		if len(r) != 1 || !strings.HasSuffix(fmt.Sprint(r[0][fileColumn]), stream+"/a."+map[string]string{"p": "parquet", "c": "csv", "j": "jsonl", "a": "avro"}[stream]) ||
+			fmt.Sprint(r[0][lineColumn]) != "1" {
+			t.Errorf("%s: %v", stream, r)
+		}
+	}
+}
+
+// A file of a compression the source doesn't read fails the read with
+// DATA_INVALID, naming the file, rather than giving its compressed bytes as
+// text; the format preflight fails as file_unreadable.
+func TestUnreadCompression(t *testing.T) {
+	cfg := map[string]any{"url": "file://" + t.TempDir()}
+	put(t, cfg, map[string][]byte{"c/a.csv.xz": []byte("\xfd7zXZ\x00 not csv\n")})
+	s := newSource(t, cfg, map[string]any{"name": "c", "glob": "c/*", "format": "csv"})
+	e, err := read(t, s, "c", source.FullRefresh, nil)
+	var coded interface{ ErrorCode() protocolv1.ErrorCode }
+	if !errors.As(err, &coded) || coded.ErrorCode() != protocolv1.ErrorCode_ERROR_CODE_DATA_INVALID || !strings.Contains(err.Error(), "c/a.csv.xz") {
+		t.Errorf("read: %v, %v", err, e.rows)
+	}
+	r := check.Run(t.Context(), s.Preflight(source.PreflightRequest{Streams: []source.ConfiguredStream{{Name: "c"}}}))
+	if it := r.Items[len(r.Items)-1]; it.Name != "stream.c.format" || it.Failure == nil || it.Failure.Reason != "file_unreadable" {
+		t.Errorf("preflight: %+v", it)
+	}
+}
+
+// A file named .bz2 is decompressed with bzip2.
+func TestBzip2(t *testing.T) {
+	cfg := map[string]any{"url": "file://" + t.TempDir()}
+	// "id,name\n1,a\n2,b\n", from bzip2 -9.
+	bz, _ := base64.StdEncoding.DecodeString("QlpoOTFBWSZTWaAwe34AAAbZAAAQAAQwADYjIAAxANNNBAMQIEFFl0b17fi7kinChIUBg9vw")
+	put(t, cfg, map[string][]byte{"c/a.csv.bz2": bz})
+	s := newSource(t, cfg, map[string]any{"name": "c", "glob": "c/*", "format": "csv"})
+	r := mustRead(t, s, "c", source.FullRefresh, nil).rows["c/"]
+	if got := values(r, "name"); !slices.Equal(got, []string{"a", "b"}) {
+		t.Errorf("names %v", got)
 	}
 }

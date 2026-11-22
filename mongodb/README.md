@@ -34,7 +34,7 @@ A CDC read takes the deployment's cluster time when it starts, reads the collect
 | delete | `delete`, with the `_id`, or with the deleted document's fields where the collection keeps pre-images |
 | drop, rename, dropDatabase, invalidate | an error, `POSITION_LOST`, that names what happened; reading the collection again takes a new snapshot |
 
-To have updates arrive as they were made, and deletes with their documents, turn on the collection's pre- and post-images:
+To have updates arrive as they were made, and deletes with their documents, turn on the collection's pre- and post-images, which needs MongoDB 6.0 or later:
 
 ```js
 db.runCommand({collMod: "orders", changeStreamPreAndPostImages: {enabled: true}})
@@ -76,7 +76,7 @@ Canonical Extended JSON never spells 24 bare hexadecimal digits, so an ObjectId 
 | types that declare differently, such as `string` and `int`, or `double` and `decimal` | string | each value as above |
 | only `null` or `undefined` | string | null |
 
-Each value is sent as text, and OpenETL parses it into the column's declared type. A value that doesn't fit is quarantined: a date before year 1 or after 9999, and a decimal that's `NaN` or infinite, or that `decimal(38, 9)` doesn't hold exactly, with more than 9 digits after the point or 29 before it. A long in a field with doubles loses the digits a double doesn't keep. Nested documents and arrays keep every type through Extended JSON, numbers and dates included.
+Each value is sent as text, and OpenETL parses it into the column's declared type. A value that doesn't fit is quarantined: a date before year 1 or after 9999, and a decimal that's `NaN` or infinite, or that `decimal(38, 9)` doesn't hold exactly, with more than 9 digits after the point or 29 before it. A long in a field with doubles loses the digits a double doesn't keep. Nested documents and arrays are relaxed Extended JSON, which tags ObjectIds, decimals, binaries, dates and the other types JSON hasn't, but spells an `int` and a `long` alike, as a JSON integer, and a `double` as a number with a point, such as `1.0`. `packed` keeps every type, in canonical Extended JSON.
 
 A document with a field the run didn't declare fails the read with a retryable error that names the field, and the next attempt's discovery declares it. A CDC read leaves out such a field when no document of the collection has it any more, as a change from before the field was removed can, since discovery wouldn't declare it. For a field whose name has a `.` or starts with `$`, it asks with `$getField`, which takes the name as it is, and which needs MongoDB 5.0 or later.
 
@@ -113,7 +113,7 @@ The source's check and a pipeline's preflight report an item for each thing they
 | `net.dns`, `net.connect` | Each host of the `uri`, or of its SRV record, resolves and takes a connection. With several hosts, each has items of its own, named after it, that only warn, since the driver needs one to find the rest. |
 | `net.tls` | The TLS handshake succeeds with a certificate the `uri`'s TLS options trust. Only when the `uri` asks for TLS, as `mongodb+srv://` does unless it sets `tls=false`. It warns when the certificate expires within 14 days. |
 | `db.connect` | The user signs in. A `uri` with no user connects without signing in, and leaves what it may do to the server. |
-| `collections.found` | Every collection `collections` names is a collection in the database, not a view or a time series. Only when `collections` is set. |
+| `collections.found` | Every collection `collections` names is a collection in the database, not a view, a time series or a `system.*` collection. Only when `collections` is set. |
 | `db.read` | The user has the `find` action on each collection the source offers, as the `read` role gives. |
 | `cdc.replica-set`, `cdc.watch` | The deployment is a replica set or a sharded cluster, and the user has the `changeStream` action on the collections. These only warn: CDC is a pipeline's choice. |
 | `cdc.images` | Warns of the collections that keep no pre- and post-images. |
@@ -123,7 +123,7 @@ A preflight is about the streams a pipeline reads:
 
 | Item | What it checks |
 |---|---|
-| `stream.NAME.read` | The stream is a collection in the database, not a view or a time series, and the user has `find` on it. |
+| `stream.NAME.read` | The stream is a collection in the database, not a view, a time series or a `system.*` collection, and the user has `find` on it. |
 | `stream.NAME.cursor` | An incremental stream names a cursor field. It warns when no index starts with the field, since each read then sorts and scans the collection. |
 | `cdc.replica-set`, `cdc.watch` | As in the check, for the collections read with CDC, and they fail. |
 | `cdc.images` | As in the check, for the collections read with CDC. It only warns: CDC works without them, as [CDC](#cdc) says. |
@@ -179,7 +179,7 @@ Each row is a document, and a null is a field the document doesn't have. A docum
 - its `_openetl_id`, where the stream is appended and deduplicated against the collection, so a row whose `_openetl_id` the collection has is skipped;
 - else an ObjectId the destination gives it. A stream deduplicated within each epoch only, as one with no primary key that the pipeline requires only `at_least_once` of, skips a row whose `_openetl_id` an earlier row of the epoch has, and a later epoch's row of that `_openetl_id` lands beside it.
 
-A column named `_id` isn't written in the last two cases: rename it in the pipeline to keep it.
+A column named `_id` is written only as the key or part of it: in the last two cases, and where the key is other columns, it isn't written, so rename it in the pipeline to keep it. A key's values land as their types do in [Types](#types), so a timestamp keeps milliseconds: keys that differ only below a millisecond share a document.
 
 From the MongoDB source, whose `_id` is a string that spells its BSON type, set `extendedJSONKeys: true`: a string key's 24 hexadecimal digits are then an ObjectId, and anything else is read as canonical Extended JSON, so each document gets back its `_id` as it was, `5` an `int` and `"5"` a string. A string key in neither form fails the write with `DATA_INVALID`. Without it, a string key is a string `_id`, one for each source `_id`.
 
@@ -201,6 +201,8 @@ The apply isn't one transaction, which MongoDB limits in size and time:
 - An overwrite's `renameCollection` can't be fenced, since MongoDB runs no rename in a transaction. A replaced attempt still applying an overwrite's last epoch after the next attempt has swapped its read in writes its last rows to a new `_openetl_read_…` collection, which stays until the stream's next overwrite read starts. If the next attempt crashed between the swap and its marker, the attempt after it swaps that collection in again, and the target then holds only those rows until the stream is read again.
 - With `destination.deletes: hard`, nothing is kept of a deleted document, so a version of its key older than the delete that lands after it, as a source that repeats rows can send, brings the document back.
 
+The destination reads from the primary, whatever read preference and read concern the `uri` gives, so that a commit finds every row it staged. Its writes take the `uri`'s write concern, or the server's default, and `majority` in place of an unacknowledged `w=0`. MongoDB's default is `majority`, but `w=1` where the replica set has an arbiter. A write concern of `w=1` acknowledges a write before the other members have it, so a failover can roll back an epoch that was committed.
+
 Up to 16 writer lanes write at once. A continuous pipeline commits every 10 seconds unless it sets its own `delivery.commit.interval`.
 
 ### Set it up
@@ -216,7 +218,7 @@ A preflight checks `db.write` on the pipeline's namespace, or on `database` if i
 | Item | What it checks |
 |---|---|
 | `stream.NAME.write` | The collection isn't a view or a time series, and a merged stream has a primary key. Where its `$jsonSchema` validator is enforced, it fails when the validator requires a field the stream lacks, or takes no field its properties don't name and the stream has one, unless it has `patternProperties`. It warns of the columns whose types the validator doesn't take, which the stream holds, as [Schema changes](#schema-changes) explains. Where the pipeline lets the stream change types, it checks instead that the user has `collMod` on the collection. |
-| `stream.NAME.indexes` | The collection's unique indexes, but `_id`'s and partial ones. It fails on an index on fields the stream doesn't have, unless it's sparse, since each document then indexes them as null. It warns of an index on the key of a stream that appends, since a row's second version repeats it, and of an index on other fields, since rows whose values repeat are refused, with `DATA_INVALID`. An index on a merged stream's whole key passes. |
+| `stream.NAME.indexes` | The collection's unique indexes, but `_id`'s and partial ones. It fails on an index on fields the stream doesn't have, unless it's sparse, since each document then indexes them as null. It warns of an index on the key of a stream that appends, since a row's second version repeats it, and of an index on other fields, since rows whose values repeat are refused, with `DATA_INVALID`. An index on the whole key of a stream that merges, or overwrites with a primary key, passes. |
 | `stream.NAME.keys` | Only for a stream merged by one text key. It only warns, since the documents it finds may be another writer's: with `extendedJSONKeys` off, when the collection has an ObjectId `_id`, which the stream's text keys never find, and with it on, when the collection has a text `_id` spelled as the source spells one, which the option's `_id`s don't find. |
 
 ### Example
@@ -251,7 +253,7 @@ spec:
 | time of day | `string`, such as `"12:34:56.789012"` |
 | interval | a document of `months`, `days` and `nanoseconds` |
 | list | `array` |
-| JSON | the value it spells, read as relaxed Extended JSON, so `{"$oid": "…"}`, `{"$date": "…"}` and the like land as their types; JSON that isn't valid Extended JSON is a string |
+| JSON | the value it spells, read as relaxed Extended JSON, so `{"$oid": "…"}`, `{"$date": "…"}` and the like land as their types, an integer as `int` or `long`, and any other number as `double`, an integer past 64 bits too; JSON that isn't valid Extended JSON is a string |
 
 `_openetl_seq` is kept as a number that orders a key's versions: a timestamp as `long` in its unit since 1970, and a decimal as `decimal`. `_openetl_held` is a document from each held field to the `_openetl_id` of the version whose value it holds.
 
@@ -273,5 +275,5 @@ A validator whose `validationAction` is `warn`, or whose `validationLevel` is `o
 ### Limits
 
 - Filling held cells uses `$getField` and `$setField`, which need MongoDB 5.0 or later.
-- Overwrite's `renameCollection` doesn't work on sharded collections.
+- Overwrite's `renameCollection` isn't tested on a sharded cluster.
 - A document is at most 16 MB, as MongoDB allows.

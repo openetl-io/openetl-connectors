@@ -437,3 +437,96 @@ func TestOverwriteNeedsReads(t *testing.T) {
 		t.Errorf("Write before StartReads: %v", err)
 	}
 }
+
+// A merged stream reports no rows collapsed, though it's deduped: dedupe
+// skips only append and overwrite rows, and a merge's apply counts none.
+func TestMergeCollapsesNothing(t *testing.T) {
+	env := newEnv(t)
+	w := env.openStreams(1, destination.ScopePipeline, destination.Stream{Name: "users", Mode: destination.Merge, PrimaryKey: []string{"id"}, Dedupe: destination.DedupeTarget})
+	recov(t, w, 1, destination.Epoch{}, nil)
+	write(t, w, destination.Epoch{Generation: 1, N: 1}, "users", batch(t, []arrow.Field{idField, nameField, rowID},
+		`[{"id": 1, "name": "a", "_openetl_id": `+uid(1)+`}, {"id": 2, "name": "b", "_openetl_id": `+uid(2)+`}]`))
+	if _, c := commit(t, w, destination.Epoch{Generation: 1, N: 1}); c.Collapsed["users"] != 0 {
+		t.Errorf("collapsed %v", c.Collapsed)
+	}
+	if got := env.text(users); got != "1:a,2:b" {
+		t.Errorf("users = %s", got)
+	}
+}
+
+var nField = arrow.Field{Name: "n", Type: arrow.PrimitiveTypes.Int64, Nullable: true}
+
+const usersN = "SELECT string_agg(id || ':' || coalesce(name, '-') || ':' || n || ':' || coalesce(_openetl_unchanged::text, '-'), ',' ORDER BY id) FROM $schema.users"
+
+// A column the latest version didn't send comes from the version staged
+// before it that did, where the versions have no seq too: a null seq ranks
+// below every other, as it does where the latest is picked.
+func TestMergeUnchangedWithoutSeq(t *testing.T) {
+	env := newEnv(t)
+	w := env.openStreams(1, destination.ScopePipeline, destination.Stream{Name: "users", Mode: destination.Merge, PrimaryKey: []string{"id"}})
+	recov(t, w, 1, destination.Epoch{}, nil)
+	fields := []arrow.Field{idField, nameField, nField, opField, seqField, unchangedField, deletedField}
+	write(t, w, destination.Epoch{Generation: 1, N: 1}, "users", batch(t, fields, `[
+		{"id": 1, "name": "a", "n": 1, "_openetl_op": "insert", "_openetl_deleted": false},
+		{"id": 1, "name": null, "n": 2, "_openetl_op": "update", "_openetl_unchanged": ["name"], "_openetl_deleted": false},
+		{"id": 2, "name": "b", "n": 1, "_openetl_op": "insert", "_openetl_deleted": false},
+		{"id": 2, "name": null, "n": 2, "_openetl_op": "update", "_openetl_seq": 4, "_openetl_unchanged": ["name"], "_openetl_deleted": false},
+		{"id": 3, "name": "c", "n": 1, "_openetl_op": "insert", "_openetl_seq": 1, "_openetl_deleted": false},
+		{"id": 3, "name": "old", "n": 0, "_openetl_op": "insert", "_openetl_deleted": false},
+		{"id": 3, "name": null, "n": 2, "_openetl_op": "update", "_openetl_seq": 2, "_openetl_unchanged": ["name"], "_openetl_deleted": false}]`))
+	commit(t, w, destination.Epoch{Generation: 1, N: 1})
+	if got := env.text(usersN); got != "1:a:2:-,2:b:2:-,3:c:2:-" {
+		t.Errorf("users = %s", got)
+	}
+}
+
+// A column the latest version didn't send keeps the target's value where
+// the staged version that sent it is older than the target's row, or where
+// no staged version sent it.
+func TestMergeUnchangedOlderThanTarget(t *testing.T) {
+	env := newEnv(t)
+	w := env.openStreams(1, destination.ScopePipeline, destination.Stream{Name: "users", Mode: destination.Merge, PrimaryKey: []string{"id"}})
+	recov(t, w, 1, destination.Epoch{}, nil)
+	fields := []arrow.Field{idField, nameField, nField, opField, seqField, unchangedField, deletedField}
+	write(t, w, destination.Epoch{Generation: 1, N: 1}, "users", batch(t, fields, `[
+		{"id": 1, "name": "current", "n": 10, "_openetl_op": "insert", "_openetl_seq": 10, "_openetl_deleted": false},
+		{"id": 2, "name": "current", "n": 10, "_openetl_op": "insert", "_openetl_seq": 10, "_openetl_deleted": false},
+		{"id": 3, "name": "current", "n": 10, "_openetl_op": "insert", "_openetl_seq": 10, "_openetl_deleted": false}]`))
+	commit(t, w, destination.Epoch{Generation: 1, N: 1})
+	write(t, w, destination.Epoch{Generation: 1, N: 2}, "users", batch(t, fields, `[
+		{"id": 1, "name": "old", "n": 5, "_openetl_op": "update", "_openetl_seq": 5, "_openetl_deleted": false},
+		{"id": 1, "name": null, "n": 11, "_openetl_op": "update", "_openetl_seq": 11, "_openetl_unchanged": ["name"], "_openetl_deleted": false},
+		{"id": 2, "name": "newer", "n": 12, "_openetl_op": "update", "_openetl_seq": 12, "_openetl_deleted": false},
+		{"id": 2, "name": null, "n": 13, "_openetl_op": "update", "_openetl_seq": 13, "_openetl_unchanged": ["name"], "_openetl_deleted": false},
+		{"id": 3, "name": null, "n": 11, "_openetl_op": "update", "_openetl_seq": 11, "_openetl_unchanged": ["name"], "_openetl_deleted": false}]`))
+	commit(t, w, destination.Epoch{Generation: 1, N: 2})
+	if got := env.text(usersN); got != "1:current:11:-,2:newer:13:-,3:current:11:-" {
+		t.Errorf("users = %s", got)
+	}
+}
+
+// An older generation, for which the stream appends, doesn't drop the read
+// table of a newer one that overwrites it once the newer has raised the
+// fence.
+func TestFencedKeepsNewerReads(t *testing.T) {
+	env := newEnv(t)
+	old := env.openStreams(1, destination.ScopePipeline, destination.Stream{Name: "users", Mode: destination.Append})
+	recov(t, old, 1, destination.Epoch{}, nil)
+	newer := env.openStreams(2, destination.ScopePipeline, destination.Stream{Name: "users", Mode: destination.Overwrite})
+	recov(t, newer, 2, destination.Epoch{}, nil)
+	startReads(t, newer, map[string]time.Time{"users": time.UnixMicro(1000)})
+	e := destination.Epoch{Generation: 2, N: 1}
+	write(t, newer, e, "users", batch(t, []arrow.Field{idField}, `[{"id": 1}]`))
+	commit(t, newer, e)
+	read := sqlstage.ReadName("p1", "users", time.UnixMicro(1000))
+	exists := func() bool {
+		return env.count("SELECT count(*) FROM pg_tables WHERE schemaname = '"+env.schema+"' AND tablename = '"+read+"'") == 1
+	}
+	if !exists() {
+		t.Fatal("the newer generation's read has no table")
+	}
+	old.(*writer).DropRemovedReads(t.Context())
+	if !exists() {
+		t.Error("the fenced generation dropped the newer one's read")
+	}
+}

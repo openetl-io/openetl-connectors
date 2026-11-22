@@ -8,7 +8,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"maps"
+	"net/http"
+	"net/http/httptest"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
@@ -24,6 +28,7 @@ import (
 	"gocloud.dev/blob"
 	"gocloud.dev/gcerrors"
 
+	"github.com/openetl-io/openetl-connectors/objstore/s3store"
 	"github.com/openetl-io/openetl/sdk/go/check"
 	"github.com/openetl-io/openetl/sdk/go/destination"
 )
@@ -714,5 +719,161 @@ func testDestinationPreflight(e *env) {
 	it := e.b.List(&blob.ListOptions{Prefix: reserved + "/check-"})
 	if obj, err := it.Next(t.Context()); err == nil {
 		t.Errorf("the preflight left %s", obj.Key)
+	}
+}
+
+// A PreCommit that fails to close one stream's file leaves the epoch's other
+// files to Close, which drops them.
+func TestFailedPreCommitLeavesItsEpochToClose(t *testing.T) {
+	dir := t.TempDir()
+	d := newDest(t, map[string]any{"url": "file://" + dir}, nil)
+	b, err := d.bucket(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = b.Close() })
+	e := &env{t: t, d: d, b: b}
+	w := e.open(1, "a", "b")
+	e.recover(w, 1, destination.Epoch{}, nil)
+	ep := destination.Epoch{Generation: 1, N: 1}
+	e.write(w, ep, "a", 1)
+	e.write(w, ep, "b", 2)
+	// a's file can't take its name, where a directory is.
+	if err := b.WriteAll(t.Context(), reserved+"/p1/staging/1/1/a/part-00000.parquet/x", nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.PreCommit(t.Context(), ep); err == nil {
+		t.Fatal("PreCommit took a file where a directory is")
+	}
+	if err := w.Close(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	var left []string
+	_ = filepath.WalkDir(filepath.Join(dir, reserved, "p1", "staging"), func(p string, de fs.DirEntry, err error) error {
+		if err == nil && !de.IsDir() && !strings.Contains(p, "part-00000.parquet/x") {
+			left = append(left, p)
+		}
+		return nil
+	})
+	if len(left) > 0 {
+		t.Errorf("left %v", left)
+	}
+}
+
+// hangingS3 is a JSON Lines writer on a fake S3 that answers each request
+// at once but a DELETE, of a file or a multipart upload, which it holds
+// until the test ends; deleted gets each DELETE's URL.
+func hangingS3(t *testing.T) (*writer, chan string) {
+	t.Helper()
+	release, deleted := make(chan struct{}), make(chan string, 16)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		switch {
+		case r.Method == http.MethodDelete:
+			select {
+			case deleted <- r.URL.String():
+			default:
+			}
+			select {
+			case <-release:
+			case <-r.Context().Done():
+			}
+		case r.Method == http.MethodHead:
+			w.Header().Set("ETag", `"e"`)
+		case r.Method == http.MethodPost:
+			_, _ = io.WriteString(w, `<InitiateMultipartUploadResult><Bucket>b</Bucket><Key>k</Key><UploadId>u</UploadId></InitiateMultipartUploadResult>`)
+		case r.Header.Get("X-Amz-Copy-Source") != "":
+			_, _ = io.WriteString(w, `<CopyObjectResult><ETag>"e"</ETag></CopyObjectResult>`)
+		default:
+			w.Header().Set("ETag", `"e"`)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	t.Cleanup(func() { close(release) })
+	var c s3store.Config
+	config, _ := json.Marshal(map[string]any{"url": "s3://b/p", "format": "jsonl", "endpoint": srv.URL, "region": "us-east-1", "accessKeyId": "a", "secretAccessKey": "b"})
+	d, err := NewDestination(config, &c, func(string) (Store, error) { return s3store.New(c) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := d.bucket(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	return &writer{d: d, b: b, cfg: destination.OpenConfig{Pipeline: "p"}, ctx: ctx, cancel: cancel, parts: map[uint64]map[string]*epochFiles{}}, deleted
+}
+
+// within fails the test unless f returns within 5 seconds.
+func within(t *testing.T, what string, f func() error) error {
+	t.Helper()
+	done := make(chan error, 1)
+	go func() { done <- f() }()
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(5 * time.Second):
+		t.Fatalf("%s waits on the store", what)
+		return nil
+	}
+}
+
+// Close returns within its context's time though the store stops answering
+// its aborts of open parts' multipart uploads and its deletes of closed
+// parts: what's left stays for a later Recover or DropStale.
+func TestCloseOfAStoreThatHangs(t *testing.T) {
+	w, deleted := hangingS3(t)
+	// Past the 16 MiB from which an upload is in parts.
+	rows := `[` + strings.Repeat(`{"s":"`+strings.Repeat("x", 1<<20)+`"},`, 17) + `{"s":"x"}]`
+	big := batch(t, []arrow.Field{{Name: "s", Type: arrow.BinaryTypes.String}}, rows)
+	w.parts[1] = map[string]*epochFiles{}
+	for _, s := range []string{"a", "b"} {
+		ef := &epochFiles{table: s, files: []stagedFile{{Staged: s + "/closed"}}}
+		p, err := w.startPart(destination.Epoch{Generation: 1, N: 1}, s, ef, big.Schema())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := p.fw.write(big); err != nil {
+			t.Fatal(err)
+		}
+		ef.open, w.parts[1][s] = p, ef
+	}
+	ctx, stop := context.WithTimeout(t.Context(), 200*time.Millisecond)
+	defer stop()
+	_ = within(t, "Close", func() error { return w.Close(ctx) })
+	var got []string
+	for len(deleted) > 0 {
+		got = append(got, <-deleted)
+	}
+	if !slices.ContainsFunc(got, func(u string) bool { return strings.Contains(u, "uploadId") }) {
+		t.Errorf("no upload aborted: %v", got)
+	}
+}
+
+// Commit returns within its context's time though the store stops
+// answering its deletes of the files it staged, which stay for a later
+// Recover or DropStale.
+func TestCommitOfAStoreThatHangs(t *testing.T) {
+	w, deleted := hangingS3(t)
+	desc, _ := json.Marshal(staged{Generation: 1, Epoch: 1, Streams: []stagedStream{{Name: "a", Table: "a", Files: []stagedFile{{Staged: "s/x", Target: "a/x"}}}}})
+	ctx, stop := context.WithTimeout(t.Context(), 200*time.Millisecond)
+	defer stop()
+	err := within(t, "Commit", func() error {
+		_, err := w.Commit(ctx, destination.Epoch{Generation: 1, N: 1}, []destination.Staged{desc})
+		return err
+	})
+	if err != nil || len(deleted) == 0 {
+		t.Errorf("commit: %v, %d deletes", err, len(deleted))
+	}
+}
+
+// A file's size is at most 4 GiB, which Commit's copy of it can take: S3
+// copies at most 5 GiB at once.
+func TestFileSizeLimits(t *testing.T) {
+	for size, ok := range map[int64]bool{1<<20 - 1: false, 1 << 20: true, 4 << 30: true, 4<<30 + 1: false} {
+		b, _ := json.Marshal(map[string]any{"url": "file://" + t.TempDir(), "fileSize": size})
+		if _, err := testDestination(b); (err == nil) != ok {
+			t.Errorf("%d: %v", size, err)
+		}
 	}
 }

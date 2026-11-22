@@ -133,7 +133,9 @@ func (w *writer) build(ctx context.Context, desc staged, s stagedStream, ready s
 	} else {
 		q = w.insertQuery(s, names(cols), rel, tmp)
 	}
-	if err := w.exec(ch.Context(ctx, ch.WithSettings(ch.Settings{"join_use_nulls": 0})), q); err != nil {
+	// The epoch's table, partitioned as the target is, takes rows of any
+	// number of its partitions, as they arrived.
+	if err := w.exec(ch.Context(ctx, ch.WithSettings(ch.Settings{"join_use_nulls": 0, "max_partitions_per_insert_block": 0})), q); err != nil {
 		return 0, err
 	}
 	var n uint64
@@ -549,7 +551,7 @@ func (w *writer) reconcile(ctx context.Context, table, like string) error {
 // replace makes the read's rows the target's: each of its partitions
 // replaces the target's, and the target's others are dropped. Run again,
 // it changes nothing more.
-func (w *writer) replace(ctx context.Context, s stagedStream) error {
+func (w *writer) replace(ctx context.Context, desc staged, s stagedStream) error {
 	if s.Table == "" {
 		return nil
 	}
@@ -567,6 +569,10 @@ func (w *writer) replace(ctx context.Context, s stagedStream) error {
 		if read, err = w.partitions(ctx, s.Read); err != nil {
 			return err
 		}
+	} else if done, err := w.marked(ctx, desc, s.Name); err != nil || done {
+		// Another applier finished the epoch, and dropped the read's
+		// table, since this one looked: the read wasn't empty.
+		return err
 	}
 	for _, p := range read {
 		if err := w.exec(ctx, "ALTER TABLE "+w.q(s.Table)+" REPLACE PARTITION ID "+literal(p)+" FROM "+w.q(s.Read)); err != nil {
@@ -597,7 +603,7 @@ func (w *writer) ensureRead(ctx context.Context, s stagedStream) error {
 	if ok {
 		return w.reconcile(ctx, s.Read, s.Table)
 	}
-	l := label{Pipeline: w.cfg.Pipeline, Stream: s.Name}
+	l := label{Pipeline: w.cfg.Pipeline, Generation: w.cfg.Generation, Stream: s.Name}
 	err = w.exec(ctx, "CREATE TABLE IF NOT EXISTS "+w.q(s.Read)+" AS "+w.q(s.Table)+" COMMENT "+literal(l.comment()))
 	if err != nil {
 		return fmt.Errorf("clickhouse: create the read table for %s: %w", s.Name, err)

@@ -714,20 +714,33 @@ func (w *writer) patch(s stagedStream, p prepared) []string {
 		parts += ", y." + q(idColumn)
 	}
 	t := w.ident(s.Table)
+	heldOf := func(c string) string {
+		if f, ok := s.Fills[c]; ok {
+			return f
+		}
+		return c
+	}
+	// The last column that fills each held column, whose UPDATE takes it out
+	// of the target's _openetl_held: an UPDATE before it needs it there.
+	last := map[string]string{}
+	for _, c := range cols {
+		if !slices.Contains(metadataColumns, c) && !slices.Contains(s.Key, c) {
+			last[heldOf(c)] = c
+		}
+	}
 	var out []string
 	for _, c := range cols {
 		if slices.Contains(metadataColumns, c) || slices.Contains(s.Key, c) {
 			continue
 		}
-		held := c
-		if f, ok := s.Fills[c]; ok {
-			held = f
-		}
+		held := heldOf(c)
 		// The member the patch fills, which its guard pins to its version.
 		m := w.lit(jsonName(held)+`:"`) + " || p." + q(idColumn) + ` || '"'`
 		h := t + "." + q(heldColumn)
-		removed := "NULLIF(REPLACE(REPLACE(REPLACE(" + h + ", ',' || " + m + ", ''), " + m + " || ',', ''), " + m + ", ''), '{}')"
-		set := q(c) + " = p." + q(c) + ", " + q(heldColumn) + " = " + removed
+		set := q(c) + " = p." + q(c)
+		if last[held] == c {
+			set += ", " + q(heldColumn) + " = NULLIF(REPLACE(REPLACE(REPLACE(" + h + ", ',' || " + m + ", ''), " + m + " || ',', ''), " + m + ", ''), '{}')"
+		}
 		if slices.Contains(cols, syncedColumn) {
 			set += ", " + q(syncedColumn) + " = p." + q(syncedColumn)
 		}
@@ -1688,11 +1701,14 @@ func (w *writer) dropAbandonedReads(ctx context.Context, drop func(l readLabel, 
 }
 
 // dropRemovedReads drops the read tables of streams that no longer
-// overwrite, once Recover has raised the fence. Best effort, like
-// dropStaging.
+// overwrite, once Recover has raised the fence, and while it holds it: a
+// newer generation that overwrites such a stream may have raised it since.
+// Best effort, like dropStaging.
 func (w *writer) dropRemovedReads(ctx context.Context) {
-	_ = w.dropAbandonedReads(ctx, func(l readLabel, _ string) bool {
-		return w.streams[l.Stream].Mode != destination.Overwrite
+	_ = w.fenced(ctx, func() error {
+		return w.dropAbandonedReads(ctx, func(l readLabel, _ string) bool {
+			return w.streams[l.Stream].Mode != destination.Overwrite
+		})
 	})
 }
 
@@ -1726,12 +1742,18 @@ func classify(err error) error {
 		return sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_AUTH_INVALID, err)
 	case pe.Code == "3D000":
 		return sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_CONFIG_INVALID, err)
-	case pe.Code == "42501" || strings.Contains(pe.Message, "Access Denied") || strings.Contains(pe.Message, "is not authorized to assume"):
+	// A Parquet COPY's S3 refusal is in the detail of a Spectrum Scan Error.
+	case pe.Code == "42501" || strings.Contains(pe.Message, "Access Denied") || strings.Contains(pe.Detail, "Access Denied") || strings.Contains(pe.Message, "is not authorized to assume"):
 		return sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_PERMISSION_DENIED, err)
+	// COPY's, for a load that logged error rows, or a Spectrum Scan Error's
+	// for a value too long for its column.
+	case strings.HasPrefix(pe.Message, "Load into table ") || strings.Contains(pe.Detail, "is longer than the length defined in the table"):
+		return sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_DATA_INVALID, err)
 	case pe.Code == "53100" || strings.Contains(pe.Message, "Disk Full"):
 		return sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_DESTINATION_QUOTA, err)
 	case strings.HasPrefix(pe.Code, "08") || pe.Code == "40001" || pe.Code == "53300" || pe.Code == "57P01" || pe.Code == "57P03" ||
-		strings.Contains(pe.Message, "Serializable isolation violation"):
+		// Error 1023, whose message is its number.
+		strings.Contains(pe.Message, "Serializable isolation violation") || strings.Contains(pe.Detail, "Serializable isolation violation"):
 		return sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_TRANSIENT, err)
 	}
 	return err

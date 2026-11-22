@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/apache/arrow-go/v18/arrow"
+	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/decimal128"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	gomysql "github.com/go-mysql-org/go-mysql/mysql"
@@ -93,6 +94,9 @@ type cdcState struct {
 	// it: a read again from no state starts there.
 	Start     *binlogPos `json:"start,omitempty"`
 	StartGTID string     `json:"startGtid,omitempty"`
+	// The XA transactions prepared whose rows were read, by their xids as
+	// the binlog writes them, until their XA COMMIT.
+	XA []string `json:"xa,omitempty"`
 }
 
 type snapshotCursor struct {
@@ -139,6 +143,8 @@ type cdcStream struct {
 	fromState cdcState
 	// It got to until, and completed.
 	finished bool
+	// As its state's XA.
+	xa []string
 }
 
 // relation is a table as a binlog table map describes it.
@@ -147,6 +153,9 @@ type relation struct {
 	// The stream's column of each of the binlog's, or -1.
 	at   []int
 	cols []binlogColumn
+	// The stream's columns the binlog's lack, as one added or renamed after
+	// it: a change sends them as unchanged.
+	absent []string
 }
 
 type txn struct {
@@ -156,8 +165,11 @@ type txn struct {
 	// A BEGIN was read: statements before the commit are its.
 	begun bool
 	skip  map[*cdcStream]bool
-	// Rows emitted so far.
-	n uint64
+	// Rows emitted so far, and the streams they're of.
+	n    uint64
+	sent map[*cdcStream]bool
+	// Its xid, from its XA END, if it's an XA transaction.
+	xa string
 }
 
 // chunk is a snapshot's chunk, held until the binlog passes its position.
@@ -235,7 +247,7 @@ func (s *Source) readCDC(ctx context.Context, conns *connPool, srv server, req s
 		// again.
 		if state.File != "" {
 			st.from = &state
-			st.start, st.startGTID = state.Start, state.StartGTID
+			st.start, st.startGTID, st.xa = state.Start, state.StartGTID, state.XA
 		}
 		if cs.Until != nil && !req.Continuous {
 			if err := r.stopAt(st, state, cs.Until); err != nil {
@@ -340,7 +352,7 @@ func (r *cdcReader) finish(st *cdcStream) error {
 			seq = seqOf(r.epoch, r.pos, 0)
 		}
 		err := scan(r.ctx, r.conn, q, append(fromArgs, toArgs...), len(st.t.cols), func(vals []any) error {
-			return r.add(st, source.OpInsert, seq, vals)
+			return r.add(st, source.OpInsert, seq, vals, nil)
 		})
 		if err != nil {
 			return fmt.Errorf("mysql: snapshot of %s: %w", st.t.name, err)
@@ -513,7 +525,11 @@ func (r *cdcReader) snapshotRanges(ctx context.Context, t table, state cdcState)
 
 func (r *cdcReader) syncerConfig(pipeline string) replication.BinlogSyncerConfig {
 	c := r.s.conn
-	host, port, _ := net.SplitHostPort(c.Addr)
+	// A socket's path, with no port, which the syncer dials as a socket.
+	host, port := c.Addr, ""
+	if c.Net != "unix" {
+		host, port, _ = net.SplitHostPort(c.Addr)
+	}
 	p, _ := strconv.ParseUint(port, 10, 16)
 	id := r.s.cfg.ServerID
 	if id == 0 {
@@ -755,7 +771,11 @@ func (r *cdcReader) run(ctx context.Context, streamer *replication.BinlogStreame
 
 func (r *cdcReader) event(ctx context.Context, ev *replication.BinlogEvent) error {
 	h := ev.Header
-	switch e := ev.Event.(type) {
+	event := ev.Event
+	if tagged, ok := event.(*replication.GtidTaggedLogEvent); ok {
+		event = &tagged.GTIDEvent
+	}
+	switch e := event.(type) {
 	case *replication.FormatDescriptionEvent:
 		// Sent again where a read starts in a file, with MariaDB's position
 		// after it filled in, which isn't one.
@@ -771,7 +791,7 @@ func (r *cdcReader) event(ctx context.Context, ev *replication.BinlogEvent) erro
 		return nil
 	case *replication.GTIDEvent:
 		var g gomysql.GTIDSet
-		if h.EventType == replication.GTID_EVENT {
+		if h.EventType != replication.ANONYMOUS_GTID_EVENT {
 			var err error
 			if g, err = e.GTIDNext(); err != nil {
 				return err
@@ -787,11 +807,18 @@ func (r *cdcReader) event(ctx context.Context, ev *replication.BinlogEvent) erro
 		if err != nil {
 			return err
 		}
-		return r.begin(g, time.Unix(int64(h.Timestamp), 0))
+		if err := r.begin(g, time.Unix(int64(h.Timestamp), 0)); err != nil {
+			return err
+		}
+		// MariaDB writes no BEGIN: a group that isn't a statement on its own
+		// ends at its COMMIT or XID, whatever statements, such as SAVEPOINT,
+		// come before.
+		r.txn.begun = !e.IsStandalone()
+		return nil
 	case *replication.QueryEvent:
 		q := strings.ToUpper(strings.TrimSpace(string(e.Query)))
 		switch {
-		case q == "BEGIN":
+		case q == "BEGIN" || strings.HasPrefix(q, "XA START"):
 			if r.txn == nil {
 				if err := r.begin(nil, time.Unix(int64(h.Timestamp), 0)); err != nil {
 					return err
@@ -801,6 +828,37 @@ func (r *cdcReader) event(ctx context.Context, ev *replication.BinlogEvent) erro
 			return nil
 		case q == "COMMIT":
 			return r.commit(h)
+		}
+		if x, ok := strings.CutPrefix(q, "XA END "); ok && r.txn != nil {
+			r.txn.xa = x
+		}
+		// An XA transaction prepared before: its rows were read then.
+		xaCommit, committed := strings.CutPrefix(q, "XA COMMIT ")
+		xaRollback, rolledBack := strings.CutPrefix(q, "XA ROLLBACK ")
+		for _, st := range r.streams {
+			switch {
+			case st.finished || r.txn != nil && r.txn.skip[st]:
+			case rolledBack && slices.Contains(st.xa, xaRollback):
+				return positionLost("mysql: binlog: XA transaction %s changed %s and was prepared, when its changes were read, and then rolled back: "+
+					"the destination has changes that never committed; read %[2]s again", xaRollback, st.t.name)
+			case committed && slices.Contains(st.xa, xaCommit):
+				st.xa = slices.DeleteFunc(st.xa, func(x string) bool { return x == xaCommit })
+				st.dirty = true
+			}
+		}
+		if written, cols, refs, ok := statementWrites(q); ok {
+			is := func(st *cdcStream) func(tableName) bool {
+				return func(t tableName) bool {
+					return cmp.Or(t.schema, strings.ToUpper(string(e.Schema))) == strings.ToUpper(r.s.cfg.Database) && t.name == strings.ToUpper(st.t.name)
+				}
+			}
+			for _, st := range r.streams {
+				hasCol := slices.ContainsFunc(st.t.cols, func(c sourceColumn) bool { return slices.Contains(cols, strings.ToUpper(c.name)) })
+				if !st.finished && (r.txn == nil || !r.txn.skip[st]) && (slices.ContainsFunc(written, is(st)) || hasCol && slices.ContainsFunc(refs, is(st))) {
+					return configInvalid("mysql: binlog: a change to %s logged as a statement, which has no rows to read: a session set binlog_format to STATEMENT or MIXED; "+
+						"log changes with binlog_format = ROW, and read %[1]s again", st.t.name)
+				}
+			}
 		}
 		if strings.HasPrefix(q, "TRUNCATE") && string(e.Schema) == r.s.cfg.Database {
 			for _, st := range r.streams {
@@ -816,6 +874,20 @@ func (r *cdcReader) event(ctx context.Context, ev *replication.BinlogEvent) erro
 		return nil
 	case *replication.XIDEvent:
 		return r.commit(h)
+	case *replication.GenericEvent:
+		// An XA transaction's changes end at its XA PREPARE; its XA COMMIT
+		// or XA ROLLBACK comes later, as a statement on its own, unless its
+		// body's first byte says it's an XA COMMIT ONE PHASE.
+		if h.EventType == replication.XA_PREPARE_LOG_EVENT {
+			if r.txn != nil && r.txn.xa != "" && len(e.Data) > 0 && e.Data[0] == 0 {
+				for st := range r.txn.sent {
+					if !slices.Contains(st.xa, r.txn.xa) {
+						st.xa = append(st.xa, r.txn.xa)
+					}
+				}
+			}
+			return r.commit(h)
+		}
 	case *replication.TableMapEvent:
 		return r.relation(ctx, e)
 	case *replication.RowsEvent:
@@ -841,6 +913,251 @@ func (r *cdcReader) event(ctx context.Context, ev *replication.BinlogEvent) erro
 	return nil
 }
 
+// tableName is a table a statement names, with its schema if it names one.
+type tableName struct{ schema, name string }
+
+// statementWrites is what q, a statement in upper case that changes rows,
+// writes, which in the binlog means a session logged it as a statement: the
+// tables it writes, and the columns an UPDATE of more than one table sets
+// without naming their table, which may be of any table in refs. ok is
+// false for another statement.
+func statementWrites(q string) (written []tableName, cols []string, refs []tableName, ok bool) {
+	ts := sqlTokens(q)
+	if len(ts) == 0 {
+		return nil, nil, nil, false
+	}
+	if ts[0] == "WITH" {
+		// The statement after the common table expressions, outside their
+		// parentheses.
+		depth := 0
+	cte:
+		for j, t := range ts {
+			switch {
+			case t == "(":
+				depth++
+			case t == ")":
+				depth--
+			case depth == 0 && (t == "UPDATE" || t == "DELETE"):
+				ts = ts[j:]
+				break cte
+			}
+		}
+	}
+	i := 1
+	skip := func(words ...string) {
+		for i < len(ts) && slices.Contains(words, ts[i]) {
+			i++
+		}
+	}
+	switch ts[0] {
+	case "INSERT", "REPLACE":
+		skip("LOW_PRIORITY", "DELAYED", "HIGH_PRIORITY", "IGNORE", "INTO")
+		list, _ := tableList(ts, i)
+		return list[:min(len(list), 1)], nil, nil, len(list) > 0
+	case "UPDATE":
+		skip("LOW_PRIORITY", "IGNORE")
+		var aliases map[string]tableName
+		refs, aliases, i = references(ts, i, "SET")
+		if len(refs) == 1 {
+			return refs, nil, nil, true
+		}
+		// Each assignment's [[schema.]table.]column, to WHERE, ORDER or LIMIT.
+		depth, start := 0, true
+		for i++; i < len(ts); i++ {
+			switch t := ts[i]; {
+			case t == "(":
+				depth++
+			case t == ")":
+				depth--
+			case depth > 0:
+			case t == ",":
+				start = true
+				continue
+			case t == "WHERE" || t == "ORDER" || t == "LIMIT":
+				return written, cols, refs, true
+			case start:
+				n, j := dotted(ts, i)
+				switch i = j - 1; len(n) {
+				case 1:
+					cols = append(cols, n[0])
+				case 2:
+					written = append(written, cmp.Or(aliases[n[0]], tableName{name: n[0]}))
+				case 3:
+					written = append(written, tableName{n[0], n[1]})
+				}
+			}
+			start = false
+		}
+		return written, cols, refs, true
+	case "DELETE":
+		skip("LOW_PRIORITY", "QUICK", "IGNORE")
+		from := i < len(ts) && ts[i] == "FROM"
+		if from {
+			i++
+		}
+		var list []tableName
+		var aliases map[string]tableName
+		list, i = tableList(ts, i)
+		switch {
+		case from && i < len(ts) && ts[i] == "USING":
+			_, aliases, _ = references(ts, i+1, "WHERE")
+		case from:
+			return list[:min(len(list), 1)], nil, nil, len(list) > 0
+		case i < len(ts) && ts[i] == "FROM":
+			_, aliases, _ = references(ts, i+1, "WHERE")
+		}
+		for j, t := range list {
+			if a, ok := aliases[t.name]; ok && t.schema == "" {
+				list[j] = a
+			}
+		}
+		return list, nil, nil, true
+	}
+	return nil, nil, nil, false
+}
+
+// tableList reads a list of [schema.]table[.*] from ts[i:], and returns where
+// it ends.
+func tableList(ts []string, i int) ([]tableName, int) {
+	var list []tableName
+	for i < len(ts) && isName(ts[i]) {
+		n, j := dotted(ts, i)
+		list, i = append(list, tableOf(n)), j
+		if i >= len(ts) || ts[i] != "," {
+			break
+		}
+		i++
+	}
+	return list, i
+}
+
+// references reads table references from ts[i:] to the first of stop: each
+// table, and by each one's alias and name, the table. It returns where they
+// end.
+func references(ts []string, i int, stop ...string) ([]tableName, map[string]tableName, int) {
+	var refs []tableName
+	aliases := map[string]tableName{}
+	expect := true
+	for ; i < len(ts) && !slices.Contains(stop, ts[i]); i++ {
+		switch t := ts[i]; {
+		case t == "," || t == "JOIN" || t == "STRAIGHT_JOIN":
+			expect = true
+		case expect && isName(t):
+			n, j := dotted(ts, i)
+			ref := tableOf(n)
+			refs, aliases[ref.name], i, expect = append(refs, ref), ref, j, false
+			if i < len(ts) && ts[i] == "AS" {
+				i++
+			}
+			if i < len(ts) && isName(ts[i]) && !slices.Contains(afterTable, ts[i]) {
+				aliases[strings.TrimPrefix(ts[i], "`")] = ref
+			} else {
+				i--
+			}
+		}
+	}
+	return refs, aliases, i
+}
+
+// afterTable are the words that may follow a table reference that aren't
+// its alias.
+var afterTable = []string{"ON", "USING", "JOIN", "INNER", "LEFT", "RIGHT", "CROSS", "NATURAL", "OUTER", "STRAIGHT_JOIN", "SET", "WHERE",
+	"USE", "FORCE", "IGNORE", "PARTITION", "ORDER", "LIMIT"}
+
+// dotted reads a name and the names it's qualified by, a.b.c, from ts[i:],
+// with a trailing .* left out, and returns where it ends.
+func dotted(ts []string, i int) ([]string, int) {
+	n := []string{strings.TrimPrefix(ts[i], "`")}
+	for i++; i+1 < len(ts) && ts[i] == "."; i += 2 {
+		if ts[i+1] == "*" {
+			return n, i + 2
+		}
+		n = append(n, strings.TrimPrefix(ts[i+1], "`"))
+	}
+	return n, i
+}
+
+// tableOf is the table that a dotted name names.
+func tableOf(n []string) tableName {
+	t := tableName{name: n[len(n)-1]}
+	if len(n) > 1 {
+		t.schema = n[len(n)-2]
+	}
+	return t
+}
+
+func isName(t string) bool { return t != "" && (t[0] == '`' || nameChar(t[0])) }
+
+// sqlTokens splits q into words, names quoted with backticks, as a backtick
+// and the name, and other characters one by one, leaving out strings,
+// whose place a ' takes, and comments.
+func sqlTokens(q string) []string {
+	var ts []string
+	for i := 0; i < len(q); {
+		c := q[i]
+		switch {
+		case c == '`':
+			n, rest := nextName(q[i:])
+			ts, i = append(ts, "`"+n), len(q)-len(rest)
+		case c == '\'' || c == '"':
+			j := i + 1
+			for ; j < len(q) && (q[j] != c || j+1 < len(q) && q[j+1] == c); j++ {
+				if q[j] == '\\' || q[j] == c {
+					j++
+				}
+			}
+			ts, i = append(ts, "'"), j+1
+		case strings.HasPrefix(q[i:], "/*"):
+			_, rest, _ := strings.Cut(q[i+2:], "*/")
+			i = len(q) - len(rest)
+		case c == '#' || strings.HasPrefix(q[i:], "-- "):
+			_, rest, _ := strings.Cut(q[i:], "\n")
+			i = len(q) - len(rest)
+		case nameChar(c):
+			j := i
+			for j < len(q) && nameChar(q[j]) {
+				j++
+			}
+			ts, i = append(ts, q[i:j]), j
+		case c > ' ':
+			ts, i = append(ts, string(c)), i+1
+		default:
+			i++
+		}
+	}
+	return ts
+}
+
+// nextName is the name s starts with, after spaces, bare or quoted with
+// backticks, and what follows it.
+func nextName(s string) (name, rest string) {
+	s = strings.TrimLeft(s, " \t\r\n")
+	if !strings.HasPrefix(s, "`") {
+		i := 0
+		for i < len(s) && nameChar(s[i]) {
+			i++
+		}
+		return s[:i], s[i:]
+	}
+	var b strings.Builder
+	for i := 1; i < len(s); i++ {
+		switch {
+		case s[i] != '`':
+			b.WriteByte(s[i])
+		case i+1 < len(s) && s[i+1] == '`':
+			b.WriteByte('`')
+			i++
+		default:
+			return b.String(), s[i+1:]
+		}
+	}
+	return "", ""
+}
+
+func nameChar(c byte) bool {
+	return c == '_' || c == '$' || c >= '0' && c <= '9' || c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z' || c >= 0x80
+}
+
 func maxPos(a, b binlogPos) binlogPos {
 	if a.less(b) {
 		return b
@@ -852,7 +1169,7 @@ func (r *cdcReader) begin(g gomysql.GTIDSet, at time.Time) error {
 	if r.txn != nil {
 		return errors.New("mysql: binlog: a transaction began inside another")
 	}
-	r.txn = &txn{start: r.pos, gtid: g, at: at, skip: map[*cdcStream]bool{}}
+	r.txn = &txn{start: r.pos, gtid: g, at: at, skip: map[*cdcStream]bool{}, sent: map[*cdcStream]bool{}}
 	for _, st := range r.streams {
 		switch {
 		case st.from == nil:
@@ -935,6 +1252,11 @@ func (r *cdcReader) relation(ctx context.Context, m *replication.TableMapEvent) 
 			return fmt.Errorf("mysql: %s's binlog lacks its primary key column %q", st.t.name, st.t.cols[k].name)
 		}
 	}
+	for j, c := range st.t.cols {
+		if !slices.Contains(rel.at, j) {
+			rel.absent = append(rel.absent, c.name)
+		}
+	}
 	return nil
 }
 
@@ -955,7 +1277,12 @@ func (r *cdcReader) rows(t replication.EventType, e *replication.RowsEvent) erro
 		return fmt.Errorf("mysql: binlog: rows of table %d, which the binlog hasn't described", e.TableID)
 	}
 	st := rel.stream
-	if st == nil || r.txn == nil || r.txn.skip[st] || st.finished {
+	switch {
+	case st == nil || st.finished:
+		return nil
+	case r.txn == nil:
+		return fmt.Errorf("mysql: binlog: changes to %s outside a transaction, at %s:%d", st.t.name, r.pos.File, r.pos.Pos)
+	case r.txn.skip[st]:
 		return nil
 	}
 	var op string
@@ -967,8 +1294,14 @@ func (r *cdcReader) rows(t replication.EventType, e *replication.RowsEvent) erro
 	default:
 		op = source.OpUpdate
 	}
+	skipped := func(i int) []int {
+		if i < len(e.SkippedColumns) {
+			return e.SkippedColumns[i]
+		}
+		return nil
+	}
 	for i := 0; i < len(e.Rows); i++ {
-		vals, err := rel.values(e.Rows[i])
+		vals, err := rel.values(e.Rows[i], skipped(i), op != source.OpInsert)
 		if err != nil {
 			return err
 		}
@@ -977,18 +1310,18 @@ func (r *cdcReader) rows(t replication.EventType, e *replication.RowsEvent) erro
 			if i == len(e.Rows) {
 				return fmt.Errorf("mysql: binlog: an update of %s without its new row", st.t.name)
 			}
-			after, err := rel.values(e.Rows[i])
+			after, err := rel.values(e.Rows[i], skipped(i), false)
 			if err != nil {
 				return err
 			}
 			if keyOf(st.t, vals) != keyOf(st.t, after) {
-				if err := r.emit(st, source.OpDelete, vals); err != nil {
+				if err := r.emit(st, source.OpDelete, vals, rel.absent); err != nil {
 					return err
 				}
 			}
 			vals = after
 		}
-		if err := r.emit(st, op, vals); err != nil {
+		if err := r.emit(st, op, vals, rel.absent); err != nil {
 			return err
 		}
 	}
@@ -1005,8 +1338,15 @@ func keyOf(t table, vals []any) string {
 }
 
 // values are a binlog row's values by stream column, as the snapshot reads
-// them.
-func (rel *relation) values(row []any) ([]any, error) {
+// them. skipped are the binlog's columns the row doesn't have, which only
+// the columns not in the key may be if keyOnly.
+func (rel *relation) values(row []any, skipped []int, keyOnly bool) ([]any, error) {
+	for _, i := range skipped {
+		if j := rel.at[i]; j >= 0 && (!keyOnly || slices.Contains(rel.stream.t.key, j)) {
+			return nil, configInvalid("mysql: binlog: a change to %s without %s's value, which a session logged with binlog_row_image MINIMAL or NOBLOB; "+
+				"log changes with binlog_row_image = FULL, and read %[1]s again", rel.stream.t.name, rel.stream.t.cols[j].name)
+		}
+	}
 	vals := make([]any, len(rel.stream.t.cols))
 	for i, v := range row {
 		j := rel.at[i]
@@ -1014,6 +1354,10 @@ func (rel *relation) values(row []any) ([]any, error) {
 			continue
 		}
 		c := rel.stream.t.cols[j]
+		if _, ok := v.(*replication.JsonDiff); ok {
+			return nil, configInvalid("mysql: binlog: a partial update of %s.%s, which a session logged with binlog_row_value_options = PARTIAL_JSON; "+
+				"log changes without it, and read %[1]s again", rel.stream.t.name, c.name)
+		}
 		x, err := binlogValue(c, rel.cols[i], v)
 		if err != nil {
 			return nil, fmt.Errorf("mysql: %s.%s: %w", rel.stream.t.name, c.name, err)
@@ -1023,17 +1367,28 @@ func (rel *relation) values(row []any) ([]any, error) {
 	return vals, nil
 }
 
-func (r *cdcReader) emit(st *cdcStream, op string, vals []any) error {
+func (r *cdcReader) emit(st *cdcStream, op string, vals []any, unchanged []string) error {
 	r.txn.n++
-	return r.add(st, op, seqOf(r.epoch, r.txn.start, r.txn.n), vals)
+	r.txn.sent[st] = true
+	return r.add(st, op, seqOf(r.epoch, r.txn.start, r.txn.n), vals, unchanged)
 }
 
-func (r *cdcReader) add(st *cdcStream, op string, seq decimal128.Num, vals []any) error {
+// add appends a change, with the columns it didn't send as unchanged.
+func (r *cdcReader) add(st *cdcStream, op string, seq decimal128.Num, vals []any, unchanged []string) error {
 	if err := st.b.add(vals); err != nil {
 		return sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_TRANSIENT, fmt.Errorf("mysql: %s: %w", st.t.name, err))
 	}
 	st.b.rb.Field(len(vals)).(interface{ Append(string) }).Append(op)
 	st.b.rb.Field(len(vals) + 1).(interface{ Append(decimal128.Num) }).Append(seq)
+	lb := st.b.rb.Field(len(vals) + 2).(*array.ListBuilder)
+	if len(unchanged) == 0 {
+		lb.AppendNull()
+	} else {
+		lb.Append(true)
+		for _, c := range unchanged {
+			lb.ValueBuilder().(*array.StringBuilder).Append(c)
+		}
+	}
 	st.dirty = true
 	if st.b.bytes >= r.s.cfg.BatchBytes {
 		return st.flush(r.out)
@@ -1058,7 +1413,7 @@ func (r *cdcReader) passed() error {
 		st := c.stream
 		seq := seqOf(r.epoch, c.at, 0)
 		for _, row := range c.rows {
-			if err := r.add(st, source.OpInsert, seq, row); err != nil {
+			if err := r.add(st, source.OpInsert, seq, row, nil); err != nil {
 				return err
 			}
 		}
@@ -1212,7 +1567,7 @@ func (r *cdcReader) resume() error {
 // state is the stream's state at the read's position, or at its own if
 // that's ahead.
 func (r *cdcReader) state(st *cdcStream) ([]byte, error) {
-	s := cdcState{Server: r.server, binlogPos: r.pos, Epoch: r.epoch, Snapshot: st.cursor(), Start: st.start, StartGTID: st.startGTID}
+	s := cdcState{Server: r.server, binlogPos: r.pos, Epoch: r.epoch, Snapshot: st.cursor(), Start: st.start, StartGTID: st.startGTID, XA: st.xa}
 	if r.gset != nil {
 		s.GTID = r.gset.String()
 	}

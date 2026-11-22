@@ -14,8 +14,11 @@ import (
 	"maps"
 	"net/http"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/bloberror"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/container"
@@ -26,11 +29,14 @@ import (
 	"github.com/apache/arrow-go/v18/parquet/pqarrow"
 	"gocloud.dev/blob"
 	"gocloud.dev/gcerrors"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 
 	"github.com/openetl-io/openetl-connectors/objstore/azurestore"
 	"github.com/openetl-io/openetl-connectors/objstore/gcsstore"
 	"github.com/openetl-io/openetl-connectors/objstore/internal/testfiles"
 	"github.com/openetl-io/openetl-connectors/objstore/s3store"
+	sdk "github.com/openetl-io/openetl/sdk/go"
 	"github.com/openetl-io/openetl/sdk/go/conformance"
 	protocolv1 "github.com/openetl-io/openetl/sdk/go/protocol/v1"
 	"github.com/openetl-io/openetl/sdk/go/source"
@@ -342,29 +348,28 @@ func readFile(ctx context.Context, name string, data []byte) ([]map[string]any, 
 // record arrives once, across lanes and the splits Resplit adds, and the
 // next read goes on from the splits the read ended with.
 func splitsOverTheProtocol(t *testing.T, exe string, st TestStore) {
-	launch := conformance.Exec(exe)
 	cfg := st.Config
+	// Each file is a batch of about 32 KiB, and attach's window holds the
+	// read to a few files ahead of the batches the test has received, so a
+	// split it asks to Resplit at its first batch has files left to give.
+	pad := strings.Repeat("x", 16<<10)
 	files := map[string][]byte{}
 	for i := range 240 {
-		files[fmt.Sprintf("many/%03d.jsonl", i)] = fmt.Appendf(nil, "{\"id\":%d}\n{\"id\":%d}\n", i, i+1000)
+		files[fmt.Sprintf("many/%03d.jsonl", i)] = fmt.Appendf(nil, "{\"id\":%d,\"pad\":%q}\n{\"id\":%d,\"pad\":%q}\n", i, pad, i+1000, pad)
 	}
 	putFiles(t, cfg, files)
 	c := maps.Clone(cfg)
 	c["streams"] = []map[string]any{{"name": "many", "glob": "many/*.jsonl", "format": "jsonl"}}
 	config, _ := json.Marshal(c)
-	p, err := launch(t.Context(), config)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer p.Close()
-	spec, err := protocolv1.NewConnectorServiceClient(p.Conn()).Spec(t.Context(), &protocolv1.SpecRequest{Host: conformance.Host})
+	p, conn := attach(t, exe, config)
+	spec, err := protocolv1.NewConnectorServiceClient(conn).Spec(t.Context(), &protocolv1.SpecRequest{Host: conformance.Host})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !spec.GetSource().GetSplits() || !spec.GetSource().GetResplit() {
 		t.Errorf("capabilities %v", spec.GetSource())
 	}
-	cl := protocolv1.NewSourceServiceClient(p.Conn())
+	cl := protocolv1.NewSourceServiceClient(conn)
 	stream := &protocolv1.ConfiguredStream{Name: "many", SyncMode: protocolv1.SyncMode_SYNC_MODE_INCREMENTAL}
 	var last []*protocolv1.Split
 	halved := 0
@@ -443,6 +448,49 @@ func splitsOverTheProtocol(t *testing.T, exe string, st TestStore) {
 	if seen, _ := read(); len(seen) != 1 {
 		t.Errorf("the next read returned %v", seen)
 	}
+}
+
+// attach starts exe with the kit's host services, as Exec does, and dials it
+// with a window of 64 KiB that, unlike gRPC's default, doesn't grow with its
+// estimate of the link's: a read is then at most about that far ahead of
+// what the test has received.
+func attach(t *testing.T, exe string, config []byte) (conformance.Process, *grpc.ClientConn) {
+	t.Helper()
+	// Short, for a Unix socket's path.
+	dir, err := os.MkdirTemp("", "oc-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	addr := "unix://" + filepath.Join(dir, "c.sock")
+	cmd := exec.Command(exe)
+	t.Cleanup(func() {
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+		}
+	})
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	p, err := conformance.Attach(addr, conformance.Options{}, func(env []string) {
+		cmd.Env = append(os.Environ(), env...)
+		if err := cmd.Start(); err != nil {
+			t.Error(err)
+			cancel()
+		}
+	})(ctx, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = p.Close() })
+	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithInitialWindowSize(64<<10), grpc.WithInitialConnWindowSize(64<<10),
+		grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(sdk.MaxMessageSize)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	return p, conn
 }
 
 // The emulators' addresses, and Azurite's well-known account.

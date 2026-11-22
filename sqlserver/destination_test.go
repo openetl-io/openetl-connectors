@@ -11,11 +11,13 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 
+	"github.com/openetl-io/openetl-connectors/sqlstage"
 	"github.com/openetl-io/openetl/sdk/go/destination"
 )
 
@@ -164,6 +166,43 @@ func TestCommitAppliesOnce(t *testing.T) {
 	}
 	if got := env.rows("SELECT count(*) FROM sys.tables WHERE schema_id = SCHEMA_ID('" + env.schema + "') AND name LIKE '\\_openetl\\_stage\\_%' ESCAPE '\\'"); got[0] != "0" {
 		t.Errorf("%s staging tables left", got[0])
+	}
+}
+
+// Streams whose names differ only in case, as a source's tables can, each
+// land: their markers are told apart in a database whose collation ignores
+// case, as SQL Server's default does.
+func TestStreamsDifferingInCase(t *testing.T) {
+	for _, scope := range []destination.Scope{destination.ScopePipeline, destination.ScopeStream} {
+		env := newEnv(t)
+		w := env.openStreams(1, scope, destination.Stream{Name: "Orders", Mode: destination.Append}, destination.Stream{Name: "orders", Mode: destination.Append})
+		recov(t, w, 1, destination.Epoch{})
+		e := destination.Epoch{Generation: 1, N: 1}
+		for stream, table := range map[string]string{"Orders": "upper", "orders": "lower"} {
+			md := arrow.NewMetadata([]string{sqlstage.TableKey}, []string{table})
+			rec, _, err := array.RecordFromJSON(memory.DefaultAllocator, arrow.NewSchema([]arrow.Field{idField}, &md), strings.NewReader(`[{"id": 1}]`))
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(rec.Release)
+			if err := w.Write(t.Context(), e, stream, rec); err != nil {
+				t.Fatal(err)
+			}
+		}
+		st, err := w.PreCommit(t.Context(), e)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := w.Commit(t.Context(), e, []destination.Staged{st}); err != nil {
+			t.Fatal(err)
+		}
+		// The target is created before the apply, so it's its rows that
+		// tell.
+		for _, table := range []string{"upper", "lower"} {
+			if got := env.rows("SELECT count(*) FROM $schema." + table); got[0] != "1" {
+				t.Errorf("scope %v: %s has %s rows, want 1", scope, table, got[0])
+			}
+		}
 	}
 }
 
@@ -411,6 +450,119 @@ func TestMergeCompositeKeyPastIndexLimit(t *testing.T) {
 	}
 	if got := env.rows("SELECT LEN(a) + LEN(b) FROM $schema.m"); !slices.Equal(got, []string{"850"}) {
 		t.Errorf("m = %v", got)
+	}
+}
+
+// Pipelines writing two schemas of one database at once, as lanes and
+// separate pipelines do, don't deadlock: each commit reads the catalog
+// while the other creates, alters and drops tables.
+func TestConcurrentCommits(t *testing.T) {
+	envs := []*env{newEnv(t), newEnv(t)}
+	errs := make(chan error, len(envs))
+	for _, env := range envs {
+		w := env.openStreams(1, destination.ScopePipeline, destination.Stream{Name: "users", Mode: destination.Append})
+		recov(t, w, 1, destination.Epoch{})
+		go func() {
+			errs <- func() error {
+				fields := []arrow.Field{idField}
+				for n := uint64(1); n <= 30; n++ {
+					// A column more every few epochs, which the apply adds.
+					if n%3 == 0 {
+						fields = append(fields, arrow.Field{Name: fmt.Sprintf("c%d", n), Type: arrow.PrimitiveTypes.Int64, Nullable: true})
+					}
+					rec, _, err := array.RecordFromJSON(memory.DefaultAllocator, arrow.NewSchema(fields, nil), strings.NewReader(`[{"id": 1}]`))
+					if err != nil {
+						return err
+					}
+					e := destination.Epoch{Generation: 1, N: n}
+					err = w.Write(t.Context(), e, "users", rec)
+					rec.Release()
+					if err != nil {
+						return err
+					}
+					st, err := w.PreCommit(t.Context(), e)
+					if err != nil {
+						return err
+					}
+					if _, err := w.Commit(t.Context(), e, []destination.Staged{st}); err != nil {
+						return fmt.Errorf("epoch %d: %w", n, err)
+					}
+				}
+				return nil
+			}()
+		}()
+	}
+	for range envs {
+		if err := <-errs; err != nil {
+			t.Error(err)
+		}
+	}
+	for _, env := range envs {
+		if got := env.rows("SELECT count(*) FROM $schema.users"); got[0] != "30" {
+			t.Errorf("%s: %s rows, want 30", env.schema, got[0])
+		}
+	}
+}
+
+// An older generation, for which the stream appends, doesn't drop the read
+// table of a newer one that overwrites it once the newer has raised the
+// fence.
+func TestFencedKeepsNewerReads(t *testing.T) {
+	env := newEnv(t)
+	old := env.openStreams(1, destination.ScopePipeline, destination.Stream{Name: "users", Mode: destination.Append})
+	recov(t, old, 1, destination.Epoch{})
+	newer := env.openStreams(2, destination.ScopePipeline, destination.Stream{Name: "users", Mode: destination.Overwrite})
+	recov(t, newer, 2, destination.Epoch{})
+	if err := newer.(destination.ReadTracker).StartReads(t.Context(), map[string]time.Time{"users": time.UnixMicro(1000)}); err != nil {
+		t.Fatal(err)
+	}
+	e := destination.Epoch{Generation: 2, N: 1}
+	if err := newer.Write(t.Context(), e, "users", batch(t, []arrow.Field{idField}, `[{"id": 1}]`)); err != nil {
+		t.Fatal(err)
+	}
+	st, err := newer.PreCommit(t.Context(), e)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := newer.Commit(t.Context(), e, []destination.Staged{st}); err != nil {
+		t.Fatal(err)
+	}
+	read := sqlstage.ReadName("p1", "users", time.UnixMicro(1000))
+	exists := func() bool {
+		return env.rows("SELECT count(*) FROM sys.tables WHERE schema_id = SCHEMA_ID('" + env.schema + "') AND name = '" + read + "'")[0] == "1"
+	}
+	if !exists() {
+		t.Fatal("the newer generation's read has no table")
+	}
+	old.(*writer).DropRemovedReads(t.Context())
+	if !exists() {
+		t.Error("the fenced generation dropped the newer one's read")
+	}
+}
+
+// Two patch columns that fill one held column both land: the first's UPDATE
+// leaves the cell held for the second's.
+func TestPatchFillsAHeldColumnTwice(t *testing.T) {
+	env := newEnv(t)
+	w := env.openStreams(1, destination.ScopePipeline, destination.Stream{Name: "users", Mode: destination.Merge, PrimaryKey: []string{"id"}})
+	recov(t, w, 1, destination.Epoch{})
+	idCol := arrow.Field{Name: idColumn, Type: &arrow.FixedSizeBinaryType{ByteWidth: 16}, Nullable: true,
+		Metadata: arrow.NewMetadata([]string{extensionNameKey}, []string{uuidExtension})}
+	held := arrow.Field{Name: heldColumn, Type: arrow.ListOf(arrow.BinaryTypes.String), Nullable: true}
+	price := arrow.Field{Name: "price", Type: arrow.BinaryTypes.String, Nullable: true}
+	v2 := arrow.Field{Name: "price__v2", Type: arrow.PrimitiveTypes.Float64, Nullable: true}
+	commit(t, w, 1, "users", batch(t, []arrow.Field{idField, idCol, opField, seqField, price, v2, held},
+		`[{"id": 1, "_openetl_id": "AQEBAQEBAQEBAQEBAQEBAQ==", "_openetl_op": "update", "_openetl_seq": 1, "price": null, "_openetl_held": ["price"]}]`))
+	fills := v2
+	fills.Metadata = arrow.NewMetadata([]string{destination.FillsKey}, []string{"price"})
+	e := destination.Epoch{Generation: 1, N: 2}
+	if err := w.(destination.Patcher).Patch(t.Context(), e, "users", batch(t, []arrow.Field{idField, idCol, seqField, held, fills, price},
+		`[{"id": 1, "_openetl_id": "AQEBAQEBAQEBAQEBAQEBAQ==", "_openetl_seq": 1, "_openetl_held": ["price"], "price__v2": 2.5, "price": "2.50"}]`)); err != nil {
+		t.Fatal(err)
+	}
+	commit(t, w, 2, "users")
+	if got := env.rows("SELECT CONCAT(coalesce(price, '-'), ':', price__v2, ':', coalesce(_openetl_held, '-')) FROM $schema.users"); !slices.Equal(got, []string{"2.50:2.5:-"}) {
+		t.Errorf("got %v", got)
 	}
 }
 

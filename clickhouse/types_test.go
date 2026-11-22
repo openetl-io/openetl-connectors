@@ -1,6 +1,7 @@
 package clickhouse
 
 import (
+	"net"
 	"slices"
 	"strings"
 	"testing"
@@ -43,6 +44,12 @@ func TestWidens(t *testing.T) {
 		{"DateTime64(6, 'UTC')", "DateTime64(3, 'UTC')", false},
 		{"DateTime64(3, 'UTC')", "DateTime64(6, 'Asia/Tokyo')", false},
 		{"Date32", "DateTime64(6, 'UTC')", true},
+		// DateTime64(9) ends at 2262-04-11, Date32 and DateTime64's others at
+		// 2299-12-31.
+		{"Date32", "DateTime64(9, 'UTC')", false},
+		{"DateTime64(6, 'UTC')", "DateTime64(9, 'UTC')", false},
+		{"Nullable(DateTime64(8))", "Nullable(DateTime64(9))", false},
+		{"DateTime64(9, 'UTC')", "DateTime64(9, 'UTC')", true},
 		{"Time64(3)", "Time64(6)", true},
 		{"Array(Nullable(Int32))", "Array(Nullable(Int64))", true},
 		{"Tuple(\n    months Int32,\n    days Int32,\n    nanoseconds Int64)", intervalType, true},
@@ -112,15 +119,20 @@ func TestSortingColumns(t *testing.T) {
 		{name: "b c", dt: arrow.BinaryTypes.String},
 		{name: "n", dt: arrow.PrimitiveTypes.Int64, nullable: true},
 		{name: "l", dt: arrow.ListOf(arrow.PrimitiveTypes.Int64)},
+		{name: "f", dt: arrow.PrimitiveTypes.Float64},
 	}
 	for key, want := range map[string]struct {
 		key []int
 		all bool
 	}{
-		"a, `b c`":        {[]int{0, 1}, true},
-		"a, toDate(b)":    {[]int{0}, false},
-		"n, a":            {nil, false},
-		"a, l":            {[]int{0}, false},
+		"a, `b c`":     {[]int{0, 1}, true},
+		"a, toDate(b)": {[]int{0}, false},
+		"n, a":         {nil, false},
+		"a, l":         {[]int{0}, false},
+		// A NaN compares false with every value, so a read can't resume
+		// after one, or past one in order.
+		"a, f":            {[]int{0}, false},
+		"f, a":            {nil, false},
 		"":                {nil, false},
 		"toStartOfDay(a)": {nil, false},
 	} {
@@ -194,6 +206,13 @@ func TestUntilQuery(t *testing.T) {
 		if got := untilQuery(s.from(c.t), at); got != c.want {
 			t.Errorf("%s:\n got %s\nwant %s", c.t.name, got, c.want)
 		}
+	}
+	// A NaN is never the highest: no row is at or below it, so a read up to
+	// it, and every read after, would read nothing.
+	f := sourceColumn{name: "f", typ: "Nullable(Float64)"}
+	want := "SELECT if(count() > 0, hex(toString(max(`f`))), NULL) FROM `db`.`m` WHERE `f` IS NOT NULL AND NOT isNaN(`f`)"
+	if got := untilQuery(s.from(table{name: "m"}), f); got != want {
+		t.Errorf("float cursor:\n got %s\nwant %s", got, want)
 	}
 }
 
@@ -302,6 +321,32 @@ func TestContainerNulls(t *testing.T) {
 			if err := col.AppendRow(c.value(arr, i)); err != nil {
 				t.Errorf("%s, row %d: %v", c.typ, i, err)
 			}
+		}
+	}
+}
+
+// A chunk's rows after the last one's order columns, compared column by
+// column, as a key's index skips granules by that but never by a tuple's
+// comparison.
+func TestAfter(t *testing.T) {
+	if got, want := after([]string{"`a`"}, []string{"1"}), "(`a` > 1)"; got != want {
+		t.Errorf("one column: %s, not %s", got, want)
+	}
+	if got, want := after([]string{"`a`", "`b`", "`c`"}, []string{"1", "2", "3"}), "(`a` > 1 OR `a` = 1 AND (`b` > 2 OR `b` = 2 AND (`c` > 3)))"; got != want {
+		t.Errorf("three columns: %s, not %s", got, want)
+	}
+}
+
+// An IPv6 address keeps its text, an IPv4-mapped one too, which net.IP
+// spells as IPv4; an IPv4 column's scans in 4 bytes.
+func TestIPText(t *testing.T) {
+	for ip, want := range map[string]string{"::ffff:1.2.3.4": "::ffff:1.2.3.4", "::1": "::1", "1.2.3.4": "1.2.3.4"} {
+		v := net.ParseIP(ip)
+		if !strings.Contains(ip, ":") {
+			v = v.To4()
+		}
+		if got := text(v); got != want {
+			t.Errorf("%s: %q", ip, got)
 		}
 	}
 }

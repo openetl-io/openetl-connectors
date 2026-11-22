@@ -12,6 +12,7 @@ import (
 	"github.com/twmb/franz-go/pkg/sr"
 
 	"github.com/openetl-io/openetl/sdk/go/check"
+	protocolv1 "github.com/openetl-io/openetl/sdk/go/protocol/v1"
 )
 
 // RegistryChecks reach the schema registry and sign in to it, each taking up
@@ -21,7 +22,7 @@ func (c *Config) RegistryChecks(timeout time.Duration) []check.Check {
 		return nil
 	}
 	var answered error
-	params := check.Params{"url": shownURL(c.SchemaRegistryURL)}
+	params := check.Params{"url": ShownURL(c.SchemaRegistryURL)}
 	authField := "schemaRegistryUrl"
 	if c.SchemaRegistryUsername != "" {
 		authField = "schemaRegistryPassword"
@@ -65,17 +66,36 @@ func (c *Config) RegistryChecks(timeout time.Duration) []check.Check {
 					}
 					return check.Unknown.Wrap(answered)
 				}
+				if answered == nil {
+					return c.ClearCredentials()
+				}
 				return answered
 			},
 		},
 	}
 }
 
-// shownURL is raw without its userinfo, query and fragment, which can hold
+var clearCredentials = check.Reason{
+	Name: "credentials_unencrypted", Code: protocolv1.ErrorCode_ERROR_CODE_CONFIG_INVALID,
+	Message: "The schema registry's URL is http, so its username and password cross the network unencrypted.",
+	Fix:     "Use the registry's https URL.",
+}
+
+// ClearCredentials is a check's warning if credentials for the registry,
+// from the settings or the URL, go over http; else nil.
+func (c *Config) ClearCredentials() error {
+	u, err := url.Parse(c.SchemaRegistryURL)
+	if err != nil || u.Scheme != "http" || (c.SchemaRegistryUsername == "" && u.User == nil) {
+		return nil
+	}
+	return check.Warn(clearCredentials.Fail())
+}
+
+// ShownURL is raw without its userinfo, query and fragment, which can hold
 // credentials, for params, which people see. A "?" or "#" in a password,
 // which ends the authority for url.Parse, doesn't keep the userinfo: an "@"
 // before the path ends it, wherever such a character is.
-func shownURL(raw string) string {
+func ShownURL(raw string) string {
 	scheme, rest := "", raw
 	if i := strings.Index(raw, "://"); i >= 0 {
 		scheme, rest = raw[:i+3], raw[i+3:]

@@ -62,9 +62,10 @@ func classify(err error) error {
 		return sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_CONFIG_INVALID, err)
 	case 229, 230, 262, 297, 300, 916, 1088, 15151, 15247, 22902:
 		return sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_PERMISSION_DENIED, err)
-	case 1205, 1222, 701, 8645, 10928, 10929, 40197, 40501, 40613, 49918, 49919, 49920, 233, 10053, 10054, 10060, 64, -2:
-		// Deadlock victims, lock timeouts, memory pressure, and Azure's
-		// throttling and failovers.
+	case 1204, 1205, 1222, 601, 701, 8645, 4221, 10928, 10929, 40143, 40197, 40501, 40540, 40613, 49918, 49919, 49920, 233, 10053, 10054, 10060, 64, -2:
+		// Deadlock victims, a NOLOCK read whose rows moved, lock timeouts,
+		// memory and lock pressure, a readable secondary still starting,
+		// and Azure's throttling and failovers.
 		return sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_TRANSIENT, err)
 	}
 	return err

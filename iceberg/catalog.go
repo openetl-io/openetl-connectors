@@ -2,11 +2,13 @@ package iceberg
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
+	"net/url"
 	"strings"
 
 	ice "github.com/apache/iceberg-go"
@@ -109,16 +111,9 @@ func (c *conn) glueEndpoint() string { return c.props["glue.endpoint"] }
 // with OAuth2 client credentials hands out a token, before it returns.
 func (c *conn) open(ctx context.Context) (catalog.Catalog, error) {
 	if c.cfg.Catalog == "glue" {
-		var opts []func(*awsconfig.LoadOptions) error
-		if c.cfg.Region != "" {
-			opts = append(opts, awsconfig.WithRegion(c.cfg.Region))
-		}
-		if !c.cfg.AccessKeyID.IsZero() {
-			opts = append(opts, awsconfig.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(c.cfg.AccessKeyID.Reveal(), c.cfg.SecretAccessKey.Reveal(), "")))
-		}
-		ac, err := awsconfig.LoadDefaultConfig(ctx, opts...)
+		ac, err := c.awsConfig(ctx)
 		if err != nil {
-			return nil, sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_CONFIG_INVALID, fmt.Errorf("iceberg: AWS config: %w", err))
+			return nil, err
 		}
 		if ep := c.glueEndpoint(); ep != "" {
 			ac.BaseEndpoint = aws.String(ep)
@@ -129,7 +124,10 @@ func (c *conn) open(ctx context.Context) (catalog.Catalog, error) {
 		}
 		return g, nil
 	}
-	opts := []rest.Option{rest.WithAdditionalProps(c.props)}
+	opts, err := c.restSignIn(ctx)
+	if err != nil {
+		return nil, err
+	}
 	if c.cfg.Warehouse != "" {
 		opts = append(opts, rest.WithWarehouseLocation(c.cfg.Warehouse))
 	}
@@ -144,6 +142,53 @@ func (c *conn) open(ctx context.Context) (catalog.Catalog, error) {
 		return nil, classify(fmt.Errorf("iceberg: catalog %s: %w", c.cfg.URI, err))
 	}
 	return r, nil
+}
+
+// awsConfig is the config's region and keys, or else the AWS defaults.
+func (c *conn) awsConfig(ctx context.Context) (aws.Config, error) {
+	var opts []func(*awsconfig.LoadOptions) error
+	if c.cfg.Region != "" {
+		opts = append(opts, awsconfig.WithRegion(c.cfg.Region))
+	}
+	if !c.cfg.AccessKeyID.IsZero() {
+		opts = append(opts, awsconfig.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(c.cfg.AccessKeyID.Reveal(), c.cfg.SecretAccessKey.Reveal(), "")))
+	}
+	ac, err := awsconfig.LoadDefaultConfig(ctx, opts...)
+	if err != nil {
+		return aws.Config{}, sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_CONFIG_INVALID, fmt.Errorf("iceberg: AWS config: %w", err))
+	}
+	return ac, nil
+}
+
+// restSignIn is the REST catalog's options with the properties that sign
+// in: iceberg-go reads them from its properties only after its first
+// request, for the catalog's config, which they must sign.
+func (c *conn) restSignIn(ctx context.Context) ([]rest.Option, error) {
+	opts := []rest.Option{rest.WithAdditionalProps(c.props)}
+	if v := c.props["scope"]; v != "" {
+		opts = append(opts, rest.WithScope(v))
+	}
+	if v := c.props["audience"]; v != "" {
+		opts = append(opts, rest.WithAudience(v))
+	}
+	if v := c.props["resource"]; v != "" {
+		opts = append(opts, rest.WithResource(v))
+	}
+	if v := cmp.Or(c.props["oauth2-server-uri"], c.props["rest.authorization-url"]); v != "" {
+		u, err := url.Parse(v)
+		if err != nil || u.Host == "" {
+			return nil, sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_CONFIG_INVALID, fmt.Errorf("iceberg: oauth2-server-uri %q isn't a URL", v))
+		}
+		opts = append(opts, rest.WithAuthURI(u))
+	}
+	if strings.EqualFold(c.props["rest.sigv4-enabled"], "true") {
+		ac, err := c.awsConfig(ctx)
+		if err != nil {
+			return nil, err
+		}
+		opts = append(opts, rest.WithAwsConfig(ac), rest.WithSigV4RegionSvc(cmp.Or(c.props["rest.signing-region"], ac.Region), c.props["rest.signing-name"]))
+	}
+	return opts, nil
 }
 
 // namespace is ns, or the config's, as a catalog identifier.

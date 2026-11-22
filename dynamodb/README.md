@@ -25,7 +25,7 @@ Keep `accessKeyId`, `secretAccessKey` and `sessionToken` in secrets, as `{ secre
 A check reports these as separate items:
 
 - the region;
-- DNS, then a TCP connection, then TLS where the endpoint is https (on AWS, `dynamodb.REGION.amazonaws.com:443`);
+- DNS, then a TCP connection, then TLS where the endpoint is https (on AWS, `dynamodb.REGION.amazonaws.com:443`), when `endpoint` is set or the region is known before connecting, from `region`, `AWS_REGION` or `AWS_DEFAULT_REGION`;
 - signing in, by listing the tables.
 
 ## Source
@@ -46,7 +46,7 @@ A Scan isn't a snapshot. It reads each item once, at whatever version the item h
 
 ### Incremental
 
-DynamoDB keeps no order of change, so an incremental read can't ask for "what changed since". It scans the whole table, with a filter on the pipeline's `cursor`: a top-level attribute, a number or a string, whose values only grow, such as an update time. **Every sync reads the whole table in read capacity, as a full refresh does**; it saves only what's emitted and written.
+DynamoDB keeps no order of change, so an incremental read can't ask for "what changed since". It scans the whole table, with a filter on the pipeline's `cursor`: a top-level attribute, a number, a string or a binary, whose values only grow, such as an update time. **Every sync reads the whole table in read capacity, as a full refresh does**; it saves only what's emitted and written.
 
 A read emits the items whose cursor is at or past its floor. The floor is the highest cursor value that the read before the last one saw, not the last one's. A write made while a scan runs, behind it, comes after every value the previous read saw, so the next read's floor is at or below it. This holds as long as cursor values only grow. The first two syncs emit every item. Items without the cursor attribute, or whose cursor has another type, are read only by those first syncs. Deleted items aren't seen; CDC sees deletes. When a cursor attribute holds numbers and strings, numbers count above strings, and strings above binaries.
 
@@ -64,11 +64,11 @@ A stream with CDC needs the table's DynamoDB stream enabled. The view type sets 
 
 With `KEYS_ONLY` or `OLD_IMAGE`, an update arrives as the item's current state, not as the change made it. A change to an item deleted since is skipped, and its delete follows. Prefer `NEW_AND_OLD_IMAGES`.
 
-The first sync takes a snapshot. It scans the table in parallel segments with consistent reads, and emits each item as an insert. It then reads every shard of the stream from its oldest record, and skips records created more than 5 minutes before the snapshot began; 5 minutes covers the rounding of a record's creation time and clock skew. So an item changed in those 5 minutes, or while the snapshot runs, arrives as the snapshot's row and again as its change, with a higher `seq`. A merge ends at the latest version. An append keeps both rows.
+The first sync takes a snapshot. It scans the table in parallel segments with consistent reads, and emits each item as an insert. It then reads every shard of the stream from its oldest record, and skips records created more than 5 minutes before the snapshot began; 5 minutes covers the rounding of a record's creation time. The snapshot's start, and a read's checks of the 24 hours below, are reckoned by AWS's clock, as the `Date` header of the read's last response has it, not the host's; the lag reported without reading is reckoned by the host's. So an item changed in those 5 minutes, or while the snapshot runs, arrives as the snapshot's row and again as its change, with a higher `seq`. A merge ends at the latest version. An append keeps both rows.
 
 Each row's `seq` is a 38-digit decimal: the snapshot's start, in seconds since 2020, times 10^29, plus the record's sequence number. It orders a key's changes, and puts the stream after its snapshot and a later snapshot after both. A sequence number of more than 29 digits fails the read with `CONTRACT_CHANGED`; DynamoDB's are up to 40 digits long, and Local's are 21.
 
-A stream's shards are read in parallel. A child shard starts only once its parents are read to their ends, or are gone, so a key's changes stay in order across splits and merges. The state keeps each shard's last sequence number. A bounded sync reads each shard up to the records created after the sync started. An open shard counts as read once 3 `GetRecords` calls in a row return nothing. The state then records that the shard had nothing after its position up to that moment, unless a sync recorded so within the last minute, and the next sync goes on from its position. A continuous sync keeps polling every shard, and lists the shards again every 10 seconds while it's reading none.
+A stream's shards are read in parallel. A child shard starts only once its parents are read to their ends, or are gone, so a key's changes stay in order across splits and merges. Once a shard is read to its end, the read lists only that shard's children, as `DescribeStream` allows 10 calls a second, or every shard if it has none listed. The state keeps each shard's last sequence number. A bounded sync reads each shard up to the records created after the sync started. An open shard counts as read once 3 `GetRecords` calls in a row return nothing, and the next sync goes on from its position. Empty pages don't prove a shard has nothing after them, so the read then asks for the first record created from the second after the shard's last record's, or since the last such check, with an `AT_TIMESTAMP` shard iterator. Only if there's none before that moment does the state record that the shard had nothing after its position up to it, unless a sync recorded so within the last minute; a record read later that was created before then moves that time back to the record's. An endpoint that refuses `AT_TIMESTAMP` as invalid has the empty pages taken as proof. DynamoDB Local fails it, so there the state never records this, and a shard with no records fails a sync more than 24 hours after the snapshot began with `POSITION_LOST`. A continuous sync keeps polling every shard, and lists the shards again every 10 seconds while it's reading none.
 
 A DynamoDB stream keeps records for 24 hours. The source reports each CDC stream's lag and how much of those 24 hours is left, from its state, without reading. A sync fails with `POSITION_LOST` when records it hasn't read may be gone:
 
@@ -77,11 +77,11 @@ A DynamoDB stream keeps records for 24 hours. The source reports each CDC stream
 - the table's stream was turned off and on again, so it has another ARN;
 - the snapshot, or a shard to be read from its start, began more than 24 hours ago.
 
-Re-sync the stream to recover. Syncs less than 24 hours apart don't fail this way, however idle a shard is, with one exception. If two syncs run within a minute of each other, a sync within a minute of 24 hours after them can fail on a trimmed position though nothing was lost. A trimmed position that a sync within the last 24 hours found nothing after loses nothing, and the read goes on from the shard's oldest record. A shard that left the stream had nothing after its position in that case either, and the read goes on without it.
+Re-sync the stream to recover. Syncs less than 24 hours apart don't fail this way, however idle a shard is, with three exceptions. If two syncs run within a minute of each other, a sync within a minute of 24 hours after them can fail on a trimmed position though nothing was lost. A sync whose `AT_TIMESTAMP` check fails past its retries records nothing for that shard, as if it hadn't run. On DynamoDB Local, as above, a shard with no records fails 24 hours after the snapshot began. A trimmed position that a sync within the last 24 hours found nothing after loses nothing, and the read goes on from the shard's oldest record. A shard that left the stream had nothing after its position in that case either, and the read goes on without it.
 
 ### Fields and types
 
-Items are schemaless, so discovery reads the table to find its top-level attributes. The key attributes come first, typed by the table's definition. Every other attribute follows by name, nullable, with a type that covers every value discovery saw:
+Items are schemaless, so discovery reads the table to find its top-level attributes. The key attributes come first: string and binary keys as the table's definition types them, and number keys as the table below types the values discovery saw, or `int64` for a table without items. Every other attribute follows by name, nullable, with a type that covers every value discovery saw:
 
 | Values seen | Column type |
 |---|---|
@@ -101,7 +101,7 @@ By default, discovery reads every item, in parallel segments, so a read never me
 
 ### Packed items
 
-With `packed: true`, each stream is the key attributes and `data`, a JSON column holding the item in DynamoDB JSON, such as `{"id":{"N":"5"},"tags":{"SS":["a"]}}`, which keeps every type. Discovery reads only the keys, and no read fails on a new attribute. A delete's `data` is the deleted item where the stream's view has old images, and null otherwise.
+With `packed: true`, each stream is the key attributes and `data`, a JSON column holding the item in DynamoDB JSON, such as `{"id":{"N":"5"},"tags":{"SS":["a"]}}`, which keeps every type. Discovery scans nothing of a table keyed on strings or binaries, and of one keyed on a number, only the key attributes, to find the number's type, from every item or `sampleSize` of them. No read fails on a new attribute. A delete's `data` is the deleted item where the stream's view has old images, and null otherwise.
 
 ### Set it up
 
@@ -188,26 +188,27 @@ An existing table keeps its key, and must be keyed on the attributes the stream 
 
 Each row is an item. A null is an attribute the item doesn't have. All three write modes work:
 
-- **Append** puts each row. Without deduplication, its `_openetl_row` is the order it was staged in, so two rows alike, which share an `_openetl_id`, both land. Deduplicated, its `_openetl_row` is `-`, so a row whose `_openetl_id` the table has is found: deduplication on the target skips it, and counts it as collapsed.
+- **Append** puts each row. Its `_openetl_row` is the order it was staged in, so two rows alike, which share an `_openetl_id`, both land. Deduplicated within each epoch, as a stream with no primary key that the pipeline requires only `at_least_once` of is, a row whose `_openetl_id` an earlier row of the epoch has is skipped and counted as collapsed, and a later epoch's row of that `_openetl_id` lands beside it. Deduplicated against the target, its `_openetl_row` is `-`, so a row whose `_openetl_id` the table has is found, skipped, and counted as collapsed.
 - **Overwrite** stages a read's rows. When the read ends, it writes them to the target, each with `_openetl_read` naming the read, then deletes the items the read didn't write. Until then, the target keeps its old items.
-- **Merge** puts each key's version under a condition on `_openetl_seq`, so an item with a higher `_openetl_seq` stays as it is. Deletes are soft unless the pipeline sets `destination.deletes: hard`. A soft delete keeps the item's attributes, and sets `_openetl_deleted` true with the delete's metadata. A hard delete is conditioned the same way, so an older version that arrives after it puts the item back.
+- **Merge** puts each key's version under a condition on `_openetl_seq`, so an item with a higher `_openetl_seq` stays as it is. A version that holds a value also leaves an item that is that version already, by `_openetl_id`, whose held values a patch may have filled since; one that holds none is put again. Deletes are soft unless the pipeline sets `destination.deletes: hard`. A soft delete keeps the item's attributes, and sets `_openetl_deleted` true with the delete's metadata. A hard delete is conditioned on `_openetl_seq` the same way, so an older version that arrives after it puts the item back.
 
 ### Commits
 
 The destination stages each epoch's rows as items of a control table, `_openetl_state`, which also holds each pipeline's fence. With a namespace, it's `NAMESPACE._openetl_state`, or else it's `tablePrefix` and `_openetl_state`. Commit then applies them with writes that land alike however often they run: merge's conditional puts and deletes, and append's puts by `_openetl_id` and `_openetl_row`. Rows are applied in parallel, in 16 groups by key, so a key's versions apply in order.
 
-A stream's apply ends with its marker, which one conditional update of the pipeline's fence item writes. It's refused once a newer attempt has raised the fence. An attempt that recovers applies again, from their staging, the epochs whose markers aren't there, and finishes an overwrite's switch that a crash cut short. So a stream lands exactly once, or effectively once when it's merged from a source that may repeat rows. Leave `_openetl_state` in place.
+A stream's apply ends with its marker, which a conditional update of the pipeline's fence item writes: with the pipeline's commit scope, one update writes every stream's marker once all of them are applied, and with the stream's, each stream's follows its own apply. The update is refused once a newer attempt has raised the fence. An attempt that recovers applies again, from their staging, the epochs whose markers aren't there, and finishes an overwrite's switch that a crash cut short. So a stream lands exactly once, or effectively once when it's merged from a source that may repeat rows. Leave `_openetl_state` in place.
 
 DynamoDB has no multi-table transaction for a whole epoch, and no table rename:
 
 - Readers can see part of an epoch while it's applied, and after a crash, until the next attempt applies the rest.
+- With the pipeline's commit scope, the streams' markers are written together, but not their writes: a commit that fails on one stream leaves the streams it applied before it visible, and the next attempt applies the rest.
 - An overwrite's switch from old items to new isn't atomic. Readers see both while it runs.
-- A replaced attempt that's still applying finishes the writes it started. They're the same writes the next attempt makes, except for a stream appended without deduplication, whose rows the next attempt stages again, with other `_openetl_row`s, and which can then land twice.
+- A replaced attempt that's still applying finishes the writes it started. They're the same writes the next attempt makes, except for a stream appended without deduplication against the target, whose rows the next attempt stages again, with other `_openetl_row`s, and which can then land twice, the replaced attempt's copy without the held values that the next attempt filled in its own.
 - An overwrite's switch isn't fenced: its puts and its deletes of the items the read didn't write are plain writes, and only the marker after them is checked against the fence. A replaced attempt still switching a read in, after the next attempt has finished that switch and then switched a later read in, deletes the later read's items, so the target can be left with few of its items or none until the stream is read again.
 
-Each row costs about three writes: staging it, applying it, and deleting it from staging. A merged row that keeps a target value, or a soft delete, also reads the item. Recovery and the start of an overwrite read scan the control table. Up to 16 writer lanes write at once. A continuous pipeline commits every 10 seconds unless it sets its own `delivery.commit.interval`.
+Each row costs about three writes: staging it, applying it, and deleting it from staging. An overwritten row costs two more, as it's copied into its read's partition of the control table and deleted from there after the switch, which also scans the target for the items the read didn't write. A merged row that keeps a target value, or a soft delete, also reads the item. Recovery and the start of an overwrite read scan the control table. Up to 16 writer lanes write at once. A continuous pipeline commits every 10 seconds unless it sets its own `delivery.commit.interval`.
 
-Throttled requests are retried with backoff, up to 10 attempts at most 10 seconds apart, and unprocessed batch items are sent again after a pause that grows from 50 ms to 5 s.
+Throttled requests are retried with backoff, up to 10 attempts at most 10 seconds apart, and unprocessed batch items are sent again after a random pause, between half and all of a bound that grows from 50 ms to 5 s.
 
 ### Set it up
 
@@ -259,7 +260,7 @@ spec:
 
 ### Schema changes
 
-An item has no column types. A new column is a new attribute, and a widened column's new values land beside the old ones, whatever their types. DynamoDB fixes the type of only the attributes that the table or an index is keyed on. A column among them whose type changes is refused, and the stream holds it. The refusal gives what makes the table take the change:
+An item has no column types. A new column is a new attribute, and a widened column's new values land beside the old ones, whatever their types. DynamoDB fixes the type of only the attributes that the table or an index is keyed on. A column among them whose type changes is refused, and the stream holds it where it can: the table's key attributes take no null, and the destination says they can't be held, whole or by cell. The refusal gives what makes the table take the change:
 
 - For the table's key, delete the table, and the next sync creates it:
 
@@ -273,9 +274,7 @@ An item has no column types. A new column is a new attribute, and a widened colu
   aws dynamodb update-table --table-name raw_orders --global-secondary-index-updates '[{"Delete":{"IndexName":"by_customer"}}]'
   ```
 
-A local secondary index can't change without recreating the table.
-
-The table's key attributes take no null, and OpenETL holds no cell there.
+- A local secondary index can't change without recreating the table: delete the table, then create it again with the index keyed on the new type, or let the next sync create it without the index.
 
 ### Limits
 

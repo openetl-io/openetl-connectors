@@ -73,15 +73,19 @@ var dayToSecond = regexp.MustCompile(`^[+-]\d+ \d{2}:\d{2}:\d{2}(\.\d+)?$`)
 // object of months, days and nanoseconds decoded. None if it doesn't exist.
 func readTable(ctx context.Context, db *sql.DB, schema, table string) ([]map[string]any, error) {
 	types := map[string]string{}
-	cols, err := db.QueryContext(ctx, "SELECT column_name, data_type FROM all_tab_columns WHERE owner = :1 AND table_name = :2", schema, table)
+	cols, err := db.QueryContext(ctx, "SELECT column_name, data_type, data_precision, data_scale FROM all_tab_columns WHERE owner = :1 AND table_name = :2", schema, table)
 	if err != nil {
 		return nil, err
 	}
 	for cols.Next() {
 		var c, typ string
-		if err := cols.Scan(&c, &typ); err != nil {
+		var prec, scale sql.NullInt64
+		if err := cols.Scan(&c, &typ, &prec, &scale); err != nil {
 			_ = cols.Close()
 			return nil, err
+		}
+		if typ == "NUMBER" && prec.Valid && prec.Int64 == 1 && (!scale.Valid || scale.Int64 == 0) {
+			typ = "NUMBER(1)"
 		}
 		types[c] = typ
 	}
@@ -118,6 +122,18 @@ func readTable(ctx context.Context, db *sql.DB, schema, table string) ([]map[str
 }
 
 func readValue(typ string, v any) any {
+	if typ == "NUMBER(1)" {
+		switch x := v.(type) {
+		case int64:
+			return x != 0
+		case float64:
+			return x != 0
+		case string:
+			return x == "1"
+		case bool:
+			return x
+		}
+	}
 	s, ok := v.(string)
 	switch {
 	case !ok:
@@ -341,6 +357,59 @@ func TestDestinationMergeUnchanged(t *testing.T) {
 	})
 }
 
+// An epoch whose rows have _openetl_unchanged, none listing a column,
+// applies.
+func TestDestinationMergeNoneUnchanged(t *testing.T) {
+	e := newDestEnv(t, "OPENETL_D_UNCHNONE", ownGrants...)
+	w := e.open(1, destination.OpenConfig{Streams: []destination.Stream{{Name: "U", Mode: destination.Merge, PrimaryKey: []string{"k"}}}})
+	fields := []arrow.Field{{Name: "k", Type: arrow.PrimitiveTypes.Int64}, {Name: "v", Type: arrow.BinaryTypes.String, Nullable: true}, opField, seqField, unchField}
+	e.commit(w, 1, streamBatch{"U", batchOf(t, fields, `[{"k": 1, "v": "a", "_openetl_op": "insert", "_openetl_seq": "1"}]`)})
+	e.commit(w, 2, streamBatch{"U", batchOf(t, fields, `[{"k": 1, "v": "b", "_openetl_op": "update", "_openetl_seq": "2"}]`)})
+	equal(t, "U", e.rows(e.user, "U", "k", "v", colUnchanged), []string{"k=1, v=b, _openetl_unchanged=<null>"})
+}
+
+// A column the latest version didn't send keeps the target's value where
+// the staged version that sent it is older than the target's row.
+func TestDestinationMergeUnchangedOlderThanTarget(t *testing.T) {
+	e := newDestEnv(t, "OPENETL_D_UNCHOLD", ownGrants...)
+	w := e.open(1, destination.OpenConfig{Streams: []destination.Stream{{Name: "U", Mode: destination.Merge, PrimaryKey: []string{"k"}}}})
+	fields := []arrow.Field{{Name: "k", Type: arrow.PrimitiveTypes.Int64}, {Name: "v", Type: arrow.BinaryTypes.String, Nullable: true},
+		{Name: "n", Type: arrow.PrimitiveTypes.Int64, Nullable: true}, opField, seqField, unchField}
+	commit := func(n uint64, rows string) { e.commit(w, n, streamBatch{"U", batchOf(t, fields, rows)}) }
+	commit(1, `[{"k": 1, "v": "current", "n": 10, "_openetl_op": "insert", "_openetl_seq": "10"},
+		{"k": 2, "v": "current", "n": 10, "_openetl_op": "insert", "_openetl_seq": "10"}]`)
+	commit(2, `[{"k": 1, "v": "old", "n": 5, "_openetl_op": "update", "_openetl_seq": "5"},
+		{"k": 1, "v": null, "n": 11, "_openetl_op": "update", "_openetl_seq": "11", "_openetl_unchanged": ["v"]},
+		{"k": 2, "v": "newer", "n": 12, "_openetl_op": "update", "_openetl_seq": "12"},
+		{"k": 2, "v": null, "n": 13, "_openetl_op": "update", "_openetl_seq": "13", "_openetl_unchanged": ["v"]}]`)
+	equal(t, "U", e.rows(e.user, "U", "k", "v", "n", colUnchanged), []string{
+		"k=1, v=current, n=11, _openetl_unchanged=<null>",
+		"k=2, v=newer, n=13, _openetl_unchanged=<null>",
+	})
+}
+
+// With held columns too, a held column comes with its hold from a newer
+// version than the target's row, and not from an older one.
+func TestDestinationMergeHeldUnchangedOlderThanTarget(t *testing.T) {
+	e := newDestEnv(t, "OPENETL_D_HELDOLD", ownGrants...)
+	w := e.open(1, destination.OpenConfig{Streams: []destination.Stream{{Name: "U", Mode: destination.Merge, PrimaryKey: []string{"k"}}}})
+	heldField := arrow.Field{Name: destination.HeldColumn, Type: arrow.ListOf(arrow.BinaryTypes.String), Nullable: true}
+	fields := []arrow.Field{{Name: "k", Type: arrow.PrimitiveTypes.Int64}, {Name: "v", Type: arrow.BinaryTypes.String, Nullable: true},
+		{Name: "n", Type: arrow.PrimitiveTypes.Int64, Nullable: true}, idField, opField, seqField, unchField, heldField}
+	commit := func(n uint64, rows string) { e.commit(w, n, streamBatch{"U", batchOf(t, fields, rows)}) }
+	commit(1, fmt.Sprintf(`[{"k": 1, "v": "current", "n": 10, "_openetl_id": %q, "_openetl_op": "insert", "_openetl_seq": "10"},
+		{"k": 2, "v": "current", "n": 10, "_openetl_id": %q, "_openetl_op": "insert", "_openetl_seq": "10"}]`, rowID(1), rowID(2)))
+	commit(2, fmt.Sprintf(`[{"k": 1, "v": null, "n": 5, "_openetl_id": %q, "_openetl_op": "update", "_openetl_seq": "5", "_openetl_held": ["v"]},
+		{"k": 1, "v": null, "n": 11, "_openetl_id": %q, "_openetl_op": "update", "_openetl_seq": "11", "_openetl_unchanged": ["v"]},
+		{"k": 2, "v": null, "n": 12, "_openetl_id": %q, "_openetl_op": "update", "_openetl_seq": "12", "_openetl_held": ["v"]},
+		{"k": 2, "v": null, "n": 13, "_openetl_id": %q, "_openetl_op": "update", "_openetl_seq": "13", "_openetl_unchanged": ["v"]}]`, rowID(3), rowID(4), rowID(5), rowID(6)))
+	got := e.rows(e.user, "U", "k", "v", "n", colUnchanged, destination.HeldColumn)
+	if len(got) != 2 || got[0] != "k=1, v=current, n=11, _openetl_unchanged=<null>, _openetl_held=<null>" ||
+		!strings.HasPrefix(got[1], "k=2, v=<null>, n=13, _openetl_unchanged=<null>, _openetl_held={") {
+		t.Fatalf("got %q", got)
+	}
+}
+
 // textOf is a value as readTable gives it, as text: times in UTC, and long
 // text and binary values by their length.
 func textOf(v any) string {
@@ -497,9 +566,20 @@ func TestDestinationTypesRoundTrip(t *testing.T) {
 	for _, c := range cat["T"].cols {
 		types[c.name] = c.typ
 	}
+	_, _, compatible, err := server(t.Context(), e.admin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	boolType := "NUMBER(1)"
+	if major(compatible) >= 23 {
+		boolType = "BOOLEAN"
+	}
+	if w.boolean != (major(compatible) >= 23) {
+		t.Errorf("w.boolean = %v with COMPATIBLE %s", w.boolean, compatible)
+	}
 	for c, typ := range map[string]string{
 		"id": "NUMBER(19)", "i8": "NUMBER(3)", "i16": "NUMBER(5)", "i32": "NUMBER(10)", "u8": "NUMBER(3)", "u16": "NUMBER(5)", "u32": "NUMBER(10)", "u64": "NUMBER(20)", "f32": "BINARY_FLOAT", "f64": "BINARY_DOUBLE",
-		"dec": "NUMBER(38,9)", "dec2": "NUMBER(10,2)", "wide": "VARCHAR2(63 BYTE)", "b": "BOOLEAN", "s": "CLOB", "bin": "BLOB", "d": "DATE",
+		"dec": "NUMBER(38,9)", "dec2": "NUMBER(10,2)", "wide": "VARCHAR2(63 BYTE)", "b": boolType, "s": "CLOB", "bin": "BLOB", "d": "DATE",
 		"tm": "INTERVAL DAY(0) TO SECOND(6)", "tmn": "INTERVAL DAY(0) TO SECOND(9)", "ts": "TIMESTAMP(6)", "tsz": "TIMESTAMP(6) WITH TIME ZONE",
 		"tsn": "TIMESTAMP(9)", "tszn": "TIMESTAMP(9) WITH TIME ZONE", "iv": "VARCHAR2(100 BYTE)", "lst": "CLOB", "st": "CLOB", "j": "CLOB", "u": "VARCHAR2(36 BYTE)",
 	} {
@@ -975,7 +1055,21 @@ func TestDestinationChecksItemByItem(t *testing.T) {
 	}
 	passed := map[string]string{"net.dns": "passed", "net.connect": "passed", "db.connect": "passed", "server.version": "passed",
 		"server.compatible": "passed", "privilege.create-table": "passed", "quota.tablespace": "passed"}
-	expectItems(t, "the least-privileged user", check.Run(t.Context(), e.d.Checks()), passed)
+	chk := check.Run(t.Context(), e.d.Checks())
+	expectItems(t, "the least-privileged user", chk, passed)
+	_, _, compatible, err := server(t.Context(), e.admin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantBool := "NUMBER(1), 1 for true"
+	if major(compatible) >= 23 {
+		wantBool = "BOOLEAN"
+	}
+	for _, it := range chk.Items {
+		if it.Name == "server.compatible" && !strings.Contains(it.Rendered().Message, wantBool) {
+			t.Errorf("server.compatible = %q, want %q", it.Rendered().Message, wantBool)
+		}
+	}
 	if err := e.d.Check(t.Context()); err != nil {
 		t.Fatal(err)
 	}

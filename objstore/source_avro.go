@@ -119,6 +119,11 @@ func avroField(name string, n *avro.SchemaNode) arrow.Field {
 	case "uuid":
 		f.Type, f.Metadata = &arrow.FixedSizeBinaryType{ByteWidth: 16}, uuidMeta
 		return f
+	case "duration":
+		if n.Type == "fixed" && n.Size == 12 {
+			f.Metadata = jsonMeta
+			return f
+		}
 	}
 	switch n.Type {
 	case "boolean":
@@ -223,6 +228,8 @@ func generic(v any) any {
 		return v.UTC().Format(time.RFC3339Nano)
 	case time.Duration:
 		return time.Time{}.Add(v).Format("15:04:05.000000")
+	case avro.Duration:
+		return map[string]any{"months": v.Months, "days": v.Days, "milliseconds": v.Milliseconds}
 	case *big.Rat:
 		// A decimal where its scale isn't at hand, nested in a JSON value:
 		// a whole number over a power of ten, written exactly.
@@ -270,6 +277,10 @@ func (s *Source) readAvro(ctx context.Context, b *blob.Bucket, o object, at file
 	}
 	stream := make([]*column, len(fs))
 	for i, f := range fs {
+		if controlColumn(f.Name) {
+			// The source's own takes its place.
+			continue
+		}
 		if declared != nil && !declared[f.Name] {
 			return undeclared(o.Key, f.Name)
 		}
@@ -308,6 +319,9 @@ func (s *Source) readAvro(ctx context.Context, b *blob.Bucket, o object, at file
 			}
 			obj := make(map[string]json.RawMessage, len(fs)+3)
 			for i, f := range fs {
+				if stream[i] == nil {
+					continue
+				}
 				v, verr := avroJSON(&fs[i].Type, rec[f.Name], stream[i].field)
 				if verr != nil {
 					return fmt.Errorf("objstore: %s: record %d: field %q: %w", o.Key, line, f.Name, verr)

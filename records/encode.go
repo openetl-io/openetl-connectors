@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/bufbuild/protocompile"
+	"github.com/bufbuild/protocompile/linker"
 	"github.com/twmb/avro"
 	"github.com/twmb/franz-go/pkg/sr"
 	"google.golang.org/protobuf/proto"
@@ -573,7 +574,7 @@ func protoType(c *Col, indent string, prev *protoLayout) (string, string, error)
 	return "", "", fmt.Errorf("column %q: no Protobuf type", c.name)
 }
 
-func compileProto(ctx context.Context, files map[string]string, root string) (protoreflect.FileDescriptor, error) {
+func compileProto(ctx context.Context, files map[string]string, root string) (linker.File, error) {
 	c := protocompile.Compiler{Resolver: protocompile.WithStandardImports(&protocompile.SourceResolver{Accessor: protocompile.SourceAccessorFromMap(files)})}
 	fds, err := c.Compile(ctx, root)
 	if err != nil {

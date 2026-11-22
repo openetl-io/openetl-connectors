@@ -179,5 +179,5 @@ func (w *writer) dropRead(ctx context.Context, stream string, r *read) {
 		}
 		w.dropManifests(w.ns, r.table, dir)
 	}
-	w.dropFiles(w.ns, r.table, files)
+	w.dropFiles(w.ctx, w.ns, r.table, files)
 }

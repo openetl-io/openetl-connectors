@@ -18,6 +18,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"math/rand/v2"
 	"slices"
 	"strconv"
 	"strings"
@@ -531,17 +532,31 @@ func (w *writer) PatchSQL(s stagedStream, p prepared) []string {
 	} else {
 		match = []string{"t." + quote(idColumn) + " = p." + quote(idColumn)}
 	}
+	heldOf := func(c string) string {
+		if f, ok := s.Fills[c]; ok {
+			return f
+		}
+		return c
+	}
+	// The last column that fills each held column, whose UPDATE takes it out
+	// of the target's _openetl_held: an UPDATE before it needs it there.
+	last := map[string]string{}
+	for _, c := range cols {
+		if !slices.Contains(metadataColumns, c) && !slices.Contains(s.Key, c) {
+			last[heldOf(c)] = c
+		}
+	}
 	var out []string
 	for _, c := range cols {
 		if slices.Contains(metadataColumns, c) || slices.Contains(s.Key, c) {
 			continue
 		}
-		held := c
-		if f, ok := s.Fills[c]; ok {
-			held = f
-		}
+		held := heldOf(c)
 		lit, path := literal(held), jsonPath(held)
-		set := quote(c) + " = p." + quote(c) + ", " + quote(heldColumn) + " = NULLIF(JSON_MODIFY(t." + quote(heldColumn) + ", " + path + ", NULL), N'{}')"
+		set := quote(c) + " = p." + quote(c)
+		if last[held] == c {
+			set += ", " + quote(heldColumn) + " = NULLIF(JSON_MODIFY(t." + quote(heldColumn) + ", " + path + ", NULL), N'{}')"
+		}
 		if slices.Contains(cols, syncedColumn) {
 			set += ", " + quote(syncedColumn) + " = p." + quote(syncedColumn)
 		}
@@ -1025,11 +1040,13 @@ func (w *writer) ensureKey(ctx context.Context, table string, key []string) ([]c
 	}
 	keys, _ := json.Marshal(key)
 	var has int
-	err = w.db.QueryRowContext(ctx, `SELECT count(*) FROM sys.indexes i WHERE i.object_id = OBJECT_ID(@p1) AND i.type > 0 AND i.has_filter = 0
-		AND (SELECT count(*) FROM sys.index_columns ic WHERE ic.object_id = i.object_id AND ic.index_id = i.index_id AND ic.key_ordinal > 0) = @p3
-		AND NOT EXISTS (SELECT 1 FROM sys.index_columns ic JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id
-			WHERE ic.object_id = i.object_id AND ic.index_id = i.index_id AND ic.key_ordinal > 0 AND c.name NOT IN (SELECT value FROM OPENJSON(@p2)))`,
-		w.ident(table), string(keys), len(key)).Scan(&has)
+	err = w.victim(ctx, func(conn *sql.Conn) error {
+		return conn.QueryRowContext(ctx, `SELECT count(*) FROM sys.indexes i WHERE i.object_id = OBJECT_ID(@p1) AND i.type > 0 AND i.has_filter = 0
+			AND (SELECT count(*) FROM sys.index_columns ic WHERE ic.object_id = i.object_id AND ic.index_id = i.index_id AND ic.key_ordinal > 0) = @p3
+			AND NOT EXISTS (SELECT 1 FROM sys.index_columns ic JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id
+				WHERE ic.object_id = i.object_id AND ic.index_id = i.index_id AND ic.key_ordinal > 0 AND c.name NOT IN (SELECT value FROM OPENJSON(@p2)))`,
+			w.ident(table), string(keys), len(key)).Scan(&has)
+	})
 	if err != nil {
 		return nil, classify(fmt.Errorf("sqlserver: read the indexes of %s: %w", table, err))
 	}
@@ -1149,41 +1166,87 @@ func (w *writer) catalog(ctx context.Context, tables []string) (map[string]*tabl
 		idents[i] = w.ident(t)
 	}
 	list, _ := json.Marshal(idents)
-	rows, err := w.db.QueryContext(ctx, `SELECT CONVERT(int, j.[key]), c.name, TYPE_NAME(c.system_type_id), c.max_length, c.precision, c.scale, c.is_nullable, `+ownIndexes+`, coalesce(c.collation_name, ''), `+theirIndex+`
-		FROM OPENJSON(@p1) AS j JOIN sys.columns c ON c.object_id = OBJECT_ID(j.value)
-		ORDER BY CONVERT(int, j.[key]), c.column_id`, string(list))
+	var out map[string]*tableInfo
+	err := w.victim(ctx, func(conn *sql.Conn) error {
+		// One literal, with ownIndexes and theirIndex written out.
+		rows, err := conn.QueryContext(ctx, `SELECT CONVERT(int, j.[key]), c.name, TYPE_NAME(c.system_type_id), c.max_length, c.precision, c.scale, c.is_nullable,
+			coalesce((SELECT STRING_AGG(i.name, N',') FROM sys.index_columns ic JOIN sys.indexes i ON i.object_id = ic.object_id AND i.index_id = ic.index_id
+				WHERE ic.object_id = c.object_id AND ic.column_id = c.column_id AND i.name LIKE N'\_openetl\_%' ESCAPE N'\'), N''),
+			coalesce(c.collation_name, ''),
+			coalesce((SELECT TOP (1) i.name FROM sys.index_columns ic JOIN sys.indexes i ON i.object_id = ic.object_id AND i.index_id = ic.index_id
+				WHERE ic.object_id = c.object_id AND ic.column_id = c.column_id AND i.name NOT LIKE N'\_openetl\_%' ESCAPE N'\'), N'')
+			FROM OPENJSON(@p1) AS j JOIN sys.columns c ON c.object_id = OBJECT_ID(j.value)
+			ORDER BY CONVERT(int, j.[key]), c.column_id`, string(list))
+		if err != nil {
+			return err
+		}
+		defer func() { _ = rows.Close() }()
+		out = map[string]*tableInfo{}
+		for rows.Next() {
+			var i int
+			var c sourceColumn
+			var nullable bool
+			var own, theirs string
+			if err := rows.Scan(&i, &c.name, &c.typ, &c.maxLength, &c.precision, &c.scale, &nullable, &own, &c.collation, &theirs); err != nil {
+				return err
+			}
+			name := tables[i]
+			t := out[name]
+			if t == nil {
+				t = &tableInfo{notNull: map[string]bool{}, own: map[string][]string{}, theirs: map[string]string{}}
+				out[name] = t
+			}
+			t.cols = append(t.cols, column{name: c.name, typ: c.sqlType(), collation: c.collation})
+			t.notNull[c.name] = !nullable
+			if own != "" {
+				t.own[c.name] = strings.Split(own, ",")
+			}
+			if theirs != "" {
+				t.theirs[c.name] = theirs
+			}
+		}
+		return rows.Err()
+	})
 	if err != nil {
 		return nil, classify(fmt.Errorf("sqlserver: read the columns of %s: %w", strings.Join(tables, ", "), err))
 	}
-	defer func() { _ = rows.Close() }()
-	out := map[string]*tableInfo{}
-	for rows.Next() {
-		var i int
-		var c sourceColumn
-		var nullable bool
-		var own, theirs string
-		if err := rows.Scan(&i, &c.name, &c.typ, &c.maxLength, &c.precision, &c.scale, &nullable, &own, &c.collation, &theirs); err != nil {
-			return nil, classify(err)
-		}
-		name := tables[i]
-		t := out[name]
-		if t == nil {
-			t = &tableInfo{notNull: map[string]bool{}, own: map[string][]string{}, theirs: map[string]string{}}
-			out[name] = t
-		}
-		t.cols = append(t.cols, column{name: c.name, typ: c.sqlType(), collation: c.collation})
-		t.notNull[c.name] = !nullable
-		if own != "" {
-			t.own[c.name] = strings.Split(own, ",")
-		}
-		if theirs != "" {
-			t.theirs[c.name] = theirs
-		}
-	}
-	if err := rows.Err(); err != nil {
-		return nil, classify(fmt.Errorf("sqlserver: read the columns of %s: %w", strings.Join(tables, ", "), err))
-	}
 	return out, nil
+}
+
+// victim runs read on a connection of its own at a low deadlock priority, so
+// that in a deadlock with another session's DDL, such as another schema's
+// drop of a staging table, read is the one rolled back, and runs it again,
+// up to 5 times. Reading the catalog, read committed, holds a lock on a row
+// of another table's columns while it waits to see that table, which the
+// DDL has locked while it waits on the row.
+func (w *writer) victim(ctx context.Context, read func(*sql.Conn) error) error {
+	wait := 50 * time.Millisecond
+	for try := 1; ; try++ {
+		err := func() error {
+			conn, err := w.db.Conn(ctx)
+			if err != nil {
+				return err
+			}
+			defer func() { _ = conn.Close() }()
+			if _, err := conn.ExecContext(ctx, "SET DEADLOCK_PRIORITY LOW"); err != nil {
+				return err
+			}
+			defer func() { _, _ = conn.ExecContext(context.WithoutCancel(ctx), "SET DEADLOCK_PRIORITY NORMAL") }()
+			return read(conn)
+		}()
+		me, ok := errors.AsType[mssql.Error](err)
+		if try == 5 || !ok || me.Number != 1205 && me.Number != 601 {
+			return err
+		}
+		t := time.NewTimer(wait + rand.N(wait))
+		select {
+		case <-t.C:
+		case <-ctx.Done():
+			t.Stop()
+			return ctx.Err()
+		}
+		wait *= 2
+	}
 }
 
 // alter creates the table with cols if it doesn't exist, or adds its new
@@ -1401,9 +1464,11 @@ func (w *writer) Fence(ctx context.Context, gen uint64) error {
 	if err := w.ensureSchema(ctx); err != nil {
 		return err
 	}
+	// Names compare by code point: the database's collation may take
+	// streams that differ in case as one.
 	for _, q := range []string{
-		"IF OBJECT_ID(" + literal(w.fenceTable()) + ", N'U') IS NULL CREATE TABLE " + w.fenceTable() + " (pipeline nvarchar(450) NOT NULL PRIMARY KEY, generation bigint NOT NULL)",
-		"IF OBJECT_ID(" + literal(w.loadsTable()) + ", N'U') IS NULL CREATE TABLE " + w.loadsTable() + ` (pipeline nvarchar(200) NOT NULL, stream nvarchar(200) NOT NULL,
+		"IF OBJECT_ID(" + literal(w.fenceTable()) + ", N'U') IS NULL CREATE TABLE " + w.fenceTable() + " (pipeline nvarchar(450) COLLATE " + binaryCollation + " NOT NULL PRIMARY KEY, generation bigint NOT NULL)",
+		"IF OBJECT_ID(" + literal(w.loadsTable()) + ", N'U') IS NULL CREATE TABLE " + w.loadsTable() + ` (pipeline nvarchar(200) COLLATE ` + binaryCollation + ` NOT NULL, stream nvarchar(200) COLLATE ` + binaryCollation + ` NOT NULL,
 			generation bigint NOT NULL, epoch bigint NOT NULL, loaded_at datetime2 NOT NULL DEFAULT SYSUTCDATETIME(),
 			PRIMARY KEY (pipeline, stream, generation, epoch))`,
 	} {
@@ -1500,12 +1565,23 @@ func (w *writer) dropAbandonedReads(ctx context.Context, q querier, drop func(l 
 }
 
 // DropRemovedReads drops the read tables of streams that no longer
-// overwrite, once Recover has raised the fence. Best effort, like
-// dropStaging.
+// overwrite, once Recover has raised the fence, and while it holds it: a
+// newer generation that overwrites such a stream may have raised it since.
+// Best effort, like dropStaging.
 func (w *writer) DropRemovedReads(ctx context.Context) {
-	_ = w.dropAbandonedReads(ctx, w.db, func(l sqlstage.ReadLabel, _ string) bool {
+	tx, err := w.db.BeginTx(ctx, nil)
+	if err != nil {
+		return
+	}
+	defer func() { _ = tx.Rollback() }()
+	if w.LockFence(ctx, tx, "HOLDLOCK, ROWLOCK") != nil {
+		return
+	}
+	if w.dropAbandonedReads(ctx, tx, func(l sqlstage.ReadLabel, _ string) bool {
 		return w.streams[l.Stream].Mode != destination.Overwrite
-	})
+	}) == nil {
+		_ = tx.Commit()
+	}
 }
 
 func (w *writer) Close(context.Context) error { return w.db.Close() }

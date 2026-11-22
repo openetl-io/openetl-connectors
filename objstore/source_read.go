@@ -65,17 +65,20 @@ func open(ctx context.Context, b *blob.Bucket, o object, offset int64) (*blob.Re
 	if err != nil {
 		return nil, fmt.Errorf("objstore: read %s: %w", o.Key, err)
 	}
-	if !sameVersion(r.ModTime(), r.Size(), o) {
+	if !sameVersion(r, o) {
 		_ = r.Close()
 		return nil, changed(o.Key)
 	}
 	return r, nil
 }
 
-// sameVersion: listings give some stores' modification times finer than
-// reads do.
-func sameVersion(mod time.Time, size int64, o object) bool {
-	return size == o.Size && mod.Truncate(time.Second).Equal(o.Modified.Truncate(time.Second))
+// sameVersion: r reads the version of o listed. Listings give some stores'
+// modification times finer than reads do.
+func sameVersion(r *blob.Reader, o object) bool {
+	if r.Size() != o.Size || !r.ModTime().Truncate(time.Second).Equal(o.Modified.Truncate(time.Second)) {
+		return false
+	}
+	return o.version == nil || sameTag(o.version(r.As), o.Version)
 }
 
 // rangeReaderAt reads a file by ranges, as Parquet's reader does.
@@ -96,7 +99,7 @@ func (r *rangeReaderAt) ReadAt(p []byte, off int64) (int, error) {
 		return 0, fmt.Errorf("objstore: read %s: %w", r.o.Key, err)
 	}
 	defer func() { _ = rr.Close() }()
-	if !sameVersion(rr.ModTime(), rr.Size(), r.o) {
+	if !sameVersion(rr, r.o) {
 		return 0, changed(r.o.Key)
 	}
 	got, err := io.ReadFull(rr, p[:n])
@@ -215,6 +218,11 @@ func (s *Source) readParquet(ctx context.Context, b *blob.Bucket, o object, at f
 	stream := make([]*column, sc.NumFields())
 	convs := make([]conversion, sc.NumFields())
 	for i, f := range sc.Fields() {
+		if controlColumn(f.Name) {
+			// The source's own takes its place.
+			fields = append(fields, f)
+			continue
+		}
 		if declared != nil && !declared[f.Name] {
 			return undeclared(o.Key, f.Name)
 		}
@@ -251,6 +259,9 @@ func (s *Source) readParquet(ctx context.Context, b *blob.Bucket, o object, at f
 			arrs := make([]arrow.Array, 0, len(fields)+3)
 			batchFields := make([]arrow.Field, 0, len(fields)+3)
 			for i, f := range fields {
+				if stream[i] == nil {
+					continue
+				}
 				c, err := convert(ctx, rec.Column(i), f, convs[i])
 				if err == nil && stream[i].text {
 					t, terr := textOf(ctx, c, f, stream[i].field)
@@ -429,6 +440,9 @@ func (s *Source) readCSV(ctx context.Context, b *blob.Bucket, spec *streamSpec, 
 			return sb, nil
 		}
 		for _, n := range names {
+			if controlColumn(n) {
+				continue
+			}
 			if _, err := builder(n); err != nil {
 				return err
 			}
@@ -445,6 +459,10 @@ func (s *Source) readCSV(ctx context.Context, b *blob.Bucket, spec *streamSpec, 
 					name = names[i]
 				case spec.csvHeader || len(spec.cfg.CSV.ColumnNames) > 0:
 					return fmt.Errorf("objstore: %s: record %d has %d fields, and the header %d", o.Key, line, len(fields), len(names))
+				}
+				if controlColumn(name) {
+					// The source's own takes its place.
+					continue
 				}
 				sb, err := builder(name)
 				if err != nil {

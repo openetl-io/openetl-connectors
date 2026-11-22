@@ -280,7 +280,7 @@
           "protobuf"
         ]
       },
-      "description": "A user for the schema registry's basic authentication. Unset: none."
+      "description": "A user for the schema registry's basic authentication, which sends the password as it is: use an https schemaRegistryUrl. Unset: none."
     },
     "schemaRegistryPassword": {
       "type": "string",

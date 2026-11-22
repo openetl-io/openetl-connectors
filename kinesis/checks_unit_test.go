@@ -1,12 +1,15 @@
 package kinesis
 
 import (
+	"context"
 	"crypto/md5"
+	"encoding/base64"
 	"encoding/json"
 	"maps"
 	"math"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"slices"
 	"strings"
 	"sync"
@@ -16,6 +19,8 @@ import (
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/kinesis/types"
+	"github.com/twmb/franz-go/pkg/sr"
+	"github.com/twmb/franz-go/pkg/sr/srfake"
 	"google.golang.org/protobuf/encoding/protowire"
 
 	"github.com/openetl-io/openetl-connectors/records"
@@ -195,6 +200,54 @@ func TestChecksAreValid(t *testing.T) {
 func schemaWith(table string) *arrow.Schema {
 	md := arrow.NewMetadata([]string{records.TableKey}, []string{table})
 	return arrow.NewSchema([]arrow.Field{{Name: "id", Type: arrow.PrimitiveTypes.Int64}, {Name: "name", Type: arrow.BinaryTypes.String, Nullable: true}}, &md)
+}
+
+// With Kinesis and the schema registry at an endpoint that takes connections
+// and never answers, the source's and the destination's checks end shortly
+// after their deadline, as an RPC's, rather than at their calls' own
+// timeouts: the list, and each check alone, which passes only if it reaches
+// no further than the connection.
+func TestChecksEndAtTheirDeadline(t *testing.T) {
+	hold := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { <-hold }))
+	t.Cleanup(srv.Close)
+	t.Cleanup(func() { close(hold) })
+	cfg := `{"region": "us-east-1", "endpoint": "` + srv.URL + `", "accessKeyId": "a", "secretAccessKey": "s", "format": "avro", "schemaRegistryUrl": "` + srv.URL + `"}`
+	src, err := NewSource([]byte(cfg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	dst, err := NewDestination([]byte(cfg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	within := func(what string, d time.Duration, checks []check.Check) check.Report {
+		ctx, cancel := context.WithTimeout(t.Context(), d)
+		defer cancel()
+		start := time.Now()
+		r := check.Run(ctx, checks)
+		if took := time.Since(start); took > d+time.Second {
+			t.Errorf("%s took %s with %s to answer", what, took, d)
+		}
+		return r
+	}
+	for role, checks := range map[string][]check.Check{"source": src.Checks(), "destination": dst.Checks()} {
+		if r := within(role+"'s checks", 2*time.Second, checks); r.OK() {
+			t.Errorf("%s: the checks passed", role)
+		}
+		names := map[string]bool{}
+		for _, c := range checks {
+			names[c.Name] = true
+			c.Needs = nil
+			it := itemsOf(within(role+"'s "+c.Name, time.Second, []check.Check{c}))[c.Name]
+			if it.Status == check.Passed && !strings.HasPrefix(c.Name, "net.") {
+				t.Errorf("%s: %s passed", role, c.Name)
+			}
+		}
+		if !names["kinesis.sign-in"] || !names["registry.reach"] {
+			t.Errorf("%s's checks: %v", role, names)
+		}
+	}
 }
 
 // Signing in fails as the reason AWS's error has, with the action and
@@ -590,6 +643,7 @@ func TestStartRefused(t *testing.T) {
 	if _, err = sr.iterator(t.Context()); codeOf(err) == protocolv1.ErrorCode_ERROR_CODE_CONFIG_INVALID || strings.Contains(err.Error(), "startTimestamp") {
 		t.Errorf("another invalid argument: %v", err)
 	}
+	sr.st = shardState{From: time.Now().Add(time.Hour)}
 	if err := sr.startRefused(&types.InvalidArgumentException{}, types.ShardIteratorTypeAtTimestamp); codeOf(err) != protocolv1.ErrorCode_ERROR_CODE_CONFIG_INVALID {
 		t.Errorf("subscribing at a time in the future: %v", err)
 	}
@@ -713,6 +767,72 @@ func TestAggregatesWhateverTheFormat(t *testing.T) {
 	rows, err := s.rows(t.Context(), "shard-0", recs)
 	if err != nil || len(rows) != 2 || !strings.Contains(string(rows[1]), `"two"`) {
 		t.Errorf("string, deaggregated: %s, %v", rows, err)
+	}
+}
+
+// Credentials for a registry reached over http, from the settings or the
+// URL, pass the registry's check with a warning.
+func TestRegistryCredentialsOverHTTPWarn(t *testing.T) {
+	fake := srfake.New(srfake.WithAuth("Basic " + base64.StdEncoding.EncodeToString([]byte("alice:s3cret"))))
+	defer fake.Close()
+	open := srfake.New()
+	defer open.Close()
+	u, _ := url.Parse(fake.URL())
+	u.User = url.UserPassword("alice", "s3cret")
+	for _, tc := range []struct {
+		c    records.Config
+		want string
+	}{
+		{records.Config{Format: records.Avro, SchemaRegistryURL: fake.URL(), SchemaRegistryUsername: "alice", SchemaRegistryPassword: sdk.NewSecret("s3cret")}, "warning:credentials_unencrypted"},
+		{records.Config{Format: records.Avro, SchemaRegistryURL: u.String()}, "warning:credentials_unencrypted"},
+		{records.Config{Format: records.Avro, SchemaRegistryURL: open.URL()}, "passed"},
+	} {
+		c, _ := registryCheck(&tc.c)
+		it := itemsOf(check.Run(t.Context(), []check.Check{c}))["registry.reach"]
+		got := it.Status.String()
+		if it.Failure != nil {
+			got += ":" + it.Failure.Reason
+		}
+		if got != tc.want {
+			t.Errorf("%s with user %q: %s, want %s", records.ShownURL(tc.c.SchemaRegistryURL), tc.c.SchemaRegistryUsername, got, tc.want)
+		}
+	}
+}
+
+// The registry's param, which people see, holds no password, even one with
+// a character that ends the URL's authority.
+func TestTheRegistrysParamHoldsNoPassword(t *testing.T) {
+	for _, u := range []string{"http://u:s3cret@registry:8081", "http://u:s3#cret@registry:8081", "http://u:s3?cret@registry:8081", "http://u:s3/cret@registry:8081/x"} {
+		c, ok := registryCheck(&records.Config{Format: records.Avro, SchemaRegistryURL: u})
+		if got := c.Params["registry"]; !ok || strings.Contains(got, "s3") || !strings.Contains(got, "registry:8081") {
+			t.Errorf("%s: the registry's param is %q", u, got)
+		}
+	}
+}
+
+// A record whose schema the registry doesn't serve for now fails the read as
+// the registry's failure, which OpenETL tries again or reports as refused
+// credentials; a schema ID it doesn't have is invalid data.
+func TestARegistryThatDoesntAnswerFailsAsItself(t *testing.T) {
+	at := time.Now()
+	recs := []types.Record{{SequenceNumber: aws.String("1"), PartitionKey: aws.String("k"), Data: []byte{0, 0, 0, 0, 1, 2}, ApproximateArrivalTimestamp: &at}}
+	for status, want := range map[int]protocolv1.ErrorCode{
+		http.StatusServiceUnavailable: protocolv1.ErrorCode_ERROR_CODE_TRANSIENT,
+		http.StatusTooManyRequests:    protocolv1.ErrorCode_ERROR_CODE_TRANSIENT,
+		http.StatusUnauthorized:       protocolv1.ErrorCode_ERROR_CODE_AUTH_INVALID,
+		http.StatusForbidden:          protocolv1.ErrorCode_ERROR_CODE_PERMISSION_DENIED,
+		http.StatusNotFound:           protocolv1.ErrorCode_ERROR_CODE_DATA_INVALID,
+	} {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(status) }))
+		reg, err := sr.NewClient(sr.URLs(srv.URL))
+		if err != nil {
+			t.Fatal(err)
+		}
+		s := &Source{cfg: SourceConfig{}, values: records.NewDecoder(records.Avro, reg)}
+		if _, err := s.rows(t.Context(), "shard-0", recs); codeOf(err) != want {
+			t.Errorf("with the registry answering %d: %v, %v", status, codeOf(err), err)
+		}
+		srv.Close()
 	}
 }
 

@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -23,10 +25,14 @@ const (
 	resumeEvery   = time.Second
 	quietEvery    = 10 * time.Second
 	progressEvery = 10 * time.Second
-	// How long redo can stay in the log buffer before LGWR writes it, at
-	// most: a window mines again what was this new when the last one
-	// started, so a change written late isn't passed.
+	// How long redo stays in the log buffer before LGWR writes it, as a
+	// rule: a window mines again at least what was this new when the last
+	// one started, and a redo log that began this long ago is taken as
+	// holding the redo before it.
 	flushLag = 5 * time.Second
+	// How long LogMiner can miss a redo log the database lists before the
+	// read takes it as gone: one being switched or archived is back sooner.
+	missingFor = 2 * time.Minute
 	// Of a fresh snapshot's SCN, while the table's definition is newer.
 	settleTries = 30
 )
@@ -58,8 +64,8 @@ type cdcStream struct {
 	t     table
 	state cdcState
 	b     *batcher
-	// All the columns the source reads, declared or not, and their indexes
-	// by SEGMENT_COLUMN_ID.
+	// All the columns the source reads, and their indexes by
+	// SEGMENT_COLUMN_ID.
 	all   []column
 	bySeg map[int]int
 	// Every SEGMENT_COLUMN_ID the table has, hidden and unread columns'
@@ -109,6 +115,7 @@ type logRow struct {
 	info, redo         string
 	at                 time.Time
 	objv               uint64
+	thread             int64
 }
 
 // lookahead asks for the window's later changes of a table's definition,
@@ -133,11 +140,22 @@ type cdcReader struct {
 	continuous bool
 
 	txns map[string]*txn
-	// Every commit at or before done is handled.
+	// The commits handled, by transaction, while a window can read them
+	// again: a commit is sent once, though a later window reads it too.
+	sent map[string]uint64
+	// Every row at or before done that a window found is handled; handled
+	// says which of them the log files certainly held.
 	done uint64
+	// By redo thread, the SCN of the last row read: the thread's redo before
+	// it is in the log files, as a thread writes its redo in SCN order.
+	seen map[int64]uint64
+	// What's handled before a row is read: the streams' first position.
+	start uint64
 	// Where the next window starts.
 	lo      uint64
 	samples []scnSample
+	// Since when LogMiner has missed a redo log; zero if it hasn't.
+	missingSince time.Time
 	// The first SCN of the redo log that changes still in the log buffer
 	// come after, and when it began; 0 if not known.
 	mark   uint64
@@ -174,7 +192,7 @@ func (s *Source) readCDC(ctx context.Context, conns *connPool, req source.ReadRe
 			return err
 		}
 	}
-	r := &cdcReader{ctx: ctx, s: s, out: out, conn: conn, schema: schema, streams: map[string]*cdcStream{}, continuous: req.Continuous, txns: map[string]*txn{}, done: ^uint64(0)}
+	r := &cdcReader{ctx: ctx, s: s, out: out, conn: conn, schema: schema, streams: map[string]*cdcStream{}, continuous: req.Continuous, txns: map[string]*txn{}, sent: map[string]uint64{}, seen: map[int64]uint64{}, done: ^uint64(0)}
 	if err := conn.QueryRowContext(ctx, `SELECT dbid || ':' || resetlogs_change# FROM v$database`).Scan(&r.db); err != nil {
 		return classify(fmt.Errorf("oracle: read the database's identity: %w", err))
 	}
@@ -195,7 +213,6 @@ func (s *Source) readCDC(ctx context.Context, conns *connPool, req source.ReadRe
 		if st.t, err = declaredOnly(t, cs.Columns); err != nil {
 			return err
 		}
-		// Of the columns sent: a LOB added since Discover isn't.
 		st.lobs = slices.ContainsFunc(st.t.cols, column.lob)
 		if err := r.supplemental(st.t.name); err != nil {
 			return err
@@ -410,6 +427,7 @@ func (r *cdcReader) mine() error {
 	if err := covered(logs, r.lo); err != nil {
 		return err
 	}
+	r.start = r.done
 	if !r.continuous {
 		if end, err = currentSCN(r.ctx, r.conn); err != nil {
 			return err
@@ -424,21 +442,24 @@ func (r *cdcReader) mine() error {
 		}
 		r.samples = append(r.samples, scnSample{started, e})
 		if e >= r.lo {
-			if err := r.window(r.lo, e); err != nil {
+			if err := r.missing(r.window(r.lo, e), started); err != nil {
 				return err
 			}
-			r.lag = time.Since(started)
+			if r.missingSince.IsZero() {
+				r.lag = time.Since(started)
+			}
 		}
 		if r.mark, r.markAt, err = logMark(r.ctx, r.conn); err != nil {
 			return err
 		}
-		// The next window starts where this one would have missed changes
-		// still in the log buffer.
+		// The next window starts where this one may have missed changes
+		// still in the log buffer: after what's handled, and no later than
+		// the end of a window that started flushLag ago.
 		for len(r.samples) > 1 && started.Sub(r.samples[1].at) >= flushLag {
 			r.samples = r.samples[1:]
 		}
 		if started.Sub(r.samples[0].at) >= flushLag {
-			r.lo = max(r.lo, r.samples[0].scn)
+			r.lo = max(r.lo, min(r.samples[0].scn, r.handled()+1))
 		}
 		if r.restart != "" {
 			for _, st := range r.order {
@@ -469,9 +490,29 @@ func (r *cdcReader) mine() error {
 	}
 }
 
+// missing has the read try a window again, nil, while LogMiner misses a redo
+// log it needs, as it does while the log is switched or archived; a log
+// missing for missingFor is gone, as a file deleted outside RMAN, which
+// the database still lists, is. Any other err it returns as it is.
+func (r *cdcReader) missing(err error, now time.Time) error {
+	if !slices.Contains([]int{1291, 308}, oraCode(err)) {
+		r.missingSince = time.Time{}
+		return err
+	}
+	if r.missingSince.IsZero() {
+		r.missingSince = now
+		slog.Warn("LogMiner is missing a redo log the read needs: it tries again", "scn", r.lo, "err", err)
+	}
+	if now.Sub(r.missingSince) >= missingFor {
+		return positionLost("oracle: LogMiner has missed a redo log the read needs from SCN %d for %s, though the database lists it: it's gone, as a file deleted outside RMAN is. Read the stream again from a snapshot, and delete archived logs with RMAN: %v", r.lo, missingFor, err)
+	}
+	return nil
+}
+
 // window mines the redo from SCN lo to SCN e.
 func (r *cdcReader) window(lo, e uint64) error {
 	r.ddls = map[string]map[uint64]bool{}
+	maps.DeleteFunc(r.sent, func(_ string, scn uint64) bool { return scn < lo })
 	for {
 		err := r.mineRange(lo, e)
 		la, ok := errors.AsType[*lookahead](err)
@@ -523,10 +564,11 @@ func (r *cdcReader) mineRange(lo, e uint64) error {
 	}
 	rows, err := r.conn.QueryContext(r.ctx, `SELECT scn, xidusn, xidslt, xidsqn, operation_code, rollback, csf,
 	  nvl(rs_id, ' '), ssn, nvl(row_id, ' '), nvl(table_name, ' '), nvl(info, ' '), nvl(sql_redo, ' '), timestamp,
-	  nvl(data_objv#, 0)
+	  nvl(data_objv#, 0), thread#
 	FROM v$logmnr_contents
 	WHERE `+thisContainer+` AND (operation_code IN (7, 36)
-	  OR (seg_owner = :1 AND table_name IN (`+strings.Join(names, ", ")+`) AND operation_code IN (1, 2, 3, 5, 9, 68, 255)))`, r.schema)
+	  OR (seg_owner = :1 AND table_name IN (`+strings.Join(names, ", ")+`) AND operation_code IN (1, 2, 3, 5, 9, 68, 255))
+	  OR (operation_code = 5 AND csf = 0 AND upper(sql_redo) LIKE '%EXCHANGE%PARTITION%WITH%TABLE%'))`, r.schema)
 	if err != nil {
 		return mining(fmt.Errorf("oracle: read LogMiner's changes from SCN %d: %w", lo, err))
 	}
@@ -538,7 +580,7 @@ func (r *cdcReader) mineRange(lo, e uint64) error {
 		var y logRow
 		var rollback, csf int
 		var part string
-		if err := rows.Scan(&y.scn, &y.usn, &y.slt, &y.sqn, &y.op, &rollback, &csf, &y.rsID, &y.ssn, &y.rowID, &y.table, &y.info, &part, &y.at, &y.objv); err != nil {
+		if err := rows.Scan(&y.scn, &y.usn, &y.slt, &y.sqn, &y.op, &rollback, &csf, &y.rsID, &y.ssn, &y.rowID, &y.table, &y.info, &part, &y.at, &y.objv, &y.thread); err != nil {
 			return mining(err)
 		}
 		y.rollback = rollback == 1
@@ -570,6 +612,7 @@ func (r *cdcReader) mineRange(lo, e uint64) error {
 
 // row handles a row of the redo, in SCN order.
 func (r *cdcReader) row(x logRow) error {
+	r.seen[x.thread] = max(r.seen[x.thread], x.scn)
 	if err := r.reached(x.scn - 1); err != nil {
 		return err
 	}
@@ -600,10 +643,13 @@ func (r *cdcReader) row(x logRow) error {
 	case 7:
 		tx := r.txns[x.xid()]
 		delete(r.txns, x.xid())
-		if tx == nil || x.scn <= r.done {
+		if tx == nil || r.sent[x.xid()] == x.scn {
 			return nil
 		}
-		return r.commit(tx, x.scn, x.at)
+		if err := r.commit(tx, x.scn, x.at); err != nil {
+			return err
+		}
+		r.sent[x.xid()] = x.scn
 	case 36:
 		delete(r.txns, x.xid())
 		if x.sqn == 0xFFFFFFFF {
@@ -678,7 +724,10 @@ func (r *cdcReader) commit(tx *txn, scn uint64, at time.Time) error {
 		if err := st.b.change(vals, row.op, seq, unchanged); err != nil {
 			return fmt.Errorf("oracle: %s: %w", st.t.name, err)
 		}
-		st.dirty, st.last, st.lastAt = true, scn, at
+		st.dirty = true
+		if scn > st.last {
+			st.last, st.lastAt = scn, at
+		}
 		if st.b.bytes >= r.s.cfg.BatchBytes {
 			if err := st.flush(r.out); err != nil {
 				return err
@@ -811,14 +860,21 @@ func (r *cdcReader) lobs(st *cdcStream, vals []any, unchanged []string, scn uint
 // ddl handles a change of a table read's definition: one that changes its
 // columns stops the read there, and the next starts again with them.
 func (r *cdcReader) ddl(x logRow) error {
+	if m := exchangedWith.FindStringSubmatch(x.redo); m != nil && (m[1] == "" || ident(m[1]) == r.schema) {
+		if st := r.streams[ident(m[2])]; st != nil && !st.finished && x.scn > st.state.SCN {
+			return positionLost("oracle: %s's rows were exchanged with a partition of %s at SCN %d, and the redo log doesn't say which: read the stream again from a snapshot", st.t.name, x.table, x.scn)
+		}
+	}
 	st := r.streams[x.table]
 	if st == nil || st.finished || x.scn <= st.state.SCN {
 		return nil
 	}
-	stmt := strings.ToLower(x.redo)
+	stmt := strings.ToLower(leading.ReplaceAllString(x.redo, ""))
 	switch {
 	case strings.HasPrefix(stmt, "truncate"):
 		return positionLost("oracle: %s was truncated at SCN %d, and the redo log doesn't say which rows that deleted: read the stream again from a snapshot", x.table, x.scn)
+	case partitionRows.MatchString(stmt):
+		return positionLost("oracle: a partition of %s was truncated, dropped or exchanged at SCN %d, and the redo log doesn't say which rows that deleted: read the stream again from a snapshot", x.table, x.scn)
 	case strings.HasPrefix(stmt, "drop table"):
 		return configInvalid("oracle: %s was dropped at SCN %d", x.table, x.scn)
 	}
@@ -833,6 +889,27 @@ func (r *cdcReader) ddl(x logRow) error {
 		r.restart, r.restartAt = fmt.Sprintf("%s's columns changed at SCN %d", x.table, x.scn), x.scn
 	}
 	return nil
+}
+
+// partitionRows matches, in lower case, a statement that truncates, drops
+// or exchanges a table's partitions or subpartitions.
+var partitionRows = regexp.MustCompile(`(?s)^alter\s+table\s.*\b(truncate|drop|exchange)\s+(sub)?partitions?\b`)
+
+// leading matches a statement's leading whitespace and comments, which
+// LogMiner keeps in SQL_REDO.
+var leading = regexp.MustCompile(`^(?:\s+|(?s:/\*.*?\*/)|--[^\n]*)*`)
+
+// exchangedWith matches a statement that exchanges a partition or
+// subpartition with a table: its schema, if named, and its name.
+var exchangedWith = regexp.MustCompile(`(?is)\bexchange\s+(?:sub)?partition\b.*\bwith\s+table\s+(?:("[^"]+"|[\w$#]+)\s*\.\s*)?("[^"]+"|[\w$#]+)`)
+
+// ident is an identifier as the dictionary names it: a quoted one as it is,
+// another in upper case.
+func ident(s string) string {
+	if q, ok := strings.CutPrefix(s, `"`); ok {
+		return strings.TrimSuffix(q, `"`)
+	}
+	return strings.ToUpper(s)
 }
 
 func sameColumn(a, b column) bool {
@@ -869,12 +946,31 @@ func (r *cdcReader) allFinished() bool {
 	return !slices.ContainsFunc(r.order, func(st *cdcStream) bool { return !st.finished })
 }
 
+// handled is the SCN at and before which every row is handled: of what the
+// windows mined, the redo the last row read of each thread that has had one
+// shows is in the log files, and the redo before the mark, which a log
+// switch wrote.
+func (r *cdcReader) handled() uint64 {
+	h := r.start
+	if len(r.seen) > 0 {
+		h = ^uint64(0)
+	}
+	for _, scn := range r.seen {
+		h = min(h, scn-1)
+	}
+	if r.mark > 0 {
+		h = max(h, r.mark-1)
+	}
+	return min(h, r.done)
+}
+
 // position is where a stream's next read starts, which depends on the
 // stream's changes and the redo logs, not on when the read ended, so a read
 // again from a resume point ends where the first did. Its SCN is past the
-// stream's last change and, up to what's mined, the start of the redo log
+// stream's last change and, up to what's handled, the start of the redo log
 // the log buffer's changes come after; its From is before the first change
-// of every transaction open at it.
+// of every transaction open at it, and of redo that may not have been in
+// the log files when it was mined.
 func (r *cdcReader) position(st *cdcStream) cdcState {
 	s := st.state
 	if s.Snapshot != nil || r.done == ^uint64(0) {
@@ -883,15 +979,16 @@ func (r *cdcReader) position(st *cdcStream) cdcState {
 	if st.last > s.SCN {
 		s.SCN, s.At = st.last, new(st.lastAt.UTC())
 	}
-	if m := min(r.mark-1, r.done); r.mark > 0 && m > s.SCN {
+	h := r.handled()
+	if m := min(r.mark-1, h); r.mark > 0 && m > s.SCN {
 		s.SCN = m
 		if m == r.mark-1 {
 			s.At = new(r.markAt.UTC())
 		}
 	}
 	// A transaction whose first change wasn't mined began after the mark,
-	// or after the read's start.
-	s.From = min(max(st.state.From, r.mark), r.done+1)
+	// or after what's handled.
+	s.From = min(max(st.state.From, r.mark), h+1)
 	for _, tx := range r.txns {
 		if len(tx.events) > 0 {
 			s.From = min(s.From, tx.first)
@@ -972,30 +1069,19 @@ func (r *cdcReader) progress() {
 	}
 }
 
-// declaredOnly narrows t to the columns the run declared. A column added
-// since the run's Discover has no declared type. No columns: the request
+// declaredOnly checks t has only the columns the run declared. A column
+// added since the run's Discover has no declared type: the read fails,
+// retryably, and the next attempt declares it. No columns: the request
 // doesn't say.
 func declaredOnly(t table, columns []string) (table, error) {
 	if len(columns) == 0 {
 		return t, nil
 	}
-	cols := make([]column, 0, len(t.cols))
-	at := make(map[int]int, len(t.cols))
-	for i, c := range t.cols {
-		if slices.Contains(columns, c.name) {
-			at[i] = len(cols)
-			cols = append(cols, c)
+	for _, c := range t.cols {
+		if !slices.Contains(columns, c.name) {
+			return t, transient("oracle: %s has a new column %q; the read starts again to declare it", t.name, c.name)
 		}
 	}
-	key := make([]int, len(t.key))
-	for i, k := range t.key {
-		j, ok := at[k]
-		if !ok {
-			return t, transient("oracle: %s has a new key column %q; the read starts again to take it", t.name, t.cols[k].name)
-		}
-		key[i] = j
-	}
-	t.cols, t.key = cols, key
 	return t, nil
 }
 

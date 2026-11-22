@@ -21,6 +21,9 @@ import (
 	"golang.org/x/text/encoding/htmlindex"
 	"golang.org/x/text/encoding/unicode"
 	"golang.org/x/text/encoding/unicode/utf32"
+
+	sdk "github.com/openetl-io/openetl/sdk/go"
+	protocolv1 "github.com/openetl-io/openetl/sdk/go/protocol/v1"
 )
 
 // kind is how a source column's values are read.
@@ -394,7 +397,7 @@ func binlogValue(c sourceColumn, bc binlogColumn, v any) (any, error) {
 	case []byte:
 		return textValue(c, x)
 	}
-	return nil, fmt.Errorf("an unexpected %T in the binlog", v)
+	return nil, sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_CONTRACT_CHANGED, fmt.Errorf("an unexpected %T in the binlog", v))
 }
 
 // enumOrInt is an ENUM's index or a SET's bits as their members, and a BIT's

@@ -185,6 +185,8 @@ type slot struct {
 	mu sync.Mutex
 	// The epoch whose transaction is open; zero for none.
 	epoch destination.Epoch
+	// When the transaction began.
+	begun time.Time
 	// The transaction's first failed produce.
 	err error
 }
@@ -204,8 +206,11 @@ func timeout(interval time.Duration) time.Duration {
 	if interval <= 0 {
 		interval = defaultInterval
 	}
-	return 2*interval + time.Minute
+	return 2*interval + txnSlack
 }
+
+// txnSlack is a transaction's time beyond its two intervals; tests shorten it.
+var txnSlack = time.Minute
 
 func (w *writer) open(ctx context.Context) error {
 	if err := w.checkTimeout(ctx); err != nil {
@@ -389,8 +394,31 @@ func (w *writer) txn(e destination.Epoch) (*slot, error) {
 	if err := s.cl.BeginTransaction(); err != nil {
 		return nil, fmt.Errorf("kafka: begin a transaction on %s: %w", s.id, err)
 	}
-	s.epoch, s.err = e, nil
+	s.epoch, s.begun, s.err = e, time.Now(), nil
 	return s, nil
+}
+
+// outlived: s's transaction has been open as long as its timeout, so the
+// brokers may have aborted it, which they report as they do a newer
+// producer's fence.
+func (w *writer) outlived(s *slot) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return time.Since(s.begun) >= timeout(w.cfg.CommitInterval)
+}
+
+// timedOut is epoch e's failure where the brokers aborted its transaction
+// on its timeout: transient, since no newer writer need own the lane.
+func (w *writer) timedOut(e destination.Epoch, err error) error {
+	return sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_TRANSIENT, fmt.Errorf("kafka: epoch %d's transaction was open longer than its timeout of %s, so the brokers aborted it: %w", e.N, timeout(w.cfg.CommitInterval), err))
+}
+
+// failed classifies a failure of s's transaction of epoch e.
+func (w *writer) failed(s *slot, e destination.Epoch, err error) error {
+	if fenced(err) && w.outlived(s) {
+		return w.timedOut(e, err)
+	}
+	return classify(err)
 }
 
 func (w *writer) Write(ctx context.Context, e destination.Epoch, stream string, batch arrow.RecordBatch) error {
@@ -410,9 +438,9 @@ func (w *writer) Write(ctx context.Context, e destination.Epoch, stream string, 
 	}
 	vals := make([]any, len(enc.cols))
 	keyVals := make([]any, len(enc.key))
-	promise := func(_ *kgo.Record, err error) {
+	promise := func(r *kgo.Record, err error) {
 		if err != nil {
-			s.fail(err)
+			s.fail(produceFailed(r, err))
 		}
 	}
 	for i := range int(batch.NumRows()) {
@@ -444,6 +472,27 @@ func (w *writer) Write(ctx context.Context, e destination.Epoch, stream string, 
 		}
 	}
 	return nil
+}
+
+// batchLimit is the most bytes a batch of records holds: franz-go's
+// default ProducerBatchMaxBytes.
+const batchLimit = 1000012
+
+// produceFailed is a record's failed produce, naming its topic, and for one
+// too large, the limit it passed: the client's, which a record over it
+// never fits, or the topic's max.message.bytes, below the client's batches.
+func produceFailed(r *kgo.Record, err error) error {
+	if !errors.Is(err, kerr.MessageTooLarge) && !errors.Is(err, kerr.RecordListTooLarge) {
+		return fmt.Errorf("kafka: a record for %s: %w", r.Topic, err)
+	}
+	size := len(r.Key) + len(r.Value)
+	for _, h := range r.Headers {
+		size += len(h.Key) + len(h.Value)
+	}
+	if size >= batchLimit {
+		return sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_DATA_INVALID, fmt.Errorf("kafka: a record of %d bytes for %s: %w: a row's record, with its key and headers, must fit in the client's batch limit of %d bytes", size, r.Topic, err, batchLimit))
+	}
+	return sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_CONFIG_INVALID, fmt.Errorf("kafka: a batch of records for %s: %w: the topic's max.message.bytes is below the client's batches of up to %d bytes; raise it to at least that", r.Topic, err, batchLimit))
 }
 
 // marker is a writer lane's record of an epoch on the marker topic, in
@@ -492,13 +541,13 @@ func (w *writer) PreCommit(ctx context.Context, e destination.Epoch) (destinatio
 	}
 	rec, err := res.First()
 	if err != nil {
-		return nil, classify(fmt.Errorf("kafka: epoch %d's marker: %w", e.N, err))
+		return nil, w.failed(s, e, fmt.Errorf("kafka: epoch %d's marker: %w", e.N, err))
 	}
 	s.mu.Lock()
 	err = s.err
 	s.mu.Unlock()
 	if err != nil {
-		return nil, classify(fmt.Errorf("kafka: epoch %d: %w", e.N, err))
+		return nil, w.failed(s, e, fmt.Errorf("kafka: epoch %d: %w", e.N, err))
 	}
 	return json.Marshal(staged{Slot: int(e.N % slots), Generation: e.Generation, Epoch: e.N, Lane: w.cfg.Lane, Partition: rec.Partition, Offset: rec.Offset})
 }
@@ -521,11 +570,12 @@ func (w *writer) committable(e destination.Epoch, committables []destination.Sta
 }
 
 // Commit commits the lane's transaction of the epoch. A fenced producer
-// means a newer attempt owns the lane. A commit franz-go can't confirm is
-// settled by aborting it on the same producer, which leaves a commit that
-// reached the broker in place; Commit then looks for the lane's marker of
-// the epoch, as it does without a transaction open for the epoch, after an
-// earlier Commit.
+// means a newer attempt owns the lane, unless the transaction outlived its
+// timeout, which the brokers abort it on. A commit franz-go can't confirm
+// is settled by aborting it on the same producer, which leaves a commit
+// that reached the broker in place; Commit then looks for the lane's marker
+// of the epoch, as it does without a transaction open for the epoch, after
+// an earlier Commit.
 func (w *writer) Commit(ctx context.Context, e destination.Epoch, committables []destination.Staged) (destination.Committed, error) {
 	desc, err := w.committable(e, committables)
 	if err != nil {
@@ -535,33 +585,37 @@ func (w *writer) Commit(ctx context.Context, e destination.Epoch, committables [
 	s.mu.Lock()
 	open := s.epoch == e
 	s.mu.Unlock()
+	outlived := open && w.outlived(s)
+	var ended error
 	if open {
-		err := s.cl.EndTransaction(ctx, kgo.TryCommit)
-		if err != nil && !fenced(err) {
+		ended = s.cl.EndTransaction(ctx, kgo.TryCommit)
+		if ended != nil && !fenced(ended) {
 			// The abort's success says nothing of the commit's: the marker
 			// does.
 			if aerr := s.cl.EndTransaction(ctx, kgo.TryAbort); fenced(aerr) {
-				err = aerr
+				ended = aerr
 			}
 		}
 		s.mu.Lock()
 		s.epoch = destination.Epoch{}
 		s.mu.Unlock()
 		switch {
-		case err == nil:
+		case ended == nil:
 			return destination.Committed{}, nil
-		case fenced(err):
-			return destination.Committed{}, fmt.Errorf("%w: kafka: commit epoch %d: %w", destination.ErrFenced, e.N, err)
+		case fenced(ended) && !outlived:
+			return destination.Committed{}, fmt.Errorf("%w: kafka: commit epoch %d: %w", destination.ErrFenced, e.N, ended)
 		}
 	}
 	ok, err := w.applied(ctx, e, desc)
-	if err != nil {
+	switch {
+	case err != nil:
 		return destination.Committed{}, err
+	case ok:
+		return destination.Committed{}, nil
+	case outlived:
+		return destination.Committed{}, w.timedOut(e, ended)
 	}
-	if !ok {
-		return destination.Committed{}, fmt.Errorf("%w: kafka: epoch %d's transaction was aborted", destination.ErrFenced, e.N)
-	}
-	return destination.Committed{}, nil
+	return destination.Committed{}, fmt.Errorf("%w: kafka: epoch %d's transaction was aborted", destination.ErrFenced, e.N)
 }
 
 func fenced(err error) bool {

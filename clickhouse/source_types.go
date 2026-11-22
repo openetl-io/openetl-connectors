@@ -6,6 +6,7 @@ import (
 	"math"
 	"math/big"
 	"net"
+	"net/netip"
 	"reflect"
 	"strconv"
 	"strings"
@@ -343,7 +344,12 @@ func text(x any) string {
 	case string:
 		s = v
 	case net.IP:
-		s = v.String()
+		// An IPv6 column's, which String spells as IPv4 where it's mapped.
+		if len(v) == net.IPv6len {
+			s = netip.AddrFrom16([16]byte(v)).String()
+		} else {
+			s = v.String()
+		}
 	case fmt.Stringer:
 		s = v.String()
 	default:
