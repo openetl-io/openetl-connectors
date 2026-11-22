@@ -153,6 +153,8 @@ Streams whose source replays exactly land exactly once. A stream that may repeat
 
 A transaction must stay open for less than the brokers' `transaction.max.timeout.ms`, 15 minutes by default, so a pipeline's commit interval can be at most 7 minutes. The destination reads the brokers' setting when it opens, and from 0.2.0 in its check too, if the credentials may describe their configs. A continuous pipeline commits every 10 seconds unless it sets its own `delivery.commit.interval`. Each transaction's timeout is twice the commit interval and a minute. The brokers abort a transaction open longer, as when a commit is held up, and answer its producer as they do a fenced one: from 0.2.0, the attempt fails as transient rather than fenced, and the next attempt writes the epoch again.
 
+A commit that the brokers fail other than by a fence, as with a server error, is settled by aborting the transaction. Unless the epoch's marker shows that the commit had landed, the epoch fails as transient, and the next attempt writes it again. From 0.2.0, OpenETL's retries of the commit fail as transient too, as does a retry of one whose transaction outlived its timeout. Before 0.2.0, they failed as fenced, which ends a scheduled sync rather than try it again.
+
 ### Jobs on several workers
 
 From 0.2.0, the destination declares lane commits and up to 64 writer lanes, so the jobs of a pipeline that sets `resources.workers` can run on workers, as [Run a job on several pods](https://github.com/openetl-io/openetl/blob/main/docs/pipelines/workers.md) explains. On one pod, a job has one writer lane, and writes as above.

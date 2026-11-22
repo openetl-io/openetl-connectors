@@ -197,8 +197,9 @@ func TestATopicLimitBelowTheClientsBatchesIsConfig(t *testing.T) {
 }
 
 // A transaction open past its timeout, which the brokers abort, fails its
-// epoch as transient, at the commit or at the pre-commit: no newer writer
-// owns the lane, as a fence would say.
+// epoch as transient, at the commit, at a commit again, as OpenETL retries
+// one, or at the pre-commit: no newer writer owns the lane, as a fence
+// would say.
 func TestATransactionTheBrokersTimedOutIsNoFence(t *testing.T) {
 	defer func(s time.Duration) { txnSlack = s }(txnSlack)
 	txnSlack = 0
@@ -212,13 +213,44 @@ func TestATransactionTheBrokersTimedOutIsNoFence(t *testing.T) {
 		t.Fatal(err)
 	}
 	time.Sleep(timeout(time.Second) + time.Second)
-	_, err := w.Commit(t.Context(), e1, []destination.Staged{st})
-	if errors.Is(err, destination.ErrFenced) || codeOf(err) != "ERROR_CODE_TRANSIENT" {
-		t.Errorf("commit: %s %v", codeOf(err), err)
+	for _, what := range []string{"commit", "commit again"} {
+		_, err := w.Commit(t.Context(), e1, []destination.Staged{st})
+		if errors.Is(err, destination.ErrFenced) || codeOf(err) != "ERROR_CODE_TRANSIENT" {
+			t.Errorf("%s: %s %v", what, codeOf(err), err)
+		}
 	}
-	_, err = w.PreCommit(t.Context(), e2)
+	_, err := w.PreCommit(t.Context(), e2)
 	if errors.Is(err, destination.ErrFenced) || codeOf(err) != "ERROR_CODE_TRANSIENT" {
 		t.Errorf("pre-commit: %s %v", codeOf(err), err)
 	}
 	l.want("after the brokers aborted both", 0, 0)
+}
+
+// A commit that the brokers fail, which Commit settles by aborting the
+// transaction, fails its epoch as transient, and so does a commit again,
+// as OpenETL retries one: no newer writer owns the lane, as a fence would
+// say, and the next attempt writes the epoch again. The lane goes on.
+func TestACommitTheBrokersFailedIsNoFence(t *testing.T) {
+	l := newLanes(t)
+	w := l.open(1, 0)
+	e1, e2 := epochOf(1, 1), epochOf(1, 2)
+	st := l.stage(w, e1, 0, 3)
+	l.c.ControlKey(int16(kmsg.EndTxn), func(req kmsg.Request) (kmsg.Response, error, bool) {
+		r := req.(*kmsg.EndTxnRequest)
+		if !r.Commit {
+			return nil, nil, false
+		}
+		resp := r.ResponseKind().(*kmsg.EndTxnResponse)
+		resp.ErrorCode = kerr.UnknownServerError.Code
+		return resp, nil, true
+	})
+	for _, what := range []string{"commit", "commit again"} {
+		_, err := w.Commit(t.Context(), e1, []destination.Staged{st})
+		if errors.Is(err, destination.ErrFenced) || codeOf(err) != "ERROR_CODE_TRANSIENT" {
+			t.Errorf("%s: %s %v", what, codeOf(err), err)
+		}
+	}
+	l.want("after the failed commit", 0, 0)
+	l.commit(w, e2, l.stage(w, e2, 3, 6))
+	l.want("after the next epoch", 3, 6)
 }
