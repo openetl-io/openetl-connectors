@@ -236,3 +236,20 @@ func TestLatePutKeepsFill(t *testing.T) {
 		})
 	}
 }
+
+// A version put again with other values, as a read that starts over can
+// send it, lands over the item it put before, when it holds no value.
+func TestSameVersionAgain(t *testing.T) {
+	cfg := destination.Stream{Name: "t", Mode: destination.Merge, PrimaryKey: []string{"id"}}
+	db := newMemDB(map[string][]string{controlTable: {"p", "n"}, "t": {"id"}})
+	w := memWriter(t, db, cfg)
+	for _, v := range []string{"a", "b"} {
+		row := map[string]types.AttributeValue{"id": str("1"), "v": str(v), idColumn: str("1-10"), opColumn: str("insert"), seqColumn: &types.AttributeValueMemberN{Value: "10"}}
+		if _, err := w.applyRow(t.Context(), cfg, "t", row, nil, ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if it := db.items("t")[0]; stringOf(it["v"]) != "b" {
+		t.Errorf("after the version again with v b, the item is %v", it)
+	}
+}

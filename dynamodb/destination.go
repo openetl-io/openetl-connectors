@@ -951,8 +951,9 @@ func (w *writer) query(ctx context.Context, p string, f func(map[string]types.At
 }
 
 // applyRow writes a staged row. A keyed stream's put, or delete, leaves an
-// item with a higher _openetl_seq, or that is the row's version already, as
-// it is, except an overwrite read's, which replaces what's there. A soft delete keeps the item's other
+// item with a higher _openetl_seq as it is, and a put that holds a value an
+// item that is the row's version already, except an overwrite read's, which
+// replaces what's there. A soft delete keeps the item's other
 // attributes, held ones too, and updates its metadata. A merged row's kept
 // columns keep the target's values and holds. An append is a put, which,
 // deduped on the target, skips an _openetl_id the table has: skipped says
@@ -963,12 +964,6 @@ func (w *writer) applyRow(ctx context.Context, cfg destination.Stream, target st
 	if seq, ok := item[seqColumn]; ok && keyed(cfg) && tag == "" {
 		cond = aws.String("attribute_not_exists(#s) OR #s <= :s")
 		names["#s"], values[":s"] = seqColumn, seq
-		// An item that is this version already was put by this attempt or
-		// another, and a patch may have filled it since.
-		if id, ok := item[idColumn]; ok {
-			cond = aws.String("attribute_not_exists(#s) OR (#s <= :s AND NOT #i = :i)")
-			names["#i"], values[":i"] = idColumn, id
-		}
 	}
 	if !keyed(cfg) {
 		if tag != "" {
@@ -1039,6 +1034,14 @@ func (w *writer) applyRow(ctx context.Context, cfg destination.Stream, target st
 	}
 	if tag != "" {
 		item[readColumn] = str(tag)
+	}
+	// A put that holds a value leaves an item that is its version already,
+	// which this attempt or another put, and whose held values a patch may
+	// have filled since.
+	id, hasID := item[idColumn]
+	if _, held := item[heldColumn]; held && hasID && cond != nil {
+		cond = aws.String("attribute_not_exists(#s) OR (#s <= :s AND NOT #i = :i)")
+		names["#i"], values[":i"] = idColumn, id
 	}
 	err = w.put(ctx, target, item, cond, names, values)
 	if conditionFailed(err) {
