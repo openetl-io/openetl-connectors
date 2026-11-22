@@ -139,7 +139,7 @@ Each row is one record:
 - Its key is the row's primary key, in the same format, if the stream has one.
 - Its header `openetl-id` holds the row's `_openetl_id`.
 
-The client sends a topic batches of records of up to 1,000,012 bytes, which the topic's `max.message.bytes` must take: a topic whose limit is lower refuses batches of rows that each fit. A record, with its key and headers, must fit in 1,000,012 bytes, and raising the topic's limit doesn't raise the client's. Either failure fails its epoch, and the attempt; from 0.2.0 the error names the topic and the limit, and is `DATA_INVALID` for a record over the client's limit, which a retry can't make fit, or `CONFIG_INVALID` for a topic's limit below the client's batches.
+The client sends a topic batches of records of up to 1,000,012 bytes, which the topic's `max.message.bytes` must take: a topic whose limit is lower refuses batches of rows that each fit. A record, with its key and headers, must fit in 1,000,012 bytes, and raising the topic's limit doesn't raise the client's. Either failure fails its epoch, and the attempt; from 0.2.0 the error names the topic and the limit, and is `DATA_INVALID` for a record over the client's limit, which OpenETL retries as it does other invalid data until someone fixes the row, or `CONFIG_INVALID` for a topic's limit below the client's batches.
 
 With `avro` or `protobuf`, the destination registers each stream's schemas under `<topic>-value` and `<topic>-key`. Only append is supported: deletes from a CDC source arrive as rows whose `_openetl_op` is `delete`. With `tombstones: true`, each delete is followed by a tombstone for its key, so a compacted topic drops the key.
 
