@@ -6,10 +6,12 @@ import (
 	"context"
 	"crypto/rand"
 	"errors"
+	"fmt"
 	"math/big"
 	"net/url"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -205,6 +207,49 @@ func TestCDCSnapshotHandoff(t *testing.T) {
 	}
 }
 
+// Updates of the key land, merged by seq, as the table has them: keys
+// shifted, swapped and moved, and a key freed and taken again in one
+// transaction. Change data capture records each as a delete and an insert,
+// all of a statement's deletes first, and an insert shares its __$seqval
+// with the delete of the row it was, which in a heap isn't the delete of
+// its key.
+func TestCDCKeyChanges(t *testing.T) {
+	for _, method := range []string{methodTracking, methodCapture} {
+		for name, ddl := range map[string]string{
+			"clustered": "CREATE TABLE $schema.t (id int PRIMARY KEY, v int)",
+			"heap":      "CREATE TABLE $schema.t (id int NOT NULL, v int, CONSTRAINT pk_t PRIMARY KEY NONCLUSTERED (id))",
+		} {
+			t.Run(method+"/"+name, func(t *testing.T) {
+				e := newSourceEnv(t)
+				e.exec(ddl)
+				e.exec("INSERT INTO $schema.t VALUES (1, 1), (2, 2), (3, 3)")
+				harvested := func() {}
+				if method == methodTracking {
+					e.exec("ALTER TABLE $schema.t ENABLE CHANGE_TRACKING")
+				} else {
+					e.capture("t")
+					harvested = e.harvested
+				}
+				harvested()
+				s := e.source(`, "cdcMethod": "` + method + `"`)
+				snap := read(t, s, source.CDC, map[string]string{"t": ""})
+				e.exec("UPDATE $schema.t SET id = id + 1")
+				e.exec("UPDATE $schema.t SET id = CASE id WHEN 2 THEN 3 WHEN 3 THEN 2 ELSE id END")
+				e.exec("UPDATE $schema.t SET id = 10 WHERE id = 4")
+				e.exec("BEGIN TRAN; DELETE FROM $schema.t WHERE id = 10; INSERT INTO $schema.t VALUES (10, 99); UPDATE $schema.t SET id = 11 WHERE id = 10; INSERT INTO $schema.t VALUES (10, 100); COMMIT")
+				// __$command_id counts through a transaction, not a statement.
+				e.exec("BEGIN TRAN; INSERT INTO $schema.t VALUES (20, 20), (21, 21), (22, 22); DELETE FROM $schema.t WHERE id = 22; UPDATE $schema.t SET v = 210 WHERE id = 21; INSERT INTO $schema.t VALUES (22, 220); COMMIT")
+				harvested()
+				c := read(t, s, source.CDC, map[string]string{"t": snap.last("t")})
+				got := fold(changes(snap, "t", "id", "v", "openetl.seq"), changes(c, "t", "id", "v", "openetl.seq"))
+				if want := e.table(); !slices.Equal(got, want) {
+					t.Errorf("merged by seq: %v, the table %v; changes %v", got, want, changes(c, "t", "id", "v", "openetl.seq"))
+				}
+			})
+		}
+	}
+}
+
 // A capture instance made for a new column is read from its start, and the
 // old one up to it.
 func TestCaptureSchemaChange(t *testing.T) {
@@ -225,6 +270,29 @@ func TestCaptureSchemaChange(t *testing.T) {
 	// The old instance has no x; the new one from its start.
 	got := changes(c, "t", "id", "v", "x")
 	if !slices.Equal(got, []string{"insert,1,1,(null)", "insert,2,2,(null)", "insert,3,3,30"}) {
+		t.Errorf("changes %v", got)
+	}
+}
+
+// A second capture instance whose start the capture job hasn't established
+// yet, its start_lsn NULL, holds none of the changes: they're read from the
+// old one.
+func TestCaptureUnstartedInstance(t *testing.T) {
+	e := newSourceEnv(t)
+	e.exec("CREATE TABLE $schema.t (id int PRIMARY KEY, v int)")
+	e.capture("t")
+	e.harvested()
+	s := e.source(`, "cdcMethod": "change_data_capture"`)
+	state := read(t, s, source.CDC, map[string]string{"t": ""}).last("t")
+	e.exec("INSERT INTO $schema.t VALUES (1, 1)")
+	e.exec("EXEC sys.sp_cdc_enable_table @source_schema = @p1, @source_name = N't', @role_name = NULL, @capture_instance = @p2", e.schema, e.schema+"_t_v2")
+	e.exec("INSERT INTO $schema.t VALUES (2, 2)")
+	e.harvested()
+	// As cdc.change_tables has it before the capture job has seen the
+	// instance.
+	e.exec("UPDATE cdc.change_tables SET start_lsn = NULL WHERE capture_instance = @p1", e.schema+"_t_v2")
+	c := read(t, s, source.CDC, map[string]string{"t": state})
+	if got := changes(c, "t", "id", "v"); !slices.Equal(got, []string{"insert,1,1", "insert,2,2"}) {
 		t.Errorf("changes %v", got)
 	}
 }
@@ -268,6 +336,32 @@ func TestCDCPositionLost(t *testing.T) {
 			t.Errorf("retention of a lost position: %v, %v", r, err)
 		}
 	})
+}
+
+// Cleanup during a read, past changes it may not have reached, fails the
+// read before its next resume point, rather than moving past them.
+func TestCaptureCleanupMidRead(t *testing.T) {
+	e := newSourceEnv(t)
+	e.exec("CREATE TABLE $schema.t (id int PRIMARY KEY)")
+	e.capture("t")
+	e.harvested()
+	s := e.source(`, "cdcMethod": "change_data_capture", "chunkRows": 1`)
+	state := read(t, s, source.CDC, map[string]string{"t": ""}).last("t")
+	for i := range 4 {
+		e.exec(fmt.Sprintf("INSERT INTO $schema.t VALUES (%d)", i))
+	}
+	e.harvested()
+	var once sync.Once
+	c := &capturer{resumed: func() {
+		once.Do(func() {
+			e.exec("DECLARE @l binary(10) = sys.fn_cdc_get_max_lsn(); EXEC sys.sp_cdc_cleanup_change_table @capture_instance = @p1, @low_water_mark = @l, @threshold = 1000", e.schema+"_t")
+		})
+	}}
+	t.Cleanup(c.release)
+	err := s.Read(t.Context(), source.ReadRequest{Streams: []source.ConfiguredStream{{Name: "t", SyncMode: source.CDC, State: []byte(state)}}}, c)
+	if codeOf(err) != protocolv1.ErrorCode_ERROR_CODE_POSITION_LOST {
+		t.Errorf("read = %v, resume points %v", err, c.states["t"])
+	}
 }
 
 func TestRetention(t *testing.T) {
@@ -420,11 +514,14 @@ func TestCaptureHandoffWindow(t *testing.T) {
 	e.exec("INSERT INTO $schema.t VALUES (1, 1), (2, 2), (3, 3), (4, 4)")
 	e.capture("t")
 	e.harvested()
-	// The capture job is the database's: it runs again whatever happens here.
+	// The capture job is the database's: it runs again whatever happens here,
+	// or the tests after this one wait for it in vain.
 	t.Cleanup(func() {
-		_, _ = e.db.ExecContext(context.Background(), "EXEC sys.sp_cdc_start_job @job_type = N'capture'")
+		if err := startCapture(context.Background(), e.db); err != nil {
+			t.Error(err)
+		}
 	})
-	e.exec("EXEC sys.sp_cdc_stop_job @job_type = N'capture'")
+	e.stopCapture()
 	e.exec("UPDATE $schema.t SET v = 10 WHERE id = 1")
 	e.exec("DELETE FROM $schema.t WHERE id = 2")
 	e.exec("INSERT INTO $schema.t VALUES (5, 5)")
@@ -435,8 +532,9 @@ func TestCaptureHandoffWindow(t *testing.T) {
 	if got := changes(snap, "t", "id", "v"); !slices.Equal(got, []string{"insert,1,10", "insert,3,3", "insert,4,41", "insert,5,5"}) {
 		t.Fatalf("snapshot %v", got)
 	}
-	e.exec("EXEC sys.sp_cdc_start_job @job_type = N'capture'")
-	e.harvested()
+	if err := startCapture(t.Context(), e.db); err != nil {
+		t.Fatal(err)
+	}
 	after := read(t, s, source.CDC, map[string]string{"t": snap.last("t")})
 	if got := changes(after, "t", "id", "v"); !slices.Equal(got, []string{"update,1,10", "delete,2,2", "insert,5,5", "update,4,40", "update,4,41"}) {
 		t.Fatalf("changes %v", got)

@@ -1,6 +1,9 @@
 package sqlserver
 
 import (
+	"errors"
+	"fmt"
+	"math/big"
 	"slices"
 	"strings"
 	"testing"
@@ -9,9 +12,11 @@ import (
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/decimal128"
 	"github.com/apache/arrow-go/v18/arrow/memory"
+	mssql "github.com/microsoft/go-mssqldb"
 
 	"github.com/openetl-io/openetl/sdk/go/check"
 	"github.com/openetl-io/openetl/sdk/go/destination"
+	protocolv1 "github.com/openetl-io/openetl/sdk/go/protocol/v1"
 	"github.com/openetl-io/openetl/sdk/go/source"
 )
 
@@ -241,5 +246,88 @@ func TestCheckListsAreValid(t *testing.T) {
 	sv := serverOf("sqlserver://u:p@host/inst?database=d")
 	if sv.address != "" || sv.principal != "u" {
 		t.Errorf("named instance: %+v", sv)
+	}
+}
+
+// A poll reads the old capture instance up to where the new one starts,
+// and the new one from there; a new one the capture job hasn't started yet,
+// whose start_lsn is NULL, has no changes of its own, so the old one is read
+// on.
+func TestInstanceRanges(t *testing.T) {
+	n := func(i int64) *big.Int { return big.NewInt(i) }
+	old := captureInstance{name: "old", start: n(1)}
+	for _, c := range []struct {
+		name string
+		ins  []captureInstance
+		want string
+	}{
+		{"one", []captureInstance{old}, "old 10-20"},
+		{"new starts within", []captureInstance{old, {name: "new", start: n(15)}}, "old 10-14 new 15-20"},
+		{"new started before", []captureInstance{old, {name: "new", start: n(8)}}, "new 10-20"},
+		{"new starts after", []captureInstance{old, {name: "new", start: n(25)}}, "old 10-20"},
+		{"new not started", []captureInstance{old, {name: "new"}}, "old 10-20"},
+	} {
+		var got []string
+		for _, r := range instanceRanges(c.ins, n(10), n(20)) {
+			got = append(got, fmt.Sprintf("%s %s-%s", c.ins[r.i].name, r.lo, r.hi))
+		}
+		if strings.Join(got, " ") != c.want {
+			t.Errorf("%s: %v, want %s", c.name, got, c.want)
+		}
+	}
+}
+
+// Errors SQL Server and Azure SQL raise for a moment, which a retry gets
+// past, are TRANSIENT.
+func TestClassifyTransient(t *testing.T) {
+	for _, n := range []int32{1204, 1205, 1222, 601, 4221, 40143, 40197, 40501, 40540, 40613, 10928, 10929, 49918} {
+		var coded interface{ ErrorCode() protocolv1.ErrorCode }
+		if err := classify(mssql.Error{Number: n}); !errors.As(err, &coded) || coded.ErrorCode() != protocolv1.ErrorCode_ERROR_CODE_TRANSIENT {
+			t.Errorf("error %d = %v", n, err)
+		}
+	}
+}
+
+// The certificate is verified only where the dsn says to: go-mssqldb trusts
+// any without encrypt, or with trustServerCertificate=true.
+func TestServerVerifiesCertificate(t *testing.T) {
+	for suffix, want := range map[string]bool{
+		"": false, "&trustServerCertificate=false": true, "&encrypt=true": true, "&encrypt=true&trustServerCertificate=true": false,
+		"&encrypt=strict&trustServerCertificate=true": true, "&encrypt=disable": false,
+	} {
+		if got := serverOf("sqlserver://u:p@host:1433?database=d" + suffix).verified; got != want {
+			t.Errorf("%q: verified = %v, want %v", suffix, got, want)
+		}
+	}
+}
+
+// Change tables have __$command_id from SQL Server 2016 RTM CU5 and SP1 CU2:
+// SP1 and its first CU, and their GDRs, came before it.
+func TestCommandIDs(t *testing.T) {
+	for v, want := range map[string]bool{
+		"13.0.1601.5": false, "13.0.1745.2": false, "13.0.2197.0": true, "13.0.2216.0": true, "13.0.4001.0": false,
+		"13.0.4259.0": false, "13.0.4411.0": false, "13.0.4422.0": true, "13.0.5026.0": true, "14.0.1000.169": true,
+		"16.0.4135.4": true, "Azure SQL": true,
+	} {
+		if got := commandIDs(v); got != want {
+			t.Errorf("%s: %v, want %v", v, got, want)
+		}
+	}
+}
+
+// Of two patch columns that fill one held column, the first's UPDATE leaves
+// it held for the second's to match, and the second's takes it out.
+func TestPatchSharedHeldColumn(t *testing.T) {
+	w := &writer{schema: "s"}
+	s := stagedStream{Table: "t", Mode: modeMerge, Key: []string{"id"}, Fills: map[string]string{"price__v2": "price"}}
+	stmts := w.PatchSQL(s, prepared{patch: []string{"id", "price__v2", "price", idColumn, heldColumn}, patches: lanesRows{rel: "[s].[p]"}, key: []column{{name: "id", typ: "bigint"}}})
+	if len(stmts) != 2 {
+		t.Fatalf("%d statements: %q", len(stmts), stmts)
+	}
+	unhold := quote(heldColumn) + " = NULLIF("
+	for i, want := range []bool{false, true} {
+		if got := strings.Contains(stmts[i], unhold); got != want {
+			t.Errorf("statement %d takes the held column out: %v, want %v\n%s", i, got, want, stmts[i])
+		}
 	}
 }

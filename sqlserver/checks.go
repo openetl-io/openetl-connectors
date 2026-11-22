@@ -42,6 +42,12 @@ var (
 		Message: "{table} has no primary key, and cdc reads only tables with one.",
 		Fix:     "Give {table} a primary key, or read it with full_refresh or incremental.",
 	}
+	variantKey = check.Reason{
+		Name:    "primary_key_variant",
+		Code:    protocolv1.ErrorCode_ERROR_CODE_CONFIG_INVALID,
+		Message: "{table}'s primary key has a sql_variant column, whose values arrive as text, which can't tell 1 from N'1', so the source reads it as a table without a key, and cdc reads only tables with one.",
+		Fix:     "Read {table} with full_refresh or incremental, or give it a primary key of other types.",
+	}
 	notTracked = check.Reason{
 		Name:    "change_tracking_off",
 		Code:    protocolv1.ErrorCode_ERROR_CODE_CONFIG_INVALID,
@@ -54,11 +60,17 @@ var (
 		Message: "{table} has no capture instance that {principal} can read.",
 		Fix:     "Run EXEC sys.sp_cdc_enable_table @source_schema = N'{schema}', @source_name = N'{name}', @role_name = NULL; and GRANT SELECT ON SCHEMA::cdc TO {principal};",
 	}
+	otherCodePage = check.Reason{
+		Name:    "code_page_differs",
+		Code:    protocolv1.ErrorCode_ERROR_CODE_CONFIG_INVALID,
+		Message: "{column} of {table} is a char, varchar or text column in a collation whose code page isn't the database's: change data capture keeps only the characters the database's code page has, and writes ? in the change table for the rest.",
+		Fix:     "Make {column} nchar or nvarchar, or give it the database's collation, or read {table} with change tracking.",
+	}
 	badCursor = check.Reason{
 		Name:    "cursor_invalid",
 		Code:    protocolv1.ErrorCode_ERROR_CODE_CONFIG_INVALID,
 		Message: "{table} has no column {cursor} of a type an incremental read orders by.",
-		Fix:     "Choose a cursor column of a number, date, datetime, text or rowversion type.",
+		Fix:     "Choose a cursor column of a number, date, datetime, text or rowversion type, but not (max).",
 	}
 	retentionShort = check.Reason{
 		Name:    "retention_short",
@@ -103,6 +115,8 @@ type server struct {
 	// The dsn's encrypt is true or strict: TLS for the whole connection, or
 	// no sign-in.
 	encrypted bool
+	// TLS, the sign-in's at least, checks the server's certificate.
+	verified bool
 }
 
 // serverOf reads a DSN that NewSource or NewDestination has parsed.
@@ -112,6 +126,7 @@ func serverOf(dsn string) server {
 	sv.database = cfg.Database
 	sv.principal = cmp.Or(cfg.User, "the connector's login")
 	sv.encrypted = cfg.Encryption == msdsn.EncryptionRequired || cfg.Encryption == msdsn.EncryptionStrict
+	sv.verified = cfg.TLSConfig != nil && (!cfg.TLSConfig.InsecureSkipVerify || cfg.TLSConfig.VerifyPeerCertificate != nil)
 	if cfg.Port != 0 || cfg.Instance == "" {
 		port := cfg.Port
 		if port == 0 {
@@ -179,8 +194,12 @@ func (sv server) connect(k *sqlcheck.Kit) []check.Check {
 		c.Needs = []string{"net.connect"}
 	}
 	tls := k.Check("db.tls", check.Connection, "Encrypt the connection", func(ctx context.Context, p *check.Probe, db *sql.DB) error {
+		cert := "with a certificate the dsn verifies."
+		if !sv.verified {
+			cert = "with a certificate the dsn doesn't verify: its trustServerCertificate is true, as it is without encrypt unless the dsn sets it."
+		}
 		if sv.encrypted {
-			p.Found("The dsn's encrypt requires TLS for the whole connection.")
+			p.Found("The dsn's encrypt requires TLS for the whole connection, " + cert)
 			return nil
 		}
 		// Without VIEW SERVER STATE, the login can't see the session's
@@ -190,7 +209,7 @@ func (sv server) connect(k *sqlcheck.Kit) []check.Check {
 		if err != nil || on != "TRUE" {
 			return check.Warn(unencrypted.Fail())
 		}
-		p.Found("The server encrypts the connection.")
+		p.Found("The server encrypts the connection, " + cert)
 		return nil
 	})
 	tls.Field = "dsn"
@@ -198,15 +217,31 @@ func (sv server) connect(k *sqlcheck.Kit) []check.Check {
 }
 
 // version needs SQL Server major version min, or Azure SQL, whose
-// versions don't compare.
-func version(k *sqlcheck.Kit, min int, name string) check.Check {
+// versions don't compare; with capture, one whose change tables have
+// __$command_id.
+func version(k *sqlcheck.Kit, min int, name string, capture bool) check.Check {
 	return k.Value("server.version", "Run on "+name+" or later", func(v string) error {
 		major, _, _ := strings.Cut(v, ".")
 		if n, err := strconv.Atoi(major); err == nil && n < min {
 			return check.UnsupportedVersion.Fail("required", name)
 		}
+		if capture && !commandIDs(v) {
+			return check.UnsupportedVersion.Fail("required", "SQL Server 2016 SP1 CU2, for change data capture,")
+		}
 		return nil
 	}, "SELECT CASE WHEN SERVERPROPERTY('EngineEdition') IN (5, 8) THEN N'Azure SQL' ELSE CONVERT(nvarchar(30), SERVERPROPERTY('ProductVersion')) END")
+}
+
+// commandIDs reports whether version v's change tables have __$command_id,
+// which SQL Server 2016 has from RTM CU5 (13.0.2197) and SP1 CU2
+// (13.0.4422), but not in SP1 and its first CU (13.0.4001 to 4421).
+func commandIDs(v string) bool {
+	parts := strings.Split(v, ".")
+	if len(parts) < 3 || parts[0] != "13" {
+		return true
+	}
+	build, err := strconv.Atoi(parts[2])
+	return err != nil || build >= 4422 || build >= 2197 && build < 4001
 }
 
 // schemaExists is a check that the user can see the schema.
@@ -237,7 +272,7 @@ func (s *Source) Checks() []check.Check {
 	sv := serverOf(s.cfg.DSN.Reveal())
 	k := sv.kit()
 	checks := sv.connect(k)
-	checks = append(checks, version(k, 13, "SQL Server 2016"), schemaExists(k, "schema.exists", s.cfg.Schema, "schema"))
+	checks = append(checks, version(k, 13, "SQL Server 2016", s.cfg.CDCMethod == methodCapture), schemaExists(k, "schema.exists", s.cfg.Schema, "schema"))
 	n := checkNames{}
 	if len(s.cfg.Tables) > 0 {
 		for _, t := range s.cfg.Tables {
@@ -345,13 +380,14 @@ func (s *Source) Preflight(req source.PreflightRequest) []check.Check {
 			params["cursor"] = st.Cursor
 			c = k.Check(n.of("stream", st.Name, "cursor"), check.Configuration, "Order {stream} by {cursor}", func(ctx context.Context, _ *check.Probe, db *sql.DB) error {
 				var typ string
-				err := db.QueryRowContext(ctx, "SELECT TYPE_NAME(system_type_id) FROM sys.columns WHERE object_id = OBJECT_ID(@p1) AND name = @p2", ident, st.Cursor).Scan(&typ)
+				var length int
+				err := db.QueryRowContext(ctx, "SELECT TYPE_NAME(system_type_id), max_length FROM sys.columns WHERE object_id = OBJECT_ID(@p1) AND name = @p2", ident, st.Cursor).Scan(&typ, &length)
 				switch {
 				case errors.Is(err, sql.ErrNoRows):
 					return badCursor.Fail()
 				case err != nil:
 					return k.Failure(err)
-				case !cursorTypes[typ]:
+				case !cursorTypes[typ] || length < 0:
 					return badCursor.Fail()
 				}
 				return nil
@@ -378,14 +414,18 @@ func (s *Source) cdcCheck(k *sqlcheck.Kit, name, ident string) check.Check {
 	if s.cfg.CDCMethod == methodCapture {
 		title = "Read {stream}'s changes through change data capture"
 	}
-	return k.Check(name, check.Compatibility, title, func(ctx context.Context, _ *check.Probe, db *sql.DB) error {
+	return k.Check(name, check.Compatibility, title, func(ctx context.Context, p *check.Probe, db *sql.DB) error {
 		var keyed int
 		var ok sql.NullInt64
-		q := "SELECT coalesce(OBJECTPROPERTY(OBJECT_ID(@p1), 'TableHasPrimaryKey'), 0), CHANGE_TRACKING_MIN_VALID_VERSION(OBJECT_ID(@p1))"
+		// 0 without a primary key, 2 with one of a sql_variant column.
+		const key = `CASE WHEN coalesce(OBJECTPROPERTY(OBJECT_ID(@p1), 'TableHasPrimaryKey'), 0) = 0 THEN 0
+			WHEN EXISTS (SELECT 1 FROM sys.indexes i JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id
+				JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id
+				WHERE i.object_id = OBJECT_ID(@p1) AND i.is_primary_key = 1 AND TYPE_NAME(c.system_type_id) = 'sql_variant') THEN 2 ELSE 1 END`
+		q := "SELECT " + key + ", CHANGE_TRACKING_MIN_VALID_VERSION(OBJECT_ID(@p1))"
 		if s.cfg.CDCMethod == methodCapture {
-			q = `SELECT coalesce(OBJECTPROPERTY(OBJECT_ID(@p1), 'TableHasPrimaryKey'), 0),
-				(SELECT TOP (1) 1 FROM cdc.change_tables ct WHERE ct.source_object_id = OBJECT_ID(@p1)
-					AND HAS_PERMS_BY_NAME(N'cdc.' + QUOTENAME(N'fn_cdc_get_all_changes_' + ct.capture_instance), 'OBJECT', 'SELECT') = 1)`
+			q = "SELECT " + key + `, (SELECT TOP (1) 1 FROM cdc.change_tables ct WHERE ct.source_object_id = OBJECT_ID(@p1)
+					AND HAS_PERMS_BY_NAME(N'cdc.' + QUOTENAME(ct.capture_instance + N'_CT'), 'OBJECT', 'SELECT') = 1)`
 		}
 		if err := db.QueryRowContext(ctx, q, ident).Scan(&keyed, &ok); err != nil {
 			if f := k.Failure(err); s.cfg.CDCMethod == methodCapture && f.Code == protocolv1.ErrorCode_ERROR_CODE_PERMISSION_DENIED {
@@ -396,12 +436,30 @@ func (s *Source) cdcCheck(k *sqlcheck.Kit, name, ident string) check.Check {
 		switch {
 		case keyed == 0:
 			return noKey.Fail()
+		case keyed == 2:
+			return variantKey.Fail()
 		case !ok.Valid && s.cfg.CDCMethod == methodCapture:
 			return notCaptured.Fail()
 		case !ok.Valid:
 			return notTracked.Fail()
+		case s.cfg.CDCMethod != methodCapture:
+			return nil
 		}
-		return nil
+		// The capture job passes such a column's values through the
+		// database's code page.
+		var column string
+		err := db.QueryRowContext(ctx, `SELECT TOP (1) c.name FROM sys.columns c
+			WHERE c.object_id = OBJECT_ID(@p1) AND TYPE_NAME(c.system_type_id) IN ('char', 'varchar', 'text')
+				AND COLLATIONPROPERTY(c.collation_name, 'CodePage') <> COLLATIONPROPERTY(CONVERT(sysname, DATABASEPROPERTYEX(DB_NAME(), 'Collation')), 'CodePage')
+			ORDER BY c.column_id`, ident).Scan(&column)
+		switch {
+		case errors.Is(err, sql.ErrNoRows):
+			return nil
+		case err != nil:
+			return k.Failure(err)
+		}
+		p.Param("column", column)
+		return check.Warn(otherCodePage.Fail())
 	})
 }
 
@@ -465,7 +523,7 @@ func (d *Destination) Checks() []check.Check {
 	compat.Description = "Applying a merge reads JSON with OPENJSON, which takes compatibility level 130."
 	create := k.True("database.create-table", "Create tables", check.PrivilegeMissing.Fail("principal", sv.principal, "privilege", "CREATE TABLE", "object", "the database"), nil,
 		"SELECT HAS_PERMS_BY_NAME(DB_NAME(), 'DATABASE', 'CREATE TABLE')")
-	return append(checks, version(k, 14, "SQL Server 2017"), compat, create, schemaWrite(k, sv, "schema.write", d.cfg.Schema, "schema"))
+	return append(checks, version(k, 14, "SQL Server 2017", false), compat, create, schemaWrite(k, sv, "schema.write", d.cfg.Schema, "schema"))
 }
 
 // schemaWrite is a check that the login can write tables in schema, or

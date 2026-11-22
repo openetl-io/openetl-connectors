@@ -30,9 +30,9 @@ A column added to a table since the run discovered it fails the read, in any mod
 `cdcMethod` picks how `cdc` reads changes, for every stream of the source:
 
 - **`change_tracking`** (the default) needs the least setup, and no SQL Server Agent. Each poll reads the keys changed since the last, with their rows as they are at the time of the read. A key changed several times between polls arrives once, with its latest row; a delete carries its key alone.
-- **`change_data_capture`** reads every change with its whole row, from the change tables that SQL Server Agent's capture job fills from the transaction log. A change is read once the capture job has harvested it, a few seconds after it commits, and a read that isn't continuous ends at the changes harvested when it starts. Computed columns, and columns the table's capture instance doesn't capture, arrive null, named as columns the change didn't send, so a merge keeps the values the destination has for them. Choose it to keep every version of a row, or for a destination that reads a writer lane's part again (see [Delivery](#delivery)).
+- **`change_data_capture`** reads every change with its whole row, from the change tables that SQL Server Agent's capture job fills from the transaction log, each transaction's in the order of their `__$command_id`, which SQL Server 2016 has from RTM CU5 and SP1 CU2. An update of a row's key arrives as a delete of the old key and an insert of the new. A change is read once the capture job has harvested it, a few seconds after it commits, and a read that isn't continuous ends at the changes harvested when it starts. Computed columns, and columns the table's capture instance doesn't capture, arrive null, named as columns the change didn't send, so a merge keeps the values the destination has for them. Choose it to keep every version of a row, or for a destination that reads a writer lane's part again (see [Delivery](#delivery)).
 
-When a captured table's schema changes, make it a second capture instance with the new columns. The source reads the old instance up to where the new one starts, then the new one, and the old one can be dropped once the source has read past it. Until then, a column added to the table arrives null in changes.
+When a captured table's schema changes, make it a second capture instance with the new columns. The source reads the old instance up to where the new one starts, once the capture job has started it, then the new one, and the old one can be dropped once the source has read past it. Until then, a column added to the table arrives null in changes.
 
 ### Set it up
 
@@ -62,9 +62,9 @@ GRANT SELECT ON SCHEMA::cdc TO openetl;
 ```
 
 > [!WARNING]
-> SQL Server cleans up changes after their retention: change tracking's `CHANGE_RETENTION`, 2 days by default, and change data capture's cleanup job, 3 days by default (`EXEC sys.sp_cdc_change_job @job_type = N'cleanup', @retention = ...`, in minutes). A pipeline that doesn't read a table for longer, or a table truncated under change tracking, fails with `POSITION_LOST`, which pauses it until it [reads from the start again](https://github.com/openetl-io/openetl/blob/main/docs/pipelines/positions.md#after-a-lost-position). OpenETL reports how far behind each stream is, and how much retention it has left: with change data capture, only if the login has `SELECT` on `msdb.dbo.cdc_jobs`.
+> SQL Server cleans up changes after their retention: change tracking's `CHANGE_RETENTION`, 2 days by default, and change data capture's cleanup job, 3 days by default (`EXEC sys.sp_cdc_change_job @job_type = N'cleanup', @retention = ...`, in minutes). A pipeline that doesn't read a table for longer, a table truncated under change tracking, or a change data capture read that cleanup passes before it reaches the changes, fails with `POSITION_LOST`, which pauses it until it [reads from the start again](https://github.com/openetl-io/openetl/blob/main/docs/pipelines/positions.md#after-a-lost-position). OpenETL reports how far behind each stream is, and how much retention it has left: with change data capture, only if the login has `SELECT` on `msdb.dbo.cdc_jobs`.
 
-The `dsn` is a `sqlserver://` URL, such as `sqlserver://openetl:PASSWORD@db.example.com:1433?database=shop`, or an ADO or ODBC connection string. It's a secret: store it with `openetl secret set app-db-dsn`. Its `encrypt` decides TLS: `true` encrypts the whole connection, and verifies the server's certificate unless `trustServerCertificate=true`; `certificate` names a file of the authority to trust, and `hostNameInCertificate` the name the certificate holds. Without `encrypt`, only the sign-in is encrypted, unless the server forces encryption.
+The `dsn` is a `sqlserver://` URL, such as `sqlserver://openetl:PASSWORD@db.example.com:1433?database=shop`, or an ADO or ODBC connection string. It's a secret: store it with `openetl secret set app-db-dsn`. Its `encrypt` decides TLS: `true` encrypts the whole connection, and verifies the server's certificate unless `trustServerCertificate=true`; `strict` (TDS 8.0, SQL Server 2022) always verifies it; `certificate` names a file of the authority to trust, and `hostNameInCertificate` the name the certificate holds. Without `encrypt`, only the sign-in is encrypted, unless the server forces encryption, and the server's certificate isn't verified, so the password can be read by whoever can stand between OpenETL and the server, unless the `dsn` sets `trustServerCertificate=false`. Set `encrypt=true` or `encrypt=strict`.
 
 ### Check and preflight
 
@@ -74,8 +74,8 @@ The source's check reports an item for each thing it looks at, with a fix for wh
 |---|---|
 | `net.dns`, `net.connect` | The `dsn`'s host resolves, and its port takes a connection. Not checked for a named instance without a port, which SQL Server Browser resolves. |
 | `db.connect` | The login signs in and opens the database. A TLS handshake that fails, such as with a certificate the `dsn` doesn't trust, fails this item. |
-| `db.tls` | The connection is encrypted: the `dsn`'s `encrypt` is `true` or `strict`, or the server encrypts it. Otherwise it warns. |
-| `server.version` | SQL Server 2016 or later. |
+| `db.tls` | The connection is encrypted: the `dsn`'s `encrypt` is `true` or `strict`, or the server encrypts it, and whether the `dsn` verifies the server's certificate. Otherwise it warns. |
+| `server.version` | SQL Server 2016 or later; with `change_data_capture`, one whose change tables have `__$command_id`: 2016 from RTM CU5 or SP1 CU2. |
 | `schema.exists` | The schema exists. |
 | `schema.read` | The login has `SELECT` on every table and view in the schema. When `tables` is set, `table.NAME.read` instead, for each one it names. |
 | `database.change-tracking` | With `change_tracking`, the database has change tracking on. It only warns: CDC is a pipeline's choice. |
@@ -87,8 +87,8 @@ A preflight is about the streams a pipeline reads:
 | Item | What it checks |
 |---|---|
 | `stream.NAME.read` | The stream's table or view exists, and the login has `SELECT` on it. |
-| `stream.NAME.cursor` | An incremental stream's cursor is a column of a type the source reads by. |
-| `stream.NAME.change-tracking`, `stream.NAME.change-data-capture` | A table read with CDC has a primary key and is tracked, with `VIEW CHANGE TRACKING`, or captured, with `SELECT` on its capture instance. |
+| `stream.NAME.cursor` | An incremental stream's cursor is a column of a type the source reads by, and not `(max)`. |
+| `stream.NAME.change-tracking`, `stream.NAME.change-data-capture` | A table read with CDC has a primary key and is tracked, with `VIEW CHANGE TRACKING`, or captured, with `SELECT` on its capture instance's change table. Captured, it warns of a `char`, `varchar` or `text` column in a collation whose code page isn't the database's (below). |
 | `cdc.retention` | Warns when the database keeps changes no longer than the pipeline's schedule goes between syncs. With change data capture, skipped unless the login has `SELECT` on `msdb.dbo.cdc_jobs`. |
 
 ### Example
@@ -162,7 +162,8 @@ A read that OpenETL gives an end, as it does to read a writer lane's part of an 
 - `cdc` reads only tables with a primary key, never views.
 - Change tracking sends net changes, as its rows are at the time of the read: an update and the delete after it arrive as the delete alone, and an update's row can be newer than the version it's sent with.
 - `sql_variant` values arrive as text, losing their base type.
-- A primary key with a `sql_variant` column that holds anything but text can't order a read in chunks: SQL Server compares a variant's type family before its value, and the text a read goes on from has lost it, so a read of `chunkRows` rows or more, or a CDC snapshot of `snapshotChunkRows` or more, reads its first chunk again and again. Read such a table through a view of it, which is read in a single query.
+- A primary key with a `sql_variant` column isn't the stream's: SQL Server compares a variant's type family before its value, so `1` and `N'1'` are two keys, which arrive as the same text, and the text can't order a read either. Such a table is offered as one without a key: read in a single query, and not with `cdc`, which its preflight fails.
+- Under change data capture, a `char`, `varchar` or `text` column in a collation whose code page isn't the database's, such as a UTF-8 collation in a database that isn't, arrives in changes with `?` for each character the database's code page doesn't have: SQL Server's capture job writes them so to the change table. The snapshot has them right. Make such a column `nvarchar`, or read the table with change tracking.
 - Under change data capture, a computed column's value arrives only in the snapshot; changes leave it out, so a merge keeps the snapshot's value at the destination, which goes stale as the row changes.
 
 ## Destination

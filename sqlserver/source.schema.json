@@ -11,7 +11,7 @@
     {"id": "performance", "title": "Performance", "description": "How much a read takes at a time."}
   ],
   "properties": {
-    "dsn": {"type": "string", "title": "Connection string", "x-secret": true, "x-group": "connection", "examples": ["sqlserver://user:password@host:1433?database=shop"], "description": "A sqlserver:// URL, or an ADO or ODBC connection string, naming the database to read, such as sqlserver://user:password@host:1433?database=shop."},
+    "dsn": {"type": "string", "title": "Connection string", "x-secret": true, "x-group": "connection", "examples": ["sqlserver://user:password@host:1433?database=shop"], "description": "A sqlserver:// URL, or an ADO or ODBC connection string, naming the database to read, such as sqlserver://user:password@host:1433?database=shop&encrypt=true. Without encrypt=true or strict, the server's certificate isn't verified."},
     "schema": {"type": "string", "title": "Schema", "default": "dbo", "x-group": "tables", "description": "The schema whose tables and views are offered as streams."},
     "tables": {"type": "array", "title": "Tables", "items": {"type": "string"}, "x-group": "tables", "description": "The tables and views to offer as streams. Empty: every one in the schema."},
     "cdcMethod": {
