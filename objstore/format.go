@@ -17,6 +17,8 @@ import (
 	"github.com/klauspost/compress/zstd"
 
 	"github.com/openetl-io/openetl-connectors/records"
+	sdk "github.com/openetl-io/openetl/sdk/go"
+	protocolv1 "github.com/openetl-io/openetl/sdk/go/protocol/v1"
 )
 
 // The formats the destination writes, and the source reads besides Avro.
@@ -292,7 +294,8 @@ func decompress(compression string, r io.Reader) (io.ReadCloser, error) {
 		return io.NopCloser(snappy.NewReader(r)), nil
 	}
 	if compression != "none" {
-		return nil, fmt.Errorf("%s compression is none of gzip, zstd, bzip2 and snappy, which the source reads", compression)
+		return nil, sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_DATA_INVALID,
+			fmt.Errorf("%s compression is none of gzip, zstd, bzip2 and snappy, which the source reads", compression))
 	}
 	return io.NopCloser(r), nil
 }
