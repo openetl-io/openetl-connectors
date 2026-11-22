@@ -369,6 +369,42 @@ func TestCDCSnapshotsThenReadsChanges(t *testing.T) {
 	})
 }
 
+// TestCDCReadsSavepointsAndXA reads a transaction with a savepoint in it,
+// which MariaDB logs without a BEGIN, and XA transactions committed in two
+// phases and in one.
+func TestCDCReadsSavepointsAndXA(t *testing.T) {
+	eachServer(t, func(t *testing.T, srv testServer) {
+		e := newSourceEnv(t, srv)
+		e.exec("CREATE TABLE $db.items (id int PRIMARY KEY, v varchar(20))")
+		s := e.source("")
+		first := read(t, s, cdc("savepoints", nil, "items"))
+		conn, err := e.db.Conn(t.Context())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = conn.Close() }()
+		items := quoteIdent(e.database) + ".items"
+		for _, q := range []string{
+			"BEGIN", "INSERT INTO " + items + " VALUES (1, 'a')", "SAVEPOINT s1", "INSERT INTO " + items + " VALUES (2, 'b')", "COMMIT",
+			"XA START 'x1'", "INSERT INTO " + items + " VALUES (3, 'c')", "XA END 'x1'", "XA PREPARE 'x1'", "XA COMMIT 'x1'",
+			"XA START 'x2'", "INSERT INTO " + items + " VALUES (4, 'd')", "XA END 'x2'", "XA COMMIT 'x2' ONE PHASE",
+			"INSERT INTO " + items + " VALUES (5, 'e')",
+		} {
+			if _, err := conn.ExecContext(t.Context(), q); err != nil {
+				t.Fatalf("%s: %v", q, err)
+			}
+		}
+		next := read(t, s, cdc("savepoints", map[string]string{"items": first.state("items")}, "items"))
+		var log []string
+		for _, r := range next.rows("items") {
+			log = append(log, r["openetl.op"]+" "+r["id"])
+		}
+		if want := []string{"insert 1", "insert 2", "insert 3", "insert 4", "insert 5"}; !slices.Equal(log, want) {
+			t.Fatalf("changes %q, want %q", log, want)
+		}
+	})
+}
+
 func TestCDCNewColumnRestartsTheRead(t *testing.T) {
 	eachServer(t, func(t *testing.T, srv testServer) {
 		e := newSourceEnv(t, srv)

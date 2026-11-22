@@ -787,11 +787,18 @@ func (r *cdcReader) event(ctx context.Context, ev *replication.BinlogEvent) erro
 		if err != nil {
 			return err
 		}
-		return r.begin(g, time.Unix(int64(h.Timestamp), 0))
+		if err := r.begin(g, time.Unix(int64(h.Timestamp), 0)); err != nil {
+			return err
+		}
+		// MariaDB writes no BEGIN: a group that isn't a statement on its own
+		// ends at its COMMIT or XID, whatever statements, such as SAVEPOINT,
+		// come before.
+		r.txn.begun = !e.IsStandalone()
+		return nil
 	case *replication.QueryEvent:
 		q := strings.ToUpper(strings.TrimSpace(string(e.Query)))
 		switch {
-		case q == "BEGIN":
+		case q == "BEGIN" || strings.HasPrefix(q, "XA START"):
 			if r.txn == nil {
 				if err := r.begin(nil, time.Unix(int64(h.Timestamp), 0)); err != nil {
 					return err
@@ -816,6 +823,12 @@ func (r *cdcReader) event(ctx context.Context, ev *replication.BinlogEvent) erro
 		return nil
 	case *replication.XIDEvent:
 		return r.commit(h)
+	case *replication.GenericEvent:
+		// An XA transaction's changes end at its XA PREPARE; its XA COMMIT
+		// comes later, as a statement on its own.
+		if h.EventType == replication.XA_PREPARE_LOG_EVENT {
+			return r.commit(h)
+		}
 	case *replication.TableMapEvent:
 		return r.relation(ctx, e)
 	case *replication.RowsEvent:
@@ -956,7 +969,12 @@ func (r *cdcReader) rows(t replication.EventType, e *replication.RowsEvent) erro
 		return fmt.Errorf("mysql: binlog: rows of table %d, which the binlog hasn't described", e.TableID)
 	}
 	st := rel.stream
-	if st == nil || r.txn == nil || r.txn.skip[st] || st.finished {
+	switch {
+	case st == nil || st.finished:
+		return nil
+	case r.txn == nil:
+		return fmt.Errorf("mysql: binlog: changes to %s outside a transaction, at %s:%d", st.t.name, r.pos.File, r.pos.Pos)
+	case r.txn.skip[st]:
 		return nil
 	}
 	var op string

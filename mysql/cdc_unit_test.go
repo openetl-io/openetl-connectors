@@ -1,9 +1,11 @@
 package mysql
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/apache/arrow-go/v18/arrow/memory"
+	gomysql "github.com/go-mysql-org/go-mysql/mysql"
 	"github.com/go-mysql-org/go-mysql/replication"
 
 	"github.com/openetl-io/openetl-connectors/connectortest"
@@ -95,6 +97,74 @@ func TestCompressedTransactionsMoveThePosition(t *testing.T) {
 	rows := emitted(t, r, rec)
 	if len(rows) != 2 || cmpSeqText(rows[0]["openetl.seq"], rows[1]["openetl.seq"]) >= 0 {
 		t.Fatalf("rows %v: the second transaction's seq isn't above the first's", rows)
+	}
+}
+
+// TestMariaDBTransactionsHaveNoBegin reads a MariaDB transaction, which
+// its GTID event begins without a BEGIN, with a SAVEPOINT inside it: the
+// rows after the savepoint are the transaction's too.
+func TestMariaDBTransactionsHaveNoBegin(t *testing.T) {
+	r, rec := binlogReader(t, true)
+	gtid := &replication.MariadbGTIDEvent{GTID: gomysql.MariadbGTID{ServerID: 1, SequenceNumber: 5}, Flags: replication.BINLOG_MARIADB_FL_TRANSACTIONAL}
+	err := feed(t, r,
+		at(100, replication.MARIADB_GTID_EVENT, gtid),
+		at(150, replication.TABLE_MAP_EVENT, itemsMap()),
+		at(200, replication.WRITE_ROWS_EVENTv1, itemRows([]any{int32(1), "a"})),
+		at(250, replication.QUERY_EVENT, query("SAVEPOINT `s1`")),
+		at(300, replication.TABLE_MAP_EVENT, itemsMap()),
+		at(350, replication.WRITE_ROWS_EVENTv1, itemRows([]any{int32(2), "b"})),
+		at(400, replication.XID_EVENT, &replication.XIDEvent{}),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rows := emitted(t, r, rec); len(rows) != 2 || r.txn != nil || r.pos.Pos != 400 {
+		t.Fatalf("rows %v, position %v, in a transaction %v", rows, r.pos, r.txn != nil)
+	}
+	// A DDL's group is standalone: its statement ends it.
+	ddl := &replication.MariadbGTIDEvent{GTID: gomysql.MariadbGTID{ServerID: 1, SequenceNumber: 6}, Flags: replication.BINLOG_MARIADB_FL_STANDALONE | replication.BINLOG_MARIADB_FL_DDL}
+	if err := feed(t, r, at(450, replication.MARIADB_GTID_EVENT, ddl), at(500, replication.QUERY_EVENT, query("ALTER TABLE items ADD COLUMN w int"))); err != nil {
+		t.Fatal(err)
+	}
+	if r.txn != nil || r.pos.Pos != 500 {
+		t.Fatalf("after a DDL: position %v, in a transaction %v", r.pos, r.txn != nil)
+	}
+}
+
+// TestXATransactionsAreRead reads an XA transaction as MySQL logs it, in two
+// parts: its changes between XA START and the XA_prepare event that ends
+// them, and later its XA COMMIT on its own.
+func TestXATransactionsAreRead(t *testing.T) {
+	r, rec := binlogReader(t, false)
+	err := feed(t, r,
+		at(100, replication.ANONYMOUS_GTID_EVENT, &replication.GTIDEvent{}),
+		at(200, replication.QUERY_EVENT, query("XA START X'78',X'',1")),
+		at(250, replication.TABLE_MAP_EVENT, itemsMap()),
+		at(300, replication.WRITE_ROWS_EVENTv2, itemRows([]any{int32(1), "a"})),
+		at(350, replication.QUERY_EVENT, query("XA END X'78',X'',1")),
+		at(400, replication.XA_PREPARE_LOG_EVENT, &replication.GenericEvent{}),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.txn != nil || r.pos.Pos != 400 {
+		t.Fatalf("after XA PREPARE: position %v, in a transaction %v", r.pos, r.txn != nil)
+	}
+	if err := feed(t, r, at(450, replication.ANONYMOUS_GTID_EVENT, &replication.GTIDEvent{}), at(550, replication.QUERY_EVENT, query("XA COMMIT X'78',X'',1"))); err != nil {
+		t.Fatal(err)
+	}
+	if rows := emitted(t, r, rec); len(rows) != 1 || rows[0]["id"] != "1" || r.txn != nil || r.pos.Pos != 550 {
+		t.Fatalf("rows %v, position %v, in a transaction %v", rows, r.pos, r.txn != nil)
+	}
+}
+
+// TestRowsOutsideATransactionFail: rows of a stream that come where the
+// read sees no transaction fail it, rather than go unread.
+func TestRowsOutsideATransactionFail(t *testing.T) {
+	r, _ := binlogReader(t, false)
+	err := feed(t, r, at(150, replication.TABLE_MAP_EVENT, itemsMap()), at(200, replication.WRITE_ROWS_EVENTv2, itemRows([]any{int32(1), "a"})))
+	if err == nil || !strings.Contains(err.Error(), "outside a transaction") {
+		t.Fatalf("rows outside a transaction: %v", err)
 	}
 }
 
