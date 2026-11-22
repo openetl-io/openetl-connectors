@@ -25,7 +25,7 @@
       "type": "string",
       "x-secret": true,
       "title": "Access key ID",
-      "description": "An AWS access key. Without one, the AWS default credentials: an IAM role the source names, or what the runner passes on.",
+      "description": "An AWS access key. Without one, the AWS default credentials: an IAM role the destination names, or what the runner passes on.",
       "x-group": "credentials"
     },
     "secretAccessKey": {
