@@ -98,6 +98,12 @@ const (
 	listTries = 5
 	// The most rows one Rows call carries.
 	rowsPerEmit = 5000
+	// How far behind the runner's clock Kinesis's may be: a start at a time
+	// the runner's clock has passed, which Kinesis refuses as later than its
+	// own, is tried again every skewEvery until then. AWS refuses requests
+	// signed further off.
+	maxClockSkew = 5 * time.Minute
+	skewEvery    = time.Second
 )
 
 type Source struct {
@@ -1143,13 +1149,21 @@ func (rd *reading) poll(ctx context.Context, r *streamRead, shard string) error 
 }
 
 // startRefused is err, or if Kinesis refused to start the shard's read at
-// startTimestamp, a config error that says so: Kinesis refuses a time later
-// than its clock.
+// startTimestamp, later than the runner's clock, a config error that says
+// so: Kinesis refuses a time later than its clock.
 func (sr *shardRead) startRefused(err error, at types.ShardIteratorType) error {
-	if at != types.ShardIteratorTypeAtTimestamp || apiCode(err) != "InvalidArgumentException" {
+	if at != types.ShardIteratorTypeAtTimestamp || apiCode(err) != "InvalidArgumentException" || !sr.st.From.After(time.Now()) {
 		return err
 	}
 	return invalid(fmt.Errorf("startTimestamp %s is later than Kinesis's clock, and a read starts only at a time that has passed: set startTimestamp to a past time, or startPosition to latest: %w", sr.st.From.UTC().Format(time.RFC3339), err))
+}
+
+// skewed says Kinesis refused to start the shard's read at a time that the
+// runner's clock passed less than maxClockSkew ago: Kinesis's clock is
+// behind the runner's, and takes the time once it has passed it too.
+func (sr *shardRead) skewed(err error, at types.ShardIteratorType) bool {
+	return at == types.ShardIteratorTypeAtTimestamp && apiCode(err) == "InvalidArgumentException" &&
+		!sr.st.From.After(time.Now()) && time.Since(sr.st.From) < maxClockSkew
 }
 
 func (sr *shardRead) failed(err error) error {
@@ -1225,6 +1239,14 @@ func (sr *shardRead) iterator(ctx context.Context) (*string, error) {
 		if throttled(err) {
 			if err := sr.th.wait(ctx, err); err != nil {
 				return nil, sr.failed(err)
+			}
+			continue
+		}
+		if sr.skewed(err, in.ShardIteratorType) {
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(skewEvery):
 			}
 			continue
 		}

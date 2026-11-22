@@ -208,6 +208,9 @@ func (sr *shardRead) subscribe(ctx context.Context) (bool, error) {
 		if ctx.Err() != nil {
 			return false, nil
 		}
+		if sr.skewed(err, at.Type) {
+			continue
+		}
 		if !resubscribable(err) {
 			return false, sr.failed(sr.startRefused(err, at.Type))
 		}

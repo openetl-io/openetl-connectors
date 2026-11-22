@@ -67,6 +67,8 @@ The source reads each shard from its sequence number, as the last checkpoint rec
 - `latest`: the records that arrive after the first read starts.
 - `timestamp`, from 0.2.0: the records that arrived at or after `startTimestamp`, in RFC 3339, such as `2026-11-01T00:00:00Z`. If that's older than the stream's retention, the read starts at the oldest record the stream still holds. The time must have passed: Kinesis starts a read only at a time that has. A time in the future fails the preflight, and the first read fails with `CONFIG_INVALID`.
 
+`latest` starts each shard at the time the first read started, by the runner's clock. From 0.2.0, where Kinesis refuses a start at a time the runner's clock has passed, as Kinesis's clock is behind it, the read tries again every second, for up to 5 minutes after that time, rather than failing with `CONFIG_INVALID`. The same holds for a `startTimestamp` that has just passed.
+
 A **scheduled** pipeline reads each shard until it has caught up, then stops. A **continuous** pipeline keeps reading.
 
 Before it reads, the source checks that each shard still holds the record it would resume from. If the stream's retention period has passed it, the read stops and the pipeline gets an incident: the position it would resume from is gone.

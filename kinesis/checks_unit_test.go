@@ -590,6 +590,7 @@ func TestStartRefused(t *testing.T) {
 	if _, err = sr.iterator(t.Context()); codeOf(err) == protocolv1.ErrorCode_ERROR_CODE_CONFIG_INVALID || strings.Contains(err.Error(), "startTimestamp") {
 		t.Errorf("another invalid argument: %v", err)
 	}
+	sr.st = shardState{From: time.Now().Add(time.Hour)}
 	if err := sr.startRefused(&types.InvalidArgumentException{}, types.ShardIteratorTypeAtTimestamp); codeOf(err) != protocolv1.ErrorCode_ERROR_CODE_CONFIG_INVALID {
 		t.Errorf("subscribing at a time in the future: %v", err)
 	}

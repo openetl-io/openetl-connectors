@@ -13,6 +13,9 @@ import (
 	"time"
 
 	"github.com/apache/arrow-go/v18/arrow"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	awskinesis "github.com/aws/aws-sdk-go-v2/service/kinesis"
+	"github.com/aws/aws-sdk-go-v2/service/kinesis/types"
 
 	"github.com/openetl-io/openetl-connectors/records"
 	protocolv1 "github.com/openetl-io/openetl/sdk/go/protocol/v1"
@@ -367,5 +370,44 @@ func TestReadCompletesAgainWhereItDid(t *testing.T) {
 	}
 	if got := again.last(1); len(got) != 1 || got[0] != " complete "+completion {
 		t.Errorf("read again from %s, completed with %q, not at %s", lastResume, got, completion)
+	}
+}
+
+// Kinesis refuses a start at a time later than its clock. A start at a time
+// the runner's clock has passed, as startPosition latest's is, is tried
+// again until Kinesis's clock passes it too: polling, and with enhanced
+// fan-out.
+func TestStartsDespiteClockSkew(t *testing.T) {
+	refused := map[string]int{}
+	f := &fakeStream{perCall: 3, shards: []*fakeShard{{id: "shardId-0"}}}
+	f.override = func(op string, in map[string]any) (int, any, bool) {
+		if op != "GetShardIterator" || in["ShardIteratorType"] != "AT_TIMESTAMP" || refused[op] == 2 {
+			return 0, nil, false
+		}
+		refused[op]++
+		status, body := apiError("InvalidArgumentException", "The timestampInMillis parameter cannot be greater than the currentTimestampInMillis.")
+		return status, body, true
+	}
+	s := newReadSource(t, f)
+	s.cfg.StartPosition = startLatest
+	if _, err := readOnce(t, s, source.ConfiguredStream{}); err != nil {
+		t.Fatalf("polling: %v", err)
+	}
+	if refused["GetShardIterator"] != 2 {
+		t.Errorf("refused %d times", refused["GetShardIterator"])
+	}
+
+	rd := &reading{s: s, lanes: make(chan struct{}, 1), start: time.Now()}
+	subscribed := 0
+	rd.subscribe = func(_ context.Context, in *awskinesis.SubscribeToShardInput) (eventStream, error) {
+		if subscribed++; subscribed <= 2 {
+			return nil, &fakeAPIError{code: "InvalidArgumentException"}
+		}
+		return subscription(nil, types.SubscribeToShardEvent{ChildShards: []types.ChildShard{{ShardId: aws.String("child")}}}), nil
+	}
+	r := &streamRead{name: "s", consumer: "arn:consumer", splits: map[string]bool{"shard-0": true}, shards: map[string]shardState{}, behind: map[string]time.Duration{}}
+	sr := &shardRead{rd: rd, r: r, shard: "shard-0", em: &unitEmitter{}, st: shardState{From: time.Now()}, th: throttle{retry: &s.cfg.Retry}}
+	if over, err := sr.subscribe(t.Context()); err != nil || !over {
+		t.Errorf("enhanced fan-out: over %v, %v", over, err)
 	}
 }
