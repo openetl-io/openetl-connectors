@@ -15,6 +15,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
+	"go.mongodb.org/mongo-driver/v2/mongo/readpref"
 
 	"github.com/openetl-io/openetl-connectors/connectortest"
 	"github.com/openetl-io/openetl/sdk/go/destination"
@@ -528,5 +529,32 @@ func TestWidening(t *testing.T) {
 	}
 	if cmd, refused, _ := widening(nil, "orders", "s", sch); cmd != nil || refused != nil {
 		t.Errorf("without a validator: %v, %v", cmd, refused)
+	}
+}
+
+// The destination reads its staging, markers and collections from the
+// primary, and its writes are acknowledged, whatever the uri asks: a
+// secondary that's behind could miss staged rows, which the apply would
+// then leave out, and unacknowledged writes report no errors.
+func TestDestinationReadsWhatItWrote(t *testing.T) {
+	d, err := NewDestination([]byte(`{"uri": "mongodb://u:p@h1,h2/?replicaSet=rs0&readPreference=secondaryPreferred&readConcernLevel=majority&w=0", "database": "d"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rp := d.opts.ReadPreference; rp == nil || rp.Mode() != readpref.PrimaryMode {
+		t.Errorf("read preference %v, want primary", rp)
+	}
+	if rc := d.opts.ReadConcern; rc == nil || rc.Level != "local" {
+		t.Errorf("read concern %v, want local", rc)
+	}
+	if wc := d.opts.WriteConcern; !wc.Acknowledged() {
+		t.Errorf("write concern %v isn't acknowledged", wc)
+	}
+	// The uri's acknowledged write concern stays.
+	if d, err = NewDestination([]byte(`{"uri": "mongodb://u:p@h1/?w=2", "database": "d"}`)); err != nil {
+		t.Fatal(err)
+	}
+	if wc := d.opts.WriteConcern; wc == nil || wc.W != 2 {
+		t.Errorf("write concern %v, want the uri's w=2", wc)
 	}
 }

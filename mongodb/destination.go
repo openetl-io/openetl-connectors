@@ -19,6 +19,9 @@ import (
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
+	"go.mongodb.org/mongo-driver/v2/mongo/readconcern"
+	"go.mongodb.org/mongo-driver/v2/mongo/readpref"
+	"go.mongodb.org/mongo-driver/v2/mongo/writeconcern"
 
 	"github.com/openetl-io/openetl-connectors/docstore"
 	sdk "github.com/openetl-io/openetl/sdk/go"
@@ -75,15 +78,21 @@ func NewDestination(config []byte) (*Destination, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Commit reads back what the writes staged and marked: from the primary,
+	// which has them, and only once they're acknowledged.
+	opts.SetReadPreference(readpref.Primary()).SetReadConcern(readconcern.Local())
+	if !opts.WriteConcern.Acknowledged() {
+		opts.SetWriteConcern(writeconcern.Majority())
+	}
 	return &Destination{cfg: cfg, opts: opts}, nil
 }
 
 func (d *Destination) Capabilities() destination.Capabilities { return DestinationCapabilities }
 
 func (d *Destination) Open(_ context.Context, cfg destination.OpenConfig) (destination.Writer, error) {
-	c, err := connect(d.cfg.URI.Reveal())
+	c, err := mongo.Connect(d.opts)
 	if err != nil {
-		return nil, err
+		return nil, sdk.WithCode(configInvalid, fmt.Errorf("mongodb: uri: %w", err))
 	}
 	db := cmpOr(cfg.Namespace, d.cfg.Database)
 	w := &writer{

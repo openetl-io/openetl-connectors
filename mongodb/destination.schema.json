@@ -5,7 +5,7 @@
   "additionalProperties": false,
   "required": ["uri", "database"],
   "properties": {
-    "uri": {"type": "string", "x-secret": true, "description": "A MongoDB connection string, mongodb:// or mongodb+srv://.", "title": "Connection string", "examples": ["mongodb+srv://USER:PASSWORD@HOST/?authSource=admin"]},
+    "uri": {"type": "string", "x-secret": true, "description": "A MongoDB connection string, mongodb:// or mongodb+srv://. The destination reads from the primary whatever its read preference and read concern, and writes with its write concern, majority in place of w=0; w=1 lets a failover roll back a committed epoch.", "title": "Connection string", "examples": ["mongodb+srv://USER:PASSWORD@HOST/?authSource=admin"]},
     "database": {"type": "string", "minLength": 1, "description": "The database collections are written to when the pipeline names no namespace.", "title": "Database"},
     "extendedJSONKeys": {"type": "boolean", "default": false, "description": "Write each string key as the _id the MongoDB source read it from, with its BSON type: 24 hex digits as an ObjectId, and anything else as canonical Extended JSON, which is how that source spells _id. A key in neither form fails the write. For pipelines from the MongoDB source. False: a string key is a string _id.", "title": "Keys as Extended JSON"}
   }
