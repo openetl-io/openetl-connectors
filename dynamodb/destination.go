@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"maps"
+	"math/rand/v2"
 	"slices"
 	"strconv"
 	"strings"
@@ -145,8 +146,8 @@ const (
 	readColumn = "_openetl_read"
 	// An unkeyed table's sort key: the staged row's order, so that two rows
 	// with one _openetl_id, as two rows alike without a key have, both land;
-	// "-" where the stream is deduplicated, so that a row's _openetl_id
-	// finds it.
+	// "-" where the stream is deduplicated against the target, so that a
+	// row's _openetl_id finds it.
 	rowColumn = "_openetl_row"
 	// The table of a namespace's, or a prefix's, staging and fences.
 	controlTable = "_openetl_state"
@@ -156,7 +157,7 @@ const (
 )
 
 type writer struct {
-	db      *dynamodb.Client
+	db      dbAPI
 	cfg     destination.OpenConfig
 	prefix  string
 	control string
@@ -347,7 +348,7 @@ func (w *writer) stage(ctx context.Context, e destination.Epoch, stream string, 
 		w.row++
 		if !keyed(cfg) && !r.patch {
 			r.item[rowColumn] = str("-")
-			if cfg.Dedupe == destination.DedupeNone {
+			if cfg.Dedupe != destination.DedupeTarget {
 				r.item[rowColumn] = str(order(e, w.cfg.Lane, w.row))
 			}
 		}
@@ -766,31 +767,42 @@ func (w *writer) Commit(ctx context.Context, e destination.Epoch, committables [
 // collapsed: the rows dedupe skipped.
 func (w *writer) Apply(ctx context.Context, s stagedStream) (collapsed uint64, err error) {
 	if s.Mode == destination.Overwrite {
-		return 0, w.copyToRead(ctx, s)
+		return w.copyToRead(ctx, s)
 	}
 	return w.applyParts(ctx, s.config(), s.Target, s.parts, "")
 }
 
 // copyToRead copies an epoch's staged rows of an overwrite stream into its
-// read's partitions, keeping their order.
-func (w *writer) copyToRead(ctx context.Context, s stagedStream) error {
+// read's partitions, keeping their order. Deduped within each epoch, it
+// leaves out a row whose _openetl_id an earlier row of the epoch has, as
+// the swap, which writes every epoch's rows, can't: collapsed counts them.
+func (w *writer) copyToRead(ctx context.Context, s stagedStream) (collapsed uint64, err error) {
 	for b, parts := range s.parts {
+		seen := map[string]bool{}
 		for _, p := range parts {
 			var reqs []types.WriteRequest
 			err := w.query(ctx, p, func(it map[string]types.AttributeValue) error {
+				if d, ok := it["d"].(*types.AttributeValueMemberM); ok && it["x"] == nil && s.Dedupe == destination.DedupeEpoch {
+					id := stringOf(d.Value[idColumn])
+					if seen[id] {
+						collapsed++
+						return nil
+					}
+					seen[id] = true
+				}
 				it["p"] = str(fmt.Sprintf("%s#%d", s.Read, b))
 				reqs = append(reqs, types.WriteRequest{PutRequest: &types.PutRequest{Item: it}})
 				return nil
 			})
 			if err != nil {
-				return err
+				return 0, err
 			}
 			if err := writeBatches(ctx, w.db, w.control, reqs); err != nil {
-				return err
+				return 0, err
 			}
 		}
 	}
-	return nil
+	return collapsed, nil
 }
 
 // Swap writes an ended overwrite read's rows to its target, each tagged
@@ -939,11 +951,13 @@ func (w *writer) query(ctx context.Context, p string, f func(map[string]types.At
 }
 
 // applyRow writes a staged row. A keyed stream's put, or delete, leaves an
-// item with a higher _openetl_seq as it is, except an overwrite read's,
-// which replaces what's there. A soft delete keeps the item's other
+// item with a higher _openetl_seq as it is, and a put that holds a value an
+// item that is the row's version already, except an overwrite read's, which
+// replaces what's there. A soft delete keeps the item's other
 // attributes, held ones too, and updates its metadata. A merged row's kept
-// columns keep the target's values. An append is a put, which, deduped on
-// the target, skips an _openetl_id the table has: skipped says so.
+// columns keep the target's values and holds. An append is a put, which,
+// deduped on the target, skips an _openetl_id the table has: skipped says
+// so.
 func (w *writer) applyRow(ctx context.Context, cfg destination.Stream, target string, item map[string]types.AttributeValue, keep []string, tag string) (skipped bool, err error) {
 	var cond *string
 	names, values := map[string]string{}, map[string]types.AttributeValue{}
@@ -997,16 +1011,37 @@ func (w *writer) applyRow(ctx context.Context, cfg destination.Stream, target st
 		if err != nil {
 			return false, err
 		}
+		// The item's holds on the kept columns, which the row's own override,
+		// so that a held version's patch still finds its hold.
+		holds := map[string]types.AttributeValue{}
+		curHeld, _ := cur[heldColumn].(*types.AttributeValueMemberM)
 		for _, c := range keep {
 			if v, ok := cur[c]; ok {
 				item[c] = v
 			} else {
 				delete(item, c)
 			}
+			if curHeld != nil && curHeld.Value[c] != nil {
+				holds[c] = curHeld.Value[c]
+			}
+		}
+		if h, ok := item[heldColumn].(*types.AttributeValueMemberM); ok {
+			maps.Copy(holds, h.Value)
+		}
+		if len(holds) > 0 {
+			item[heldColumn] = &types.AttributeValueMemberM{Value: holds}
 		}
 	}
 	if tag != "" {
 		item[readColumn] = str(tag)
+	}
+	// A put that holds a value leaves an item that is its version already,
+	// which this attempt or another put, and whose held values a patch may
+	// have filled since.
+	id, hasID := item[idColumn]
+	if _, held := item[heldColumn]; held && hasID && cond != nil {
+		cond = aws.String("attribute_not_exists(#s) OR (#s <= :s AND NOT #i = :i)")
+		names["#i"], values[":i"] = idColumn, id
 	}
 	err = w.put(ctx, target, item, cond, names, values)
 	if conditionFailed(err) {
@@ -1080,7 +1115,10 @@ func (w *writer) applyPatch(ctx context.Context, target string, p map[string]typ
 	return nil
 }
 
-// fill fills an item's columns that version holds with fills' values.
+// fill fills an item's columns that version holds with fills' values,
+// unless the item is no longer the version cur read, as when a replaced
+// attempt's patch read it: what wrote over it or removed it since came
+// after the patch's epoch was applied.
 func (w *writer) fill(ctx context.Context, target string, cur map[string]types.AttributeValue, version string, fills map[string]types.AttributeValue) error {
 	held, _ := cur[heldColumn].(*types.AttributeValueMemberM)
 	if held == nil {
@@ -1105,7 +1143,11 @@ func (w *writer) fill(ctx context.Context, target string, cur map[string]types.A
 	if len(held.Value) == 0 {
 		delete(cur, heldColumn)
 	}
-	return w.put(ctx, target, cur, nil, nil, nil)
+	err := w.put(ctx, target, cur, aws.String("#i = :i"), map[string]string{"#i": idColumn}, map[string]types.AttributeValue{":i": cur[idColumn]})
+	if conditionFailed(err) {
+		return nil
+	}
+	return err
 }
 
 // deletePartitions deletes the control table's items in the partitions.
@@ -1250,9 +1292,12 @@ type batchAPI interface {
 }
 
 // unprocessedPause is how long writeBatches waits before sending a batch's
-// unprocessed items again, the nth time in a row: from 50ms, doubling, to
-// 5s.
-var unprocessedPause = func(n int) time.Duration { return min(5*time.Second, 50*time.Millisecond<<min(n, 7)) }
+// unprocessed items again, the nth time in a row: between half and all of a
+// bound that doubles from 50ms to 5s, at random.
+var unprocessedPause = func(n int) time.Duration {
+	bound := min(5*time.Second, 50*time.Millisecond<<min(n, 7))
+	return bound/2 + rand.N(bound/2+1)
+}
 
 // writeBatches sends reqs to table 25 at a time, sending again, after a
 // pause, what DynamoDB left unprocessed, as it does when the table's

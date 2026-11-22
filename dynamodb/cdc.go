@@ -9,15 +9,20 @@ import (
 	"math/big"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/apache/arrow-go/v18/arrow/decimal128"
 	"github.com/aws/aws-sdk-go-v2/aws"
+	awsmiddleware "github.com/aws/aws-sdk-go-v2/aws/middleware"
+	"github.com/aws/aws-sdk-go-v2/aws/ratelimit"
+	"github.com/aws/aws-sdk-go-v2/aws/retry"
 	"github.com/aws/aws-sdk-go-v2/feature/dynamodb/attributevalue"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodbstreams"
 	streamtypes "github.com/aws/aws-sdk-go-v2/service/dynamodbstreams/types"
+	"github.com/aws/smithy-go/middleware"
 	"golang.org/x/sync/errgroup"
 
 	sdk "github.com/openetl-io/openetl/sdk/go"
@@ -30,7 +35,7 @@ const (
 	retention = 24 * time.Hour
 	// Records this long before a snapshot starts are read from the stream
 	// again: a record's ApproximateCreationDateTime is rounded down, to the
-	// minute on DynamoDB Local, and clocks differ.
+	// minute on DynamoDB Local, and a Date header to the second.
 	skipMargin = 5 * time.Minute
 	// A seq is a snapshot's generation times 10^seqDigits, plus the
 	// sequence number; 38 digits in all.
@@ -38,7 +43,8 @@ const (
 	// A bounded read counts an open shard as read once this many
 	// GetRecords in a row return nothing: an empty page doesn't prove
 	// there's nothing after it, but what the read leaves the next one
-	// reads.
+	// reads, and it records nothing after the position only once
+	// AT_TIMESTAMP finds no record since.
 	emptyPages = 3
 	// Pauses between GetRecords: DynamoDB Streams allows five a second per
 	// shard.
@@ -98,7 +104,7 @@ type shardInfo struct {
 // end. Its emits are serial, each resume point covering every shard.
 type cdcRead struct {
 	s          *Source
-	db         *dynamodb.Client
+	db         dbAPI
 	streams    streamsAPI
 	cs         source.ConfiguredStream
 	t          *table
@@ -106,6 +112,9 @@ type cdcRead struct {
 	progress   source.Progresser
 	continuous bool
 	start      time.Time
+	// AWS's clock less the host's, in nanoseconds, as the last response
+	// with a Date header had it.
+	skew atomic.Int64
 
 	// A read until a resume point's state: where it stops, and that state.
 	until    *cdcState
@@ -151,22 +160,14 @@ func (s *Source) readCDC(ctx context.Context, cl *clients, cs source.ConfiguredS
 		if r.st.Stream != t.streamARN {
 			return positionLost(fmt.Errorf("dynamodb: %s's stream is %s, not the %s the read was reading: the stream needs a re-sync", cs.Name, t.streamARN, r.st.Stream))
 		}
-		if err := r.list(ctx); err != nil {
+		if err := r.begin(ctx); err != nil {
 			return err
-		}
-		r.st.Shards = map[string]shardState{}
-		for id := range r.listed {
-			r.st.Shards[id] = shardState{Since: r.st.Skip}
 		}
 	default:
-		r.st = cdcState{Stream: t.streamARN, G: int64(r.start.Sub(epoch2020) / time.Second), Skip: r.start.Add(-skipMargin)}
+		r.st = cdcState{Stream: t.streamARN, G: int64(r.start.Sub(epoch2020) / time.Second)}
 		r.st.Snapshot = make([]segState, s.segments(t))
-		if err := r.list(ctx); err != nil {
+		if err := r.begin(ctx); err != nil {
 			return err
-		}
-		r.st.Shards = map[string]shardState{}
-		for id := range r.listed {
-			r.st.Shards[id] = shardState{Since: r.st.Skip}
 		}
 	}
 	if len(r.st.Snapshot) > 0 {
@@ -178,6 +179,22 @@ func (s *Source) readCDC(ctx context.Context, cl *clients, cs source.ConfiguredS
 		}
 	}
 	return r.follow(ctx)
+}
+
+// begin lists the stream's shards, each to be read from the snapshot's
+// skip: skipMargin before now, unless the read has one.
+func (r *cdcRead) begin(ctx context.Context) error {
+	if err := r.list(ctx, ""); err != nil {
+		return err
+	}
+	if r.st.Skip.IsZero() {
+		r.st.Skip = r.awsNow().Add(-skipMargin)
+	}
+	r.st.Shards = map[string]shardState{}
+	for id := range r.listed {
+		r.st.Shards[id] = shardState{Since: r.st.Skip}
+	}
+	return nil
 }
 
 func positionLost(err error) error {
@@ -218,7 +235,7 @@ func (r *cdcRead) emit(b *batcher, update func()) error {
 // snapshot scans the table, its segments in parallel, with consistent
 // reads, each row an insert at the generation's seq.
 func (r *cdcRead) snapshot(ctx context.Context) error {
-	if now().Sub(r.st.Skip) > retention {
+	if r.awsNow().Sub(r.st.Skip) > retention {
 		return positionLost(fmt.Errorf("dynamodb: %s's snapshot started more than %v ago, and the stream no longer has every change since: the stream needs a re-sync", r.cs.Name, retention))
 	}
 	seq, err := r.seq("")
@@ -242,7 +259,7 @@ func (r *cdcRead) snapshot(ctx context.Context) error {
 		g.Go(func() error {
 			b := r.s.newBatcher(r.cs, r.t, true)
 			defer b.Release()
-			return r.s.scanPages(gctx, &clients{db: r.db}, r.t.name, i, len(r.st.Snapshot), seg.After.attrs(), nil, true, func(items []map[string]types.AttributeValue, last map[string]types.AttributeValue) (bool, error) {
+			return r.s.scanPages(gctx, &clients{db: r.db}, r.t.name, i, len(r.st.Snapshot), seg.After.attrs(), nil, nil, true, func(items []map[string]types.AttributeValue, last map[string]types.AttributeValue) (bool, error) {
 				reached := false
 				if until.After != nil {
 					var n int
@@ -273,18 +290,28 @@ func (r *cdcRead) snapshot(ctx context.Context) error {
 }
 
 // list lists the stream's shards, and checks every shard the state has
-// that isn't read to its end is still there.
-func (r *cdcRead) list(ctx context.Context) error {
+// that isn't read to its end is still there. With a parent, it lists only
+// that shard's children, which join the shards listed before: DescribeStream
+// allows 10 calls a second, and a whole listing takes one per 100 shards.
+func (r *cdcRead) list(ctx context.Context, parent string) error {
 	listed := map[string]shardInfo{}
 	in := &dynamodbstreams.DescribeStreamInput{StreamArn: aws.String(r.st.Stream)}
+	if parent != "" {
+		in.ShardFilter = &streamtypes.ShardFilter{Type: streamtypes.ShardFilterTypeChildShards, ShardId: aws.String(parent)}
+	}
 	for {
 		res, err := r.streams.DescribeStream(ctx, in)
+		if parent != "" && apiCode(err) == "ValidationException" {
+			// An endpoint without ShardFilter.
+			return r.list(ctx, "")
+		}
 		if err != nil {
 			if apiCode(err) == "ResourceNotFoundException" {
 				return positionLost(fmt.Errorf("dynamodb: %s's stream %s is gone: the stream needs a re-sync", r.cs.Name, r.st.Stream))
 			}
 			return classify(fmt.Errorf("dynamodb: describe %s's stream: %w", r.cs.Name, err))
 		}
+		r.clock(res.ResultMetadata)
 		d := res.StreamDescription
 		for _, sh := range d.Shards {
 			listed[aws.ToString(sh.ShardId)] = shardInfo{
@@ -297,17 +324,26 @@ func (r *cdcRead) list(ctx context.Context) error {
 		}
 		in.ExclusiveStartShardId = d.LastEvaluatedShardId
 	}
+	if parent != "" && len(listed) == 0 {
+		// No child listed: a whole listing, which also finds a child that an
+		// earlier shard's lookup came too early for.
+		return r.list(ctx, "")
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.listed = listed
+	if parent != "" {
+		maps.Copy(r.listed, listed)
+	} else {
+		r.listed = listed
+	}
 	for id, sh := range r.st.Shards {
-		if _, ok := listed[id]; ok {
+		if _, ok := r.listed[id]; ok {
 			continue
 		}
 		// A shard leaves the list once its records are past the stream's
 		// 24 hours, and nothing after its position was created before
 		// Since: if that's within 24 hours, there was nothing after it.
-		if !sh.Done && now().Sub(sh.Since) >= retention {
+		if !sh.Done && r.awsNow().Sub(sh.Since) >= retention {
 			return positionLost(fmt.Errorf("dynamodb: %s's stream no longer has shard %s, which the read hadn't read to its end (at %q), and its changes since %s are gone; the stream needs a re-sync",
 				r.cs.Name, id, sh.After, sh.Since.UTC().Format(time.RFC3339)))
 		}
@@ -368,7 +404,7 @@ type shardEnd struct {
 // end. A bounded read completes once no shard can run; a continuous one
 // lists shards again while none is open.
 func (r *cdcRead) follow(ctx context.Context) error {
-	if err := r.list(ctx); err != nil {
+	if err := r.list(ctx, ""); err != nil {
 		return err
 	}
 	var wg sync.WaitGroup
@@ -416,7 +452,7 @@ func (r *cdcRead) follow(ctx context.Context) error {
 			}
 			r.mu.Unlock()
 			if e.ended {
-				if err := r.list(ctx); err != nil {
+				if err := r.list(ctx, e.id); err != nil {
 					return err
 				}
 			}
@@ -425,7 +461,7 @@ func (r *cdcRead) follow(ctx context.Context) error {
 				continue
 			}
 			if idle {
-				if err := r.list(ctx); err != nil {
+				if err := r.list(ctx, ""); err != nil {
 					return err
 				}
 			}
@@ -434,7 +470,7 @@ func (r *cdcRead) follow(ctx context.Context) error {
 			}
 		case <-report.C:
 			if r.progress != nil {
-				if err := r.progress.Progress(r.lag(time.Now())); err != nil {
+				if err := r.progress.Progress(r.lag(r.awsNow())); err != nil {
 					return err
 				}
 			}
@@ -500,7 +536,7 @@ func (r *cdcRead) poll(ctx context.Context, id string) (ended bool, err error) {
 	until, bounded := r.untilShard(id)
 	r.mu.Unlock()
 	bounded = bounded && !until.Done
-	if st.After == "" && now().Sub(st.Since) > retention {
+	if st.After == "" && r.awsNow().Sub(st.Since) > retention {
 		return false, positionLost(fmt.Errorf("dynamodb: %s's shard %s has records from before %s that the read hasn't read, and the stream keeps records for %v: some may be gone; the stream needs a re-sync",
 			r.cs.Name, id, st.Since.UTC().Format(time.RFC3339), retention))
 	}
@@ -527,7 +563,7 @@ func (r *cdcRead) poll(ctx context.Context, id string) (ended bool, err error) {
 		return res.ShardIterator, nil
 	}
 	resume := func(err error) (*string, error) {
-		if !trimmed(err) || now().Sub(st.Since) > retention || retries >= 3 {
+		if !trimmed(err) || r.awsNow().Sub(st.Since) > retention || retries >= 3 {
 			return nil, failed(err)
 		}
 		horizon, skipTo, retries = true, st.After, retries+1
@@ -549,9 +585,9 @@ func (r *cdcRead) poll(ctx context.Context, id string) (ended bool, err error) {
 	b := r.s.newBatcher(r.cs, r.t, true)
 	defer b.Release()
 	b.gone = r.gone(ctx)
-	empty := 0
+	empty, probed := 0, time.Time{}
 	for {
-		at, polled := now(), time.Now()
+		at, polled := r.awsNow(), time.Now()
 		if it == nil {
 			return true, r.emit(b, func() { r.setShard(id, shardState{After: st.After, Done: true, Since: st.Since}) })
 		}
@@ -576,6 +612,7 @@ func (r *cdcRead) poll(ctx context.Context, id string) (ended bool, err error) {
 		if err != nil {
 			return false, failed(err)
 		}
+		r.clock(res.ResultMetadata)
 		recs, stop := res.Records, false
 		if horizon && skipTo != "" {
 			recs = slices.DeleteFunc(slices.Clone(recs), func(rec streamtypes.Record) bool {
@@ -602,7 +639,9 @@ func (r *cdcRead) poll(ctx context.Context, id string) (ended bool, err error) {
 			}
 			horizon, retries = false, 0
 			st.After = aws.ToString(rec.Dynamodb.SequenceNumber)
-			if c := aws.ToTime(rec.Dynamodb.ApproximateCreationDateTime); c.After(st.Since) {
+			// A record created before a time empty pages had nothing until
+			// shows they missed it: Since goes back to it.
+			if c := aws.ToTime(rec.Dynamodb.ApproximateCreationDateTime); c.After(st.Since) || st.Checked {
 				st.Since, st.Checked = c, false
 			}
 		}
@@ -613,8 +652,11 @@ func (r *cdcRead) poll(ctx context.Context, id string) (ended bool, err error) {
 			// it records, with a resume point, unless a read recorded so
 			// within the last minute: so a read again soon after completes
 			// where this one did, and Since lags by at most the minute.
-			if empty >= emptyPages && at.After(st.Since) && (!st.Checked || at.Sub(st.Since) > checkEvery) {
-				st.Since, st.Checked, checked = at, true, true
+			if empty >= emptyPages && at.After(st.Since) && (!st.Checked || at.Sub(st.Since) > checkEvery) && at.Sub(probed) > checkEvery {
+				probed = at
+				if r.nothingSince(ctx, id, st, at) {
+					st.Since, st.Checked, checked = at, true, true
+				}
 			}
 		} else {
 			empty = 0
@@ -648,6 +690,42 @@ func (r *cdcRead) poll(ctx context.Context, id string) (ended bool, err error) {
 	}
 }
 
+// nothingSince says whether a shard has no record after st's position
+// created before at, which empty pages don't prove: it looks for the first
+// record created since Since with an AT_TIMESTAMP iterator, from the second
+// after the position's record's where Since is its time. An endpoint that
+// refuses AT_TIMESTAMP, as one without it does, has the empty pages stand;
+// any other failure, past the throttling it retries, proves nothing.
+func (r *cdcRead) nothingSince(ctx context.Context, id string, st shardState, at time.Time) bool {
+	from := st.Since
+	if st.After != "" && !st.Checked {
+		from = from.Truncate(time.Second).Add(time.Second)
+	}
+	if !from.Before(at) {
+		return false
+	}
+	it, err := r.streams.GetShardIterator(ctx, &dynamodbstreams.GetShardIteratorInput{
+		StreamArn: aws.String(r.st.Stream), ShardId: aws.String(id), ShardIteratorType: streamtypes.ShardIteratorTypeAtTimestamp, Timestamp: aws.Time(from),
+	}, throttled)
+	if apiCode(err) == "ValidationException" {
+		return true
+	}
+	if err != nil {
+		return false
+	}
+	res, err := r.streams.GetRecords(ctx, &dynamodbstreams.GetRecordsInput{ShardIterator: it.ShardIterator, Limit: aws.Int32(1)}, throttled)
+	return err == nil && (len(res.Records) == 0 || res.Records[0].Dynamodb != nil && !aws.ToTime(res.Records[0].Dynamodb.ApproximateCreationDateTime).Before(at))
+}
+
+// throttled retries a call while it's throttled, as the client does, but
+// not on a server error, which is how DynamoDB Local fails AT_TIMESTAMP.
+func throttled(o *dynamodbstreams.Options) {
+	o.Retryer = retry.NewStandard(func(s *retry.StandardOptions) {
+		s.MaxAttempts, s.MaxBackoff, s.RateLimiter = 10, 10*time.Second, ratelimit.None
+		s.Retryables = []retry.IsErrorRetryable{retry.RetryableErrorCode{Codes: retry.DefaultThrottleErrorCodes}}
+	})
+}
+
 // trimmed says the stream refused a read of records it has trimmed.
 func trimmed(err error) bool { return apiCode(err) == "TrimmedDataAccessException" }
 
@@ -660,8 +738,24 @@ func seqAfter(a, b string) bool {
 // shard's position.
 const checkEvery = time.Minute
 
-// now is the clock retention is reckoned by.
+// now is the host's clock.
 var now = time.Now
+
+// serverTime is AWS's clock when a response was sent, from its Date header.
+var serverTime = awsmiddleware.GetServerTime
+
+// clock keeps how far AWS's clock is from the host's, from a response's
+// Date header.
+func (r *cdcRead) clock(m middleware.Metadata) {
+	if t, ok := serverTime(m); ok {
+		r.skew.Store(int64(t.Sub(now())))
+	}
+}
+
+// awsNow is now by AWS's clock, which stream records' times and retention
+// are reckoned by, as the last response with a Date header had it; before
+// one, the host's.
+func (r *cdcRead) awsNow() time.Time { return now().Add(time.Duration(r.skew.Load())) }
 
 // setShard sets a shard's position; the caller holds mu.
 func (r *cdcRead) setShard(id string, st shardState) { r.st.Shards[id] = st }

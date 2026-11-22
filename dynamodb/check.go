@@ -50,7 +50,7 @@ var (
 	noCursor = check.Reason{
 		Name: "cursor_missing", Code: protocolv1.ErrorCode_ERROR_CODE_CONFIG_INVALID,
 		Message: "{table} is read incrementally, which needs a cursor attribute.",
-		Fix:     "Name the stream's cursor in the pipeline: a top-level attribute, a number or a string, whose values only grow, such as an update time.",
+		Fix:     "Name the stream's cursor in the pipeline: a top-level attribute, a number, a string or a binary, whose values only grow, such as an update time.",
 	}
 )
 

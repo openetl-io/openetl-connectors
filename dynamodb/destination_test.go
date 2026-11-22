@@ -205,11 +205,13 @@ func commitRows(t *testing.T, w *writer, e destination.Epoch, stream string, fie
 
 // Appended without deduplication, two rows alike, with one _openetl_id,
 // both land; deduplicated on the target, a row whose _openetl_id the table
-// has is skipped, and counted.
+// has is skipped, and counted; deduplicated within each epoch, a repeat in
+// the epoch is skipped, and counted, and a later epoch's row lands beside.
 func TestDestinationAppendIdentity(t *testing.T) {
 	cl := testClient(t)
 	ns := prefix(t) + "ns"
-	w := openWriter(t, ns, destination.Stream{Name: "all", Mode: destination.Append}, destination.Stream{Name: "once", Mode: destination.Append, Dedupe: destination.DedupeTarget})
+	w := openWriter(t, ns, destination.Stream{Name: "all", Mode: destination.Append}, destination.Stream{Name: "once", Mode: destination.Append, Dedupe: destination.DedupeTarget},
+		destination.Stream{Name: "epoch", Mode: destination.Append, Dedupe: destination.DedupeEpoch})
 	fields := append([]arrow.Field{{Name: "v", Type: arrow.BinaryTypes.String}}, meta...)
 	row := []any{"same", "00000000-0000-0000-0000-000000000001", "insert", 1}
 	commitRows(t, w, destination.Epoch{Generation: 1, N: 1}, "all", fields, row, row)
@@ -218,7 +220,12 @@ func TestDestinationAppendIdentity(t *testing.T) {
 	if c.Collapsed["once"] != 1 {
 		t.Errorf("collapsed %v, want once: 1", c.Collapsed)
 	}
-	for stream, want := range map[string]int{"all": 2, "once": 1} {
+	c = commitRows(t, w, destination.Epoch{Generation: 1, N: 4}, "epoch", fields, row, row)
+	commitRows(t, w, destination.Epoch{Generation: 1, N: 5}, "epoch", fields, row)
+	if c.Collapsed["epoch"] != 1 {
+		t.Errorf("collapsed %v, want epoch: 1", c.Collapsed)
+	}
+	for stream, want := range map[string]int{"all": 2, "once": 1, "epoch": 2} {
 		items, err := readTable(t.Context(), cl, ns+"."+stream)
 		if err != nil {
 			t.Fatal(err)

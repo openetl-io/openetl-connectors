@@ -272,3 +272,24 @@ func TestCDCOffered(t *testing.T) {
 		t.Errorf("cdc of a table without a stream: %v", err)
 	}
 }
+
+// Packed, a table keyed on a number, whose key attributes are reserved
+// words, is discovered by its keys alone, and read whole.
+func TestPackedDiscoveryKeys(t *testing.T) {
+	cl := testClient(t)
+	name := prefix(t) + "ns"
+	createTable(t, cl, name, "", key{"status", types.ScalarAttributeTypeN}, key{"order", types.ScalarAttributeTypeS})
+	put(t, cl, name, map[string]types.AttributeValue{"status": avN("12.5"), "order": avS("first"), "payload": avS("full")})
+	s := testSource(t, fmt.Sprintf(`, "tables": [%q], "packed": true`, name))
+	f := discovered(t, s, name).Schema.Fields()
+	if len(f) != 3 || f[0].Name != "status" || !arrow.TypeEqual(f[0].Type, decimalType) || f[1].Name != "order" || f[2].Name != dataColumn {
+		t.Errorf("fields %v", f)
+	}
+	rec, err := read(t, s, source.ConfiguredStream{Name: name, SyncMode: source.FullRefresh})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rows := rec.RowsOf(name); len(rows) != 1 || rows[0]["status"] != "12.5" || rows[0][dataColumn] != `{"order":{"S":"first"},"payload":{"S":"full"},"status":{"N":"12.5"}}` {
+		t.Errorf("rows %v", rows)
+	}
+}
