@@ -43,6 +43,12 @@ Deduping costs reads, since Iceberg has no index to look IDs up in: the commit r
 
 Set `uri`, and `warehouse` if the catalog serves more than one. For authentication, give a bearer `token`, or OAuth2 client credentials as `credential`, in the form `CLIENT_ID:CLIENT_SECRET`.
 
+From 0.2.0, these `properties` apply from the first request, for the catalog's config, so a catalog that needs them can be signed in to:
+
+- `scope`: the scope a token is asked for, `catalog` unless set. Polaris takes `PRINCIPAL_ROLE:ALL`.
+- `oauth2-server-uri`: the token endpoint of an identity provider of the catalog's own, such as Keycloak's, which `credential` goes to instead of the catalog's `v1/oauth/tokens`. `audience` and `resource` go with the token request.
+- `rest.sigv4-enabled: "true"`: requests are signed with the AWS credentials, for the service `rest.signing-name` names, such as `glue` for Glue's Iceberg REST endpoint, in `rest.signing-region`, or else `region`.
+
 The destination writes data files to the tables' locations itself. If the catalog doesn't hand out storage credentials, give them: for S3, `region`, and `accessKeyId` and `secretAccessKey` or the AWS default credentials; for another S3-compatible store, `s3Endpoint` too, which uses path-style addressing. Any other catalog or file IO property, by the name Iceberg gives it, goes in `properties`.
 
 ```yaml
@@ -82,32 +88,57 @@ spec:
 
 Without `accessKeyId` and `secretAccessKey`, the destination uses the AWS SDK's default credential chain, which finds only what the runner gives it. By default, the runner gives it no AWS credentials. Name an IAM role in the destination's `aws.role`, which the runner assumes for it, on EC2 and EKS alike. [Run on AWS](https://github.com/openetl-io/openetl/blob/main/docs/self-host/aws.md#credentials-for-connectors) explains the setup, and the runner's `inherit` setting. With keys, keep them in secrets, as `{ secret: NAME }`. Keys in the config are used even if the destination names a role.
 
+The credentials need these actions:
+
+- **S3**, whenever the destination writes to S3 with them: `s3:GetObject`, `s3:PutObject` and `s3:DeleteObject` on the tables' locations, and `s3:ListBucket` on their bucket, which an overwrite needs to clean up after a read.
+- **Glue**: `glue:GetDatabase`, `glue:CreateDatabase` for a namespace that doesn't exist yet, `glue:GetTable`, `glue:CreateTable` and `glue:UpdateTable`. From 0.2.0, the checks also use `glue:DeleteTable`, `glue:GetTables` and `glue:DeleteDatabase` when they created the namespace, and `glue:GetDatabases`, though they pass without it.
+
 The [config schema](./destination.schema.json) has every setting.
 
 ### Checks
 
 From 0.2.0, `openetl check` runs the destination's checks, in order: it resolves and connects to the catalog's host, and, over HTTPS, completes a TLS handshake (`net.dns`, `net.connect`, `net.tls`; for Glue at AWS's own endpoint, and for a host that the `HTTPS_PROXY`, `HTTP_PROXY` and `NO_PROXY` environment variables send through a proxy, these only advise, since the client may reach it through a proxy a dial doesn't take); signs in and lists namespaces (`catalog.auth`); finds the namespace, which the first write creates if it's missing (`catalog.namespace`); creates a table `_openetl_check_…` there, creating the namespace if needed (`catalog.create`); commits a property change to it (`catalog.commit`); with `s3Endpoint`, reaches the store (`store.dns`, `store.connect`, `store.tls`, which only advise for a host behind a proxy too); and writes and deletes a file in the table's location (`store.write`, `store.delete`). It then purges the table, and drops a namespace it created.
 
-From 0.2.0, a pipeline's preflight signs in, finds the namespace, and checks each stream: that its write mode is append, overwrite or merge and that a merge has a primary key of columns that aren't floating-point (`stream.NAME.mode`), and that its table, if it exists, takes the stream's columns without a type change the stream doesn't allow, and, for a merge, is format 2 or later, partitioned by nothing outside the key, and holds no files of an earlier partitioning (`stream.NAME.table`).
+From 0.2.0, a refusal of the credentials or of access, by the catalog or the store, fails a run with the refusal's code, as it fails the checks, rather than as an internal error the platform retries.
+
+From 0.2.0, a pipeline's preflight reaches the catalog, signs in and finds the namespace, without the checks that create a table or write files, and checks each stream: that its write mode is append, overwrite or merge and that a merge has a primary key of columns that aren't floating-point (`stream.NAME.mode`), and that its table, if it exists, takes the stream's columns without a type change the stream doesn't allow, and, for a merge, is format 2 or later, partitioned by nothing outside the key, and holds no files of an earlier partitioning (`stream.NAME.table`). For a stream whose schema OpenETL doesn't know yet, it checks only the write mode, that a merge has a primary key, and whether the table named after the stream exists.
 
 ## Types
 
-Columns take the Iceberg type of their Arrow type, with two exceptions:
+| Arrow type | Iceberg type | Notes |
+| --- | --- | --- |
+| `boolean` | `boolean` | |
+| `int8`, `int16`, `int32`, `uint8`, `uint16` | `int` | |
+| `int64`, `uint32` | `long` | |
+| `float16`, `float32` | `float` | |
+| `float64` | `double` | |
+| `decimal128(p, s)` | `decimal(p, s)` | |
+| `string`, `large_string`, `string_view`, `null`, JSON | `string` | |
+| `binary`, `large_binary`, `binary_view` | `binary` | |
+| `fixed_size_binary(16)` with `arrow.uuid` | `uuid` | |
+| other `fixed_size_binary(N)` | `fixed[N]` | |
+| `date32`, `date64` | `date` | |
+| `time32`, `time64` | `time` | Microseconds |
+| `timestamp` | `timestamp`, or `timestamptz` with a time zone | Microseconds; `timestamptz` in UTC |
+| `list`, `large_list`, `fixed_size_list`, `list_view`, `large_list_view` | `list` | |
+| `struct` | `struct` | |
+| `month_day_nano_interval` | `struct<months: int, days: int, nanoseconds: long>` | Iceberg has no interval type; these are the parts JSON destinations spell an interval with |
 
-- Timestamps are kept in microseconds.
-- Intervals, which Iceberg has no type for, become a struct of `months` (32-bit integer), `days` (32-bit integer) and `nanoseconds` (64-bit integer), the parts JSON destinations spell them with.
+Every column, and every field of a struct, is optional, and other extension types take their storage type's. Values are cast safely: a time or timestamp with nanoseconds that microseconds can't hold, or a `date64` that isn't midnight, fails the write rather than being cut short. A table can't be made for a column of another type, such as `uint64`, `decimal256`, `duration`, a dictionary or a union.
 
 ## Schema changes
 
-New columns are added to the table, and new fields to a struct column.
+New columns are added to the table, and new fields to a struct column. A column narrower than the table's, in a way Iceberg promotes, such as an `int` into a `long`, is written as it is, without a change to the table.
 
-The destination doesn't change an existing column's type by itself. When a stream's column widens in a way Iceberg can promote (an `int` to a `long`, a `float` to a `double`, or a decimal to one of greater precision and the same scale), the destination refuses the change, the stream holds the column where it can, and the refusal gives the Spark SQL that makes the change:
+The destination doesn't change an existing column's type by itself. When a stream's top-level column widens in a way Iceberg can promote (an `int` to a `long`, a `float` to a `double`, or a decimal to one of greater precision and the same scale), the destination refuses the change, the stream [holds](https://github.com/openetl-io/openetl/blob/main/docs/pipelines/holds-and-quarantine.md) the column where it can, and the refusal gives the Spark SQL that makes the change:
 
 ```sql
 ALTER TABLE `raw`.`orders` ALTER COLUMN `amount` TYPE DECIMAL(20, 2)
 ```
 
-Run it in an engine that can change the table, then release the hold. Or let the destination make those promotions itself with the pipeline's `destination.typeChanges: allow`, for every stream or one. A change Iceberg can't make, such as a `long` to a `string`, is refused either way, with no statement to run.
+Run it in an engine that can change the table, then release the hold. Or let the destination make those promotions itself with the pipeline's `destination.typeChanges: allow`, for every stream or one. Any other change, such as a `long` to a `string`, or a widening inside a struct or a list, is refused either way, with no statement to run.
+
+Until the stream holds a refused column, the epoch's rows are written without its values. If the table changes while the epoch is written, so that it takes them, the attempt fails, and the epoch is read again.
 
 Columns of the table's partition spec can't be held, and nor can a required column take the nulls a hold leaves; a table the destination created has neither.
 
@@ -121,10 +152,18 @@ A merge writes equality deletes in the partition of the key's new row, so it nee
 
 A delete written in a table's current partitioning doesn't reach files of an earlier one. So a merge, or a patch of an appended stream's held cells, fails on a partitioned table that still holds files written before its partitioning last changed, until they're rewritten into the current one, as Spark's `rewrite_data_files` procedure does.
 
+## Maintenance
+
+Each commit adds a snapshot, and a metadata file, to each table it writes, and the destination neither expires snapshots, nor compacts data files, nor deletes old metadata files. Run them in an engine that can, such as Spark's `expire_snapshots` and `rewrite_data_files` procedures, and set a table's `write.metadata.delete-after-commit.enabled` to `true` to keep only its `write.metadata.previous-versions-max` newest metadata files.
+
+An epoch's data files are in its tables' locations from when they're written until the epoch commits, which can be long after for a pipeline that stops with an epoch staged, and a table's catalog knows nothing of them until then. A `remove_orphan_files` that runs with an `older_than` shorter than that deletes them, and the epoch can't commit: its recovery reports it lost. Keep `older_than` longer than a pipeline may stay stopped.
+
 ## Limits
 
-- New tables are unpartitioned and unsorted: the destination has no setting for a new table's partitioning or sort order. Partition a table with an engine that can, such as Spark's `ALTER TABLE … ADD PARTITION FIELD`, and the destination writes into its partitions from then on.
+- New tables are unpartitioned and unsorted: the destination has no setting for a new table's partitioning or sort order. Partition a table with an engine that can, such as Spark's `ALTER TABLE … ADD PARTITION FIELD`, and from 0.2.0, the destination writes into its partitions from then on.
 - New tables are format 2, and timestamps are kept in microseconds: the destination neither creates format 3 tables nor writes `timestamp_ns`. From 0.2.0, it appends to and overwrites a format 3 table that exists, giving its rows their row IDs; merges and held cells' patches into a format 3 table are untested.
-- Deduping holds every `_openetl_id` of the epoch in memory, and of the whole read for an overwrite, and a staged file that loses rows is read whole to be written again.
+- From 0.2.0, deduping holds every `_openetl_id` of the epoch in memory, and of the whole read for an overwrite, and a staged file that loses rows is read whole to be written again.
+- A merge, and a patch of held cells, holds in memory at commit the epoch's staged rows or patches of one stream at a time, with the table's rows they match. It finds those by up to 1,000 distinct values of each column it matches on, by the range between the lowest and highest beyond that, and by no value of a column with a null among them, so a match on one column with a null reads the whole table.
 - The destination writes; it doesn't read tables back as a source.
 - Glue commits one table at a time, so a pipeline into Glue needs stream scope, and an epoch's tables may land a few moments apart.
+- From 0.2.0, an epoch that can't be recovered, as some of its staged files are gone, leaves the rest in its tables' locations as orphan files, which no snapshot holds.

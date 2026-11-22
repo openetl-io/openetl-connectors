@@ -89,6 +89,10 @@ func (d *Destination) Open(ctx context.Context, cfg destination.OpenConfig) (des
 	if err != nil {
 		return nil, err
 	}
+	return d.newWriter(ctx, c, cfg), nil
+}
+
+func (d *Destination) newWriter(ctx context.Context, c catalog.Catalog, cfg destination.OpenConfig) *writer {
 	wctx, cancel := context.WithCancel(context.WithoutCancel(ctx))
 	w := &writer{
 		d: d, cat: c, cfg: cfg, ns: d.namespace(cfg.Namespace),
@@ -105,7 +109,7 @@ func (d *Destination) Open(ctx context.Context, cfg destination.OpenConfig) (des
 	for _, s := range cfg.Streams {
 		w.streams[s.Name] = s
 	}
-	return w, nil
+	return w
 }
 
 type writer struct {
@@ -466,7 +470,8 @@ func (w *writer) create(ctx context.Context, ident table.Identifier, sc *ice.Sch
 // never changes a column's type: it refuses a column whose type changed,
 // even where Iceberg could promote it, and the platform holds the column
 // until the user changes it. It reports what each table can't take.
-func (w *writer) ApplySchema(ctx context.Context, streams []destination.StreamSchema) (destination.SchemaApplied, error) {
+func (w *writer) ApplySchema(ctx context.Context, streams []destination.StreamSchema) (_ destination.SchemaApplied, err error) {
+	defer func() { err = classifyRun(err) }()
 	out := destination.SchemaApplied{Limits: make(map[string]destination.TableLimits, len(streams))}
 	for _, s := range streams {
 		// Not from the cache: the user may have changed the table.
@@ -493,7 +498,8 @@ func (w *writer) ApplySchema(ctx context.Context, streams []destination.StreamSc
 	return out, nil
 }
 
-func (w *writer) StartReads(ctx context.Context, starts map[string]time.Time) error {
+func (w *writer) StartReads(ctx context.Context, starts map[string]time.Time) (err error) {
+	defer func() { err = classifyRun(err) }()
 	w.starts = starts
 	for name, r := range w.reads {
 		if start, ok := starts[name]; ok && start.UnixMicro() == r.start {
@@ -588,7 +594,8 @@ func (p *part) finish() ([]string, error) {
 	return p.files, p.err
 }
 
-func (w *writer) Write(ctx context.Context, e destination.Epoch, stream string, batch arrow.RecordBatch) error {
+func (w *writer) Write(ctx context.Context, e destination.Epoch, stream string, batch arrow.RecordBatch) (err error) {
+	defer func() { err = classifyRun(err) }()
 	cfg, ok := w.streams[stream]
 	if !ok {
 		return fmt.Errorf("iceberg: unknown stream %q", stream)
@@ -620,7 +627,8 @@ func (w *writer) Write(ctx context.Context, e destination.Epoch, stream string, 
 
 // Patch stages patches in files of their own, which Commit reads back and
 // applies after the epoch's rows, in the same snapshot.
-func (w *writer) Patch(ctx context.Context, e destination.Epoch, stream string, batch arrow.RecordBatch) error {
+func (w *writer) Patch(ctx context.Context, e destination.Epoch, stream string, batch arrow.RecordBatch) (err error) {
+	defer func() { err = classifyRun(err) }()
 	cfg, ok := w.streams[stream]
 	switch {
 	case !ok:
@@ -688,12 +696,9 @@ func (w *writer) stage(ctx context.Context, parts map[uint64]map[string]*epochFi
 		byStream[stream] = ef
 	}
 	if ef.open != nil && ef.open.schemaID != tbl.Schema().ID {
-		files, err := ef.open.finish()
-		ef.open = nil
-		if err != nil {
+		if _, err := ef.finish(); err != nil {
 			return nil, err
 		}
-		ef.files = append(ef.files, files...)
 	}
 	if ef.open == nil {
 		if ef.open, err = w.startPart(tbl, e, stream, ef.n, patch); err != nil {
@@ -721,28 +726,29 @@ func without(batch arrow.RecordBatch, refused []destination.RefusedColumn) arrow
 	return array.NewRecordBatch(arrow.NewSchema(fields, &md), cols, batch.NumRows())
 }
 
-// finish closes the files' last part, and returns all of them.
+// finish closes the files' last part, and returns all of them. If it fails,
+// the files it closed are still among ef.files, to be dropped.
 func (ef *epochFiles) finish() ([]string, error) {
 	if ef == nil {
 		return nil, nil
 	}
-	files := ef.files
 	if ef.open != nil {
 		more, err := ef.open.finish()
 		ef.open = nil
+		ef.files = append(ef.files, more...)
 		if err != nil {
 			return nil, err
 		}
-		files = append(files, more...)
 	}
-	return files, nil
+	return ef.files, nil
 }
 
 // PreCommit closes the epoch's data files. They are durable once closed,
 // and invisible until Commit adds them to their tables. A lane with a read in
 // progress describes it in every epoch, with rows or not, as the epoch it ends
 // in can be one the lane knows nothing of.
-func (w *writer) PreCommit(ctx context.Context, e destination.Epoch) (destination.Staged, error) {
+func (w *writer) PreCommit(ctx context.Context, e destination.Epoch) (_ destination.Staged, err error) {
+	defer func() { err = classifyRun(err) }()
 	if err := w.checkDropped(ctx); err != nil {
 		return nil, err
 	}
@@ -750,6 +756,12 @@ func (w *writer) PreCommit(ctx context.Context, e destination.Epoch) (destinatio
 	byStream, patches := w.parts[e.N], w.patches[e.N]
 	delete(w.parts, e.N)
 	delete(w.patches, e.N)
+	defer func() {
+		if err != nil {
+			w.drop(w.ctx, byStream)
+			w.drop(w.ctx, patches)
+		}
+	}()
 	ended := w.ended[e.N]
 	delete(w.ended, e.N)
 	for _, s := range w.cfg.Streams {
@@ -822,7 +834,8 @@ func (w *writer) checkDropped(ctx context.Context) error {
 	return nil
 }
 
-func (w *writer) Commit(ctx context.Context, _ destination.Epoch, committables []destination.Staged) (destination.Committed, error) {
+func (w *writer) Commit(ctx context.Context, _ destination.Epoch, committables []destination.Staged) (_ destination.Committed, err error) {
+	defer func() { err = classifyRun(err) }()
 	desc, err := w.mergeLanes(committables)
 	if err != nil {
 		return destination.Committed{}, err
@@ -906,12 +919,12 @@ type pending struct {
 
 func (w *writer) discard(ps []pending) {
 	for _, p := range ps {
-		w.removeFiles(p.tbl, p.written)
+		w.removeFiles(w.ctx, p.tbl, p.written)
 	}
 }
 
 func (w *writer) committed(p pending) {
-	w.removeFiles(p.tbl, p.staged)
+	w.removeFiles(w.ctx, p.tbl, p.staged)
 	w.removeManifests(p.tbl, p.readsDir)
 }
 
@@ -1084,7 +1097,7 @@ func (w *writer) prepareStream(ctx context.Context, desc staged, s stagedStream,
 	}
 	tx, res, err := w.transaction(ctx, tbl, desc, s, paths)
 	if err != nil {
-		w.removeFiles(tbl, res.written)
+		w.removeFiles(w.ctx, tbl, res.written)
 		return nil, fmt.Errorf("iceberg: %s: %w", strings.Join(ident, "."), err)
 	}
 	p := &pending{stream: s.Name, tx: tx, tbl: tbl, written: res.written, staged: append(slices.Clone(s.Patches), res.replaced...), collapsed: res.collapsed}
@@ -1289,7 +1302,8 @@ func (w *writer) fenceTable(ctx context.Context, ident table.Identifier, gen uin
 	}
 }
 
-func (w *writer) Recover(ctx context.Context, gen uint64, e destination.Epoch, committables []destination.Staged) (destination.Recovery, error) {
+func (w *writer) Recover(ctx context.Context, gen uint64, e destination.Epoch, committables []destination.Staged) (_ destination.Recovery, err error) {
+	defer func() { err = classifyRun(err) }()
 	var desc staged
 	if !e.IsZero() {
 		var err error
@@ -1336,9 +1350,9 @@ func (w *writer) Recover(ctx context.Context, gen uint64, e destination.Epoch, c
 		if tbl != nil && applied(tbl.Properties(), w.cfg.Pipeline, desc) {
 			cleanup.Go(func() error {
 				if st.Mode == modeMerge {
-					w.removeFiles(tbl, st.Files)
+					w.removeFiles(w.ctx, tbl, st.Files)
 				}
-				w.removeFiles(tbl, st.Patches)
+				w.removeFiles(w.ctx, tbl, st.Patches)
 				if st.Mode == modeOverwrite {
 					w.removeManifests(tbl, w.readsDir(tbl, st.Name))
 				}
@@ -1370,12 +1384,16 @@ func (w *writer) Recover(ctx context.Context, gen uint64, e destination.Epoch, c
 		}
 		r = destination.Redone
 	case len(missing) == applying:
-		// Nothing of it is visible, and some lane's files are gone.
-		r = destination.Lost
-		for _, st := range desc.Streams {
-			w.dropFiles(desc.Namespace, st.Table, st.Files)
-			w.dropFiles(desc.Namespace, st.Table, st.Patches)
+		// Nothing of it is visible, and some lane's files are gone, unless a
+		// newer generation has since raised the fence, applied the epoch and
+		// dropped a merge's files. The rest stay, as orphans: an older
+		// generation that read the fence before can lower it again, as
+		// Iceberg sets a property unconditionally, so they may be an
+		// append's that is its table's now.
+		if _, err := w.raiseFence(ctx, desc.Namespace, names, gen); err != nil {
+			return 0, err
 		}
+		r = destination.Lost
 	default:
 		return 0, fmt.Errorf("iceberg: epoch %d-g%d is partly applied and the staged files for the rest are gone", desc.Epoch, desc.Generation)
 	}
@@ -1444,23 +1462,23 @@ func (w *writer) allExist(ctx context.Context, tbl *table.Table, paths []string)
 
 // dropFiles deletes data files that no table holds. Best effort: whatever
 // stays behind is an orphan, which Iceberg's orphan-file cleanup removes.
-func (w *writer) dropFiles(ns []string, name string, paths []string) {
+func (w *writer) dropFiles(ctx context.Context, ns []string, name string, paths []string) {
 	if len(paths) == 0 || name == "" {
 		return
 	}
-	tbl, err := w.cat.LoadTable(w.ctx, w.ident(ns, name))
+	tbl, err := w.cat.LoadTable(ctx, w.ident(ns, name))
 	if err != nil {
 		return
 	}
-	w.removeFiles(tbl, paths)
+	w.removeFiles(ctx, tbl, paths)
 }
 
 // removeFiles is dropFiles on a table already loaded.
-func (w *writer) removeFiles(tbl *table.Table, paths []string) {
+func (w *writer) removeFiles(ctx context.Context, tbl *table.Table, paths []string) {
 	if len(paths) == 0 {
 		return
 	}
-	fs, err := tbl.FS(w.ctx)
+	fs, err := tbl.FS(ctx)
 	if err != nil {
 		return
 	}
@@ -1469,20 +1487,32 @@ func (w *writer) removeFiles(tbl *table.Table, paths []string) {
 	}
 }
 
-// Close drops the files of epochs that were never pre-committed.
-func (w *writer) Close(context.Context) error {
+// Close drops the files of epochs that were never pre-committed. It stops
+// the files still being written first, rather than finish them, so a store
+// that doesn't answer can't hold it up.
+func (w *writer) Close(ctx context.Context) error {
+	w.cancel()
 	for _, parts := range []map[uint64]map[string]*epochFiles{w.parts, w.patches} {
 		for _, byStream := range parts {
-			for stream, ef := range byStream {
-				files := ef.files
-				if ef.open != nil {
-					more, _ := ef.open.finish()
-					files = append(files, more...)
-				}
-				w.dropFiles(w.ns, w.name(stream), files)
-			}
+			w.drop(ctx, byStream)
 		}
 	}
-	w.cancel()
 	return nil
+}
+
+// drop drops an epoch's files, by stream, closing its open ones first.
+func (w *writer) drop(ctx context.Context, byStream map[string]*epochFiles) {
+	for stream, ef := range byStream {
+		_, _ = ef.finish()
+		w.dropFiles(ctx, w.ns, w.name(stream), ef.files)
+	}
+}
+
+// classifyRun is classify for a writer's errors, but for a table or
+// namespace that's missing, which the next attempt creates.
+func classifyRun(err error) error {
+	if errors.Is(err, catalog.ErrNoSuchTable) || errors.Is(err, catalog.ErrNoSuchNamespace) {
+		return err
+	}
+	return classify(err)
 }
