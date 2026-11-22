@@ -64,7 +64,7 @@ GRANT SELECT ON SCHEMA::cdc TO openetl;
 > [!WARNING]
 > SQL Server cleans up changes after their retention: change tracking's `CHANGE_RETENTION`, 2 days by default, and change data capture's cleanup job, 3 days by default (`EXEC sys.sp_cdc_change_job @job_type = N'cleanup', @retention = ...`, in minutes). A pipeline that doesn't read a table for longer, or a table truncated under change tracking, fails with `POSITION_LOST`, which pauses it until it [reads from the start again](https://github.com/openetl-io/openetl/blob/main/docs/pipelines/positions.md#after-a-lost-position). OpenETL reports how far behind each stream is, and how much retention it has left: with change data capture, only if the login has `SELECT` on `msdb.dbo.cdc_jobs`.
 
-The `dsn` is a `sqlserver://` URL, such as `sqlserver://openetl:PASSWORD@db.example.com:1433?database=shop`, or an ADO or ODBC connection string. It's a secret: store it with `openetl secret set app-db-dsn`. Its `encrypt` decides TLS: `true` encrypts the whole connection, and verifies the server's certificate unless `trustServerCertificate=true`; `certificate` names a file of the authority to trust, and `hostNameInCertificate` the name the certificate holds. Without `encrypt`, only the sign-in is encrypted, unless the server forces encryption.
+The `dsn` is a `sqlserver://` URL, such as `sqlserver://openetl:PASSWORD@db.example.com:1433?database=shop`, or an ADO or ODBC connection string. It's a secret: store it with `openetl secret set app-db-dsn`. Its `encrypt` decides TLS: `true` encrypts the whole connection, and verifies the server's certificate unless `trustServerCertificate=true`; `strict` (TDS 8.0, SQL Server 2022) always verifies it; `certificate` names a file of the authority to trust, and `hostNameInCertificate` the name the certificate holds. Without `encrypt`, only the sign-in is encrypted, unless the server forces encryption, and the server's certificate isn't verified, so the password can be read by whoever can stand between OpenETL and the server, unless the `dsn` sets `trustServerCertificate=false`. Set `encrypt=true` or `encrypt=strict`.
 
 ### Check and preflight
 
@@ -74,7 +74,7 @@ The source's check reports an item for each thing it looks at, with a fix for wh
 |---|---|
 | `net.dns`, `net.connect` | The `dsn`'s host resolves, and its port takes a connection. Not checked for a named instance without a port, which SQL Server Browser resolves. |
 | `db.connect` | The login signs in and opens the database. A TLS handshake that fails, such as with a certificate the `dsn` doesn't trust, fails this item. |
-| `db.tls` | The connection is encrypted: the `dsn`'s `encrypt` is `true` or `strict`, or the server encrypts it. Otherwise it warns. |
+| `db.tls` | The connection is encrypted: the `dsn`'s `encrypt` is `true` or `strict`, or the server encrypts it, and whether the `dsn` verifies the server's certificate. Otherwise it warns. |
 | `server.version` | SQL Server 2016 or later. |
 | `schema.exists` | The schema exists. |
 | `schema.read` | The login has `SELECT` on every table and view in the schema. When `tables` is set, `table.NAME.read` instead, for each one it names. |

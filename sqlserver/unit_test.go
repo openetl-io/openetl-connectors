@@ -1,6 +1,7 @@
 package sqlserver
 
 import (
+	"errors"
 	"slices"
 	"strings"
 	"testing"
@@ -9,9 +10,11 @@ import (
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/decimal128"
 	"github.com/apache/arrow-go/v18/arrow/memory"
+	mssql "github.com/microsoft/go-mssqldb"
 
 	"github.com/openetl-io/openetl/sdk/go/check"
 	"github.com/openetl-io/openetl/sdk/go/destination"
+	protocolv1 "github.com/openetl-io/openetl/sdk/go/protocol/v1"
 	"github.com/openetl-io/openetl/sdk/go/source"
 )
 
@@ -241,5 +244,29 @@ func TestCheckListsAreValid(t *testing.T) {
 	sv := serverOf("sqlserver://u:p@host/inst?database=d")
 	if sv.address != "" || sv.principal != "u" {
 		t.Errorf("named instance: %+v", sv)
+	}
+}
+
+// Errors SQL Server and Azure SQL raise for a moment, which a retry gets
+// past, are TRANSIENT.
+func TestClassifyTransient(t *testing.T) {
+	for _, n := range []int32{1204, 1205, 1222, 4221, 40143, 40197, 40501, 40540, 40613, 10928, 10929, 49918} {
+		var coded interface{ ErrorCode() protocolv1.ErrorCode }
+		if err := classify(mssql.Error{Number: n}); !errors.As(err, &coded) || coded.ErrorCode() != protocolv1.ErrorCode_ERROR_CODE_TRANSIENT {
+			t.Errorf("error %d = %v", n, err)
+		}
+	}
+}
+
+// The certificate is verified only where the dsn says to: go-mssqldb trusts
+// any without encrypt, or with trustServerCertificate=true.
+func TestServerVerifiesCertificate(t *testing.T) {
+	for suffix, want := range map[string]bool{
+		"": false, "&trustServerCertificate=false": true, "&encrypt=true": true, "&encrypt=true&trustServerCertificate=true": false,
+		"&encrypt=strict&trustServerCertificate=true": true, "&encrypt=disable": false,
+	} {
+		if got := serverOf("sqlserver://u:p@host:1433?database=d" + suffix).verified; got != want {
+			t.Errorf("%q: verified = %v, want %v", suffix, got, want)
+		}
 	}
 }

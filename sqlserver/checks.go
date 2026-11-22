@@ -103,6 +103,8 @@ type server struct {
 	// The dsn's encrypt is true or strict: TLS for the whole connection, or
 	// no sign-in.
 	encrypted bool
+	// TLS, the sign-in's at least, checks the server's certificate.
+	verified bool
 }
 
 // serverOf reads a DSN that NewSource or NewDestination has parsed.
@@ -112,6 +114,7 @@ func serverOf(dsn string) server {
 	sv.database = cfg.Database
 	sv.principal = cmp.Or(cfg.User, "the connector's login")
 	sv.encrypted = cfg.Encryption == msdsn.EncryptionRequired || cfg.Encryption == msdsn.EncryptionStrict
+	sv.verified = cfg.TLSConfig != nil && (!cfg.TLSConfig.InsecureSkipVerify || cfg.TLSConfig.VerifyPeerCertificate != nil)
 	if cfg.Port != 0 || cfg.Instance == "" {
 		port := cfg.Port
 		if port == 0 {
@@ -179,8 +182,12 @@ func (sv server) connect(k *sqlcheck.Kit) []check.Check {
 		c.Needs = []string{"net.connect"}
 	}
 	tls := k.Check("db.tls", check.Connection, "Encrypt the connection", func(ctx context.Context, p *check.Probe, db *sql.DB) error {
+		cert := "with a certificate the dsn verifies."
+		if !sv.verified {
+			cert = "with a certificate the dsn doesn't verify: its trustServerCertificate is true, as it is without encrypt unless the dsn sets it."
+		}
 		if sv.encrypted {
-			p.Found("The dsn's encrypt requires TLS for the whole connection.")
+			p.Found("The dsn's encrypt requires TLS for the whole connection, " + cert)
 			return nil
 		}
 		// Without VIEW SERVER STATE, the login can't see the session's
@@ -190,7 +197,7 @@ func (sv server) connect(k *sqlcheck.Kit) []check.Check {
 		if err != nil || on != "TRUE" {
 			return check.Warn(unencrypted.Fail())
 		}
-		p.Found("The server encrypts the connection.")
+		p.Found("The server encrypts the connection, " + cert)
 		return nil
 	})
 	tls.Field = "dsn"
