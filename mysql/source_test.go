@@ -861,7 +861,7 @@ func TestResplitDividesTheRemainder(t *testing.T) {
 		s := e.source(`, "chunkRows": 10`)
 		var added []source.Split
 		out := &resplitter{s: s, added: &added}
-		err := s.readSplit(t.Context(), &connPool{DB: e.db, Held: make(chan struct{}, 1)}, mustTables(t, s, e), source.ConfiguredStream{Name: "big", SyncMode: source.FullRefresh}, source.Split{ID: "x"}, nil, out)
+		err := s.readSplit(t.Context(), &connPool{DB: e.db, Held: make(chan struct{}, 1)}, mustTables(t, s, e), source.ConfiguredStream{Name: "big", SyncMode: source.FullRefresh}, source.Split{ID: "x"}, out)
 		if err != nil {
 			t.Fatal(err)
 		}

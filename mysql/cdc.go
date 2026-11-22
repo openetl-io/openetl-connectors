@@ -133,9 +133,9 @@ type cdcStream struct {
 	// Where its first read started the binlog, and the GTIDs before it.
 	start     *binlogPos
 	startGTID string
-	// A read that stops at a resume point it sent before: that point's
-	// state, as it came and parsed, with its GTIDs; nil for a read to the
-	// binlog's end. Such a read sends its snapshot's rows once it gets there:
+	// A read that stops at a resume point or completion it sent before:
+	// that state, as it came and parsed, with its GTIDs; nil for a read to
+	// the binlog's end. Such a read sends its snapshot's rows once it gets there:
 	// those its state, fromState, hadn't read and until's had.
 	until     *cdcState
 	untilRaw  []byte
@@ -249,8 +249,12 @@ func (s *Source) readCDC(ctx context.Context, conns *connPool, srv server, req s
 			st.from = &state
 			st.start, st.startGTID, st.xa = state.Start, state.StartGTID, state.XA
 		}
-		if cs.Until != nil && !req.Continuous {
-			if err := r.stopAt(st, state, cs.Until); err != nil {
+		stop := cs.Until
+		if stop == nil {
+			stop = cs.CompleteAt
+		}
+		if stop != nil && !req.Continuous {
+			if err := r.stopAt(st, state, stop); err != nil {
 				return err
 			}
 		} else if st.ranges, err = r.snapshotRanges(ctx, t, state); err != nil {
@@ -296,8 +300,9 @@ func (s *Source) readCDC(ctx context.Context, conns *connPool, srv server, req s
 	return r.run(ctx, streamer)
 }
 
-// stopAt sets a stream up to stop at the resume point whose state is until.
-// From no state, its read starts the binlog where the first read did.
+// stopAt sets a stream up to stop at the resume point, or the completion,
+// whose state is until: either is the read's position then. From no state,
+// its read starts the binlog where the first read did.
 func (r *cdcReader) stopAt(st *cdcStream, from cdcState, until []byte) error {
 	var u cdcState
 	if err := json.Unmarshal(until, &u); err != nil {
