@@ -217,7 +217,7 @@ A continuous pipeline commits every minute unless it sets its own `delivery.comm
 
 The credentials need to read, write, copy, delete and list objects under the URL. On Amazon S3 that's `s3:ListBucket` on the bucket, and `s3:GetObject`, `s3:PutObject` and `s3:DeleteObject` on its objects under the URL. Overwrite also needs the store to honor conditional writes, `If-None-Match` and `If-Match`, which the `store.conditional-write` preflight checks. The destination's check writes and deletes an object under `_openetl/`. The source needs to list and read objects under the URL.
 
-A file over 16 MiB is uploaded in parts. From 0.2.0, a staged file whose write stops partway, as when a sync fails, has its parts dropped with `s3:AbortMultipartUpload`, which the credentials need for that; without it, the parts stay. A bucket lifecycle rule that aborts incomplete multipart uploads after a day also clears those of a connector that was killed.
+A file over 16 MiB is uploaded in parts. From 0.2.0, a staged file whose write stops partway, as when a sync fails, has its parts dropped with `s3:AbortMultipartUpload`, which the credentials need for that; without it, the parts stay, as they do when the store doesn't answer the abort within 30 seconds of the writer's close. A bucket lifecycle rule that aborts incomplete multipart uploads after a day also clears those, and those of a connector that was killed.
 
 ## Types
 

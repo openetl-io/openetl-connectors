@@ -172,15 +172,24 @@ func (s *store) open(ctx context.Context) (*blob.Bucket, error) {
 //
 //	BeforeWrite(as func(any) bool) error
 //
-// gives each write to b. Its as gives what the write's and b's As do.
-func (s *store) writeOptions(b *blob.Bucket, o blob.WriterOptions) *blob.WriterOptions {
+// gives each write to b. Its as gives what the write's and b's As do, and,
+// as a *context.Context, abort: an abort of the write, as of a multipart
+// upload that failed, ends with it too; nil for none.
+func (s *store) writeOptions(b *blob.Bucket, o blob.WriterOptions, abort context.Context) *blob.WriterOptions {
 	st, ok := s.st.(interface{ BeforeWrite(as func(any) bool) error })
 	if !ok {
 		return &o
 	}
 	before := o.BeforeWrite
 	o.BeforeWrite = func(as func(any) bool) error {
-		if err := st.BeforeWrite(func(i any) bool { return as(i) || b.As(i) }); err != nil || before == nil {
+		err := st.BeforeWrite(func(i any) bool {
+			if p, ok := i.(*context.Context); ok && abort != nil {
+				*p = abort
+				return true
+			}
+			return as(i) || b.As(i)
+		})
+		if err != nil || before == nil {
 			return err
 		}
 		return before(as)
@@ -258,7 +267,7 @@ func (s *store) swap(ctx context.Context, b *blob.Bucket, key string, data []byt
 			return nil
 		}
 		return s.st.IfMatch(as, was.etag, was.generation)
-	}})
+	}}, nil)
 	err := b.WriteAll(ctx, key, data, opts)
 	if gcerrors.Code(err) == gcerrors.FailedPrecondition || err != nil && s.st.Conflict(err) {
 		return errConflict

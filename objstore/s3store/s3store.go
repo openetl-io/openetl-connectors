@@ -213,20 +213,40 @@ func (s *Store) Version(as func(any) bool) string {
 }
 
 // BeforeWrite gives an upload a minute of its own to abort a multipart
-// upload that failed, which the context that ended it can't, and, on an
-// endpoint, only the checksums the store asks for: S3 takes a CRC32 of every
-// upload, which some S3-compatible stores refuse.
+// upload that failed, which the context that ended it can't, ending sooner
+// with the context as gives, if any; and, on an endpoint, only the checksums
+// the store asks for: S3 takes a CRC32 of every upload, which some
+// S3-compatible stores refuse.
 func (s *Store) BeforeWrite(as func(any) bool) error {
 	var tm *transfermanager.Client
 	var c *awss3.Client
 	if !as(&tm) || !as(&c) {
 		return nil
 	}
+	var abort context.Context
+	as(&abort)
 	*tm = *transfermanager.New(c, func(o *transfermanager.Options) {
 		o.FailTimeout = time.Minute
+		if abort != nil {
+			o.S3 = abortWithin{o.S3, abort}
+		}
 		if s.cfg.Endpoint != "" {
 			o.RequestChecksumCalculation = aws.RequestChecksumCalculationWhenRequired
 		}
 	})
 	return nil
+}
+
+// abortWithin ends an abort of a multipart upload, whose context
+// transfermanager makes of FailTimeout alone, when ctx ends too.
+type abortWithin struct {
+	transfermanager.S3APIClient
+	ctx context.Context
+}
+
+func (a abortWithin) AbortMultipartUpload(ctx context.Context, in *awss3.AbortMultipartUploadInput, opts ...func(*awss3.Options)) (*awss3.AbortMultipartUploadOutput, error) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	defer context.AfterFunc(a.ctx, cancel)()
+	return a.S3APIClient.AbortMultipartUpload(ctx, in, opts...)
 }

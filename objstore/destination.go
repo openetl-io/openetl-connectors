@@ -267,7 +267,7 @@ func (w *writer) startPart(e destination.Epoch, stream string, ef *epochFiles, s
 		Target: fmt.Sprintf("%s%s-%020d-g%020d-%s%s", dir, w.cfg.Pipeline, e.N, e.Generation, k, ext),
 	}}
 	ctx, cancel := context.WithCancel(w.ctx)
-	bw, err := w.b.NewWriter(ctx, p.file.Staged, w.d.store.writeOptions(w.b, blob.WriterOptions{ContentType: contentType(w.d.cfg.Format)}))
+	bw, err := w.b.NewWriter(ctx, p.file.Staged, w.d.store.writeOptions(w.b, blob.WriterOptions{ContentType: contentType(w.d.cfg.Format)}, w.ctx))
 	if err != nil {
 		cancel()
 		return nil, fmt.Errorf("objstore: stage %s: %w", p.file.Staged, err)
@@ -474,7 +474,7 @@ func (w *writer) Commit(ctx context.Context, e destination.Epoch, committables [
 			return destination.Committed{}, err
 		}
 	}
-	w.dropStaged(d)
+	w.dropStaged(ctx, d)
 	return destination.Committed{}, nil
 }
 
@@ -506,7 +506,7 @@ func (w *writer) apply(ctx context.Context, d staged, st stagedStream) error {
 	if err != nil {
 		return err
 	}
-	if err := w.b.WriteAll(ctx, marker, body, w.d.store.writeOptions(w.b, blob.WriterOptions{ContentType: "application/json"})); err != nil {
+	if err := w.b.WriteAll(ctx, marker, body, w.d.store.writeOptions(w.b, blob.WriterOptions{ContentType: "application/json"}, nil)); err != nil {
 		return fmt.Errorf("objstore: write the marker of %s: %w", st.Name, err)
 	}
 	return nil
@@ -631,12 +631,15 @@ func (w *writer) deleteAll(ctx context.Context, prefix string) {
 	}
 }
 
-// dropStaged is best effort: a staged file left behind is never applied
-// again, because its stream's marker exists.
-func (w *writer) dropStaged(d staged) {
+// dropStaged is best effort, within ctx and cleanupTimeout: a staged file
+// left behind is never applied again, because its stream's marker exists,
+// and DropStale or Recover drops it later.
+func (w *writer) dropStaged(ctx context.Context, d staged) {
+	ctx, cancel := context.WithTimeout(ctx, cleanupTimeout)
+	defer cancel()
 	for _, st := range d.Streams {
 		for _, f := range st.Files {
-			_ = w.b.Delete(w.ctx, f.Staged)
+			_ = w.b.Delete(ctx, f.Staged)
 		}
 	}
 }
@@ -691,7 +694,7 @@ func (w *writer) recover(ctx context.Context, e destination.Epoch, committables 
 	}
 	switch {
 	case len(missing) == 0:
-		w.dropStaged(d)
+		w.dropStaged(ctx, d)
 		return destination.Applied, nil
 	case present == needs:
 		for _, st := range missing {
@@ -699,7 +702,7 @@ func (w *writer) recover(ctx context.Context, e destination.Epoch, committables 
 				return 0, err
 			}
 		}
-		w.dropStaged(d)
+		w.dropStaged(ctx, d)
 		return destination.Redone, nil
 	case copied == 0 && len(missing) == len(d.Streams):
 		return destination.Lost, nil
@@ -724,15 +727,19 @@ func (w *writer) dropGenerations(ctx context.Context, gen uint64) {
 	}
 }
 
-// The longest Close deletes files for, whose context OpenETL gives no end.
-const closeTimeout = 30 * time.Second
+// The longest a cleanup takes, Close's or a commit's drop of its staged
+// files, whose contexts OpenETL gives no end.
+const cleanupTimeout = 30 * time.Second
 
-// Close drops the files of epochs that were never pre-committed, within
-// ctx and closeTimeout: those a store that stops answering keeps stay for a
-// later Recover or DropStale, as after a crash.
+// Close aborts open parts and drops the files of epochs that were never
+// pre-committed, within ctx and cleanupTimeout: what a store that stops
+// answering keeps stays for a later Recover or DropStale, as after a crash.
 func (w *writer) Close(ctx context.Context) error {
-	ctx, cancel := context.WithTimeout(ctx, closeTimeout)
+	ctx, cancel := context.WithTimeout(ctx, cleanupTimeout)
 	defer cancel()
+	// A part's abort, as of a multipart upload, ends with the writer's
+	// context, as its write's options give it to the store.
+	defer context.AfterFunc(ctx, w.cancel)()
 	for _, byStream := range w.parts {
 		for _, ef := range byStream {
 			if ef.open != nil {
