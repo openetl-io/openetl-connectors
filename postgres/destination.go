@@ -687,8 +687,11 @@ func (w *writer) latestResolved(s stagedStream, prep prepared, hasSeq bool) stri
 	order, before, latestFirst := key, "("+prep.rows.place("e", "ctid")+") < ("+prep.rows.place("l", "_openetl_ctid")+")", prep.rows.latestFirst("e")
 	if hasSeq {
 		order += ", " + q(seqColumn) + " DESC NULLS LAST"
-		before = "(e." + q(seqColumn) + ", " + prep.rows.place("e", "ctid") + ") < (l." + q(seqColumn) + ", " + prep.rows.place("l", "_openetl_ctid") + ")"
-		latestFirst = "e." + q(seqColumn) + " DESC, " + latestFirst
+		// e was staged before l as order ranks them, where a null seq is
+		// below every other: a row comparison with a null in it is unknown.
+		es, ls := "e."+q(seqColumn), "l."+q(seqColumn)
+		before = "(" + es + " < " + ls + " OR (" + es + " IS NULL AND " + ls + " IS NOT NULL) OR (" + es + " IS NOT DISTINCT FROM " + ls + " AND " + before + "))"
+		latestFirst = es + " DESC NULLS LAST, " + latestFirst
 	}
 	match := make([]string, len(s.Key))
 	for i, k := range s.Key {
