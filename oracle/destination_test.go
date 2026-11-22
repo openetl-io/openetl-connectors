@@ -341,6 +341,26 @@ func TestDestinationMergeUnchanged(t *testing.T) {
 	})
 }
 
+// A column the latest version didn't send keeps the target's value where
+// the staged version that sent it is older than the target's row.
+func TestDestinationMergeUnchangedOlderThanTarget(t *testing.T) {
+	e := newDestEnv(t, "OPENETL_D_UNCHOLD", ownGrants...)
+	w := e.open(1, destination.OpenConfig{Streams: []destination.Stream{{Name: "U", Mode: destination.Merge, PrimaryKey: []string{"k"}}}})
+	fields := []arrow.Field{{Name: "k", Type: arrow.PrimitiveTypes.Int64}, {Name: "v", Type: arrow.BinaryTypes.String, Nullable: true},
+		{Name: "n", Type: arrow.PrimitiveTypes.Int64, Nullable: true}, opField, seqField, unchField}
+	commit := func(n uint64, rows string) { e.commit(w, n, streamBatch{"U", batchOf(t, fields, rows)}) }
+	commit(1, `[{"k": 1, "v": "current", "n": 10, "_openetl_op": "insert", "_openetl_seq": "10"},
+		{"k": 2, "v": "current", "n": 10, "_openetl_op": "insert", "_openetl_seq": "10"}]`)
+	commit(2, `[{"k": 1, "v": "old", "n": 5, "_openetl_op": "update", "_openetl_seq": "5"},
+		{"k": 1, "v": null, "n": 11, "_openetl_op": "update", "_openetl_seq": "11", "_openetl_unchanged": ["v"]},
+		{"k": 2, "v": "newer", "n": 12, "_openetl_op": "update", "_openetl_seq": "12"},
+		{"k": 2, "v": null, "n": 13, "_openetl_op": "update", "_openetl_seq": "13", "_openetl_unchanged": ["v"]}]`)
+	equal(t, "U", e.rows(e.user, "U", "k", "v", "n", colUnchanged), []string{
+		"k=1, v=current, n=11, _openetl_unchanged=<null>",
+		"k=2, v=newer, n=13, _openetl_unchanged=<null>",
+	})
+}
+
 // textOf is a value as readTable gives it, as text: times in UTC, and long
 // text and binary values by their length.
 func textOf(v any) string {
