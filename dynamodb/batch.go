@@ -41,13 +41,17 @@ func (s *Source) newBatcher(cs source.ConfiguredStream, t *table, changes bool) 
 	if b.packed {
 		b.Column(dataColumn)
 	}
-	for _, c := range columnsOf(cs) {
-		if !b.packed {
+	for _, c := range cs.Columns {
+		if !b.packed && (!changes || !slices.Contains(controlNames, c)) {
 			b.Column(c)
 		}
 	}
 	return b
 }
+
+// controlNames are the names of a cdc batch's control columns, which the
+// run's columns can have too.
+var controlNames = []string{source.OpField().Name, source.SeqField(seqType).Name}
 
 // add appends an item's row, with op and seq for cdc. A delete's row has
 // only the attributes the run declares, whose values only say what it

@@ -8,7 +8,6 @@ import (
 	"maps"
 	"math/rand/v2"
 	"slices"
-	"strings"
 	"sync"
 
 	"github.com/apache/arrow-go/v18/arrow"
@@ -690,8 +689,4 @@ func (s *Source) newFieldError(stream, attr string) error {
 		err = fmt.Errorf("%w, but discovery reads a sample of %d items, which can miss it again: set sampleSize to 0 to read every item, or packed to read items whole", err, s.cfg.SampleSize)
 	}
 	return sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_TRANSIENT, err)
-}
-
-func columnsOf(cs source.ConfiguredStream) []string {
-	return slices.DeleteFunc(slices.Clone(cs.Columns), func(c string) bool { return strings.HasPrefix(c, "openetl.") })
 }
