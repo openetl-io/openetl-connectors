@@ -953,8 +953,9 @@ func (w *writer) query(ctx context.Context, p string, f func(map[string]types.At
 // item with a higher _openetl_seq as it is, except an overwrite read's,
 // which replaces what's there. A soft delete keeps the item's other
 // attributes, held ones too, and updates its metadata. A merged row's kept
-// columns keep the target's values. An append is a put, which, deduped on
-// the target, skips an _openetl_id the table has: skipped says so.
+// columns keep the target's values and holds. An append is a put, which,
+// deduped on the target, skips an _openetl_id the table has: skipped says
+// so.
 func (w *writer) applyRow(ctx context.Context, cfg destination.Stream, target string, item map[string]types.AttributeValue, keep []string, tag string) (skipped bool, err error) {
 	var cond *string
 	names, values := map[string]string{}, map[string]types.AttributeValue{}
@@ -1008,12 +1009,25 @@ func (w *writer) applyRow(ctx context.Context, cfg destination.Stream, target st
 		if err != nil {
 			return false, err
 		}
+		// The item's holds on the kept columns, which the row's own override,
+		// so that a held version's patch still finds its hold.
+		holds := map[string]types.AttributeValue{}
+		curHeld, _ := cur[heldColumn].(*types.AttributeValueMemberM)
 		for _, c := range keep {
 			if v, ok := cur[c]; ok {
 				item[c] = v
 			} else {
 				delete(item, c)
 			}
+			if curHeld != nil && curHeld.Value[c] != nil {
+				holds[c] = curHeld.Value[c]
+			}
+		}
+		if h, ok := item[heldColumn].(*types.AttributeValueMemberM); ok {
+			maps.Copy(holds, h.Value)
+		}
+		if len(holds) > 0 {
+			item[heldColumn] = &types.AttributeValueMemberM{Value: holds}
 		}
 	}
 	if tag != "" {

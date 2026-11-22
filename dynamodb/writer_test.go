@@ -1,8 +1,14 @@
 package dynamodb
 
 import (
+	"reflect"
 	"testing"
 	"time"
+
+	"github.com/apache/arrow-go/v18/arrow"
+	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/memory"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 
 	"github.com/openetl-io/openetl/sdk/go/destination"
 )
@@ -44,5 +50,67 @@ func TestOverwriteDedupeEpoch(t *testing.T) {
 	got += memCommit(t, w, 2, "t", memBatch(cols, row)).Collapsed["t"]
 	if n := len(db.items("t")); n != 2 || got != 1 {
 		t.Errorf("%d items, %d collapsed; want 2 and 1", n, got)
+	}
+}
+
+// A merged row that doesn't send a held column keeps the item's value and
+// its hold, so that the held version's patch still fills it.
+func TestUnchangedKeepsHold(t *testing.T) {
+	db := newMemDB(map[string][]string{controlTable: {"p", "n"}, "t": {"id"}})
+	w := memWriter(t, db, destination.Stream{Name: "t", Mode: destination.Merge, PrimaryKey: []string{"id"}})
+	list := arrow.ListOf(arrow.BinaryTypes.String)
+	schema := arrow.NewSchema([]arrow.Field{
+		{Name: "id", Type: arrow.BinaryTypes.String},
+		{Name: "v", Type: arrow.BinaryTypes.String, Nullable: true},
+		{Name: idColumn, Type: arrow.BinaryTypes.String},
+		{Name: seqColumn, Type: arrow.PrimitiveTypes.Int64},
+		{Name: heldColumn, Type: list, Nullable: true},
+		{Name: unchangedColumn, Type: list, Nullable: true},
+	}, nil)
+	// row is id 1's version with v, held and unchanged as given; nil is null.
+	row := func(v *string, version string, seq int64, held, unchanged []string) arrow.RecordBatch {
+		b := array.NewRecordBuilder(memory.DefaultAllocator, schema)
+		defer b.Release()
+		b.Field(0).(*array.StringBuilder).Append("1")
+		if v == nil {
+			b.Field(1).AppendNull()
+		} else {
+			b.Field(1).(*array.StringBuilder).Append(*v)
+		}
+		b.Field(2).(*array.StringBuilder).Append(version)
+		b.Field(3).(*array.Int64Builder).Append(seq)
+		for i, l := range [][]string{held, unchanged} {
+			lb := b.Field(4 + i).(*array.ListBuilder)
+			if l == nil {
+				lb.AppendNull()
+				continue
+			}
+			lb.Append(true)
+			for _, s := range l {
+				lb.ValueBuilder().(*array.StringBuilder).Append(s)
+			}
+		}
+		return b.NewRecordBatch()
+	}
+	memCommit(t, w, 1, "t", row(nil, "1-10", 10, []string{"v"}, nil))
+	memCommit(t, w, 2, "t", row(nil, "1-20", 20, nil, []string{"v"}))
+	if it := db.items("t")[0]; !reflect.DeepEqual(it[heldColumn], &types.AttributeValueMemberM{Value: map[string]types.AttributeValue{"v": str("1-10")}}) {
+		t.Errorf("after a row that didn't send v, the item's holds are %v", it[heldColumn])
+	}
+	e := destination.Epoch{Generation: 1, N: 3}
+	p := row(sp("filled"), "1-10", 10, []string{"v"}, nil)
+	defer p.Release()
+	if err := w.Patch(t.Context(), e, "t", p); err != nil {
+		t.Fatal(err)
+	}
+	staged, err := w.PreCommit(t.Context(), e)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Commit(t.Context(), e, []destination.Staged{staged}); err != nil {
+		t.Fatal(err)
+	}
+	if it := db.items("t")[0]; stringOf(it["v"]) != "filled" || it[heldColumn] != nil || stringOf(it[idColumn]) != "1-20" {
+		t.Errorf("after the held version's patch: %v", it)
 	}
 }
