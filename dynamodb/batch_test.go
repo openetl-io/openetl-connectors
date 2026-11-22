@@ -37,6 +37,25 @@ func TestBatcherControlNames(t *testing.T) {
 	}
 }
 
+// A scan with a filter and a projection keeps both.
+func TestScanFilterAndProjection(t *testing.T) {
+	db := newMemDB(map[string][]string{"t": {"id"}})
+	for _, it := range []map[string]types.AttributeValue{{"id": str("1"), "c": str("b"), "v": str("x")}, {"id": str("2"), "v": str("y")}} {
+		if _, err := db.PutItem(t.Context(), &dynamodb.PutItemInput{TableName: aws.String("t"), Item: it}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var got []map[string]types.AttributeValue
+	err := (&Source{}).scanPages(t.Context(), &clients{db: db}, "t", 0, 1, nil, &scanFilter{cursor: "c", floor: str("a")}, []string{"id"}, false,
+		func(items []map[string]types.AttributeValue, _ map[string]types.AttributeValue) (bool, error) {
+			got = append(got, items...)
+			return false, nil
+		})
+	if err != nil || len(got) != 1 || len(got[0]) != 1 || stringOf(got[0]["id"]) != "1" {
+		t.Errorf("items %v, %v; want only id 1's key", got, err)
+	}
+}
+
 // Packed, discovery scans nothing of a table whose keys are strings or
 // binaries, and only the key of one keyed on a number, which it types.
 func TestPackedDiscovery(t *testing.T) {

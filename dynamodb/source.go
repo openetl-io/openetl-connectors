@@ -282,7 +282,9 @@ func (s *Source) scanPages(ctx context.Context, cl *clients, tableName string, s
 		in.ExpressionAttributeValues = map[string]types.AttributeValue{":f": filter.floor}
 	}
 	if proj != nil {
-		in.ExpressionAttributeNames = map[string]string{}
+		if in.ExpressionAttributeNames == nil {
+			in.ExpressionAttributeNames = map[string]string{}
+		}
 		var names []string
 		for i, a := range proj {
 			names = append(names, fmt.Sprintf("#k%d", i))
