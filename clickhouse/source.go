@@ -487,6 +487,18 @@ func (r *tableRead) complete(next []byte) error {
 	return r.out.Complete(next)
 }
 
+// after is the condition that cols, in order, come after vals. A key's
+// index skips granules by a bound on a column, but not by a tuple's
+// comparison, so the first column's bound comes too: without it, each
+// chunk read the table from its start.
+func after(cols, vals []string) string {
+	tuple := "(" + strings.Join(cols, ", ") + ") > (" + strings.Join(vals, ", ") + ")"
+	if len(cols) == 1 {
+		return tuple
+	}
+	return cols[0] + " >= " + vals[0] + " AND " + tuple
+}
+
 // chunks reads in order of the columns order, a chunk per query, from st,
 // which conds bound. It completes with next.
 func (r *tableRead) chunks(ctx context.Context, st sourceState, order []int, conds []string, next []byte) error {
@@ -498,12 +510,12 @@ func (r *tableRead) chunks(ctx context.Context, st sourceState, order []int, con
 	for i, k := range order {
 		cols[i], texts[i] = ident(r.t.cols[k].name), keyText(r.t.cols[k])
 	}
-	after := func(vals []string) string {
+	afterVals := func(vals []string) string {
 		exprs := make([]string, len(vals))
 		for i, v := range vals {
 			exprs[i] = castBack(r.t.cols[order[i]], v)
 		}
-		return "(" + strings.Join(cols, ", ") + ") > (" + strings.Join(exprs, ", ") + ")"
+		return after(cols, exprs)
 	}
 	head := "SELECT " + r.selectList() + ", " + strings.Join(texts, ", ") + " FROM " + r.from()
 	// Rows that share the last row's order columns come in its chunk.
@@ -512,7 +524,7 @@ func (r *tableRead) chunks(ctx context.Context, st sourceState, order []int, con
 		if len(r.until.After) != len(order) {
 			return fmt.Errorf("clickhouse: %s until has %d order columns, the read has %d", r.t.name, len(r.until.After), len(order))
 		}
-		conds = append(slices.Clip(conds), "NOT "+after(r.until.After))
+		conds = append(slices.Clip(conds), "NOT ("+afterVals(r.until.After)+")")
 	}
 	if r.until != nil && r.until.After == nil {
 		// It stops before the first row.
@@ -530,7 +542,7 @@ func (r *tableRead) chunks(ctx context.Context, st sourceState, order []int, con
 			where = append(where, st.where(r.t.cols[r.t.key[0]])...)
 		}
 		if st.After != nil {
-			where = append(where, after(st.After))
+			where = append(where, afterVals(st.After))
 		}
 		q := head
 		if len(where) > 0 {

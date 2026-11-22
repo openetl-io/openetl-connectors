@@ -319,6 +319,18 @@ func TestContainerNulls(t *testing.T) {
 	}
 }
 
+// A chunk's rows after the last one's order columns: a key's index skips
+// granules by a bound on its first column, never by a tuple's comparison,
+// so a chunk of a key of several columns bounds the first one too.
+func TestAfter(t *testing.T) {
+	if got, want := after([]string{"`a`"}, []string{"1"}), "(`a`) > (1)"; got != want {
+		t.Errorf("one column: %s, not %s", got, want)
+	}
+	if got, want := after([]string{"`a`", "`b`"}, []string{"1", "2"}), "`a` >= 1 AND (`a`, `b`) > (1, 2)"; got != want {
+		t.Errorf("two columns: %s, not %s", got, want)
+	}
+}
+
 // An IPv6 address keeps its text, an IPv4-mapped one too, which net.IP
 // spells as IPv4; an IPv4 column's scans in 4 bytes.
 func TestIPText(t *testing.T) {

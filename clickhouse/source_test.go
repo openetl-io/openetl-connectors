@@ -8,8 +8,10 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 
+	ch "github.com/ClickHouse/clickhouse-go/v2"
 	"github.com/apache/arrow-go/v18/arrow"
 
 	"github.com/openetl-io/openetl/sdk/go/source"
@@ -518,5 +520,28 @@ func TestSourceNaN(t *testing.T) {
 	}
 	if got := c.ids("fc"); !slices.Equal(got, []int64{3}) {
 		t.Errorf("the next read read ids %v, not 3", got)
+	}
+}
+
+// A key of several columns is read a chunk at a time from where the last
+// ended, not from the table's start: each chunk's rows read are about a
+// chunk's, so the read's are about the table's.
+func TestSourceChunksSkipGranules(t *testing.T) {
+	db := newDatabase(t)
+	e := sourceEnv{t: t, db: db, conn: testConn(t)}
+	e.exec("CREATE TABLE $db.k (g Int64, id Int64) ENGINE = MergeTree ORDER BY (g, id) SETTINGS index_granularity = 64")
+	e.exec("INSERT INTO $db.k SELECT intDiv(number, 1000), number + 1 FROM numbers(50000)")
+	s := newTestSource(t, db, `, "chunkRows": 500`)
+	var read atomic.Uint64
+	ctx := ch.Context(t.Context(), ch.WithProgress(func(p *ch.Progress) { read.Add(p.Rows) }))
+	c := newCollector()
+	if err := s.Read(ctx, source.ReadRequest{Streams: []source.ConfiguredStream{{Name: "k", SyncMode: source.FullRefresh}}}, c); err != nil {
+		t.Fatal(err)
+	}
+	if got := c.ids("k"); !slices.Equal(got, span(1, 50000)) {
+		t.Fatalf("read %d rows, not ids 1 to 50000 once", len(got))
+	}
+	if n := read.Load(); n > 3*50000 {
+		t.Errorf("the read's 100 chunks read %d rows of a table of 50000", n)
 	}
 }
