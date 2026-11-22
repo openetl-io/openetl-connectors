@@ -325,6 +325,36 @@ func TestSplitStopsAtItsEnd(t *testing.T) {
 	}
 }
 
+// A redo of an epoch that 0.1.0 read, whose states have no "checked", ends
+// with exactly the state 0.1.0 sent, the read and each split caught up.
+func TestRedoesAnEpochOf010(t *testing.T) {
+	old := time.Now().Add(-time.Hour)
+	f := &fakeStream{perCall: 3, shards: []*fakeShard{{id: "shardId-0"}}}
+	f.put(f.shards[0], 10, old)
+	s := newReadSource(t, f)
+	since := old.Add(time.Minute).UTC().Format(time.RFC3339Nano)
+	shard := []byte(`{"after":"109","since":"` + since + `"}`)
+	whole := []byte(`{"shards":{"shardId-0":` + string(shard) + `}}`)
+	for _, c := range []struct {
+		cs   source.ConfiguredStream
+		end  []byte
+		name string
+	}{
+		{source.ConfiguredStream{Until: whole}, whole, ""},
+		{source.ConfiguredStream{CompleteAt: whole}, whole, ""},
+		{source.ConfiguredStream{Splits: []source.Split{{ID: "shardId-0", State: []byte(`{}`), Until: shard}}}, shard, "shardId-0"},
+		{source.ConfiguredStream{Splits: []source.Split{{ID: "shardId-0", State: []byte(`{}`), CompleteAt: shard}}}, shard, "shardId-0"},
+	} {
+		log, err := readOnce(t, s, c.cs)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got, want := log.last(2), []string{c.name + " resume " + string(c.end), c.name + " complete " + string(c.end)}; !slices.Equal(got, want) {
+			t.Errorf("ended with %q, want %q", got, want)
+		}
+	}
+}
+
 // A read whose end retention removed fails with POSITION_LOST rather than
 // completing at an end it never reached.
 func TestReadToAnEndRetentionRemoved(t *testing.T) {
