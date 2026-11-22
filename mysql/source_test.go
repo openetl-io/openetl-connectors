@@ -457,6 +457,72 @@ func TestCDCRefusesRolledBackXA(t *testing.T) {
 	})
 }
 
+// TestCDCReadsRolledBackTransactions reads transactions that changed a
+// MyISAM table and rolled back, which MariaDB writes to the binlog with
+// their changes: one logged as statements, with a ROLLBACK, and one logged
+// as rows, with a ROLLBACK TO a savepoint, that rolled back no change to
+// items are passed, and the read goes on to the next; ones that rolled back
+// a change to items fail the read as lost, rather than send it. MySQL with
+// GTIDs refuses such transactions.
+func TestCDCReadsRolledBackTransactions(t *testing.T) {
+	eachServer(t, func(t *testing.T, srv testServer) {
+		e := newSourceEnv(t, srv)
+		enforced, _, err := globalVariable(t.Context(), e.db, "enforce_gtid_consistency")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.EqualFold(enforced, "ON") {
+			t.Skip("enforce_gtid_consistency refuses a transaction that changes a MyISAM table and an InnoDB one, so the binlog has none")
+		}
+		e.exec("CREATE TABLE $db.items (id int PRIMARY KEY, v varchar(20))")
+		e.exec("CREATE TABLE $db.other (id int PRIMARY KEY)")
+		e.exec("CREATE TABLE $db.log (id int PRIMARY KEY) ENGINE=MyISAM")
+		s := e.source("")
+		session := func(qs ...string) {
+			conn, err := e.db.Conn(t.Context())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = conn.Close() }()
+			for _, q := range append(qs, "SET SESSION binlog_format = DEFAULT") {
+				if _, err := conn.ExecContext(t.Context(), strings.ReplaceAll(q, "$db", quoteIdent(e.database))); err != nil {
+					t.Fatalf("%s: %v", q, err)
+				}
+			}
+		}
+		first := read(t, s, cdc("rollback", nil, "items"))
+		session("SET SESSION binlog_format = 'STATEMENT'", "BEGIN", "INSERT INTO $db.other VALUES (1)", "INSERT INTO $db.log VALUES (1)", "ROLLBACK")
+		session("BEGIN", "INSERT INTO $db.items VALUES (1, 'a')", "SAVEPOINT s1", "INSERT INTO $db.other VALUES (2)", "INSERT INTO $db.log VALUES (2)", "ROLLBACK TO s1", "COMMIT")
+		e.exec("INSERT INTO $db.items VALUES (2, 'b')")
+		next := read(t, s, cdc("rollback", map[string]string{"items": first.state("items")}, "items"))
+		var log []string
+		for _, r := range next.rows("items") {
+			log = append(log, r["openetl.op"]+" "+r["id"])
+		}
+		if want := []string{"insert 1", "insert 2"}; !slices.Equal(log, want) {
+			t.Fatalf("changes %q, want %q", log, want)
+		}
+		for i, qs := range [][]string{
+			{"BEGIN", "INSERT INTO $db.items VALUES (3, 'c')", "SAVEPOINT s1", "INSERT INTO $db.items VALUES (4, 'd')", "INSERT INTO $db.log VALUES (3)", "ROLLBACK TO s1", "COMMIT"},
+			{"SET SESSION binlog_format = 'MIXED'", "BEGIN", "INSERT INTO $db.items VALUES (UUID_SHORT() % 1000 + 1000, 'e')", "CREATE TEMPORARY TABLE $db.tmp (x int)",
+				"INSERT INTO $db.tmp VALUES (1)", "ROLLBACK"},
+		} {
+			// As after a reset of items, from past the transactions before.
+			from := read(t, s, cdc("rollback", nil, "items")).state("items")
+			session(qs...)
+			// A transaction after it, which a read that misses the rollback
+			// fails at.
+			e.exec("INSERT INTO $db.items VALUES (?, 'later')", 100+i)
+			c := &capture{}
+			t.Cleanup(c.release)
+			err := s.Read(t.Context(), cdc("rollback", map[string]string{"items": from}, "items"), c)
+			if codeOf(err) != protocolv1.ErrorCode_ERROR_CODE_POSITION_LOST || !strings.Contains(err.Error(), "items") {
+				t.Fatalf("%s: %v (%v), rows %v", qs[len(qs)-1], err, codeOf(err), c.rows("items"))
+			}
+		}
+	})
+}
+
 // TestCDCRefusesPartialRowImages reads a session's changes logged with
 // binlog_row_image = MINIMAL: its delete has the key it needs, its update
 // hasn't the columns it left alone and fails the read.

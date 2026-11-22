@@ -165,9 +165,12 @@ type txn struct {
 	// A BEGIN was read: statements before the commit are its.
 	begun bool
 	skip  map[*cdcStream]bool
-	// Rows emitted so far, and the streams they're of.
+	// Rows emitted so far, and the streams they're of, each with the number
+	// of its last.
 	n    uint64
-	sent map[*cdcStream]bool
+	sent map[*cdcStream]uint64
+	// How many rows were emitted before each of its savepoints, by name.
+	savepoints map[string]uint64
 	// Its xid, from its XA END, if it's an XA transaction.
 	xa string
 }
@@ -833,6 +836,11 @@ func (r *cdcReader) event(ctx context.Context, ev *replication.BinlogEvent) erro
 			return nil
 		case q == "COMMIT":
 			return r.commit(h)
+		case q == "ROLLBACK":
+			return r.rollback(h)
+		}
+		if err := r.savepoint(q); err != nil {
+			return err
 		}
 		if x, ok := strings.CutPrefix(q, "XA END "); ok && r.txn != nil {
 			r.txn.xa = x
@@ -1174,7 +1182,7 @@ func (r *cdcReader) begin(g gomysql.GTIDSet, at time.Time) error {
 	if r.txn != nil {
 		return errors.New("mysql: binlog: a transaction began inside another")
 	}
-	r.txn = &txn{start: r.pos, gtid: g, at: at, skip: map[*cdcStream]bool{}, sent: map[*cdcStream]bool{}}
+	r.txn = &txn{start: r.pos, gtid: g, at: at, skip: map[*cdcStream]bool{}, sent: map[*cdcStream]uint64{}, savepoints: map[string]uint64{}}
 	for _, st := range r.streams {
 		switch {
 		case st.from == nil:
@@ -1212,6 +1220,49 @@ func (r *cdcReader) commit(h *replication.EventHeader) error {
 	}
 	r.serverEnd = maxPos(r.serverEnd, r.pos)
 	return r.passed()
+}
+
+// rollback ends a transaction that rolled back, which the binlog has where
+// it changed a table that can't roll back, such as a MyISAM one, whose
+// changes stay.
+func (r *cdcReader) rollback(h *replication.EventHeader) error {
+	if r.txn != nil {
+		if err := r.rolledBack(0); err != nil {
+			return err
+		}
+	}
+	return r.commit(h)
+}
+
+// savepoint takes a transaction's SAVEPOINT or ROLLBACK TO, q. The binlog
+// has the changes after a savepoint that a ROLLBACK TO it undid where the
+// transaction changed a table that can't roll back.
+func (r *cdcReader) savepoint(q string) error {
+	if r.txn == nil {
+		return nil
+	}
+	if name, ok := strings.CutPrefix(q, "SAVEPOINT "); ok {
+		r.txn.savepoints[name] = r.txn.n
+	} else if name, ok := strings.CutPrefix(q, "ROLLBACK TO "); ok {
+		return r.rolledBack(r.txn.savepoints[name])
+	}
+	return nil
+}
+
+// rolledBack fails the read if the transaction emitted rows after its
+// first n, which it rolled back: they never committed.
+func (r *cdcReader) rolledBack(n uint64) error {
+	var names []string
+	for _, st := range r.streams {
+		if r.txn.sent[st] > n {
+			names = append(names, st.t.name)
+		}
+	}
+	if len(names) == 0 {
+		return nil
+	}
+	return positionLost("mysql: binlog: the transaction at %s:%d changed %s and rolled the changes back, which the binlog has as it changed a table that can't roll back, such as a MyISAM one; "+
+		"they never committed, and were read as if they had: read %[3]s again", r.txn.start.File, r.txn.start.Pos, strings.Join(names, ", "))
 }
 
 // relation maps a table the binlog describes to its stream. A column the
@@ -1374,7 +1425,7 @@ func (rel *relation) values(row []any, skipped []int, keyOnly bool) ([]any, erro
 
 func (r *cdcReader) emit(st *cdcStream, op string, vals []any, unchanged []string) error {
 	r.txn.n++
-	r.txn.sent[st] = true
+	r.txn.sent[st] = r.txn.n
 	return r.add(st, op, seqOf(r.epoch, r.txn.start, r.txn.n), vals, unchanged)
 }
 

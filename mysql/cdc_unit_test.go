@@ -5,6 +5,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -223,6 +224,52 @@ func TestXATransactionsAreRead(t *testing.T) {
 	}
 	if rows := emitted(t, r, rec); len(rows) != 1 || rows[0]["id"] != "1" || r.txn != nil || r.pos.Pos != 550 {
 		t.Fatalf("rows %v, position %v, in a transaction %v", rows, r.pos, r.txn != nil)
+	}
+}
+
+// TestRolledBackTransactions reads transactions that the binlog has though
+// they rolled back, as it has one that changed a MyISAM table, with a
+// ROLLBACK at its end, or a ROLLBACK TO a savepoint inside it, as MySQL and
+// MariaDB log them: one that rolled back no row the read sent is passed,
+// and the read goes on, and one that did fails the read as lost, before
+// its rows are sent.
+func TestRolledBackTransactions(t *testing.T) {
+	ev := func(typ replication.EventType, e replication.Event) *replication.BinlogEvent { return at(0, typ, e) }
+	item := []*replication.BinlogEvent{ev(replication.TABLE_MAP_EVENT, itemsMap()), ev(replication.WRITE_ROWS_EVENTv2, itemRows([]any{int32(1), "a"}))}
+	logged := []*replication.BinlogEvent{
+		ev(replication.TABLE_MAP_EVENT, &replication.TableMapEvent{TableID: 2, Schema: []byte("app"), Table: []byte("log"), ColumnCount: 1, ColumnName: [][]byte{[]byte("id")}}),
+		ev(replication.WRITE_ROWS_EVENTv2, &replication.RowsEvent{TableID: 2, ColumnCount: 1, Rows: [][]any{{int32(1)}}}),
+	}
+	savepoint, toSavepoint := []*replication.BinlogEvent{ev(replication.QUERY_EVENT, query("SAVEPOINT `s1`"))}, []*replication.BinlogEvent{ev(replication.QUERY_EVENT, query("ROLLBACK TO `s1`"))}
+	rollback := func(pos uint32) []*replication.BinlogEvent {
+		return []*replication.BinlogEvent{at(pos, replication.QUERY_EVENT, query("ROLLBACK"))}
+	}
+	commit := func(pos uint32) []*replication.BinlogEvent {
+		return []*replication.BinlogEvent{at(pos, replication.XID_EVENT, &replication.XIDEvent{})}
+	}
+	for _, mariadb := range []bool{false, true} {
+		begin := []*replication.BinlogEvent{ev(replication.ANONYMOUS_GTID_EVENT, &replication.GTIDEvent{}), ev(replication.QUERY_EVENT, query("BEGIN"))}
+		if mariadb {
+			begin = []*replication.BinlogEvent{ev(replication.MARIADB_GTID_EVENT, &replication.MariadbGTIDEvent{GTID: gomysql.MariadbGTID{ServerID: 1, SequenceNumber: 5}, Flags: replication.BINLOG_MARIADB_FL_TRANSACTIONAL})}
+		}
+		r, rec := binlogReader(t, mariadb)
+		err := feed(t, r, slices.Concat(begin, logged, rollback(100), begin, item, savepoint, logged, toSavepoint, commit(200), begin, item, commit(300))...)
+		if err != nil {
+			t.Fatalf("mariadb %v: %v", mariadb, err)
+		}
+		if rows := emitted(t, r, rec); len(rows) != 2 || r.txn != nil || r.pos.Pos != 300 {
+			t.Fatalf("mariadb %v: rows %v, position %v, in a transaction %v", mariadb, rows, r.pos, r.txn != nil)
+		}
+		for name, events := range map[string][]*replication.BinlogEvent{
+			"rolled back":                slices.Concat(begin, item, logged, rollback(100), begin, item, commit(200)),
+			"rolled back to a savepoint": slices.Concat(begin, item, savepoint, item, logged, toSavepoint, commit(100)),
+		} {
+			r, rec := binlogReader(t, mariadb)
+			err := feed(t, r, events...)
+			if connectortest.CodeOf(err) != protocolv1.ErrorCode_ERROR_CODE_POSITION_LOST || !strings.Contains(err.Error(), "items") || len(rec.RowsOf("items")) > 0 {
+				t.Fatalf("mariadb %v, %s: %v (%v), rows %v", mariadb, name, err, connectortest.CodeOf(err), rec.RowsOf("items"))
+			}
+		}
 	}
 }
 
