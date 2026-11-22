@@ -404,14 +404,17 @@ func (d *Destination) store(ctx context.Context) (*store, error) {
 	return &store{client: client, up: transfermanager.New(client), bucket: d.cfg.Bucket, prefix: strings.Trim(d.cfg.Prefix, "/")}, nil
 }
 
-// key is a staging table's object. COPY reads every object whose key
-// starts with the one it names, so each ends in .parquet: no table's name
-// is another's with more after it.
+// key is a new object for a staging table's file. Its random part keeps it
+// from another deployment's, whose pipeline of the same name stages tables
+// of the same names; COPY reads every object whose key starts with the one
+// it names, and the part's fixed length keeps any key from starting with
+// another.
 func (s *store) key(name string) string {
+	key := name + "." + uuid.NewString() + ".parquet"
 	if s.prefix == "" {
-		return name + ".parquet"
+		return key
 	}
-	return s.prefix + "/" + name + ".parquet"
+	return s.prefix + "/" + key
 }
 
 func (s *store) url(key string) string { return "s3://" + s.bucket + "/" + key }

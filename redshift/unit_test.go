@@ -415,3 +415,24 @@ func TestPatchSharedHeldColumn(t *testing.T) {
 		}
 	}
 }
+
+// Each load's object is its own, though another deployment of a pipeline of
+// the same name stages a table of the same name in the same bucket, and no
+// key is a prefix of another, whose object COPY would read too.
+func TestStoreKeys(t *testing.T) {
+	s := &store{bucket: "b", prefix: "p"}
+	var keys []string
+	for _, name := range []string{"_openetl_stage_a", "_openetl_stage_a", "_openetl_stage_a_2", "_openetl_stage_a_20"} {
+		keys = append(keys, s.key(name))
+	}
+	for i, a := range keys {
+		if !strings.HasPrefix(a, "p/") || !strings.HasSuffix(a, ".parquet") {
+			t.Errorf("key %q", a)
+		}
+		for j, b := range keys {
+			if i != j && strings.HasPrefix(b, a) {
+				t.Errorf("COPY of %q reads %q too", a, b)
+			}
+		}
+	}
+}
