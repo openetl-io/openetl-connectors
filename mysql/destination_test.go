@@ -269,8 +269,11 @@ func TestSessionsCommitAndReadEveryRow(t *testing.T) {
 		}
 		de := &destEnv{t: t, d: d, db: e.db, database: e.database}
 		w := de.open(destination.Stream{Name: "out", Mode: destination.Append})
-		de.commit(w, 1, "out", batchOf(t, []arrow.Field{{Name: "x", Type: arrow.PrimitiveTypes.Int32, Nullable: true}}, `[{"x": 1}, {"x": 2}, {"x": 3}]`))
 		var n int
+		if err := e.db.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM "+quoteIdent(e.database)+"._openetl_fence").Scan(&n); err != nil || n != 1 {
+			t.Errorf("another session sees %d fence rows of 1 that Recover wrote: %v", n, err)
+		}
+		de.commit(w, 1, "out", batchOf(t, []arrow.Field{{Name: "x", Type: arrow.PrimitiveTypes.Int32, Nullable: true}}, `[{"x": 1}, {"x": 2}, {"x": 3}]`))
 		if err := e.db.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM "+quoteIdent(e.database)+".out").Scan(&n); err != nil || n != 3 {
 			t.Errorf("another session sees %d rows of 3 the destination wrote: %v", n, err)
 		}
