@@ -996,9 +996,10 @@ func (w *writer) ensureRead(ctx context.Context, s stagedStream, cols []column) 
 	return w.ensureTable(ctx, s.Name, s.Read, cols)
 }
 
-// ensureIndex builds the index without blocking the table's writers. A
-// concurrent build that was cut off leaves the index invalid, so it drops
-// such an index and builds it again.
+// ensureIndex builds the index without blocking the table's writers, unless
+// a valid non-partial index matching cols already exists. A concurrent build
+// that was cut off leaves the index invalid, so it drops such an index and
+// builds it again.
 func (w *writer) ensureIndex(ctx context.Context, table, name string, unique bool, cols []string) error {
 	if w.indexed[name] {
 		return nil
@@ -1011,6 +1012,22 @@ func (w *writer) ensureIndex(ctx context.Context, table, name string, unique boo
 	if err == nil && !valid {
 		if err := w.dropIndex(ctx, name); err != nil {
 			return err
+		}
+	}
+	if !unique && len(cols) > 0 {
+		var has bool
+		err := w.pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM pg_index i
+			WHERE i.indrelid = to_regclass($1) AND i.indisvalid AND i.indpred IS NULL AND i.indnkeyatts >= cardinality($2::text[])
+			AND (SELECT array_agg(a.attname::text ORDER BY k.ord)
+				FROM unnest((i.indkey::int2[])[0:cardinality($2::text[]) - 1]) WITH ORDINALITY AS k(attnum, ord)
+				JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.attnum AND a.attnum > 0 AND NOT a.attisdropped)
+				= $2::text[])`, w.ident(table), cols).Scan(&has)
+		if err != nil {
+			return err
+		}
+		if has {
+			w.indexed[name] = true
+			return nil
 		}
 	}
 	kind := "INDEX"

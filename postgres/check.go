@@ -572,8 +572,9 @@ func (d *Destination) schemaCheck(k *sqlcheck.Kit, schema string) check.Check {
 
 // Preflight looks at the pipeline's schema, and at each stream's table:
 // one that exists takes what the stream's write mode does to it, and if the
-// user doesn't own it, it has the stream's columns and, to merge into, a
-// unique index on the key. A hold's release updates any mode's table, which
+// user doesn't own it, it has the stream's columns, to merge into, a
+// unique index on the key, and to append with target deduplication, an
+// index on _openetl_id. A hold's release updates any mode's table, which
 // this doesn't ask of append and overwrite.
 func (d *Destination) Preflight(req destination.PreflightRequest) []check.Check {
 	cc := d.pool.ConnConfig
@@ -622,10 +623,11 @@ func (d *Destination) Preflight(req destination.PreflightRequest) []check.Check 
 				return f
 			}
 			// What the table lacks of the privileges and the stream's columns,
-			// and whether it has the unique index on the key that ensureKey
-			// would otherwise create.
+			// whether it has the unique index on the key that ensureKey
+			// would otherwise create, and whether it has an _openetl_id index
+			// for target-deduped append.
 			var lacks, gains sql.NullString
-			var owner, keyed bool
+			var owner, keyed, dedupeIndexed bool
 			err := db.QueryRowContext(ctx, `SELECT
 					(SELECT string_agg(p, ', ') FROM unnest($3::text[]) p WHERE NOT has_table_privilege(c.oid, p)),
 					(SELECT string_agg(f, ', ') FROM unnest($4::text[]) f WHERE NOT EXISTS
@@ -635,9 +637,13 @@ func (d *Destination) Preflight(req destination.PreflightRequest) []check.Check 
 						AND i.indnkeyatts = cardinality($5::text[])
 						AND (SELECT array_agg(a.attname::text ORDER BY a.attname) FROM pg_attribute a
 							WHERE a.attrelid = i.indrelid AND a.attnum = ANY ((i.indkey::int2[])[0:i.indnkeyatts - 1]))
-							= (SELECT array_agg(k ORDER BY k) FROM unnest($5::text[]) k))
+							= (SELECT array_agg(k ORDER BY k) FROM unnest($5::text[]) k)),
+					EXISTS (SELECT FROM pg_index i
+						JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = (i.indkey::int2[])[0]
+						WHERE i.indrelid = c.oid AND i.indisvalid AND i.indpred IS NULL AND i.indnkeyatts >= 1
+							AND a.attname = $6 AND a.attnum > 0 AND NOT a.attisdropped)
 				FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
-				WHERE n.nspname = $1 AND c.relname = $2 AND c.relkind IN ('r', 'p')`, schema, table, privileges, fields, key).Scan(&lacks, &gains, &owner, &keyed)
+				WHERE n.nspname = $1 AND c.relname = $2 AND c.relkind IN ('r', 'p')`, schema, table, privileges, fields, key, idColumn).Scan(&lacks, &gains, &owner, &keyed, &dedupeIndexed)
 			switch {
 			case errors.Is(err, sql.ErrNoRows):
 				p.Found("{table} doesn't exist, and the first write creates it.")
@@ -657,6 +663,12 @@ func (d *Destination) Preflight(req destination.PreflightRequest) []check.Check 
 				f := notOwned.Fail()
 				f.Message = "{principal} doesn't own {table}, so the unique index on its key that a merge needs can't be created."
 				f.Fix = "Run ALTER TABLE {table} OWNER TO {principal}; or create a unique index on the stream's key."
+				return f
+			case st.Mode == destination.Append && st.Dedupe == destination.DedupeTarget && !dedupeIndexed:
+				p.Param("index", pgx.Identifier{sqlstage.IndexName(table)}.Sanitize())
+				f := notOwned.Fail()
+				f.Message = "{principal} doesn't own {table}, so the index on _openetl_id that target deduplication needs can't be created."
+				f.Fix = "Run ALTER TABLE {table} OWNER TO {principal}; or CREATE INDEX {index} ON {table} (\"_openetl_id\");"
 				return f
 			}
 			return check.Warn(notOwned.Fail())

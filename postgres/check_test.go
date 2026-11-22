@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"fmt"
 	"net/url"
+	"slices"
 	"strings"
 	"testing"
 
@@ -134,4 +135,130 @@ func TestChecksItemByItem(t *testing.T) {
 	})
 	dpf = check.Run(t.Context(), d.Preflight(destination.PreflightRequest{Namespace: missing}))
 	connectortest.ExpectItems(t, "a schema to create", dpf, map[string]string{"schema.create": "passed"})
+}
+
+// An append deduped against a table the user doesn't own fails the preflight
+// without an index led by _openetl_id, which only the owner can create, and
+// writes with one, whatever its name.
+func TestDestinationPreflightDedupeIndex(t *testing.T) {
+	e := newSourceEnv(t)
+	role := "dedupe_" + strings.ToLower(rand.Text())[:10]
+	e.exec(fmt.Sprintf("CREATE ROLE %s LOGIN PASSWORD 'pw'", role))
+	t.Cleanup(func() {
+		ctx := context.Background()
+		_, _ = e.conn.Exec(ctx, "DROP OWNED BY "+role)
+		_, _ = e.conn.Exec(ctx, "DROP ROLE "+role)
+	})
+	e.exec("GRANT USAGE, CREATE ON SCHEMA $schema TO " + role)
+
+	e.exec("CREATE TABLE $schema.unowned_no_idx (id bigint, _openetl_id uuid)")
+	e.exec("GRANT SELECT, INSERT ON $schema.unowned_no_idx TO " + role)
+
+	e.exec("CREATE TABLE $schema.unowned_nonunique_idx (id bigint, _openetl_id uuid)")
+	e.exec("CREATE INDEX unowned_nonunique_idx_id ON $schema.unowned_nonunique_idx (_openetl_id)")
+	e.exec("GRANT SELECT, INSERT ON $schema.unowned_nonunique_idx TO " + role)
+
+	e.exec("CREATE TABLE $schema.owned_no_idx (id bigint, _openetl_id uuid)")
+	e.exec("ALTER TABLE $schema.owned_no_idx OWNER TO " + role)
+
+	e.exec("CREATE TABLE $schema.unowned_overwrite (id bigint, _openetl_id uuid)")
+	e.exec("GRANT INSERT, DELETE ON $schema.unowned_overwrite TO " + role)
+
+	e.exec("CREATE TABLE $schema.unowned_nonleading_idx (id bigint, _openetl_id uuid)")
+	e.exec("CREATE INDEX unowned_nonleading_idx_id ON $schema.unowned_nonleading_idx (id, _openetl_id)")
+	e.exec("GRANT SELECT, INSERT ON $schema.unowned_nonleading_idx TO " + role)
+
+	u, err := url.Parse(dsn())
+	if err != nil {
+		t.Fatal(err)
+	}
+	u.User = url.UserPassword(role, "pw")
+	d, err := NewDestination(fmt.Appendf(nil, `{"dsn": %q, "schema": %q}`, u.String(), e.schema))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	dpf := check.Run(t.Context(), d.Preflight(destination.PreflightRequest{
+		Streams: []destination.Stream{
+			{Name: "unowned_no_idx", Mode: destination.Append, Dedupe: destination.DedupeTarget},
+			{Name: "unowned_nonunique_idx", Mode: destination.Append, Dedupe: destination.DedupeTarget},
+			{Name: "owned_no_idx", Mode: destination.Append, Dedupe: destination.DedupeTarget},
+			{Name: "unowned_overwrite", Mode: destination.Overwrite, Dedupe: destination.DedupeTarget},
+			{Name: "unowned_nonleading_idx", Mode: destination.Append, Dedupe: destination.DedupeTarget},
+		},
+	}))
+	connectortest.ExpectItems(t, "dedupe target preflight", dpf, map[string]string{
+		"schema.create":                       "passed",
+		"stream.unowned-no-idx.write":         "failed table_not_owned",
+		"stream.unowned-nonunique-idx.write":  "warning table_not_owned",
+		"stream.owned-no-idx.write":           "passed",
+		"stream.unowned-overwrite.write":      "warning table_not_owned",
+		"stream.unowned-nonleading-idx.write": "failed table_not_owned",
+	})
+
+	i := slices.IndexFunc(dpf.Items, func(it check.Item) bool { return it.Name == "stream.unowned-no-idx.write" })
+	if i < 0 {
+		t.Fatal("missing stream.unowned-no-idx.write item")
+	}
+	r := dpf.Items[i].Rendered()
+	if r.Failure == nil {
+		t.Fatal("expected Failure on stream.unowned-no-idx.write")
+	}
+	if !strings.Contains(r.Message, "_openetl_id") {
+		t.Errorf("message %q does not mention _openetl_id", r.Message)
+	}
+	if !strings.Contains(r.Failure.Fix, "CREATE INDEX") || !strings.Contains(r.Failure.Fix, "_openetl_id") {
+		t.Errorf("fix %q does not include CREATE INDEX on _openetl_id", r.Failure.Fix)
+	}
+	if strings.ContainsAny(r.Message+r.Failure.Fix, "{}") {
+		t.Errorf("unfilled template placeholder in message=%q fix=%q", r.Message, r.Failure.Fix)
+	}
+
+	// Executing the suggested CREATE INDEX fix as the owner satisfies Preflight.
+	_, ddl, ok := strings.Cut(r.Failure.Fix, " or ")
+	if !ok {
+		t.Fatalf("unexpected fix format: %q", r.Failure.Fix)
+	}
+	if _, err := e.conn.Exec(t.Context(), ddl); err != nil {
+		t.Fatalf("owner executing suggested fix %q: %v", ddl, err)
+	}
+	dpfAfter := check.Run(t.Context(), d.Preflight(destination.PreflightRequest{
+		Streams: []destination.Stream{{Name: "unowned_no_idx", Mode: destination.Append, Dedupe: destination.DedupeTarget}},
+	}))
+	connectortest.ExpectItems(t, "after CREATE INDEX fix", dpfAfter, map[string]string{
+		"schema.create":               "passed",
+		"stream.unowned-no-idx.write": "warning table_not_owned",
+	})
+
+	// Non-owner writer can also apply target-deduped append to an unowned table
+	// that already has a valid non-unique _openetl_id index (even under another name).
+	ctx := t.Context()
+	w, err := d.Open(ctx, destination.OpenConfig{
+		Pipeline: "p_dedupe", Generation: 1, Scope: destination.ScopeStream,
+		Streams: []destination.Stream{{Name: "unowned_nonunique_idx", Mode: destination.Append, Dedupe: destination.DedupeTarget}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = w.Close(context.Background()) })
+	recov(t, w, 1, destination.Epoch{}, nil)
+	e1 := destination.Epoch{Generation: 1, N: 1}
+	rows := `[{"id": 1, "_openetl_id": ` + uid(1) + `}, {"id": 1, "_openetl_id": ` + uid(1) + `}, {"id": 2, "_openetl_id": ` + uid(2) + `}]`
+	if err := w.Write(ctx, e1, "unowned_nonunique_idx", batch(t, []arrow.Field{idField, rowID}, rows)); err != nil {
+		t.Fatal(err)
+	}
+	c, err := w.Commit(ctx, e1, []destination.Staged{precommit(t, w, e1)})
+	if err != nil {
+		t.Fatalf("commit on unowned indexed table: %v", err)
+	}
+	if c.Collapsed["unowned_nonunique_idx"] != 1 {
+		t.Errorf("collapsed = %v, want 1", c.Collapsed)
+	}
+	var count int
+	if err := e.conn.QueryRow(ctx, "SELECT count(*) FROM "+pgx.Identifier{e.schema, "unowned_nonunique_idx"}.Sanitize()).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 2 {
+		t.Errorf("unowned_nonunique_idx has %d rows, want 2", count)
+	}
 }
