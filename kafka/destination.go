@@ -450,7 +450,7 @@ func (w *writer) Write(ctx context.Context, e destination.Epoch, stream string, 
 // record too large, the limits it passed.
 func produceFailed(r *kgo.Record, err error) error {
 	if errors.Is(err, kerr.MessageTooLarge) || errors.Is(err, kerr.RecordListTooLarge) {
-		return fmt.Errorf("kafka: a record for %s: %w: a row's record, with its key and headers, must fit in the client's batch limit of 1000012 bytes and in the topic's max.message.bytes", r.Topic, err)
+		return sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_DATA_INVALID, fmt.Errorf("kafka: a record for %s: %w: a row's record, with its key and headers, must fit in the client's batch limit of 1000012 bytes and in the topic's max.message.bytes", r.Topic, err))
 	}
 	return fmt.Errorf("kafka: a record for %s: %w", r.Topic, err)
 }

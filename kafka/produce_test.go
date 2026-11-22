@@ -29,7 +29,7 @@ func TestARowTooLargeNamesItsTopicAndTheLimit(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, err := w.PreCommit(t.Context(), e)
-	if err == nil || !strings.Contains(err.Error(), l.table) || !strings.Contains(err.Error(), "max.message.bytes") {
-		t.Errorf("a row of 1.1 MB pre-committed with %v", err)
+	if err == nil || !strings.Contains(err.Error(), l.table) || !strings.Contains(err.Error(), "max.message.bytes") || codeOf(err) != "ERROR_CODE_DATA_INVALID" {
+		t.Errorf("a row of 1.1 MB pre-committed with %s %v", codeOf(err), err)
 	}
 }
