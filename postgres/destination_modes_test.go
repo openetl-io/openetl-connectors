@@ -437,3 +437,19 @@ func TestOverwriteNeedsReads(t *testing.T) {
 		t.Errorf("Write before StartReads: %v", err)
 	}
 }
+
+// A merged stream reports no rows collapsed, though it's deduped: dedupe
+// skips only append and overwrite rows, and a merge's apply counts none.
+func TestMergeCollapsesNothing(t *testing.T) {
+	env := newEnv(t)
+	w := env.openStreams(1, destination.ScopePipeline, destination.Stream{Name: "users", Mode: destination.Merge, PrimaryKey: []string{"id"}, Dedupe: destination.DedupeTarget})
+	recov(t, w, 1, destination.Epoch{}, nil)
+	write(t, w, destination.Epoch{Generation: 1, N: 1}, "users", batch(t, []arrow.Field{idField, nameField, rowID},
+		`[{"id": 1, "name": "a", "_openetl_id": `+uid(1)+`}, {"id": 2, "name": "b", "_openetl_id": `+uid(2)+`}]`))
+	if _, c := commit(t, w, destination.Epoch{Generation: 1, N: 1}); c.Collapsed["users"] != 0 {
+		t.Errorf("collapsed %v", c.Collapsed)
+	}
+	if got := env.text(users); got != "1:a,2:b" {
+		t.Errorf("users = %s", got)
+	}
+}

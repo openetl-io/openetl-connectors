@@ -438,7 +438,9 @@ func (w *writer) applyTx(ctx context.Context, desc staged, streams []stagedStrea
 			if err != nil {
 				return fmt.Errorf("postgres: apply %s: %w", s.Name, err)
 			}
-			if s.Deduped() && s.Rows > n {
+			// Dedupe skips append and overwrite rows; a merge's apply counts
+			// none of the rows it applies.
+			if s.Deduped() && s.Mode != modeMerge && s.Rows > n {
 				skipped[s.Name] = s.Rows - n
 			}
 			if _, err := tx.Exec(ctx, "INSERT INTO "+w.ident("_openetl_loads")+" (pipeline, stream, generation, epoch) VALUES ($1, $2, $3, $4)",
