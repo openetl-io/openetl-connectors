@@ -91,7 +91,7 @@ Without `accessKeyId` and `secretAccessKey`, the destination uses the AWS SDK's 
 The credentials need these actions:
 
 - **S3**, whenever the destination writes to S3 with them: `s3:GetObject`, `s3:PutObject` and `s3:DeleteObject` on the tables' locations, and `s3:ListBucket` on their bucket, which an overwrite needs to clean up after a read.
-- **Glue**: `glue:GetDatabase`, `glue:CreateDatabase` for a namespace that doesn't exist yet, `glue:GetTable`, `glue:CreateTable` and `glue:UpdateTable`. The checks also use `glue:DeleteTable`, `glue:GetTables` and `glue:DeleteDatabase` when they created the namespace, and `glue:GetDatabases`, though they pass without it.
+- **Glue**: `glue:GetDatabase`, `glue:CreateDatabase` for a namespace that doesn't exist yet, `glue:GetTable`, `glue:CreateTable` and `glue:UpdateTable`. From 0.2.0, the checks also use `glue:DeleteTable`, `glue:GetTables` and `glue:DeleteDatabase` when they created the namespace, and `glue:GetDatabases`, though they pass without it.
 
 The [config schema](./destination.schema.json) has every setting.
 
