@@ -1157,6 +1157,12 @@ func (t *tableInfo) limits() destination.TableLimits {
 
 // catalog reads the tables' columns in one query: their types, and which
 // can't take a null. A table that doesn't exist is missing.
+//
+// It reads the catalog WITH (NOLOCK): read committed, its scan holds a
+// shared lock on a row of another table's columns while it waits to see that
+// table, which DDL elsewhere, such as another schema's drop of a staging
+// table, has locked while it waits on the row: a deadlock. A row read dirty
+// is DDL in flight, which a commit of the stream's would wait on anyway.
 func (w *writer) catalog(ctx context.Context, tables []string) (map[string]*tableInfo, error) {
 	idents := make([]string, len(tables))
 	for i, t := range tables {
@@ -1164,7 +1170,7 @@ func (w *writer) catalog(ctx context.Context, tables []string) (map[string]*tabl
 	}
 	list, _ := json.Marshal(idents)
 	rows, err := w.db.QueryContext(ctx, `SELECT CONVERT(int, j.[key]), c.name, TYPE_NAME(c.system_type_id), c.max_length, c.precision, c.scale, c.is_nullable, `+ownIndexes+`, coalesce(c.collation_name, ''), `+theirIndex+`
-		FROM OPENJSON(@p1) AS j JOIN sys.columns c ON c.object_id = OBJECT_ID(j.value)
+		FROM OPENJSON(@p1) AS j JOIN sys.columns c WITH (NOLOCK) ON c.object_id = OBJECT_ID(j.value)
 		ORDER BY CONVERT(int, j.[key]), c.column_id`, string(list))
 	if err != nil {
 		return nil, classify(fmt.Errorf("sqlserver: read the columns of %s: %w", strings.Join(tables, ", "), err))
@@ -1312,12 +1318,12 @@ func alterColumn(ident, col, typ string, notNull bool, own []string) string {
 
 // ownIndexes selects, for a column c of sys.columns, the names of the
 // connector's indexes on it, joined by commas.
-const ownIndexes = `coalesce((SELECT STRING_AGG(i.name, N',') FROM sys.index_columns ic JOIN sys.indexes i ON i.object_id = ic.object_id AND i.index_id = ic.index_id
+const ownIndexes = `coalesce((SELECT STRING_AGG(i.name, N',') FROM sys.index_columns ic WITH (NOLOCK) JOIN sys.indexes i WITH (NOLOCK) ON i.object_id = ic.object_id AND i.index_id = ic.index_id
 	WHERE ic.object_id = c.object_id AND ic.column_id = c.column_id AND i.name LIKE N'\_openetl\_%' ESCAPE N'\'), N'')`
 
 // theirIndex selects the name of an index on c that isn't the connector's,
 // or an empty string.
-const theirIndex = `coalesce((SELECT TOP (1) i.name FROM sys.index_columns ic JOIN sys.indexes i ON i.object_id = ic.object_id AND i.index_id = ic.index_id
+const theirIndex = `coalesce((SELECT TOP (1) i.name FROM sys.index_columns ic WITH (NOLOCK) JOIN sys.indexes i WITH (NOLOCK) ON i.object_id = ic.object_id AND i.index_id = ic.index_id
 	WHERE ic.object_id = c.object_id AND ic.column_id = c.column_id AND i.name NOT LIKE N'\_openetl\_%' ESCAPE N'\'), N'')`
 
 // refusal is why adding columns failed, if the table can't take them: too

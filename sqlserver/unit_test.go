@@ -280,7 +280,7 @@ func TestInstanceRanges(t *testing.T) {
 // Errors SQL Server and Azure SQL raise for a moment, which a retry gets
 // past, are TRANSIENT.
 func TestClassifyTransient(t *testing.T) {
-	for _, n := range []int32{1204, 1205, 1222, 4221, 40143, 40197, 40501, 40540, 40613, 10928, 10929, 49918} {
+	for _, n := range []int32{1204, 1205, 1222, 601, 4221, 40143, 40197, 40501, 40540, 40613, 10928, 10929, 49918} {
 		var coded interface{ ErrorCode() protocolv1.ErrorCode }
 		if err := classify(mssql.Error{Number: n}); !errors.As(err, &coded) || coded.ErrorCode() != protocolv1.ErrorCode_ERROR_CODE_TRANSIENT {
 			t.Errorf("error %d = %v", n, err)

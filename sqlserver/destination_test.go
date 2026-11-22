@@ -453,6 +453,57 @@ func TestMergeCompositeKeyPastIndexLimit(t *testing.T) {
 	}
 }
 
+// Pipelines writing two schemas of one database at once, as lanes and
+// separate pipelines do, don't deadlock: each commit reads the catalog
+// while the other creates, alters and drops tables.
+func TestConcurrentCommits(t *testing.T) {
+	envs := []*env{newEnv(t), newEnv(t)}
+	errs := make(chan error, len(envs))
+	for _, env := range envs {
+		w := env.openStreams(1, destination.ScopePipeline, destination.Stream{Name: "users", Mode: destination.Append})
+		recov(t, w, 1, destination.Epoch{})
+		go func() {
+			errs <- func() error {
+				fields := []arrow.Field{idField}
+				for n := uint64(1); n <= 30; n++ {
+					// A column more every few epochs, which the apply adds.
+					if n%3 == 0 {
+						fields = append(fields, arrow.Field{Name: fmt.Sprintf("c%d", n), Type: arrow.PrimitiveTypes.Int64, Nullable: true})
+					}
+					rec, _, err := array.RecordFromJSON(memory.DefaultAllocator, arrow.NewSchema(fields, nil), strings.NewReader(`[{"id": 1}]`))
+					if err != nil {
+						return err
+					}
+					e := destination.Epoch{Generation: 1, N: n}
+					err = w.Write(t.Context(), e, "users", rec)
+					rec.Release()
+					if err != nil {
+						return err
+					}
+					st, err := w.PreCommit(t.Context(), e)
+					if err != nil {
+						return err
+					}
+					if _, err := w.Commit(t.Context(), e, []destination.Staged{st}); err != nil {
+						return fmt.Errorf("epoch %d: %w", n, err)
+					}
+				}
+				return nil
+			}()
+		}()
+	}
+	for range envs {
+		if err := <-errs; err != nil {
+			t.Error(err)
+		}
+	}
+	for _, env := range envs {
+		if got := env.rows("SELECT count(*) FROM $schema.users"); got[0] != "30" {
+			t.Errorf("%s: %s rows, want 30", env.schema, got[0])
+		}
+	}
+}
+
 // An older generation, for which the stream appends, doesn't drop the read
 // table of a newer one that overwrites it once the newer has raised the
 // fence.
