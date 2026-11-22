@@ -32,7 +32,7 @@ A column added to a table since the run discovered it fails the read, in any mod
 - **`change_tracking`** (the default) needs the least setup, and no SQL Server Agent. Each poll reads the keys changed since the last, with their rows as they are at the time of the read. A key changed several times between polls arrives once, with its latest row; a delete carries its key alone.
 - **`change_data_capture`** reads every change with its whole row, from the change tables that SQL Server Agent's capture job fills from the transaction log. A change is read once the capture job has harvested it, a few seconds after it commits, and a read that isn't continuous ends at the changes harvested when it starts. Computed columns, and columns the table's capture instance doesn't capture, arrive null, named as columns the change didn't send, so a merge keeps the values the destination has for them. Choose it to keep every version of a row, or for a destination that reads a writer lane's part again (see [Delivery](#delivery)).
 
-When a captured table's schema changes, make it a second capture instance with the new columns. The source reads the old instance up to where the new one starts, then the new one, and the old one can be dropped once the source has read past it. Until then, a column added to the table arrives null in changes.
+When a captured table's schema changes, make it a second capture instance with the new columns. The source reads the old instance up to where the new one starts, once the capture job has started it, then the new one, and the old one can be dropped once the source has read past it. Until then, a column added to the table arrives null in changes.
 
 ### Set it up
 

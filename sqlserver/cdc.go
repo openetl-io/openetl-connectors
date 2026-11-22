@@ -664,7 +664,8 @@ func (m *capture) current(ctx context.Context) (string, *time.Time, error) {
 }
 
 type captureInstance struct {
-	name  string
+	name string
+	// Nil until the capture job has started it.
 	start *big.Int
 	// The columns it captures.
 	cols []string
@@ -672,7 +673,7 @@ type captureInstance struct {
 
 // instances are t's capture instances, oldest first.
 func (m *capture) instances(ctx context.Context, t table) ([]captureInstance, error) {
-	rows, err := m.s.db.QueryContext(ctx, `SELECT ct.capture_instance, coalesce(ct.start_lsn, 0x00), cc.column_name
+	rows, err := m.s.db.QueryContext(ctx, `SELECT ct.capture_instance, ct.start_lsn, cc.column_name
 		FROM cdc.change_tables ct JOIN cdc.captured_columns cc ON cc.object_id = ct.object_id
 		WHERE ct.source_object_id = OBJECT_ID(@p1) ORDER BY ct.create_date, ct.capture_instance, cc.column_ordinal`, qualified(m.s.cfg.Schema, t.name))
 	if err != nil {
@@ -687,7 +688,11 @@ func (m *capture) instances(ctx context.Context, t table) ([]captureInstance, er
 			return nil, classify(err)
 		}
 		if len(out) == 0 || out[len(out)-1].name != name {
-			out = append(out, captureInstance{name: name, start: new(big.Int).SetBytes(start)})
+			in := captureInstance{name: name}
+			if start != nil {
+				in.start = new(big.Int).SetBytes(start)
+			}
+			out = append(out, in)
 		}
 		out[len(out)-1].cols = append(out[len(out)-1].cols, col)
 	}
@@ -762,19 +767,8 @@ func (m *capture) poll(ctx context.Context, r *cdcReader, ct *cdcTable, to strin
 		return 0, positionLost("sqlserver: %s isn't captured any more", t.name)
 	}
 	total := 0
-	for i, in := range ins {
-		lo, hi := from, end
-		if i > 0 && in.start.Cmp(lo) > 0 {
-			lo = in.start
-		}
-		if i+1 < len(ins) {
-			if before := new(big.Int).Sub(ins[i+1].start, big.NewInt(1)); before.Cmp(hi) < 0 {
-				hi = before
-			}
-		}
-		if lo.Cmp(hi) > 0 {
-			continue
-		}
+	for _, rg := range instanceRanges(ins, from, end) {
+		in, lo, hi := ins[rg.i], rg.lo, rg.hi
 		low, err := m.minLSN(ctx, in.name)
 		if err != nil {
 			return total, err
@@ -791,6 +785,39 @@ func (m *capture) poll(ctx context.Context, r *cdcReader, ct *cdcTable, to strin
 	}
 	ct.st.Position = to
 	return total, nil
+}
+
+// instanceRange is the changes from lo to hi, inclusive, that a table's
+// capture instance ins[i] gives a poll.
+type instanceRange struct {
+	i      int
+	lo, hi *big.Int
+}
+
+// instanceRanges divides the changes from lo to hi between a table's capture
+// instances, oldest first: each up to where the next starts, and a newer one
+// from its start. A newer one the capture job hasn't started has none: until
+// it starts, the older one has them all.
+func instanceRanges(ins []captureInstance, lo, hi *big.Int) []instanceRange {
+	var out []instanceRange
+	for i, in := range ins {
+		if i > 0 && in.start == nil {
+			continue
+		}
+		from, to := lo, hi
+		if i > 0 && in.start.Cmp(from) > 0 {
+			from = in.start
+		}
+		if i+1 < len(ins) && ins[i+1].start != nil {
+			if before := new(big.Int).Sub(ins[i+1].start, big.NewInt(1)); before.Cmp(to) < 0 {
+				to = before
+			}
+		}
+		if from.Cmp(to) <= 0 {
+			out = append(out, instanceRange{i, from, to})
+		}
+	}
+	return out
 }
 
 // The ops of __$operation, with 'all': a delete's row, an insert's, and an

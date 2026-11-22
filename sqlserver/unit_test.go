@@ -2,6 +2,8 @@ package sqlserver
 
 import (
 	"errors"
+	"fmt"
+	"math/big"
 	"slices"
 	"strings"
 	"testing"
@@ -244,6 +246,34 @@ func TestCheckListsAreValid(t *testing.T) {
 	sv := serverOf("sqlserver://u:p@host/inst?database=d")
 	if sv.address != "" || sv.principal != "u" {
 		t.Errorf("named instance: %+v", sv)
+	}
+}
+
+// A poll reads the old capture instance up to where the new one starts,
+// and the new one from there; a new one the capture job hasn't started yet,
+// whose start_lsn is NULL, has no changes of its own, so the old one is read
+// on.
+func TestInstanceRanges(t *testing.T) {
+	n := func(i int64) *big.Int { return big.NewInt(i) }
+	old := captureInstance{name: "old", start: n(1)}
+	for _, c := range []struct {
+		name string
+		ins  []captureInstance
+		want string
+	}{
+		{"one", []captureInstance{old}, "old 10-20"},
+		{"new starts within", []captureInstance{old, {name: "new", start: n(15)}}, "old 10-14 new 15-20"},
+		{"new started before", []captureInstance{old, {name: "new", start: n(8)}}, "new 10-20"},
+		{"new starts after", []captureInstance{old, {name: "new", start: n(25)}}, "old 10-20"},
+		{"new not started", []captureInstance{old, {name: "new"}}, "old 10-20"},
+	} {
+		var got []string
+		for _, r := range instanceRanges(c.ins, n(10), n(20)) {
+			got = append(got, fmt.Sprintf("%s %s-%s", c.ins[r.i].name, r.lo, r.hi))
+		}
+		if strings.Join(got, " ") != c.want {
+			t.Errorf("%s: %v, want %s", c.name, got, c.want)
+		}
 	}
 }
 

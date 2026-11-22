@@ -229,6 +229,29 @@ func TestCaptureSchemaChange(t *testing.T) {
 	}
 }
 
+// A second capture instance whose start the capture job hasn't established
+// yet, its start_lsn NULL, holds none of the changes: they're read from the
+// old one.
+func TestCaptureUnstartedInstance(t *testing.T) {
+	e := newSourceEnv(t)
+	e.exec("CREATE TABLE $schema.t (id int PRIMARY KEY, v int)")
+	e.capture("t")
+	e.harvested()
+	s := e.source(`, "cdcMethod": "change_data_capture"`)
+	state := read(t, s, source.CDC, map[string]string{"t": ""}).last("t")
+	e.exec("INSERT INTO $schema.t VALUES (1, 1)")
+	e.exec("EXEC sys.sp_cdc_enable_table @source_schema = @p1, @source_name = N't', @role_name = NULL, @capture_instance = @p2", e.schema, e.schema+"_t_v2")
+	e.exec("INSERT INTO $schema.t VALUES (2, 2)")
+	e.harvested()
+	// As cdc.change_tables has it before the capture job has seen the
+	// instance.
+	e.exec("UPDATE cdc.change_tables SET start_lsn = NULL WHERE capture_instance = @p1", e.schema+"_t_v2")
+	c := read(t, s, source.CDC, map[string]string{"t": state})
+	if got := changes(c, "t", "id", "v"); !slices.Equal(got, []string{"insert,1,1", "insert,2,2"}) {
+		t.Errorf("changes %v", got)
+	}
+}
+
 func TestCDCPositionLost(t *testing.T) {
 	t.Run(methodTracking, func(t *testing.T) {
 		e := newSourceEnv(t)
