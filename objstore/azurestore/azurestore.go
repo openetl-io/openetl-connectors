@@ -222,3 +222,22 @@ func (s *Store) IfMatch(as func(any) bool, etag string, _ int64) error {
 }
 
 func (s *Store) Generation(*blob.Attributes) int64 { return 0 }
+
+// Version is a listed or opened blob's ETag, unquoted.
+func (s *Store) Version(as func(any) bool) string {
+	var etag *azcore.ETag
+	var item container.BlobItem
+	var r azblobblob.DownloadStreamResponse
+	switch {
+	case as(&item):
+		if item.Properties != nil {
+			etag = item.Properties.ETag
+		}
+	case as(&r):
+		etag = r.ETag
+	}
+	if etag == nil {
+		return ""
+	}
+	return strings.Trim(string(*etag), `"`)
+}

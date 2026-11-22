@@ -220,6 +220,12 @@ func (s *store) version(a *blob.Attributes) *version {
 	return v
 }
 
+// versioner is a Store that gives a listed or opened file's version, such as
+// its ETag or generation, from its As; empty where it has none.
+type versioner interface {
+	Version(as func(any) bool) string
+}
+
 // errConflict: a conditional write found the object changed.
 var errConflict = errors.New("objstore: the object changed since it was read")
 

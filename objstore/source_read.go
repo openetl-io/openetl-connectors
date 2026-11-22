@@ -65,17 +65,20 @@ func open(ctx context.Context, b *blob.Bucket, o object, offset int64) (*blob.Re
 	if err != nil {
 		return nil, fmt.Errorf("objstore: read %s: %w", o.Key, err)
 	}
-	if !sameVersion(r.ModTime(), r.Size(), o) {
+	if !sameVersion(r, o) {
 		_ = r.Close()
 		return nil, changed(o.Key)
 	}
 	return r, nil
 }
 
-// sameVersion: listings give some stores' modification times finer than
-// reads do.
-func sameVersion(mod time.Time, size int64, o object) bool {
-	return size == o.Size && mod.Truncate(time.Second).Equal(o.Modified.Truncate(time.Second))
+// sameVersion: r reads the version of o listed. Listings give some stores'
+// modification times finer than reads do.
+func sameVersion(r *blob.Reader, o object) bool {
+	if r.Size() != o.Size || !r.ModTime().Truncate(time.Second).Equal(o.Modified.Truncate(time.Second)) {
+		return false
+	}
+	return o.version == nil || sameTag(o.version(r.As), o.Version)
 }
 
 // rangeReaderAt reads a file by ranges, as Parquet's reader does.
@@ -96,7 +99,7 @@ func (r *rangeReaderAt) ReadAt(p []byte, off int64) (int, error) {
 		return 0, fmt.Errorf("objstore: read %s: %w", r.o.Key, err)
 	}
 	defer func() { _ = rr.Close() }()
-	if !sameVersion(rr.ModTime(), rr.Size(), r.o) {
+	if !sameVersion(rr, r.o) {
 		return 0, changed(r.o.Key)
 	}
 	got, err := io.ReadFull(rr, p[:n])

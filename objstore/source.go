@@ -83,6 +83,9 @@ type streamSpec struct {
 	encoding encoding.Encoding
 	nulls    map[string]bool
 	declared []arrow.Field
+	// The store's version of a listed or opened file; nil where it gives
+	// none.
+	version func(as func(any) bool) string
 }
 
 var (
@@ -113,6 +116,7 @@ func NewSource(config []byte, settings any, store NewStore) (*Source, error) {
 	if len(cfg.Streams) == 0 {
 		return nil, errors.New("objstore: the source has no streams")
 	}
+	versioned, _ := st.st.(versioner)
 	for _, sc := range cfg.Streams {
 		spec, err := parseStream(sc)
 		if err != nil {
@@ -120,6 +124,9 @@ func NewSource(config []byte, settings any, store NewStore) (*Source, error) {
 		}
 		if _, dup := s.streams[sc.Name]; dup {
 			return nil, fmt.Errorf("objstore: two streams are named %q", sc.Name)
+		}
+		if versioned != nil {
+			spec.version = versioned.Version
 		}
 		s.streams[sc.Name] = spec
 	}
@@ -508,8 +515,8 @@ func (s *Source) readSplit(ctx context.Context, b *blob.Bucket, typed *typedColu
 			}
 		}
 		run.mu.Unlock()
-		at := filePos{Key: o.Key, Modified: o.Modified.UnixNano(), Size: o.Size}
-		if st.At != nil && st.At.Key == o.Key && st.At.Modified == at.Modified && st.At.Size == o.Size {
+		at := filePos{Key: o.Key, Modified: o.Modified.UnixNano(), Size: o.Size, Version: o.Version}
+		if st.At != nil && st.At.Key == o.Key && st.At.Modified == at.Modified && st.At.Size == o.Size && sameTag(st.At.Version, o.Version) {
 			at = *st.At
 		}
 		stop := false
@@ -517,7 +524,7 @@ func (s *Source) readSplit(ctx context.Context, b *blob.Bucket, typed *typedColu
 			records: out.Records,
 			rows:    func(rows []json.RawMessage) error { return out.Rows(rows) },
 			resume: func(p filePos) error {
-				p.Key, p.Modified, p.Size = at.Key, at.Modified, at.Size
+				p.Key, p.Modified, p.Size, p.Version = at.Key, at.Modified, at.Size, o.Version
 				st.At = &p
 				var err error
 				stop, err = resume(o, true)

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 
 	"cloud.google.com/go/storage"
@@ -124,4 +125,21 @@ func (s *Store) Generation(a *blob.Attributes) int64 {
 		return oa.Generation
 	}
 	return 0
+}
+
+// Version is a listed or opened object's generation.
+func (s *Store) Version(as func(any) bool) string {
+	var gen int64
+	var oa storage.ObjectAttrs
+	var r *storage.Reader
+	switch {
+	case as(&oa):
+		gen = oa.Generation
+	case as(&r) && r != nil:
+		gen = r.Attrs.Generation
+	}
+	if gen == 0 {
+		return ""
+	}
+	return strconv.FormatInt(gen, 10)
 }

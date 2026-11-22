@@ -19,6 +19,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/feature/s3/transfermanager"
 	awss3 "github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
 	"github.com/aws/smithy-go/middleware"
 	"gocloud.dev/blob"
@@ -197,6 +198,19 @@ func (s *Store) IfMatch(as func(any) bool, etag string, _ int64) error {
 }
 
 func (s *Store) Generation(*blob.Attributes) int64 { return 0 }
+
+// Version is a listed or opened object's ETag, unquoted.
+func (s *Store) Version(as func(any) bool) string {
+	var o types.Object
+	if as(&o) {
+		return strings.Trim(aws.ToString(o.ETag), `"`)
+	}
+	var r awss3.GetObjectOutput
+	if as(&r) {
+		return strings.Trim(aws.ToString(r.ETag), `"`)
+	}
+	return ""
+}
 
 // BeforeWrite gives an upload a minute of its own to abort a multipart
 // upload that failed, which the context that ended it can't, and, on an

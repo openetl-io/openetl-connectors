@@ -100,7 +100,7 @@ The [config schema](./source.schema.json) has every setting.
 - **Full refresh** reads every matching file, in key order.
 - **Incremental** reads files that weren't read before, in the order of their `_modified`. A file that's written again after it was read is read again, whole.
 
-The state an incremental read leaves records each file it read since `lookback` (1 hour by default) before the newest file it read, with its modification time. The next read takes any file it doesn't list and that's no older than that, so files that share a modification time with ones already read, or that appear late, still get read. Files older than that, and not read, are skipped. The state lists at most 10,000 files; past that, the oldest ones drop out, and files no newer than them are treated as read. Files that share the oldest modification time the state keeps all stay in it, so when more than 10,000 files share one, the state lists every one of them.
+The state an incremental read leaves records each file it read since `lookback` (1 hour by default) before the newest file it read, with its modification time and generation. The next read takes any file it doesn't list and that's no older than that, so files that share a modification time with ones already read, or that appear late, still get read. Files older than that, and not read, are skipped. The state lists at most 10,000 files; past that, the oldest ones drop out, and files no newer than them are treated as read. Files that share the oldest modification time the state keeps all stay in it, so when more than 10,000 files share one, the state lists every one of them.
 
 The source's replay is **superset**: a retried read may send records again, such as those of a file it was partway through, or of a file written again. A pipeline that needs exactly once has to drop repeats by the primary key, `_file` and `_line` by default.
 
@@ -261,8 +261,8 @@ The destination adds new columns: later files have them, and earlier files don't
 
 - An Avro read that resumes within a file decodes the file from its start again, as the Avro library doesn't give blocks' offsets.
 - Each read, as well as discovery, reads every Parquet file's footer and Avro file's header, 16 at a time, so it takes longer to start with more files.
-- A read checks that a file is the one it listed by the file's size and its modification time to the second, as precise as some stores' reads give it. A file replaced while it's read, by one of the same size within the same second, isn't noticed, and a Parquet file's row groups could then come from both.
-- The source doesn't capture deleted files or deleted rows. A file written again is read again whole, as new records, if its modification time changed: a file rewritten within the store's time resolution with the same time isn't read again.
+- A read checks that a file is the one it listed by its generation, size and modification time, so a file replaced while it's read fails the read with `TRANSIENT`, and the next attempt reads it again.
+- The source doesn't capture deleted files or deleted rows. A file written again is read again whole, as new records, if its modification time changed or its generation did, so a file rewritten within the same second is read again too.
 - Discovery reads every file's footer or header, so it takes longer with more files.
 - The destination doesn't merge or deduplicate.
 - Only fake-gcs-server is tested. It checks no credentials, so refused credentials are untested, and it answers over plain HTTP, so the check's `net.tls` item is untested. Google Cloud Storage's own consistency and permissions aren't shown by it.
