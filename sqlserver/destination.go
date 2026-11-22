@@ -18,6 +18,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"math/rand/v2"
 	"slices"
 	"strconv"
 	"strings"
@@ -1039,11 +1040,13 @@ func (w *writer) ensureKey(ctx context.Context, table string, key []string) ([]c
 	}
 	keys, _ := json.Marshal(key)
 	var has int
-	err = w.db.QueryRowContext(ctx, `SELECT count(*) FROM sys.indexes i WHERE i.object_id = OBJECT_ID(@p1) AND i.type > 0 AND i.has_filter = 0
-		AND (SELECT count(*) FROM sys.index_columns ic WHERE ic.object_id = i.object_id AND ic.index_id = i.index_id AND ic.key_ordinal > 0) = @p3
-		AND NOT EXISTS (SELECT 1 FROM sys.index_columns ic JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id
-			WHERE ic.object_id = i.object_id AND ic.index_id = i.index_id AND ic.key_ordinal > 0 AND c.name NOT IN (SELECT value FROM OPENJSON(@p2)))`,
-		w.ident(table), string(keys), len(key)).Scan(&has)
+	err = w.victim(ctx, func(conn *sql.Conn) error {
+		return conn.QueryRowContext(ctx, `SELECT count(*) FROM sys.indexes i WHERE i.object_id = OBJECT_ID(@p1) AND i.type > 0 AND i.has_filter = 0
+			AND (SELECT count(*) FROM sys.index_columns ic WHERE ic.object_id = i.object_id AND ic.index_id = i.index_id AND ic.key_ordinal > 0) = @p3
+			AND NOT EXISTS (SELECT 1 FROM sys.index_columns ic JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id
+				WHERE ic.object_id = i.object_id AND ic.index_id = i.index_id AND ic.key_ordinal > 0 AND c.name NOT IN (SELECT value FROM OPENJSON(@p2)))`,
+			w.ident(table), string(keys), len(key)).Scan(&has)
+	})
 	if err != nil {
 		return nil, classify(fmt.Errorf("sqlserver: read the indexes of %s: %w", table, err))
 	}
@@ -1157,55 +1160,87 @@ func (t *tableInfo) limits() destination.TableLimits {
 
 // catalog reads the tables' columns in one query: their types, and which
 // can't take a null. A table that doesn't exist is missing.
-//
-// It reads the catalog WITH (NOLOCK): read committed, its scan holds a
-// shared lock on a row of another table's columns while it waits to see that
-// table, which DDL elsewhere, such as another schema's drop of a staging
-// table, has locked while it waits on the row: a deadlock. A row read dirty
-// is DDL in flight, which a commit of the stream's would wait on anyway. SQL
-// Server doesn't promise to honour the hint on catalog views; 2022 does
-// (TestConcurrentCommits).
 func (w *writer) catalog(ctx context.Context, tables []string) (map[string]*tableInfo, error) {
 	idents := make([]string, len(tables))
 	for i, t := range tables {
 		idents[i] = w.ident(t)
 	}
 	list, _ := json.Marshal(idents)
-	rows, err := w.db.QueryContext(ctx, `SELECT CONVERT(int, j.[key]), c.name, TYPE_NAME(c.system_type_id), c.max_length, c.precision, c.scale, c.is_nullable, `+ownIndexes+`, coalesce(c.collation_name, ''), `+theirIndex+`
-		FROM OPENJSON(@p1) AS j JOIN sys.columns c WITH (NOLOCK) ON c.object_id = OBJECT_ID(j.value)
-		ORDER BY CONVERT(int, j.[key]), c.column_id`, string(list))
+	var out map[string]*tableInfo
+	err := w.victim(ctx, func(conn *sql.Conn) error {
+		rows, err := conn.QueryContext(ctx, `SELECT CONVERT(int, j.[key]), c.name, TYPE_NAME(c.system_type_id), c.max_length, c.precision, c.scale, c.is_nullable, `+ownIndexes+`, coalesce(c.collation_name, ''), `+theirIndex+`
+			FROM OPENJSON(@p1) AS j JOIN sys.columns c ON c.object_id = OBJECT_ID(j.value)
+			ORDER BY CONVERT(int, j.[key]), c.column_id`, string(list))
+		if err != nil {
+			return err
+		}
+		defer func() { _ = rows.Close() }()
+		out = map[string]*tableInfo{}
+		for rows.Next() {
+			var i int
+			var c sourceColumn
+			var nullable bool
+			var own, theirs string
+			if err := rows.Scan(&i, &c.name, &c.typ, &c.maxLength, &c.precision, &c.scale, &nullable, &own, &c.collation, &theirs); err != nil {
+				return err
+			}
+			name := tables[i]
+			t := out[name]
+			if t == nil {
+				t = &tableInfo{notNull: map[string]bool{}, own: map[string][]string{}, theirs: map[string]string{}}
+				out[name] = t
+			}
+			t.cols = append(t.cols, column{name: c.name, typ: c.sqlType(), collation: c.collation})
+			t.notNull[c.name] = !nullable
+			if own != "" {
+				t.own[c.name] = strings.Split(own, ",")
+			}
+			if theirs != "" {
+				t.theirs[c.name] = theirs
+			}
+		}
+		return rows.Err()
+	})
 	if err != nil {
 		return nil, classify(fmt.Errorf("sqlserver: read the columns of %s: %w", strings.Join(tables, ", "), err))
 	}
-	defer func() { _ = rows.Close() }()
-	out := map[string]*tableInfo{}
-	for rows.Next() {
-		var i int
-		var c sourceColumn
-		var nullable bool
-		var own, theirs string
-		if err := rows.Scan(&i, &c.name, &c.typ, &c.maxLength, &c.precision, &c.scale, &nullable, &own, &c.collation, &theirs); err != nil {
-			return nil, classify(err)
-		}
-		name := tables[i]
-		t := out[name]
-		if t == nil {
-			t = &tableInfo{notNull: map[string]bool{}, own: map[string][]string{}, theirs: map[string]string{}}
-			out[name] = t
-		}
-		t.cols = append(t.cols, column{name: c.name, typ: c.sqlType(), collation: c.collation})
-		t.notNull[c.name] = !nullable
-		if own != "" {
-			t.own[c.name] = strings.Split(own, ",")
-		}
-		if theirs != "" {
-			t.theirs[c.name] = theirs
-		}
-	}
-	if err := rows.Err(); err != nil {
-		return nil, classify(fmt.Errorf("sqlserver: read the columns of %s: %w", strings.Join(tables, ", "), err))
-	}
 	return out, nil
+}
+
+// victim runs read on a connection of its own at a low deadlock priority, so
+// that in a deadlock with another session's DDL, such as another schema's
+// drop of a staging table, read is the one rolled back, and runs it again,
+// up to 5 times. Reading the catalog, read committed, holds a lock on a row
+// of another table's columns while it waits to see that table, which the
+// DDL has locked while it waits on the row.
+func (w *writer) victim(ctx context.Context, read func(*sql.Conn) error) error {
+	wait := 50 * time.Millisecond
+	for try := 1; ; try++ {
+		err := func() error {
+			conn, err := w.db.Conn(ctx)
+			if err != nil {
+				return err
+			}
+			defer func() { _ = conn.Close() }()
+			if _, err := conn.ExecContext(ctx, "SET DEADLOCK_PRIORITY LOW"); err != nil {
+				return err
+			}
+			defer func() { _, _ = conn.ExecContext(context.WithoutCancel(ctx), "SET DEADLOCK_PRIORITY NORMAL") }()
+			return read(conn)
+		}()
+		me, ok := errors.AsType[mssql.Error](err)
+		if try == 5 || !ok || me.Number != 1205 && me.Number != 601 {
+			return err
+		}
+		t := time.NewTimer(wait + rand.N(wait))
+		select {
+		case <-t.C:
+		case <-ctx.Done():
+			t.Stop()
+			return ctx.Err()
+		}
+		wait *= 2
+	}
 }
 
 // alter creates the table with cols if it doesn't exist, or adds its new
@@ -1320,12 +1355,12 @@ func alterColumn(ident, col, typ string, notNull bool, own []string) string {
 
 // ownIndexes selects, for a column c of sys.columns, the names of the
 // connector's indexes on it, joined by commas.
-const ownIndexes = `coalesce((SELECT STRING_AGG(i.name, N',') FROM sys.index_columns ic WITH (NOLOCK) JOIN sys.indexes i WITH (NOLOCK) ON i.object_id = ic.object_id AND i.index_id = ic.index_id
+const ownIndexes = `coalesce((SELECT STRING_AGG(i.name, N',') FROM sys.index_columns ic JOIN sys.indexes i ON i.object_id = ic.object_id AND i.index_id = ic.index_id
 	WHERE ic.object_id = c.object_id AND ic.column_id = c.column_id AND i.name LIKE N'\_openetl\_%' ESCAPE N'\'), N'')`
 
 // theirIndex selects the name of an index on c that isn't the connector's,
 // or an empty string.
-const theirIndex = `coalesce((SELECT TOP (1) i.name FROM sys.index_columns ic WITH (NOLOCK) JOIN sys.indexes i WITH (NOLOCK) ON i.object_id = ic.object_id AND i.index_id = ic.index_id
+const theirIndex = `coalesce((SELECT TOP (1) i.name FROM sys.index_columns ic JOIN sys.indexes i ON i.object_id = ic.object_id AND i.index_id = ic.index_id
 	WHERE ic.object_id = c.object_id AND ic.column_id = c.column_id AND i.name NOT LIKE N'\_openetl\_%' ESCAPE N'\'), N'')`
 
 // refusal is why adding columns failed, if the table can't take them: too
