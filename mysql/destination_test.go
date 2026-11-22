@@ -235,9 +235,9 @@ func TestPatchFillsAHeldColumnTwice(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		var got string
-		err = e.db.QueryRowContext(t.Context(), "SELECT CONCAT(coalesce(price, '-'), ':', price__v2, ':', coalesce(_openetl_held, '-')) FROM "+quoteIdent(e.database)+".users").Scan(&got)
-		if want := "2.50:2.5:-"; err != nil || got != want {
+		var gotPrice, gotV2, gotHeld string
+		err = e.db.QueryRowContext(t.Context(), "SELECT coalesce(price, '-'), price__v2, coalesce(_openetl_held, '-') FROM "+quoteIdent(e.database)+".users").Scan(&gotPrice, &gotV2, &gotHeld)
+		if got, want := gotPrice+":"+gotV2+":"+gotHeld, "2.50:2.5:-"; err != nil || got != want {
 			t.Fatalf("price:price__v2:held %s %v, want %s", got, err, want)
 		}
 	})
@@ -440,6 +440,23 @@ func TestRowOverMaxAllowedPacket(t *testing.T) {
 		err := w.Write(t.Context(), destination.Epoch{Generation: 1, N: 1}, "big", rec)
 		if code := connectortest.CodeOf(err); code != protocolv1.ErrorCode_ERROR_CODE_DATA_INVALID || !strings.Contains(err.Error(), "big") || !strings.Contains(err.Error(), strconv.Itoa(limit)) {
 			t.Fatalf("a row over max_allowed_packet: %v (%v)", err, code)
+		}
+	})
+}
+
+// TestMergeIntoATableMadeFromStaging merges changes with JSON columns into a
+// table no ApplySchema made, as when one is dropped during a run: the table
+// made from the staging has JSON columns as ApplySchema makes them, and the
+// merge takes the changes, an unchanged column too.
+func TestMergeIntoATableMadeFromStaging(t *testing.T) {
+	eachServer(t, func(t *testing.T, srv testServer) {
+		e := newDestEnv(t, srv)
+		w := e.open(destination.Stream{Name: "users", Mode: destination.Merge, PrimaryKey: []string{"id"}})
+		fields := append(slices.Clone(unchangedFields), arrow.Field{Name: "tags", Type: arrow.ListOf(arrow.BinaryTypes.String), Nullable: true})
+		e.commit(w, 1, "users", batchOf(t, fields, `[{"id": 1, "name": "a", "n": 1, "_openetl_op": "insert", "_openetl_seq": 1, "tags": ["x"]}]`))
+		e.commit(w, 2, "users", batchOf(t, fields, `[{"id": 1, "name": null, "n": 2, "_openetl_op": "update", "_openetl_seq": 2, "_openetl_unchanged": ["name"], "tags": ["y"]}]`))
+		if got := e.usersN(); got != "1:a:2:-" {
+			t.Errorf("users = %s", got)
 		}
 	})
 }
