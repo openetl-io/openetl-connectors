@@ -188,7 +188,10 @@ func newPart(dir, name string, cols []column) (*part, error) {
 	if err != nil {
 		return nil, err
 	}
-	fw, err := pqarrow.NewFileWriter(schema, f, parquet.NewWriterProperties(parquet.WithCompression(compress.Codecs.Snappy)), pqarrow.DefaultWriterProps())
+	// Parquet 1.0, which Redshift documents: for these load types it differs
+	// from 2.x only in the dictionary's encoding and the file's version.
+	props := parquet.NewWriterProperties(parquet.WithCompression(compress.Codecs.Snappy), parquet.WithVersion(parquet.V1_0))
+	fw, err := pqarrow.NewFileWriter(schema, f, props, pqarrow.DefaultWriterProps())
 	if err != nil {
 		_ = f.Close()
 		_ = os.Remove(f.Name())

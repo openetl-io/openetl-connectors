@@ -14,7 +14,10 @@ import (
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/memory"
+	"github.com/apache/arrow-go/v18/parquet"
+	"github.com/apache/arrow-go/v18/parquet/file"
 	"github.com/apache/arrow-go/v18/parquet/pqarrow"
+	pqschema "github.com/apache/arrow-go/v18/parquet/schema"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgconn"
 
@@ -286,6 +289,29 @@ func TestStage(t *testing.T) {
 	}
 	if ord := tbl.Column(len(p.cols)).Data().Chunk(0).ValueStr(1); ord != "2" {
 		t.Errorf("_openetl_ord of row 2: %s", ord)
+	}
+	// Parquet 1.0, which Redshift documents, with times and decimals as
+	// their logical types still.
+	pf, err := file.OpenParquetFile(p.file.Name(), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = pf.Close() }()
+	if v := pf.MetaData().Version(); v != parquet.V1_0 {
+		t.Errorf("Parquet %s", v)
+	}
+	for i, c := range p.cols {
+		lt := pf.MetaData().Schema.Column(i).LogicalType()
+		switch l := c.load.(type) {
+		case *arrow.TimestampType:
+			if ts, ok := lt.(pqschema.TimestampLogicalType); !ok || ts.TimeUnit() != pqschema.TimeUnitMicros {
+				t.Errorf("%s: %s", c.name, lt)
+			}
+		case *arrow.Decimal128Type:
+			if d, ok := lt.(pqschema.DecimalLogicalType); !ok || d.Precision() != l.Precision || d.Scale() != l.Scale {
+				t.Errorf("%s: %s", c.name, lt)
+			}
+		}
 	}
 
 	// Another batch's columns start the next staging table.
