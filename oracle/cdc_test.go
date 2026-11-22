@@ -446,6 +446,20 @@ func TestCDCPositionLost(t *testing.T) {
 	}
 }
 
+// Truncating a partition deletes rows the redo log doesn't name: the read
+// fails as lost rather than keep them.
+func TestCDCPartitionTruncated(t *testing.T) {
+	db := testDB(t)
+	cdcTable(t, db, "CDC_PART", `(id NUMBER(10) PRIMARY KEY, v VARCHAR2(10)) PARTITION BY RANGE (id) (PARTITION p1 VALUES LESS THAN (10), PARTITION p2 VALUES LESS THAN (MAXVALUE))`)
+	exec(t, db, `INSERT INTO cdc_part VALUES (1, 'a')`, `INSERT INTO cdc_part VALUES (20, 'b')`)
+	s := cdcSource(t, "")
+	first := mustRead(t, s, nil, "CDC_PART")
+	exec(t, db, `INSERT INTO cdc_part VALUES (2, 'c')`, `ALTER TABLE cdc_part TRUNCATE PARTITION p1`)
+	if _, err := readCDCOnce(t, s, map[string][]byte{"CDC_PART": first.state("CDC_PART")}, "CDC_PART"); cdcCode(err) != protocolv1.ErrorCode_ERROR_CODE_POSITION_LOST {
+		t.Errorf("a truncated partition: got %v, want POSITION_LOST", err)
+	}
+}
+
 func TestCDCNeedsSupplementalLogging(t *testing.T) {
 	db := testDB(t)
 	dropTable(t, db, "CDC_NOSUP")
