@@ -27,6 +27,39 @@ func TestCmpSeq(t *testing.T) {
 	}
 }
 
+// A read that stops at a sequence number keeps the records up to it, and
+// finds it lost where a record past it doesn't follow it.
+func TestUpTo(t *testing.T) {
+	recs := func(seqs ...string) []types.Record {
+		out := make([]types.Record, len(seqs))
+		for i, s := range seqs {
+			out[i].SequenceNumber = aws.String(s)
+		}
+		return out
+	}
+	for _, c := range []struct {
+		records       []types.Record
+		after         string
+		keep          int
+		reached, lost bool
+	}{
+		{recs("10", "20"), "", 2, false, false},
+		{recs("10", "30"), "", 2, true, false},
+		{recs("10", "30", "40"), "", 2, true, false},
+		{recs("40", "50"), "30", 0, true, false},
+		{nil, "", 0, false, false},
+		// Retention removed 30, and what came before it.
+		{recs("40", "50"), "", 0, false, true},
+		{recs("40", "50"), "20", 0, false, true},
+		{recs("10", "40"), "", 0, false, true},
+	} {
+		keep, reached, lost := upTo(c.records, c.after, "30")
+		if keep != c.keep || reached != c.reached || lost != c.lost {
+			t.Errorf("upTo(%d records, %q, 30) = %d, %v, %v; want %d, %v, %v", len(c.records), c.after, keep, reached, lost, c.keep, c.reached, c.lost)
+		}
+	}
+}
+
 func TestPartitionKey(t *testing.T) {
 	sc := arrow.NewSchema([]arrow.Field{
 		{Name: "id", Type: arrow.PrimitiveTypes.Int64},

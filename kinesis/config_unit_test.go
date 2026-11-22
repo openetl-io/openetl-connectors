@@ -589,7 +589,7 @@ func TestSubscribe(t *testing.T) {
 			types.SubscribeToShardEvent{ChildShards: []types.ChildShard{{ShardId: aws.String("child")}}})},
 	}
 	var starts []string
-	r := &streamRead{name: "s", consumer: "arn:consumer", splits: map[string]bool{"shard-0": true}, shards: map[string]shardState{}, behind: map[string]time.Duration{}}
+	r := &streamRead{name: "s", consumer: "arn:consumer", retention: 24 * time.Hour, splits: map[string]bool{"shard-0": true}, shards: map[string]shardState{}, behind: map[string]time.Duration{}}
 	rd := &reading{
 		s:     &Source{cfg: SourceConfig{Connection: Connection{Retry: Retry{InitialBackoff: Duration(time.Millisecond), MaxBackoff: Duration(time.Millisecond), MaxElapsed: Duration(time.Minute)}}}, values: records.NewDecoder(records.JSON, nil)},
 		lanes: make(chan struct{}, 1),

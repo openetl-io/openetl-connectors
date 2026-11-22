@@ -1,6 +1,7 @@
 package kinesis
 
 import (
+	"context"
 	"crypto/md5"
 	"encoding/base64"
 	"encoding/json"
@@ -199,6 +200,54 @@ func TestChecksAreValid(t *testing.T) {
 func schemaWith(table string) *arrow.Schema {
 	md := arrow.NewMetadata([]string{records.TableKey}, []string{table})
 	return arrow.NewSchema([]arrow.Field{{Name: "id", Type: arrow.PrimitiveTypes.Int64}, {Name: "name", Type: arrow.BinaryTypes.String, Nullable: true}}, &md)
+}
+
+// With Kinesis and the schema registry at an endpoint that takes connections
+// and never answers, the source's and the destination's checks end shortly
+// after their deadline, as an RPC's, rather than at their calls' own
+// timeouts: the list, and each check alone, which passes only if it reaches
+// no further than the connection.
+func TestChecksEndAtTheirDeadline(t *testing.T) {
+	hold := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { <-hold }))
+	t.Cleanup(srv.Close)
+	t.Cleanup(func() { close(hold) })
+	cfg := `{"region": "us-east-1", "endpoint": "` + srv.URL + `", "accessKeyId": "a", "secretAccessKey": "s", "format": "avro", "schemaRegistryUrl": "` + srv.URL + `"}`
+	src, err := NewSource([]byte(cfg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	dst, err := NewDestination([]byte(cfg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	within := func(what string, d time.Duration, checks []check.Check) check.Report {
+		ctx, cancel := context.WithTimeout(t.Context(), d)
+		defer cancel()
+		start := time.Now()
+		r := check.Run(ctx, checks)
+		if took := time.Since(start); took > d+time.Second {
+			t.Errorf("%s took %s with %s to answer", what, took, d)
+		}
+		return r
+	}
+	for role, checks := range map[string][]check.Check{"source": src.Checks(), "destination": dst.Checks()} {
+		if r := within(role+"'s checks", 2*time.Second, checks); r.OK() {
+			t.Errorf("%s: the checks passed", role)
+		}
+		names := map[string]bool{}
+		for _, c := range checks {
+			names[c.Name] = true
+			c.Needs = nil
+			it := itemsOf(within(role+"'s "+c.Name, time.Second, []check.Check{c}))[c.Name]
+			if it.Status == check.Passed && !strings.HasPrefix(c.Name, "net.") {
+				t.Errorf("%s: %s passed", role, c.Name)
+			}
+		}
+		if !names["kinesis.sign-in"] || !names["registry.reach"] {
+			t.Errorf("%s's checks: %v", role, names)
+		}
+	}
 }
 
 // Signing in fails as the reason AWS's error has, with the action and
@@ -594,6 +643,7 @@ func TestStartRefused(t *testing.T) {
 	if _, err = sr.iterator(t.Context()); codeOf(err) == protocolv1.ErrorCode_ERROR_CODE_CONFIG_INVALID || strings.Contains(err.Error(), "startTimestamp") {
 		t.Errorf("another invalid argument: %v", err)
 	}
+	sr.st = shardState{From: time.Now().Add(time.Hour)}
 	if err := sr.startRefused(&types.InvalidArgumentException{}, types.ShardIteratorTypeAtTimestamp); codeOf(err) != protocolv1.ErrorCode_ERROR_CODE_CONFIG_INVALID {
 		t.Errorf("subscribing at a time in the future: %v", err)
 	}

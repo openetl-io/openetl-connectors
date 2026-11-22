@@ -67,9 +67,13 @@ The source reads each shard from its sequence number, as the last checkpoint rec
 - `latest`: the records that arrive after the first read starts.
 - `timestamp`, from 0.2.0: the records that arrived at or after `startTimestamp`, in RFC 3339, such as `2026-11-01T00:00:00Z`. If that's older than the stream's retention, the read starts at the oldest record the stream still holds. The time must have passed: Kinesis starts a read only at a time that has. A time in the future fails the preflight, and the first read fails with `CONFIG_INVALID`.
 
+`latest` starts each shard at the time the first read started, by the runner's clock. From 0.2.0, where Kinesis refuses a start at a time the runner's clock has passed, as Kinesis's clock is behind it, the read tries again every second, for up to 5 minutes after that time, rather than failing with `CONFIG_INVALID`. The same holds for a `startTimestamp` that has just passed.
+
 A **scheduled** pipeline reads each shard until it has caught up, then stops. A **continuous** pipeline keeps reading.
 
 Before it reads, the source checks that each shard still holds the record it would resume from. If the stream's retention period has passed it, the read stops and the pipeline gets an incident: the position it would resume from is gone.
+
+From 0.2.0, a read further behind than the retention period checks again each time it needs a new shard iterator, its last having expired after 5 minutes unused, or a new enhanced fan-out subscription: Kinesis would otherwise go on from the oldest record left, past the ones it removed, without an error. Between those checks, a read that stays further behind than the retention period can still miss records Kinesis removes before the read reaches them, so keep reads well within it.
 
 ### Polling or enhanced fan-out
 
@@ -131,6 +135,10 @@ spec:
 ### Delivery
 
 Reads replay exactly within the stream's retention period: a read resumed from a checkpoint yields the same records in the same order.
+
+From 0.2.0, a redo that OpenETL asks for reads each shard up to the sequence number where the recorded read sent its resume point, or completed, and no further. It reads no shard the recorded read hadn't reached by then, adds no shards, and ends with a resume point there and completes there. If retention has removed that record, the redo fails with `POSITION_LOST`, as it can't read the same records again.
+
+A bounded read that finds a shard caught up records when it did, unless it recorded that within the last minute. So a read again from where one stopped, within that minute, completes where it did.
 
 ## Destination
 
