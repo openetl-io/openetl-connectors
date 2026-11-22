@@ -239,3 +239,40 @@ func TestPatchFillsAHeldColumnTwice(t *testing.T) {
 		}
 	})
 }
+
+// TestSessionsCommitAndReadEveryRow reads and writes with a DSN whose
+// sessions don't commit by themselves and return one row a SELECT: the
+// source reads every row, and the destination's rows are there for another
+// session to read.
+func TestSessionsCommitAndReadEveryRow(t *testing.T) {
+	eachServer(t, func(t *testing.T, srv testServer) {
+		if strings.Contains(srv.dsn, "?") {
+			t.Skip("the DSN has parameters of its own")
+		}
+		e := newSourceEnv(t, srv)
+		e.exec("CREATE TABLE $db.items (id int PRIMARY KEY, v varchar(20))")
+		e.exec("INSERT INTO $db.items VALUES (1, 'a'), (2, 'b'), (3, 'c')")
+		e.exec("CREATE TABLE $db.keyless (v varchar(20))")
+		e.exec("INSERT INTO $db.keyless VALUES ('a'), ('b'), ('c')")
+		e.srv.dsn += "?autocommit=0&sql_select_limit=1"
+		c := read(t, e.source(""), full("items", "keyless"))
+		for _, s := range []string{"items", "keyless"} {
+			if rows := c.rows(s); len(rows) != 3 || rows[0]["v"] != "a" {
+				t.Errorf("the source read %s's rows %v, want 3 with v", s, rows)
+			}
+		}
+
+		cfg, _ := json.Marshal(map[string]string{"dsn": e.srv.dsn, "database": e.database})
+		d, err := NewDestination(cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		de := &destEnv{t: t, d: d, db: e.db, database: e.database}
+		w := de.open(destination.Stream{Name: "out", Mode: destination.Append})
+		de.commit(w, 1, "out", batchOf(t, []arrow.Field{{Name: "x", Type: arrow.PrimitiveTypes.Int32, Nullable: true}}, `[{"x": 1}, {"x": 2}, {"x": 3}]`))
+		var n int
+		if err := e.db.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM "+quoteIdent(e.database)+".out").Scan(&n); err != nil || n != 3 {
+			t.Errorf("another session sees %d rows of 3 the destination wrote: %v", n, err)
+		}
+	})
+}

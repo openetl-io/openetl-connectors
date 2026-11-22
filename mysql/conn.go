@@ -191,15 +191,15 @@ func (s sessionConnector) Connect(ctx context.Context) (driver.Conn, error) {
 // quoteIdent, quoteLiteral and the driver need (in a character set such as
 // gbk or sjis, a backslash or quote they add can end a multibyte character
 // instead); UTC; and a SQL mode that stops writes of values a column can't
-// hold and keeps backslash escapes, which quoteLiteral needs. The collation
-// is set here and not in the handshake, which takes only those the driver
-// knows.
+// hold and keeps backslash escapes, which quoteLiteral needs; and no limit
+// on a SELECT's rows, the catalog's included. The collation is set here and
+// not in the handshake, which takes only those the driver knows.
 func sessionSQL(c *mysql.Config) string {
 	collation := strings.ToLower(c.Collation)
 	if !strings.HasPrefix(collation, "utf8mb4_") || !plainName(collation) {
 		collation = "utf8mb4_general_ci"
 	}
-	return "SET NAMES utf8mb4 COLLATE " + collation + ", time_zone = '+00:00', sql_mode = 'STRICT_ALL_TABLES,NO_ENGINE_SUBSTITUTION'"
+	return "SET NAMES utf8mb4 COLLATE " + collation + ", time_zone = '+00:00', sql_mode = 'STRICT_ALL_TABLES,NO_ENGINE_SUBSTITUTION', sql_select_limit = 18446744073709551615"
 }
 
 // connConfig is c as every connection of the connector needs it: values

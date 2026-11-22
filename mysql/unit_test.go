@@ -211,7 +211,7 @@ func TestParseDSN(t *testing.T) {
 // quoteIdent's, quoteLiteral's and the driver's escapes hold only in a
 // session in utf8mb4 that keeps backslash escapes, whatever the DSN asks.
 func TestSessionsAreUTF8WithBackslashEscapes(t *testing.T) {
-	const session = "SET NAMES utf8mb4 COLLATE utf8mb4_general_ci, time_zone = '+00:00', sql_mode = 'STRICT_ALL_TABLES,NO_ENGINE_SUBSTITUTION'"
+	const session = "SET NAMES utf8mb4 COLLATE utf8mb4_general_ci, time_zone = '+00:00', sql_mode = 'STRICT_ALL_TABLES,NO_ENGINE_SUBSTITUTION', sql_select_limit = 18446744073709551615"
 	c, err := parseDSN("u:p@tcp(h)/d?charset=gbk&SQL_MODE='NO_BACKSLASH_ESCAPES'&@@session.character_set_client=sjis&Time_Zone='+05:30'" +
 		"&SESSION character_set_results=latin1&LOCAL\tsql_mode=''&@@LOCAL.collation_connection=latin1_bin&WAIT_TIMEOUT=60, sql_mode=''&@@net_read_timeout=30")
 	if err != nil {
