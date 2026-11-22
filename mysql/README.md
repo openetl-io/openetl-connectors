@@ -274,3 +274,7 @@ ALTER TABLE `raw`.`orders` MODIFY COLUMN `amount` decimal(20,2) NOT NULL DEFAULT
 Run it, then release the hold. Or let the destination make such changes itself with the pipeline's `destination.typeChanges: allow`, for every stream or one. It then widens integers to wider integers, an unsigned one to a wider signed one, `float` to `double`, integers to `double` and the small ones to `float`, integers and decimals to a `decimal` that holds them, a `varchar` or `varbinary` to a longer one, binary to `longblob`, and anything else to `longtext`. A change that isn't a widening is refused either way.
 
 A schema change waits up to 5 seconds for its table's metadata lock, and tries up to 5 times in all, so queries on the table don't queue behind it.
+
+### Limits
+
+A value longer than the server's `max_allowed_packet` can't be written: it fails the write with `DATA_INVALID`, naming the stream and the limit. Raise `max_allowed_packet` to write it.

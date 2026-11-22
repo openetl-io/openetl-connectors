@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -16,8 +17,10 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 
+	"github.com/openetl-io/openetl-connectors/connectortest"
 	"github.com/openetl-io/openetl-connectors/sqlstage"
 	"github.com/openetl-io/openetl/sdk/go/destination"
+	protocolv1 "github.com/openetl-io/openetl/sdk/go/protocol/v1"
 	"github.com/openetl-io/openetl/sdk/go/source"
 )
 
@@ -412,6 +415,31 @@ func TestFencedKeepsNewerReads(t *testing.T) {
 		old.(*writer).DropRemovedReads(t.Context())
 		if !exists() {
 			t.Error("the fenced generation dropped the newer one's read")
+		}
+	})
+}
+
+// TestRowOverMaxAllowedPacket writes a row with a value longer than the
+// server's max_allowed_packet, which no statement can carry: the write fails
+// with DATA_INVALID, naming the stream and the limit.
+func TestRowOverMaxAllowedPacket(t *testing.T) {
+	eachServer(t, func(t *testing.T, srv testServer) {
+		e := newDestEnv(t, srv)
+		var limit int
+		if err := e.db.QueryRowContext(t.Context(), "SELECT @@max_allowed_packet").Scan(&limit); err != nil {
+			t.Fatal(err)
+		}
+		w := e.open(destination.Stream{Name: "big", Mode: destination.Append})
+		b := array.NewStringBuilder(memory.DefaultAllocator)
+		defer b.Release()
+		b.Append(strings.Repeat("x", limit+1))
+		v := b.NewArray()
+		defer v.Release()
+		rec := array.NewRecordBatch(arrow.NewSchema([]arrow.Field{{Name: "v", Type: arrow.BinaryTypes.String}}, nil), []arrow.Array{v}, 1)
+		defer rec.Release()
+		err := w.Write(t.Context(), destination.Epoch{Generation: 1, N: 1}, "big", rec)
+		if code := connectortest.CodeOf(err); code != protocolv1.ErrorCode_ERROR_CODE_DATA_INVALID || !strings.Contains(err.Error(), "big") || !strings.Contains(err.Error(), strconv.Itoa(limit)) {
+			t.Fatalf("a row over max_allowed_packet: %v (%v)", err, code)
 		}
 	})
 }

@@ -103,14 +103,15 @@ func (d *Destination) Open(ctx context.Context, cfg destination.OpenConfig) (des
 		return nil, classify(fmt.Errorf("mysql: connect: %w", err))
 	}
 	w := &writer{
-		db:      db,
-		srv:     srv,
-		packet:  min(packet/4, 4<<20),
-		cfg:     cfg,
-		schema:  cmp.Or(cfg.Namespace, d.cfg.Database),
-		Epochs:  sqlstage.NewEpochs[*stagingTable](),
-		streams: map[string]destination.Stream{},
-		indexed: map[string]bool{},
+		db:        db,
+		srv:       srv,
+		packet:    min(packet/4, 4<<20),
+		maxPacket: packet,
+		cfg:       cfg,
+		schema:    cmp.Or(cfg.Namespace, d.cfg.Database),
+		Epochs:    sqlstage.NewEpochs[*stagingTable](),
+		streams:   map[string]destination.Stream{},
+		indexed:   map[string]bool{},
 	}
 	for _, s := range cfg.Streams {
 		w.streams[s.Name] = s
@@ -130,11 +131,12 @@ func (d *Destination) Open(ctx context.Context, cfg destination.OpenConfig) (des
 type writer struct {
 	db  *sql.DB
 	srv server
-	// Bytes of values in one INSERT statement.
-	packet  int
-	cfg     destination.OpenConfig
-	schema  string
-	streams map[string]destination.Stream
+	// Bytes of values in one INSERT statement, and the server's
+	// max_allowed_packet.
+	packet, maxPacket int
+	cfg               destination.OpenConfig
+	schema            string
+	streams           map[string]destination.Stream
 	sqlstage.Epochs[*stagingTable]
 	sqlstage.Own
 	// Only Commit and Recover use it: tables with an _openetl_id index, or
@@ -212,6 +214,12 @@ func (w *writer) Stage(ctx context.Context, tables map[uint64]map[string]*stagin
 		st.cols = wider
 	}
 	if err := w.insertRows(ctx, st, cols, batch); err != nil {
+		// Statements carry less than max_allowed_packet, and values past
+		// what one can carry go on their own, so this is one value.
+		if n, _ := serverError(err); n == 1153 || n == 1105 && strings.Contains(err.Error(), "max_allowed_packet") {
+			return nil, sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_DATA_INVALID,
+				fmt.Errorf("mysql: stage %s: a value longer than the server's max_allowed_packet of %d bytes: %w", stream, w.maxPacket, err))
+		}
 		return nil, classify(fmt.Errorf("mysql: stage %s: %w", stream, err))
 	}
 	st.Rows += uint64(batch.NumRows())
