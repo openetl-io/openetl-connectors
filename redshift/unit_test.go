@@ -3,6 +3,7 @@ package redshift
 import (
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"regexp"
@@ -428,10 +429,40 @@ func TestClassify(t *testing.T) {
 		{&pgconn.PgError{Code: "XX000", Message: "Disk Full", Detail: "error:  Disk Full\ncode:      1016"}, protocolv1.ErrorCode_ERROR_CODE_DESTINATION_QUOTA},
 		{&pgconn.PgError{Code: "40001", Message: "could not serialize access"}, protocolv1.ErrorCode_ERROR_CODE_TRANSIENT},
 		{&pgconn.PgError{Code: "42501", Message: "permission denied for schema s"}, protocolv1.ErrorCode_ERROR_CODE_PERMISSION_DENIED},
+		// COPY's: a load that logged error rows, before and since SYS views.
+		{&pgconn.PgError{Code: "XX000", Message: "Load into table '_openetl_load' failed.  Check 'stl_load_errors' system table for details."}, protocolv1.ErrorCode_ERROR_CODE_DATA_INVALID},
+		{&pgconn.PgError{Code: "XX000", Message: "Load into table '_openetl_load' failed. Check 'sys_load_error_detail' system table for details."}, protocolv1.ErrorCode_ERROR_CODE_DATA_INVALID},
+		// A Parquet COPY's, read by Spectrum, whose reason is in the detail.
+		{&pgconn.PgError{Code: "XX000", Message: "Spectrum Scan Error", Detail: spectrumDetail("The length of the data column display_name is longer than the length defined in the table. Table: 256, Data: 1020")}, protocolv1.ErrorCode_ERROR_CODE_DATA_INVALID},
+		{&pgconn.PgError{Code: "XX000", Message: "Spectrum Scan Error", Detail: spectrumDetail("\nError: HTTP response error code: 403 Message: AccessDenied Access Denied\nx-amz-request-id: 9A5F3F8BB1C6AD5C")}, protocolv1.ErrorCode_ERROR_CODE_PERMISSION_DENIED},
 	} {
 		if f := check.Classify(classify(c.err)); f == nil || f.Code != c.want {
 			t.Errorf("%s %s: %v, want %s", c.err.Message, c.err.Detail, f, c.want)
 		}
+	}
+}
+
+func spectrumDetail(context string) string {
+	return "\n  -----------------------------------------------\n  error:  Spectrum Scan Error\n  code:      15001\n  context:   " + context +
+		"\n  query:     20027980\n  location:  dory_util.cpp:929\n  process:   fetchtask_thread [pid=527]\n  -----------------------------------------------\n"
+}
+
+// A failed COPY's error says the stream's column, the line and the reason
+// of the row its load logged, or else the context Spectrum gave.
+func TestCopyError(t *testing.T) {
+	cols := []column{{name: "id"}, {name: "price"}}
+	copyErr := classify(&pgconn.PgError{Code: "XX000", Message: "Load into table '_openetl_load' failed. Check 'sys_load_error_detail' system table for details."})
+	err := copyError(copyErr, &loadError{column: "c1", line: 3, reason: "Invalid digit, Value 'a', Pos 0, Type: Integer"}, cols)
+	if f := check.Classify(err); f == nil || f.Code != protocolv1.ErrorCode_ERROR_CODE_DATA_INVALID || !strings.Contains(err.Error(), `column "price", line 3: Invalid digit, Value 'a'`) {
+		t.Errorf("a logged row: %v (%v)", err, f)
+	}
+	spectrum := &pgconn.PgError{Code: "XX000", Message: "Spectrum Scan Error", Detail: spectrumDetail("File 'https://s3.us-west-2.amazonaws.com/b/k' has an incompatible Parquet schema for column 's3://b/k.c1'.\n  Column type: VARCHAR, Parquet schema:\noptional int64 c1 [i:1 d:1 r:0]")}
+	err = copyError(classify(spectrum), nil, cols)
+	if !strings.Contains(err.Error(), "has an incompatible Parquet schema for column 's3://b/k.c1'. Column type: VARCHAR, Parquet schema: optional int64 c1 [i:1 d:1 r:0]: ") || !errors.Is(err, spectrum) {
+		t.Errorf("Spectrum's context: %v", err)
+	}
+	if err := copyError(copyErr, nil, cols); err != copyErr {
+		t.Errorf("no row and no context: %v", err)
 	}
 }
 

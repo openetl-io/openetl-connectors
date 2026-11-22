@@ -1742,8 +1742,13 @@ func classify(err error) error {
 		return sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_AUTH_INVALID, err)
 	case pe.Code == "3D000":
 		return sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_CONFIG_INVALID, err)
-	case pe.Code == "42501" || strings.Contains(pe.Message, "Access Denied") || strings.Contains(pe.Message, "is not authorized to assume"):
+	// A Parquet COPY's S3 refusal is in the detail of a Spectrum Scan Error.
+	case pe.Code == "42501" || strings.Contains(pe.Message, "Access Denied") || strings.Contains(pe.Detail, "Access Denied") || strings.Contains(pe.Message, "is not authorized to assume"):
 		return sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_PERMISSION_DENIED, err)
+	// COPY's, for a load that logged error rows, or a Spectrum Scan Error's
+	// for a value too long for its column.
+	case strings.HasPrefix(pe.Message, "Load into table ") || strings.Contains(pe.Detail, "is longer than the length defined in the table"):
+		return sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_DATA_INVALID, err)
 	case pe.Code == "53100" || strings.Contains(pe.Message, "Disk Full"):
 		return sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_DESTINATION_QUOTA, err)
 	case strings.HasPrefix(pe.Code, "08") || pe.Code == "40001" || pe.Code == "53300" || pe.Code == "57P01" || pe.Code == "57P03" ||
