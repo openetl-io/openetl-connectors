@@ -28,6 +28,9 @@ const (
 	// How long ago a redo log must have begun for the redo before it to be
 	// taken as in the log files.
 	flushLag = 5 * time.Second
+	// How long LogMiner can miss a redo log the database lists before the
+	// read takes it as gone: one being switched or archived is back sooner.
+	missingFor = 2 * time.Minute
 	// Of a fresh snapshot's SCN, while the table's definition is newer.
 	settleTries = 30
 )
@@ -148,6 +151,8 @@ type cdcReader struct {
 	start uint64
 	// Where the next window starts.
 	lo uint64
+	// Since when LogMiner has missed a redo log; zero if it hasn't.
+	missingSince time.Time
 	// The first SCN of the redo log that changes still in the log buffer
 	// come after, and when it began; 0 if not known.
 	mark   uint64
@@ -428,10 +433,12 @@ func (r *cdcReader) mine() error {
 			return err
 		}
 		if e >= r.lo {
-			if err := r.window(r.lo, e); err != nil {
+			if err := r.missing(r.window(r.lo, e), started); err != nil {
 				return err
 			}
-			r.lag = time.Since(started)
+			if r.missingSince.IsZero() {
+				r.lag = time.Since(started)
+			}
 		}
 		if r.mark, r.markAt, err = logMark(r.ctx, r.conn); err != nil {
 			return err
@@ -465,6 +472,25 @@ func (r *cdcReader) mine() error {
 			return err
 		}
 	}
+}
+
+// missing has the read try a window again, nil, while LogMiner misses a redo
+// log it needs, as it does while the log is switched or archived; a log
+// missing for missingFor is gone, as a file deleted outside RMAN, which
+// the database still lists, is. Any other err it returns as it is.
+func (r *cdcReader) missing(err error, now time.Time) error {
+	if !slices.Contains([]int{1291, 308}, oraCode(err)) {
+		r.missingSince = time.Time{}
+		return err
+	}
+	if r.missingSince.IsZero() {
+		r.missingSince = now
+		slog.Warn("LogMiner is missing a redo log the read needs: it tries again", "scn", r.lo, "err", err)
+	}
+	if now.Sub(r.missingSince) >= missingFor {
+		return positionLost("oracle: LogMiner has missed a redo log the read needs from SCN %d for %s, though the database lists it: it's gone, as a file deleted outside RMAN is. Read the stream again from a snapshot, and delete archived logs with RMAN: %v", r.lo, missingFor, err)
+	}
+	return nil
 }
 
 // window mines the redo from SCN lo to SCN e.

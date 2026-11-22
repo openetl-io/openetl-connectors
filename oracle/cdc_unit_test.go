@@ -1,10 +1,13 @@
 package oracle
 
 import (
+	"errors"
 	"slices"
 	"testing"
+	"time"
 
 	"github.com/apache/arrow-go/v18/arrow/memory"
+	"github.com/sijms/go-ora/v2/network"
 
 	"github.com/openetl-io/openetl-connectors/connectortest"
 	protocolv1 "github.com/openetl-io/openetl/sdk/go/protocol/v1"
@@ -132,5 +135,33 @@ func TestCDCDeclaredOnly(t *testing.T) {
 	}
 	if _, err := declaredOnly(tb, []string{"ID", "V"}); connectortest.CodeOf(err) != protocolv1.ErrorCode_ERROR_CODE_TRANSIENT {
 		t.Errorf("an undeclared column: got %v, want TRANSIENT", err)
+	}
+}
+
+// LogMiner missing a redo log the database lists, as it does while the log
+// is switched or archived, has the read try the window again; a log missing
+// for missingFor, as a file deleted outside RMAN is, fails it as lost.
+func TestCDCMissingLog(t *testing.T) {
+	r, _, _ := cdcReaderOf(t, 50)
+	gone := mining(&network.OracleError{ErrCode: 1291, ErrMsg: "ORA-01291: missing log file"})
+	t0 := time.Now()
+	for _, at := range []time.Duration{0, missingFor - time.Second} {
+		if err := r.missing(gone, t0.Add(at)); err != nil {
+			t.Fatalf("missing for %s: %v, want another try", at, err)
+		}
+	}
+	// A window read since starts the count again.
+	if err := r.missing(nil, t0.Add(missingFor)); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.missing(gone, t0.Add(missingFor+time.Second)); err != nil {
+		t.Fatalf("missing again: %v, want another try", err)
+	}
+	if err := r.missing(gone, t0.Add(2*missingFor+time.Second)); connectortest.CodeOf(err) != protocolv1.ErrorCode_ERROR_CODE_POSITION_LOST {
+		t.Errorf("missing for %s: got %v, want POSITION_LOST", missingFor, err)
+	}
+	other := mining(&network.OracleError{ErrCode: 942, ErrMsg: "ORA-00942: table or view does not exist"})
+	if err := r.missing(other, t0); !errors.Is(err, other) {
+		t.Errorf("another error: got %v, want it as it is", err)
 	}
 }
