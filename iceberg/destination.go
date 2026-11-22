@@ -480,14 +480,8 @@ func (w *writer) ApplySchema(ctx context.Context, streams []destination.StreamSc
 			return destination.SchemaApplied{}, err
 		}
 		w.setTable(s.Name, tbl, ensured{schema: s.Schema, refused: refused}, false)
-		w.mu.Lock()
-		dropped := w.dropped[s.Name]
-		delete(w.dropped, s.Name)
-		w.mu.Unlock()
-		for col := range dropped {
-			if !slices.ContainsFunc(refused, func(r destination.RefusedColumn) bool { return r.Column == col }) {
-				return destination.SchemaApplied{}, fmt.Errorf("iceberg: %s's column %q changed type while the epoch was written, and its values were left out; read the epoch again", s.Name, col)
-			}
+		if err := w.checkLeftOut(s.Name, tbl.Schema(), refused); err != nil {
+			return destination.SchemaApplied{}, err
 		}
 		for _, r := range refused {
 			r.Stream = s.Name
@@ -498,11 +492,51 @@ func (w *writer) ApplySchema(ctx context.Context, streams []destination.StreamSc
 	return out, nil
 }
 
+// checkLeftOut fails if the table, of schema sc, takes by now the type of a
+// column whose values the stream's writes left out, which ApplySchema
+// doesn't refuse. ApplySchema can't tell which epoch it applies for, so it
+// forgets only the columns it refuses, which the platform then holds: a
+// failure fails each retry too. An epoch's schema holds the type of each of
+// its rows' columns, so ApplySchema refuses the epoch's own left-out columns
+// while the table can't take them; one it doesn't refuse, of a type the
+// table still has, is a later epoch's, and waits for that epoch's.
+func (w *writer) checkLeftOut(stream string, sc *ice.Schema, refused []destination.RefusedColumn) error {
+	isRefused := func(col string) bool {
+		return slices.ContainsFunc(refused, func(r destination.RefusedColumn) bool { return r.Column == col })
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	cols := w.dropped[stream]
+	for col, typ := range cols {
+		if !isRefused(col) && changedType(sc, col, typ) {
+			return leftOut(stream, col)
+		}
+	}
+	maps.DeleteFunc(cols, func(col, _ string) bool { return isRefused(col) })
+	return nil
+}
+
+// changedType reports whether sc's column col isn't of type typ, or is gone.
+func changedType(sc *ice.Schema, col, typ string) bool {
+	f, ok := sc.FindFieldByName(col)
+	return !ok || f.Type.String() != typ
+}
+
+func leftOut(stream, col string) error {
+	return fmt.Errorf("iceberg: %s's column %q changed type while the epoch was written, and its values were left out; read the epoch again", stream, col)
+}
+
 func (w *writer) StartReads(ctx context.Context, starts map[string]time.Time) (err error) {
 	defer func() { err = classifyRun(err) }()
 	w.starts = starts
 	for name, r := range w.reads {
-		if start, ok := starts[name]; ok && start.UnixMicro() == r.start {
+		start, ok := starts[name]
+		if !ok {
+			// The attempt doesn't read the stream, as it doesn't a paused
+			// one: the read goes on once it does.
+			continue
+		}
+		if start.UnixMicro() == r.start {
 			r.restored = false
 			continue
 		}
@@ -790,24 +824,59 @@ func (w *writer) PreCommit(ctx context.Context, e destination.Epoch) (_ destinat
 			}
 		}
 		if s.Mode == destination.Overwrite {
-			if r == nil {
-				r = &read{start: w.starts[s.Name].UnixMicro(), table: ss.Table}
-				w.reads[s.Name] = r
-			}
-			ss.Table = cmp.Or(ss.Table, r.table)
-			r.table = ss.Table
-			if err := w.saveEarlier(ctx, s.Name, r); err != nil {
+			if err := w.describeRead(ctx, &ss, files, isEnd); err != nil {
 				return nil, err
-			}
-			ss.Mode, ss.Read, ss.Manifests, ss.Ended = modeOverwrite, r.start, slices.Clone(r.manifests), isEnd
-			r.files = files
-			if isEnd {
-				delete(w.reads, s.Name)
 			}
 		}
 		desc.Streams = append(desc.Streams, ss)
 	}
+	if err := w.carryReads(ctx, &desc); err != nil {
+		return nil, err
+	}
 	return json.Marshal(desc)
+}
+
+// describeRead describes the stream's read in ss, with the epoch's files of
+// it, and ends it with end.
+func (w *writer) describeRead(ctx context.Context, ss *stagedStream, files []string, end bool) error {
+	r := w.reads[ss.Name]
+	if r == nil {
+		r = &read{start: w.starts[ss.Name].UnixMicro(), table: ss.Table}
+		w.reads[ss.Name] = r
+	}
+	ss.Table = cmp.Or(ss.Table, r.table)
+	r.table = ss.Table
+	if err := w.saveEarlier(ctx, ss.Name, r); err != nil {
+		return err
+	}
+	ss.Mode, ss.Read, ss.Manifests, ss.Ended = modeOverwrite, r.start, slices.Clone(r.manifests), end
+	r.files = files
+	if end {
+		delete(w.reads, ss.Name)
+	}
+	return nil
+}
+
+// carryReads describes the reads Recover restored of streams the attempt
+// doesn't write, as it doesn't a paused one's, so that each goes on once its
+// stream is back. A read whose table is gone, with what it wrote there, stops.
+func (w *writer) carryReads(ctx context.Context, desc *staged) error {
+	for _, name := range slices.Sorted(maps.Keys(w.reads)) {
+		if _, ok := w.streams[name]; ok {
+			continue
+		}
+		ss := stagedStream{Name: name}
+		err := w.describeRead(ctx, &ss, nil, false)
+		if errors.Is(err, catalog.ErrNoSuchTable) {
+			delete(w.reads, name)
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		desc.Streams = append(desc.Streams, ss)
+	}
+	return nil
 }
 
 // checkDropped stops an epoch whose values a lane left out, if the table has
@@ -826,8 +895,8 @@ func (w *writer) checkDropped(ctx context.Context) error {
 			return fmt.Errorf("iceberg: load %s: %w", w.name(stream), err)
 		}
 		for col, typ := range cols {
-			if f, ok := tbl.Schema().FindFieldByName(col); !ok || f.Type.String() != typ {
-				return fmt.Errorf("iceberg: %s's column %q changed type while the epoch was written, and its values were left out; read the epoch again", stream, col)
+			if changedType(tbl.Schema(), col, typ) {
+				return leftOut(stream, col)
 			}
 		}
 	}
@@ -1080,8 +1149,8 @@ func (w *writer) prepareStream(ctx context.Context, desc staged, s stagedStream,
 	if err := w.checkFence(tbl.Properties(), w.cfg.Generation); err != nil {
 		return nil, err
 	}
-	if applied(tbl.Properties(), w.cfg.Pipeline, desc) {
-		return nil, nil
+	if done, err := applied(tbl, w.cfg.Pipeline, desc); err != nil || done {
+		return nil, err
 	}
 	paths := s.adds()
 	if len(s.Manifests) > 0 {
@@ -1218,24 +1287,26 @@ func (w *writer) checkFence(props ice.Properties, gen uint64) error {
 	return nil
 }
 
-// applied reports whether the table holds the epoch: its last committed
-// epoch is this one or a later one. Epochs commit in order, and only the
-// one at the log's HEAD is ever recovered.
-func applied(props ice.Properties, pipeline string, desc staged) bool {
-	v, ok := props[loadedKey(pipeline)]
+// applied reports whether tbl, nil if there's no such table, holds the
+// epoch: its last committed epoch is this one or a later one. Epochs commit
+// in order, and only the one at the log's HEAD is ever recovered. A marker it
+// can't read fails, rather than have the epoch applied again.
+func applied(tbl *table.Table, pipeline string, desc staged) (bool, error) {
+	if tbl == nil {
+		return false, nil
+	}
+	key := loadedKey(pipeline)
+	v, ok := tbl.Properties()[key]
 	if !ok {
-		return false
+		return false, nil
 	}
 	n, g, ok := strings.Cut(v, ":")
-	if !ok {
-		return false
-	}
 	epoch, err1 := strconv.ParseUint(n, 10, 64)
 	gen, err2 := strconv.ParseUint(g, 10, 64)
-	if err1 != nil || err2 != nil {
-		return false
+	if !ok || err1 != nil || err2 != nil {
+		return false, configInvalid(fmt.Errorf("iceberg: %s's property %s is %q, not the EPOCH:GENERATION the destination writes; set it to the %s and %s of the last snapshot the pipeline committed", strings.Join(tbl.Identifier(), "."), key, v, epochKey, generationKey))
 	}
-	return epoch > desc.Epoch || (epoch == desc.Epoch && gen == desc.Generation)
+	return epoch > desc.Epoch || (epoch == desc.Epoch && gen == desc.Generation), nil
 }
 
 // parallelism is how many tables Recover fences and cleans up and Commit
@@ -1347,7 +1418,12 @@ func (w *writer) Recover(ctx context.Context, gen uint64, e destination.Epoch, c
 		applying++
 		// Nil: there's no such table.
 		tbl := fenced[st.Table]
-		if tbl != nil && applied(tbl.Properties(), w.cfg.Pipeline, desc) {
+		done, err := applied(tbl, w.cfg.Pipeline, desc)
+		if err != nil {
+			_ = cleanup.Wait()
+			return 0, err
+		}
+		if done {
 			cleanup.Go(func() error {
 				if st.Mode == modeMerge {
 					w.removeFiles(w.ctx, tbl, st.Files)
