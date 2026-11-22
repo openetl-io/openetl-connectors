@@ -525,7 +525,11 @@ func (r *cdcReader) snapshotRanges(ctx context.Context, t table, state cdcState)
 
 func (r *cdcReader) syncerConfig(pipeline string) replication.BinlogSyncerConfig {
 	c := r.s.conn
-	host, port, _ := net.SplitHostPort(c.Addr)
+	// A socket's path, with no port, which the syncer dials as a socket.
+	host, port := c.Addr, ""
+	if c.Net != "unix" {
+		host, port, _ = net.SplitHostPort(c.Addr)
+	}
 	p, _ := strconv.ParseUint(port, 10, 16)
 	id := r.s.cfg.ServerID
 	if id == 0 {

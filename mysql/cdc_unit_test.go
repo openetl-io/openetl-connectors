@@ -2,12 +2,17 @@ package mysql
 
 import (
 	"encoding/hex"
+	"net"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	gomysql "github.com/go-mysql-org/go-mysql/mysql"
 	"github.com/go-mysql-org/go-mysql/replication"
+	"github.com/go-sql-driver/mysql"
 
 	"github.com/openetl-io/openetl-connectors/connectortest"
 	protocolv1 "github.com/openetl-io/openetl/sdk/go/protocol/v1"
@@ -274,4 +279,33 @@ func TestUnexpectedBinlogValuesFail(t *testing.T) {
 	if connectortest.CodeOf(err) != protocolv1.ErrorCode_ERROR_CODE_CONTRACT_CHANGED || !strings.Contains(err.Error(), "items.v") {
 		t.Fatalf("%v (%v)", err, connectortest.CodeOf(err))
 	}
+}
+
+// TestCDCDialsUnixSockets reads the binlog of a server the DSN reaches by a
+// Unix socket: the binlog connection dials the socket.
+func TestCDCDialsUnixSockets(t *testing.T) {
+	dir, err := os.MkdirTemp("", "s")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	sock := filepath.Join(dir, "m.sock")
+	l, err := net.ListenUnix("unix", &net.UnixAddr{Name: sock, Net: "unix"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = l.Close() }()
+	r, _ := binlogReader(t, false)
+	if r.s.conn, err = mysql.ParseDSN("u:p@unix(" + sock + ")/app"); err != nil {
+		t.Fatal(err)
+	}
+	syncer := replication.NewBinlogSyncer(r.syncerConfig("p"))
+	defer syncer.Close()
+	go func() { _, _ = syncer.StartSync(gomysql.Position{Name: "binlog.000001", Pos: 4}) }()
+	_ = l.SetDeadline(time.Now().Add(5 * time.Second))
+	conn, err := l.Accept()
+	if err != nil {
+		t.Fatalf("nothing dialed %s: %v", sock, err)
+	}
+	_ = conn.Close()
 }
