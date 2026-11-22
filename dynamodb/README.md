@@ -101,7 +101,7 @@ By default, discovery reads every item, in parallel segments, so a read never me
 
 ### Packed items
 
-With `packed: true`, each stream is the key attributes and `data`, a JSON column holding the item in DynamoDB JSON, such as `{"id":{"N":"5"},"tags":{"SS":["a"]}}`, which keeps every type. Discovery reads only the keys, and no read fails on a new attribute. A delete's `data` is the deleted item where the stream's view has old images, and null otherwise.
+With `packed: true`, each stream is the key attributes and `data`, a JSON column holding the item in DynamoDB JSON, such as `{"id":{"N":"5"},"tags":{"SS":["a"]}}`, which keeps every type. Discovery scans nothing of a table keyed on strings or binaries, and of one keyed on a number, only the key attributes, to find the number's type, from every item or `sampleSize` of them. No read fails on a new attribute. A delete's `data` is the deleted item where the stream's view has old images, and null otherwise.
 
 ### Set it up
 

@@ -8,6 +8,7 @@ import (
 	"maps"
 	"math/rand/v2"
 	"slices"
+	"strings"
 	"sync"
 
 	"github.com/apache/arrow-go/v18/arrow"
@@ -187,12 +188,20 @@ func (s *Source) Discover(ctx context.Context) (source.Catalog, error) {
 
 // attributes are the types of the table's top-level attributes' values,
 // key attributes included, over every item, or over sampleSize items from
-// random segments. Packed, only the keys'.
+// random segments. Packed, only the keys': read alone, and only where a key
+// is a number, whose type depends on its values.
 func (s *Source) attributes(ctx context.Context, cl *clients, t *table) (map[string]*attrTypes, error) {
 	var mu sync.Mutex
 	out := map[string]*attrTypes{}
 	for _, k := range t.keys {
 		out[k] = &attrTypes{}
+	}
+	var proj []string
+	if s.cfg.Packed {
+		if !slices.ContainsFunc(t.keys, func(k string) bool { return t.keyTypes[k] == "N" }) {
+			return out, nil
+		}
+		proj = t.keys
 	}
 	n := 0
 	add := func(items []map[string]types.AttributeValue) bool {
@@ -215,7 +224,7 @@ func (s *Source) attributes(ctx context.Context, cl *clients, t *table) (map[str
 		return s.cfg.SampleSize > 0 && n >= s.cfg.SampleSize
 	}
 	scan := func(ctx context.Context, seg, total int) error {
-		return s.scanPages(ctx, cl, t.name, seg, total, nil, nil, false, func(items []map[string]types.AttributeValue, _ map[string]types.AttributeValue) (bool, error) {
+		return s.scanPages(ctx, cl, t.name, seg, total, nil, nil, proj, false, func(items []map[string]types.AttributeValue, _ map[string]types.AttributeValue) (bool, error) {
 			return add(items), nil
 		})
 	}
@@ -257,9 +266,9 @@ func (s *Source) segments(t *table) int {
 
 // scanPages scans one segment of total (total 1: the whole table) from the
 // key after, with the filter if there is one, calling page with each page's
-// items and the key it ended at, nil at the segment's end. page returns
-// true to stop.
-func (s *Source) scanPages(ctx context.Context, cl *clients, tableName string, seg, total int, after map[string]types.AttributeValue, filter *scanFilter, consistent bool, page func(items []map[string]types.AttributeValue, last map[string]types.AttributeValue) (bool, error)) error {
+// items, of only the attributes proj names unless it's nil, and the key it
+// ended at, nil at the segment's end. page returns true to stop.
+func (s *Source) scanPages(ctx context.Context, cl *clients, tableName string, seg, total int, after map[string]types.AttributeValue, filter *scanFilter, proj []string, consistent bool, page func(items []map[string]types.AttributeValue, last map[string]types.AttributeValue) (bool, error)) error {
 	in := &dynamodb.ScanInput{TableName: aws.String(tableName), ExclusiveStartKey: after, ConsistentRead: aws.Bool(consistent)}
 	if total > 1 {
 		in.Segment, in.TotalSegments = aws.Int32(int32(seg)), aws.Int32(int32(total))
@@ -271,6 +280,15 @@ func (s *Source) scanPages(ctx context.Context, cl *clients, tableName string, s
 		in.FilterExpression = aws.String("#c >= :f")
 		in.ExpressionAttributeNames = map[string]string{"#c": filter.cursor}
 		in.ExpressionAttributeValues = map[string]types.AttributeValue{":f": filter.floor}
+	}
+	if proj != nil {
+		in.ExpressionAttributeNames = map[string]string{}
+		var names []string
+		for i, a := range proj {
+			names = append(names, fmt.Sprintf("#k%d", i))
+			in.ExpressionAttributeNames[names[i]] = a
+		}
+		in.ProjectionExpression = aws.String(strings.Join(names, ", "))
 	}
 	for {
 		res, err := cl.db.Scan(ctx, in)
@@ -445,7 +463,7 @@ func (s *Source) readScan(ctx context.Context, cl *clients, cs source.Configured
 	b := s.newBatcher(cs, t, false)
 	defer b.Release()
 	reached := false
-	err = s.scanPages(ctx, cl, t.name, seg, total, st.After.attrs(), filter, false, func(items []map[string]types.AttributeValue, last map[string]types.AttributeValue) (bool, error) {
+	err = s.scanPages(ctx, cl, t.name, seg, total, st.After.attrs(), filter, nil, false, func(items []map[string]types.AttributeValue, last map[string]types.AttributeValue) (bool, error) {
 		if until.After != nil {
 			var n int
 			n, reached = untilCut(items, last, until.After.attrs())

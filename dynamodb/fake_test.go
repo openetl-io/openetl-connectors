@@ -25,6 +25,8 @@ import (
 type memDB struct {
 	mu     sync.Mutex
 	tables map[string]*memTable
+	// Every Scan's input.
+	scans []*dynamodb.ScanInput
 }
 
 type memTable struct {
@@ -243,6 +245,7 @@ func (m *memDB) Query(_ context.Context, in *dynamodb.QueryInput, _ ...func(*dyn
 func (m *memDB) Scan(_ context.Context, in *dynamodb.ScanInput, _ ...func(*dynamodb.Options)) (*dynamodb.ScanOutput, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.scans = append(m.scans, in)
 	t, err := m.table(in.TableName)
 	if err != nil {
 		return nil, err

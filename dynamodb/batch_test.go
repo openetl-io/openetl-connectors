@@ -3,7 +3,10 @@ package dynamodb
 import (
 	"testing"
 
+	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/decimal128"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 
 	"github.com/openetl-io/openetl-connectors/connectortest"
@@ -31,5 +34,28 @@ func TestBatcherControlNames(t *testing.T) {
 		if rows := rec.RowsOf("t"); len(rows) != 1 || rows[0]["openetl.note"] != "x" {
 			t.Errorf("changes %v: rows = %v", changes, rows)
 		}
+	}
+}
+
+// Packed, discovery scans nothing of a table whose keys are strings or
+// binaries, and only the key of one keyed on a number, which it types.
+func TestPackedDiscovery(t *testing.T) {
+	db := newMemDB(map[string][]string{"t": {"id"}})
+	if _, err := db.PutItem(t.Context(), &dynamodb.PutItemInput{TableName: aws.String("t"), Item: map[string]types.AttributeValue{"id": num("1.5"), "v": str("x")}}); err != nil {
+		t.Fatal(err)
+	}
+	s := &Source{cfg: SourceConfig{Packed: true}}
+	if _, err := s.attributes(t.Context(), &clients{db: db}, &table{name: "t", keys: []string{"id"}, keyTypes: map[string]string{"id": "S"}}); err != nil || len(db.scans) != 0 {
+		t.Errorf("a table keyed on a string: %d scans, %v", len(db.scans), err)
+	}
+	attrs, err := s.attributes(t.Context(), &clients{db: db}, &table{name: "t", keys: []string{"id"}, keyTypes: map[string]string{"id": "N"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(db.scans) != 1 || aws.ToString(db.scans[0].ProjectionExpression) != "#k0" || db.scans[0].ExpressionAttributeNames["#k0"] != "id" {
+		t.Errorf("a table keyed on a number: scans %+v", db.scans)
+	}
+	if got := keyType("N", *attrs["id"]); !arrow.TypeEqual(got, decimalType) {
+		t.Errorf("the key's type is %v, want %v", got, decimalType)
 	}
 }

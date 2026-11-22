@@ -56,7 +56,7 @@
       "type": "boolean",
       "default": false,
       "title": "Packed items",
-      "description": "Read each item whole: every stream is the table's key attributes and data, a JSON column with the item in DynamoDB JSON, which keeps every type, instead of a column per top-level attribute. Discovery reads only the keys, and no read fails on a new attribute.",
+      "description": "Read each item whole: every stream is the table's key attributes and data, a JSON column with the item in DynamoDB JSON, which keeps every type, instead of a column per top-level attribute. Discovery scans nothing of a table keyed on strings or binaries, and of one keyed on a number, only the key attributes, and no read fails on a new attribute.",
       "x-group": "tables"
     },
     "sampleSize": {
@@ -64,11 +64,8 @@
       "minimum": 0,
       "default": 0,
       "title": "Discovery sample",
-      "description": "Items discovery reads of each table, from random scan segments, to find its attributes and their types. 0: every item, so that a read never meets an attribute discovery didn't declare, at the cost of a scan of each table per discovery. A sample can miss a rare attribute, and a read that meets it fails and starts again until a sample finds it: set 0, or packed, for tables with rare attributes.",
-      "x-group": "tables",
-      "x-when": {
-        "packed": false
-      }
+      "description": "Items discovery reads of each table, from random scan segments, to find its attributes and their types. 0: every item, so that a read never meets an attribute discovery didn't declare, at the cost of a scan of each table per discovery. A sample can miss a rare attribute, and a read that meets it fails and starts again until a sample finds it: set 0, or packed, for tables with rare attributes. Packed, only a table keyed on a number is scanned, for its key.",
+      "x-group": "tables"
     },
     "segments": {
       "type": "integer",

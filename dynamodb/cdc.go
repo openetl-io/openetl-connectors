@@ -242,7 +242,7 @@ func (r *cdcRead) snapshot(ctx context.Context) error {
 		g.Go(func() error {
 			b := r.s.newBatcher(r.cs, r.t, true)
 			defer b.Release()
-			return r.s.scanPages(gctx, &clients{db: r.db}, r.t.name, i, len(r.st.Snapshot), seg.After.attrs(), nil, true, func(items []map[string]types.AttributeValue, last map[string]types.AttributeValue) (bool, error) {
+			return r.s.scanPages(gctx, &clients{db: r.db}, r.t.name, i, len(r.st.Snapshot), seg.After.attrs(), nil, nil, true, func(items []map[string]types.AttributeValue, last map[string]types.AttributeValue) (bool, error) {
 				reached := false
 				if until.After != nil {
 					var n int
