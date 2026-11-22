@@ -2,6 +2,7 @@ package records
 
 import (
 	"encoding/base64"
+	"fmt"
 	"net/url"
 	"strings"
 	"testing"
@@ -63,6 +64,24 @@ func TestRegistryCredentialsOverHTTPWarn(t *testing.T) {
 			if it.Name == "registry.auth" && got != tc.want {
 				t.Errorf("%s with user %q: %s %s, want %s", shownURL(tc.c.SchemaRegistryURL), tc.c.SchemaRegistryUsername, it.Name, got, tc.want)
 			}
+		}
+	}
+}
+
+// A registry that doesn't answer fails the checks with errors that don't
+// show the URL's credentials, whatever their characters.
+func TestFailedRegistryChecksShowNoCredentials(t *testing.T) {
+	for _, raw := range []string{
+		"http://alice:s3cret@127.0.0.1:1/sr",
+		"http://alice:s3?cret@127.0.0.1:1/sr",
+		"http://alice:s3/cret@127.0.0.1:1/sr",
+		"http://alice:s3#cret@127.0.0.1:1/sr",
+		"http://alice:s3%zzcret@127.0.0.1:1/sr",
+	} {
+		c := Config{SchemaRegistryURL: raw}
+		got := fmt.Sprintf("%+v", check.Run(t.Context(), c.RegistryChecks(5*time.Second)).Items)
+		if strings.Contains(got, "cret") || !strings.Contains(got, "failed") {
+			t.Errorf("%s: %s", shownURL(raw), got)
 		}
 	}
 }

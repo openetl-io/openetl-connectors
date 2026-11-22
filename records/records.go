@@ -60,7 +60,12 @@ func (c *Config) Registry() (*sr.Client, error) {
 	// The URL's own credentials sign in as basic authentication does, and
 	// leave the URL, which the client's errors show.
 	raw, user, pass := c.SchemaRegistryURL, c.SchemaRegistryUsername, c.SchemaRegistryPassword.Reveal()
-	if u, err := url.Parse(raw); err == nil && u.User != nil {
+	u, err := url.Parse(raw)
+	if err != nil {
+		// url's errors show the URL.
+		return nil, errors.New("schema registry: schemaRegistryUrl isn't a URL; percent-encode reserved characters in its username and password")
+	}
+	if u.User != nil {
 		if user == "" {
 			user = u.User.Username()
 			pass, _ = u.User.Password()
