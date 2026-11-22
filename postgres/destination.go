@@ -561,17 +561,31 @@ func (w *writer) patch(s stagedStream, p prepared) []string {
 	} else {
 		match = []string{"t." + q(idColumn) + " = p." + q(idColumn)}
 	}
+	heldOf := func(c string) string {
+		if f, ok := s.Fills[c]; ok {
+			return f
+		}
+		return c
+	}
+	// The last column that fills each held column, whose UPDATE takes it out
+	// of the target's _openetl_held: an UPDATE before it needs it there.
+	last := map[string]string{}
+	for _, c := range cols {
+		if !slices.Contains(metadataColumns, c) && !slices.Contains(s.Key, c) {
+			last[heldOf(c)] = c
+		}
+	}
 	var out []string
 	for _, c := range cols {
 		if slices.Contains(metadataColumns, c) || slices.Contains(s.Key, c) {
 			continue
 		}
-		held := c
-		if f, ok := s.Fills[c]; ok {
-			held = f
-		}
+		held := heldOf(c)
 		lit := quoteLiteral(held)
-		set := q(c) + " = p." + q(c) + ", " + q(heldColumn) + " = nullif(t." + q(heldColumn) + " - " + lit + ", '{}'::jsonb)"
+		set := q(c) + " = p." + q(c)
+		if last[held] == c {
+			set += ", " + q(heldColumn) + " = nullif(t." + q(heldColumn) + " - " + lit + ", '{}'::jsonb)"
+		}
 		if slices.Contains(cols, syncedColumn) {
 			set += ", " + q(syncedColumn) + " = p." + q(syncedColumn)
 		}
