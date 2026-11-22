@@ -60,8 +60,8 @@ type cdcStream struct {
 	t     table
 	state cdcState
 	b     *batcher
-	// All the columns the source reads, declared or not, and their indexes
-	// by SEGMENT_COLUMN_ID.
+	// All the columns the source reads, and their indexes by
+	// SEGMENT_COLUMN_ID.
 	all   []column
 	bySeg map[int]int
 	// Every SEGMENT_COLUMN_ID the table has, hidden and unread columns'
