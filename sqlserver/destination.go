@@ -1162,7 +1162,9 @@ func (t *tableInfo) limits() destination.TableLimits {
 // shared lock on a row of another table's columns while it waits to see that
 // table, which DDL elsewhere, such as another schema's drop of a staging
 // table, has locked while it waits on the row: a deadlock. A row read dirty
-// is DDL in flight, which a commit of the stream's would wait on anyway.
+// is DDL in flight, which a commit of the stream's would wait on anyway. SQL
+// Server doesn't promise to honour the hint on catalog views; 2022 does
+// (TestConcurrentCommits).
 func (w *writer) catalog(ctx context.Context, tables []string) (map[string]*tableInfo, error) {
 	idents := make([]string, len(tables))
 	for i, t := range tables {
