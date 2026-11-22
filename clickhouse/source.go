@@ -2,6 +2,7 @@ package clickhouse
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -101,6 +102,7 @@ var (
 )
 
 func (s *Source) Discover(ctx context.Context) (source.Catalog, error) {
+	ctx = noDeadline{ctx}
 	conn, err := s.cfg.connect(ctx, 1, nil)
 	if err != nil {
 		return source.Catalog{}, err
@@ -221,7 +223,8 @@ func (s *Source) readTables(rows tableRows) ([]table, error) {
 
 // sortingColumns returns the leading columns of a sorting key that a read
 // can order and resume by: plain columns of scalar types that hold no
-// null. all says the whole key is.
+// null, nor a NaN, which compares false with every value, so a read can't
+// resume past one. all says the whole key is.
 func sortingColumns(cols []sourceColumn, sortingKey string) (key []int, all bool) {
 	if strings.TrimSpace(sortingKey) == "" {
 		return nil, false
@@ -230,7 +233,7 @@ func sortingColumns(cols []sourceColumn, sortingKey string) (key []int, all bool
 	for _, p := range parts {
 		p = strings.Trim(p, "`")
 		i := slices.IndexFunc(cols, func(c sourceColumn) bool { return c.name == p })
-		if i < 0 || cols[i].nullable || cols[i].opaque || !scalar(cols[i].dt) {
+		if i < 0 || cols[i].nullable || cols[i].opaque || !scalar(cols[i].dt) || arrow.IsFloating(cols[i].dt.ID()) {
 			return key, false
 		}
 		key = append(key, i)
@@ -273,6 +276,7 @@ type sourceState struct {
 }
 
 func (s *Source) Read(ctx context.Context, req source.ReadRequest, out source.Emitter) error {
+	ctx = noDeadline{ctx}
 	limit := min(max(req.Lanes, 1), s.cfg.MaxConnections)
 	conn, err := s.cfg.connect(ctx, limit, nil)
 	if err != nil {
@@ -364,9 +368,13 @@ func (s *Source) from(t table) string {
 
 // untilQuery selects the highest value of the cursor c in from, as a state
 // keeps it; NULL if it has none. from is a read's, so that the value is of
-// the rows the read sees.
+// the rows the read sees. A NaN is left out: no value is at or below one.
 func untilQuery(from string, c sourceColumn) string {
-	return "SELECT if(count() > 0, " + stateText(c, "max("+ident(c.name)+")") + ", NULL) FROM " + from + " WHERE " + ident(c.name) + " IS NOT NULL"
+	q := "SELECT if(count() > 0, " + stateText(c, "max("+ident(c.name)+")") + ", NULL) FROM " + from + " WHERE " + ident(c.name) + " IS NOT NULL"
+	if t, _ := parseType(c.typ).unwrap(); strings.HasPrefix(t.name, "Float") || t.name == "BFloat16" {
+		q += " AND NOT isNaN(" + ident(c.name) + ")"
+	}
+	return q
 }
 
 func (r *tableRead) selectList() string {
@@ -482,6 +490,18 @@ func (r *tableRead) complete(next []byte) error {
 	return r.out.Complete(next)
 }
 
+// after is the condition that cols, in order, come after vals, column by
+// column, as a key's index skips granules by that but not by a tuple's
+// comparison.
+func after(cols, vals []string) string {
+	i := len(cols) - 1
+	s := cols[i] + " > " + vals[i]
+	for i--; i >= 0; i-- {
+		s = cols[i] + " > " + vals[i] + " OR " + cols[i] + " = " + vals[i] + " AND (" + s + ")"
+	}
+	return "(" + s + ")"
+}
+
 // chunks reads in order of the columns order, a chunk per query, from st,
 // which conds bound. It completes with next.
 func (r *tableRead) chunks(ctx context.Context, st sourceState, order []int, conds []string, next []byte) error {
@@ -493,21 +513,25 @@ func (r *tableRead) chunks(ctx context.Context, st sourceState, order []int, con
 	for i, k := range order {
 		cols[i], texts[i] = ident(r.t.cols[k].name), keyText(r.t.cols[k])
 	}
-	after := func(vals []string) string {
+	afterVals := func(vals []string) string {
 		exprs := make([]string, len(vals))
 		for i, v := range vals {
 			exprs[i] = castBack(r.t.cols[order[i]], v)
 		}
-		return "(" + strings.Join(cols, ", ") + ") > (" + strings.Join(exprs, ", ") + ")"
+		return after(cols, exprs)
 	}
 	head := "SELECT " + r.selectList() + ", " + strings.Join(texts, ", ") + " FROM " + r.from()
-	// Rows that share the last row's order columns come in its chunk.
-	tail := " ORDER BY " + strings.Join(cols, ", ") + " LIMIT " + strconv.Itoa(r.s.cfg.ChunkRows) + " WITH TIES"
+	orderBy := " ORDER BY " + strings.Join(cols, ", ")
+	// A chunk ends at its chunkRows-th row's order columns, and takes every
+	// row that shares them. The end is found first, to bound the chunk's
+	// query: one with LIMIT … WITH TIES reads the table's rest ahead.
+	ends := "SELECT " + strings.Join(texts, ", ") + " FROM " + r.from()
+	endAt := orderBy + " LIMIT 1 OFFSET " + strconv.Itoa(r.s.cfg.ChunkRows-1)
 	if r.until != nil && r.until.After != nil {
 		if len(r.until.After) != len(order) {
 			return fmt.Errorf("clickhouse: %s until has %d order columns, the read has %d", r.t.name, len(r.until.After), len(order))
 		}
-		conds = append(slices.Clip(conds), "NOT "+after(r.until.After))
+		conds = append(slices.Clip(conds), "NOT "+afterVals(r.until.After))
 	}
 	if r.until != nil && r.until.After == nil {
 		// It stops before the first row.
@@ -525,20 +549,25 @@ func (r *tableRead) chunks(ctx context.Context, st sourceState, order []int, con
 			where = append(where, st.where(r.t.cols[r.t.key[0]])...)
 		}
 		if st.After != nil {
-			where = append(where, after(st.After))
+			where = append(where, afterVals(st.After))
 		}
-		q := head
-		if len(where) > 0 {
-			q += " WHERE " + strings.Join(where, " AND ")
-		}
-		n, last, err := r.query(ctx, q+tail, len(order))
+		end, err := r.end(ctx, ends+whereClause(where)+endAt, len(order))
 		if err != nil {
 			return err
 		}
-		if n > 0 {
+		if end != nil {
+			where = append(where, "NOT "+afterVals(end))
+		}
+		n, last, err := r.query(ctx, head+whereClause(where)+orderBy, len(order))
+		if err != nil {
+			return err
+		}
+		if end != nil {
+			st.After = end
+		} else if n > 0 {
 			st.After = last
 		}
-		ended := n < r.s.cfg.ChunkRows
+		ended := end == nil
 		if r.until != nil {
 			if ended || slices.Equal(st.After, r.until.After) {
 				return r.complete(next)
@@ -630,6 +659,29 @@ func configInvalid(format string, args ...any) error {
 // query runs q and emits its rows. The last keyCols result columns are
 // order columns' text; query returns the last row's. Every row is emitted
 // before it returns.
+// end is the order columns' texts of q's row, nil if it has none.
+func (r *tableRead) end(ctx context.Context, q string, keyCols int) ([]string, error) {
+	vals := make([]string, keyCols)
+	dest := make([]any, keyCols)
+	for i := range vals {
+		dest[i] = &vals[i]
+	}
+	if err := r.conn.QueryRow(ctx, q).Scan(dest...); errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	} else if err != nil {
+		return nil, classify(fmt.Errorf("clickhouse: read %s: %w", r.t.name, err))
+	}
+	return vals, nil
+}
+
+// whereClause is conds as a WHERE clause, or nothing for none.
+func whereClause(conds []string) string {
+	if len(conds) == 0 {
+		return ""
+	}
+	return " WHERE " + strings.Join(conds, " AND ")
+}
+
 func (r *tableRead) query(ctx context.Context, q string, keyCols int) (int, []string, error) {
 	b := newBatcher(memory.DefaultAllocator, r.t)
 	defer b.release()

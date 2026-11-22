@@ -277,7 +277,18 @@ func (s *Source) Checks() []check.Check {
 		return nil
 	})
 	read.Field, read.Params, read.Needs = "tables", check.Params{"database": database, "user": user}, readNeeds
-	return append(checks, read)
+	return withoutDeadline(append(checks, read))
+}
+
+// withoutDeadline has checks run as noDeadline does, so that a readonly
+// user's pass.
+func withoutDeadline(checks []check.Check) []check.Check {
+	for i, c := range checks {
+		if run := c.Run; run != nil {
+			checks[i].Run = func(ctx context.Context, p *check.Probe) error { return run(noDeadline{ctx}, p) }
+		}
+	}
+	return checks
 }
 
 // selectMissing is the failure of a user without SELECT on objects.
@@ -366,7 +377,7 @@ func (s *Source) Preflight(req source.PreflightRequest) []check.Check {
 					return err
 				}
 				if len(t.key) == 0 {
-					p.Found("{stream} has no sorting key that starts with plain columns that hold no null, so it's read in one query, which a stopped read starts again.")
+					p.Found("{stream} has no sorting key that starts with plain columns, other than floats and UUIDs, that hold no null, so it's read in one query, which a stopped read starts again.")
 					return nil
 				}
 				var key []string
@@ -401,14 +412,14 @@ func (s *Source) Preflight(req source.PreflightRequest) []check.Check {
 				if !cursorType(t.cols[i].typ) {
 					return badCursor.Fail()
 				}
-				p.Found("{stream} is read by {cursor}, of type {type}; rows whose {cursor} is NULL are never read.")
+				p.Found("{stream} is read by {cursor}, of type {type}; rows whose {cursor} is NULL, or NaN, are never read.")
 				return nil
 			})
 			c.Params, c.Needs = check.Params{"stream": st.Name, "cursor": st.Cursor}, []string{read.Name}
 			checks = append(checks, c)
 		}
 	}
-	return checks
+	return withoutDeadline(checks)
 }
 
 // Check is Checks run, its first failure as an error.
@@ -507,7 +518,7 @@ func databaseChecks(k *sqlcheck.Kit, database, user, field string) []check.Check
 	system.Params = params
 
 	settings := k.Check("settings.write", check.Compatibility, "Set what the destination's queries set", func(ctx context.Context, p *check.Probe, db *sql.DB) error {
-		_, err := db.ExecContext(ctx, "SELECT 1 SETTINGS async_insert = 0, mutations_sync = 2, join_use_nulls = 0")
+		_, err := db.ExecContext(ctx, "SELECT 1 SETTINGS async_insert = 0, mutations_sync = 2, join_use_nulls = 0, max_partitions_per_insert_block = 0")
 		if isCode(err, codeReadonly, codeSettingConstraint) {
 			return settingLocked.Wrap(err)
 		}
@@ -517,8 +528,8 @@ func databaseChecks(k *sqlcheck.Kit, database, user, field string) []check.Check
 		p.Found("{user} can set {settings}.")
 		return nil
 	})
-	settings.Params = check.Params{"user": user, "settings": "async_insert, mutations_sync and join_use_nulls"}
-	settings.Description = "The destination sets async_insert = 0 and mutations_sync = 2 so a write is in a part, and a change done, before it goes on, and join_use_nulls = 0 for the joins a merge makes."
+	settings.Params = check.Params{"user": user, "settings": "async_insert, mutations_sync, join_use_nulls and max_partitions_per_insert_block"}
+	settings.Description = "The destination sets async_insert = 0 and mutations_sync = 2 so a write is in a part, and a change done, before it goes on, and join_use_nulls = 0 for the joins a merge makes and max_partitions_per_insert_block = 0 when it builds an epoch's table, so that rows of any number of a table's partitions land."
 	return append(checks, system, settings)
 }
 

@@ -8,8 +8,10 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 
+	ch "github.com/ClickHouse/clickhouse-go/v2"
 	"github.com/apache/arrow-go/v18/arrow"
 
 	"github.com/openetl-io/openetl/sdk/go/source"
@@ -475,5 +477,72 @@ func TestSourceDateTimeArrays(t *testing.T) {
 	b, _ := json.Marshal(c.rows["ad"][0])
 	if want := `{"a":["2290-01-01T00:00:00.123456Z","1900-01-01T00:00:00Z"],"an":[[null,"2299-12-31T14:59:59.999Z"]],"id":1}`; string(b) != want {
 		t.Errorf("read %s, not %s", b, want)
+	}
+}
+
+// A sorting key's float column, which can hold NaN, isn't one a read orders
+// and resumes by: NaN sorts last and compares false with every value, so a
+// chunk after one with a NaN, or with the value before it, left it out.
+// Rows whose float cursor is NaN aren't read, and a cursor all NaN reads
+// later rows once they come.
+func TestSourceNaN(t *testing.T) {
+	db := newDatabase(t)
+	e := sourceEnv{t: t, db: db, conn: testConn(t)}
+	e.exec("CREATE TABLE $db.fk (id Int64, f Float64) ENGINE = MergeTree ORDER BY f")
+	e.exec("CREATE TABLE $db.gk (id Int64, g Int64, f Float64) ENGINE = MergeTree ORDER BY (g, f)")
+	e.exec("INSERT INTO $db.fk SELECT number + 1, if(number % 4 = 3, nan, number) FROM numbers(40)")
+	e.exec("INSERT INTO $db.gk SELECT number + 1, intDiv(number, 4), if(number % 4 = 3, nan, number) FROM numbers(40)")
+	e.exec("CREATE TABLE $db.fc (id Int64, f Float64) ENGINE = MergeTree ORDER BY id")
+	e.exec("INSERT INTO $db.fc VALUES (1, nan), (2, nan)")
+	s := newTestSource(t, db, `, "chunkRows": 3`)
+	for _, name := range []string{"fk", "gk"} {
+		c := newCollector()
+		if err := s.Read(t.Context(), source.ReadRequest{Streams: []source.ConfiguredStream{{Name: name, SyncMode: source.FullRefresh}}}, c); err != nil {
+			t.Fatal(err)
+		}
+		if got := c.ids(name); !slices.Equal(got, span(1, 40)) {
+			t.Errorf("%s read ids %v, not 1 to 40 once", name, got)
+		}
+	}
+	cs := source.ConfiguredStream{Name: "fc", SyncMode: source.Incremental, Cursor: "f"}
+	c := newCollector()
+	if err := s.Read(t.Context(), source.ReadRequest{Streams: []source.ConfiguredStream{cs}}, c); err != nil {
+		t.Fatal(err)
+	}
+	if got := c.ids("fc"); len(got) != 0 {
+		t.Errorf("read ids %v whose cursor is NaN", got)
+	}
+	e.exec("INSERT INTO $db.fc VALUES (3, 1.5), (4, nan)")
+	cs.State = c.complete["fc"]
+	c = newCollector()
+	if err := s.Read(t.Context(), source.ReadRequest{Streams: []source.ConfiguredStream{cs}}, c); err != nil {
+		t.Fatal(err)
+	}
+	if got := c.ids("fc"); !slices.Equal(got, []int64{3}) {
+		t.Errorf("the next read read ids %v, not 3", got)
+	}
+}
+
+// A chunk reads about its own rows, not the table's rest, nor a group of a
+// key's first column from its start: the read's rows read are about the
+// table's, not its square's over 2. The server reads by blocks of 65,409
+// rows, so a smaller table, or chunk, couldn't tell.
+func TestSourceChunksSkipGranules(t *testing.T) {
+	db := newDatabase(t)
+	e := sourceEnv{t: t, db: db, conn: testConn(t)}
+	e.exec("CREATE TABLE $db.k (g Int64, id Int64) ENGINE = MergeTree ORDER BY (g, id)")
+	e.exec("INSERT INTO $db.k SELECT intDiv(number, 250000), number + 1 FROM numbers(1000000)")
+	s := newTestSource(t, db, `, "chunkRows": 100000`)
+	var read atomic.Uint64
+	ctx := ch.Context(t.Context(), ch.WithProgress(func(p *ch.Progress) { read.Add(p.Rows) }))
+	c := newCollector()
+	if err := s.Read(ctx, source.ReadRequest{Streams: []source.ConfiguredStream{{Name: "k", SyncMode: source.FullRefresh}}}, c); err != nil {
+		t.Fatal(err)
+	}
+	if got := c.ids("k"); !slices.Equal(got, span(1, 1000000)) {
+		t.Fatalf("read %d rows, not ids 1 to 1000000 once", len(got))
+	}
+	if n := read.Load(); n < 1000000 || n > 3500000 {
+		t.Errorf("the read's 10 chunks read %d rows of a table of 1000000", n)
 	}
 }

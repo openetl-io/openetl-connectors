@@ -43,6 +43,7 @@ func (k keyRange) where(c sourceColumn) []string {
 // incremental read's ranges share the highest cursor value it reads and its
 // floor, where the last read's splits all ended.
 func (s *Source) Splits(ctx context.Context, cs source.ConfiguredStream, ended []source.Split) ([]source.Split, error) {
+	ctx = noDeadline{ctx}
 	conn, err := s.cfg.connect(ctx, 1, nil)
 	if err != nil {
 		return nil, err

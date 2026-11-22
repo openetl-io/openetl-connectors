@@ -498,14 +498,16 @@ func widens(from, to string) bool {
 		ts, _ := strconv.Atoi(tm[2])
 		return ts >= fs && tp-ts >= fp-fs
 	}
+	// DateTime64(9) ends at 2262-04-11, Date32 and DateTime64's others at
+	// 2299-12-31, past which ClickHouse would clamp a value or fail to read it.
 	if fm, tm := dt64Spec.FindStringSubmatch(f), dt64Spec.FindStringSubmatch(t); fm != nil && tm != nil {
-		return fm[3] == tm[3] && tm[1] >= fm[1]
+		return fm[3] == tm[3] && tm[1] >= fm[1] && (tm[1] != "9" || fm[1] == "9")
 	}
 	if fm, tm := time64Spec.FindStringSubmatch(f), time64Spec.FindStringSubmatch(t); fm != nil && tm != nil {
 		return tm[1] >= fm[1]
 	}
-	if f == "Date32" && dt64Spec.MatchString(t) {
-		return true
+	if m := dt64Spec.FindStringSubmatch(t); f == "Date32" && m != nil {
+		return m[1] != "9"
 	}
 	if inner, ok := strings.CutPrefix(f, "Array("); ok {
 		if tinner, ok := strings.CutPrefix(t, "Array("); ok {

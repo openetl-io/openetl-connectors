@@ -866,3 +866,139 @@ func TestKillPatch(t *testing.T) {
 		t.Errorf("mutations left: %q, not only theirs", got)
 	}
 }
+
+// A table its user partitioned finely takes an epoch that spans more of
+// its partitions than one insert block may by default, 100: the epoch's
+// rows are built in a table of the destination's own, whose partitions
+// then move one at a time.
+func TestDestinationManyPartitions(t *testing.T) {
+	k := newKit(t)
+	if err := testConn(t).Exec(t.Context(), "CREATE TABLE "+qualified(k.db, "p")+" (id Int64, v Nullable(String)) ENGINE = MergeTree PARTITION BY id ORDER BY id"); err != nil {
+		t.Fatal(err)
+	}
+	s := schemaOf("p", idCol, vCol)
+	w, _ := k.open(1, []destination.Stream{{Name: "p", Mode: destination.Append}}, destination.Epoch{}, nil)
+	k.apply(w, s)
+	var rows []row
+	for i := range 150 {
+		rows = append(rows, ins(1, int64(i), "x"))
+	}
+	k.commit(w, epoch(1, 1), batchOf(s, rows...))
+	wantRows(t, "p's rows and partitions", k.query("SELECT concat(toString(count()), ' ', toString(uniqExact(_partition_id))) FROM $db.p"), "150 150")
+}
+
+// An overwrite's replace that comes after another applier finished the
+// epoch, as one paused past its checks would, leaves the table as that
+// applier made it: the read's table is gone because the epoch is applied,
+// not because the read was empty.
+func TestDestinationReplaceAfterApplied(t *testing.T) {
+	k := newKit(t)
+	s := schemaOf("o", idCol, vCol)
+	w, _ := k.open(1, []destination.Stream{{Name: "o", Mode: destination.Overwrite}}, destination.Epoch{}, nil)
+	k.apply(w, s)
+	if err := w.StartReads(t.Context(), map[string]time.Time{"o": time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.EndRead(t.Context(), epoch(1, 1), "o"); err != nil {
+		t.Fatal(err)
+	}
+	st := k.stage(w, epoch(1, 1), batchOf(s, ins(1, int64(1), "a")))
+	if _, err := w.Commit(t.Context(), epoch(1, 1), []destination.Staged{st}); err != nil {
+		t.Fatal(err)
+	}
+	wantRows(t, "o", k.rows("o", "id", "v"), "1|a")
+	desc, err := w.mergeLanes([]destination.Staged{st})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.replace(t.Context(), desc, desc.Streams[0]); err != nil {
+		t.Fatal(err)
+	}
+	wantRows(t, "o after a late replace", k.rows("o", "id", "v"), "1|a")
+}
+
+// A replaced attempt that drops its stream's abandoned reads after a newer
+// generation started a read of its own, as one paused past its checks
+// would, leaves the newer read's table, which holds that read's epochs.
+func TestDestinationStaleDropsNoNewerRead(t *testing.T) {
+	k := newKit(t)
+	s := schemaOf("o", idCol, vCol)
+	streams := []destination.Stream{{Name: "o", Mode: destination.Overwrite}}
+	w1, _ := k.open(1, streams, destination.Epoch{}, nil)
+	k.apply(w1, s)
+	start := time.Now()
+	if err := w1.StartReads(t.Context(), map[string]time.Time{"o": start}); err != nil {
+		t.Fatal(err)
+	}
+	if err := w1.EndRead(t.Context(), epoch(1, 1), "o"); err != nil {
+		t.Fatal(err)
+	}
+	st := k.stage(w1, epoch(1, 1), batchOf(s, ins(1, int64(1), "a")))
+	w2, r := k.open(2, streams, epoch(1, 1), []destination.Staged{st})
+	if r != destination.Redone {
+		t.Fatalf("recovered %v, not redone", r)
+	}
+	k.apply(w2, s)
+	if err := w2.StartReads(t.Context(), map[string]time.Time{"o": start.Add(time.Second)}); err != nil {
+		t.Fatal(err)
+	}
+	k.commit(w2, epoch(2, 2), batchOf(s, ins(1, int64(2), "b")))
+	desc, err := w1.mergeLanes([]destination.Staged{st})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w1.dropAbandonedReads(t.Context(), w1.abandoned(desc.Streams[0])); err != nil {
+		t.Fatal(err)
+	}
+	if err := w2.EndRead(t.Context(), epoch(2, 3), "o"); err != nil {
+		t.Fatal(err)
+	}
+	k.commit(w2, epoch(2, 3))
+	wantRows(t, "o after generation 2's read", k.rows("o", "id", "v"), "2|b")
+}
+
+// A lane keeps at most maxPendingBytes of batches in all, whatever its
+// number of streams: past it, it inserts its largest stream's.
+func TestDestinationPendingBound(t *testing.T) {
+	k := newKit(t)
+	var streams []destination.Stream
+	var schemas []*arrow.Schema
+	for i := range 9 {
+		streams = append(streams, destination.Stream{Name: fmt.Sprintf("s%d", i), Mode: destination.Append})
+		schemas = append(schemas, schemaOf(fmt.Sprintf("s%d", i), idCol, vCol))
+	}
+	w, _ := k.open(1, streams, destination.Epoch{}, nil)
+	k.apply(w, schemas...)
+	big := strings.Repeat("x", 1<<20)
+	var batches []arrow.RecordBatch
+	for _, s := range schemas {
+		var rows []row
+		for i := range 30 {
+			rows = append(rows, ins(int64(i), int64(i), big))
+		}
+		batches = append(batches, batchOf(s, rows...))
+	}
+	for i, b := range batches {
+		if err := w.Write(t.Context(), epoch(1, 1), streams[i].Name, b); err != nil {
+			t.Fatal(err)
+		}
+		b.Release()
+	}
+	var pending int64
+	for _, ls := range w.staging[1] {
+		pending += ls.pendingBytes
+	}
+	if pending > maxPendingBytes {
+		t.Errorf("the lane keeps %d bytes of 9 streams' batches", pending)
+	}
+	st, err := w.PreCommit(t.Context(), epoch(1, 1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Commit(t.Context(), epoch(1, 1), []destination.Staged{st}); err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range streams {
+		wantRows(t, s.Name, k.query("SELECT toString(count()) FROM $db."+ident(s.Name)), "30")
+	}
+}
