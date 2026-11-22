@@ -452,6 +452,32 @@ func TestMergeCompositeKeyPastIndexLimit(t *testing.T) {
 	}
 }
 
+// Two patch columns that fill one held column both land: the first's UPDATE
+// leaves the cell held for the second's.
+func TestPatchFillsAHeldColumnTwice(t *testing.T) {
+	env := newEnv(t)
+	w := env.openStreams(1, destination.ScopePipeline, destination.Stream{Name: "users", Mode: destination.Merge, PrimaryKey: []string{"id"}})
+	recov(t, w, 1, destination.Epoch{})
+	idCol := arrow.Field{Name: idColumn, Type: &arrow.FixedSizeBinaryType{ByteWidth: 16}, Nullable: true,
+		Metadata: arrow.NewMetadata([]string{extensionNameKey}, []string{uuidExtension})}
+	held := arrow.Field{Name: heldColumn, Type: arrow.ListOf(arrow.BinaryTypes.String), Nullable: true}
+	price := arrow.Field{Name: "price", Type: arrow.BinaryTypes.String, Nullable: true}
+	v2 := arrow.Field{Name: "price__v2", Type: arrow.PrimitiveTypes.Float64, Nullable: true}
+	commit(t, w, 1, "users", batch(t, []arrow.Field{idField, idCol, opField, seqField, price, v2, held},
+		`[{"id": 1, "_openetl_id": "AQEBAQEBAQEBAQEBAQEBAQ==", "_openetl_op": "update", "_openetl_seq": 1, "price": null, "_openetl_held": ["price"]}]`))
+	fills := v2
+	fills.Metadata = arrow.NewMetadata([]string{destination.FillsKey}, []string{"price"})
+	e := destination.Epoch{Generation: 1, N: 2}
+	if err := w.(destination.Patcher).Patch(t.Context(), e, "users", batch(t, []arrow.Field{idField, idCol, seqField, held, fills, price},
+		`[{"id": 1, "_openetl_id": "AQEBAQEBAQEBAQEBAQEBAQ==", "_openetl_seq": 1, "_openetl_held": ["price"], "price__v2": 2.5, "price": "2.50"}]`)); err != nil {
+		t.Fatal(err)
+	}
+	commit(t, w, 2, "users")
+	if got := env.rows("SELECT CONCAT(coalesce(price, '-'), ':', price__v2, ':', coalesce(_openetl_held, '-')) FROM $schema.users"); !slices.Equal(got, []string{"2.50:2.5:-"}) {
+		t.Errorf("got %v", got)
+	}
+}
+
 func TestDedupe(t *testing.T) {
 	env := newEnv(t)
 	idCol := arrow.Field{Name: idColumn, Type: &arrow.FixedSizeBinaryType{ByteWidth: 16}, Nullable: true,
