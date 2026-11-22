@@ -390,10 +390,8 @@ func (w *writer) close(ef *epochFiles) error {
 func (w *writer) PreCommit(_ context.Context, e destination.Epoch) (_ destination.Staged, err error) {
 	defer func() { err = w.d.store.classify(err) }()
 	desc := staged{Generation: e.Generation, Epoch: e.N}
-	byStream := w.parts[e.N]
-	delete(w.parts, e.N)
-	ended := w.ended[e.N]
-	delete(w.ended, e.N)
+	// Until it's staged, the epoch's files stay where Close drops them.
+	byStream, ended := w.parts[e.N], w.ended[e.N]
 	for _, s := range w.cfg.Streams {
 		ef := byStream[s.Name]
 		end := s.Mode == destination.Overwrite && slices.Contains(ended, s.Name)
@@ -417,6 +415,8 @@ func (w *writer) PreCommit(_ context.Context, e destination.Epoch) (_ destinatio
 		}
 		desc.Streams = append(desc.Streams, ss)
 	}
+	delete(w.parts, e.N)
+	delete(w.ended, e.N)
 	return json.Marshal(desc)
 }
 

@@ -8,7 +8,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"maps"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
@@ -714,6 +716,44 @@ func testDestinationPreflight(e *env) {
 	it := e.b.List(&blob.ListOptions{Prefix: reserved + "/check-"})
 	if obj, err := it.Next(t.Context()); err == nil {
 		t.Errorf("the preflight left %s", obj.Key)
+	}
+}
+
+// A PreCommit that fails to close one stream's file leaves the epoch's other
+// files to Close, which drops them.
+func TestFailedPreCommitLeavesItsEpochToClose(t *testing.T) {
+	dir := t.TempDir()
+	d := newDest(t, map[string]any{"url": "file://" + dir}, nil)
+	b, err := d.bucket(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = b.Close() })
+	e := &env{t: t, d: d, b: b}
+	w := e.open(1, "a", "b")
+	e.recover(w, 1, destination.Epoch{}, nil)
+	ep := destination.Epoch{Generation: 1, N: 1}
+	e.write(w, ep, "a", 1)
+	e.write(w, ep, "b", 2)
+	// a's file can't take its name, where a directory is.
+	if err := b.WriteAll(t.Context(), reserved+"/p1/staging/1/1/a/part-00000.parquet/x", nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.PreCommit(t.Context(), ep); err == nil {
+		t.Fatal("PreCommit took a file where a directory is")
+	}
+	if err := w.Close(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	var left []string
+	_ = filepath.WalkDir(filepath.Join(dir, reserved, "p1", "staging"), func(p string, de fs.DirEntry, err error) error {
+		if err == nil && !de.IsDir() && !strings.Contains(p, "part-00000.parquet/x") {
+			left = append(left, p)
+		}
+		return nil
+	})
+	if len(left) > 0 {
+		t.Errorf("left %v", left)
 	}
 }
 
