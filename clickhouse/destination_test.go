@@ -55,16 +55,29 @@ func newKit(t *testing.T) kit {
 // open opens lane 0's writer as generation gen, and recovers e.
 func (k kit) open(gen uint64, streams []destination.Stream, e destination.Epoch, staged []destination.Staged) (*writer, destination.Recovery) {
 	k.t.Helper()
+	w := k.writer(gen, streams)
+	r, err := w.Recover(k.t.Context(), gen, e, staged)
+	if err != nil {
+		k.t.Fatalf("recover generation %d: %v", gen, err)
+	}
+	return w, r
+}
+
+// writer opens lane 0's writer as generation gen, without recovering.
+func (k kit) writer(gen uint64, streams []destination.Stream) *writer {
+	k.t.Helper()
 	w, err := k.d.Open(k.t.Context(), destination.OpenConfig{Pipeline: "p", Generation: gen, Scope: destination.ScopeStream, Namespace: k.db, Streams: streams})
 	if err != nil {
 		k.t.Fatal(err)
 	}
 	k.t.Cleanup(func() { _ = w.Close(k.t.Context()) })
-	r, err := w.Recover(k.t.Context(), gen, e, staged)
-	if err != nil {
-		k.t.Fatalf("recover generation %d: %v", gen, err)
-	}
-	return w.(*writer), r
+	return w.(*writer)
+}
+
+// exists reports whether the kit's database has table.
+func (k kit) exists(table string) bool {
+	k.t.Helper()
+	return slices.Equal(k.query("SELECT toString(count()) FROM system.tables WHERE database = '"+k.db+"' AND name = '"+table+"'"), []string{"1"})
 }
 
 func (k kit) apply(w *writer, schemas ...*arrow.Schema) destination.SchemaApplied {
@@ -1021,5 +1034,50 @@ func TestDestinationFenceOfGenerationZero(t *testing.T) {
 	t.Cleanup(func() { _ = other.Close(t.Context()) })
 	if err := other.(*writer).checkFence(t.Context()); err == nil || !strings.Contains(err.Error(), "Recover must run first") {
 		t.Errorf("a pipeline whose fence has no row: %v", err)
+	}
+}
+
+// A generation that no longer overwrites a stream drops the stream's read
+// tables when it recovers, but none once a newer generation has raised the
+// fence, which may overwrite the stream and be writing the read, and none a
+// newer generation made. Each generation here drops them as its Recover
+// would once paused past its own raise of the fence.
+func TestDestinationFencedKeepsNewerReads(t *testing.T) {
+	k := newKit(t)
+	s := schemaOf("o", idCol, vCol)
+	overwrite := []destination.Stream{{Name: "o", Mode: destination.Overwrite}}
+	appends := []destination.Stream{{Name: "o", Mode: destination.Append}}
+	start := time.Now()
+	w1, _ := k.open(1, overwrite, destination.Epoch{}, nil)
+	k.apply(w1, s)
+	if err := w1.StartReads(t.Context(), map[string]time.Time{"o": start}); err != nil {
+		t.Fatal(err)
+	}
+	k.commit(w1, epoch(1, 1), batchOf(s, ins(1, int64(1), "a")))
+	// Generation 2 goes on with the read, whose table keeps generation 1's
+	// label.
+	w2, _ := k.open(2, overwrite, destination.Epoch{}, nil)
+	k.apply(w2, s)
+	if err := w2.StartReads(t.Context(), map[string]time.Time{"o": start}); err != nil {
+		t.Fatal(err)
+	}
+	k.commit(w2, epoch(2, 2), batchOf(s, ins(1, int64(2), "b")))
+	read := readName("p", "o", start)
+	k.writer(1, appends).dropRemovedReads(t.Context(), 1)
+	if !k.exists(read) {
+		t.Fatal("a generation behind the fence dropped the read a newer one goes on with")
+	}
+	// Generation 3 makes a read of its own, as it would once it raised the
+	// fence after generation 2's drop read it.
+	newer := readName("p", "o", start.Add(time.Second))
+	if err := k.writer(3, overwrite).ensureRead(t.Context(), stagedStream{Name: "o", Table: "o", Read: newer}); err != nil {
+		t.Fatal(err)
+	}
+	k.writer(2, appends).dropRemovedReads(t.Context(), 2)
+	if !k.exists(newer) {
+		t.Error("the fence's generation dropped a newer generation's read")
+	}
+	if k.exists(read) {
+		t.Error("the fence's generation, which appends, kept the stream's read")
 	}
 }

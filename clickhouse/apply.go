@@ -928,7 +928,7 @@ func (w *writer) Recover(ctx context.Context, gen uint64, e destination.Epoch, c
 		}
 	}
 	if e.IsZero() {
-		w.dropRemovedReads(ctx)
+		w.dropRemovedReads(ctx, gen)
 		return destination.Applied, nil
 	}
 	desc, err := w.mergeLanes(committables)
@@ -985,7 +985,7 @@ func (w *writer) Recover(ctx context.Context, gen uint64, e destination.Epoch, c
 		w.trimMarkers(ctx, desc.Epoch)
 	}
 	w.dropStale(ctx, gen)
-	w.dropRemovedReads(ctx)
+	w.dropRemovedReads(ctx, gen)
 	return r, nil
 }
 
@@ -1052,10 +1052,14 @@ func (w *writer) dropAbandonedReads(ctx context.Context, drop func(l label, tabl
 }
 
 // dropRemovedReads drops the read tables of streams that no longer
-// overwrite, once Recover has raised the fence. Best effort.
-func (w *writer) dropRemovedReads(ctx context.Context) {
+// overwrite, once Recover has raised the fence to gen: none a newer
+// generation made, and none once a newer generation has raised the fence,
+// as it may overwrite such a stream and be writing its read. With no
+// transaction to hold the fence in, it reads it again before each drop.
+// Best effort.
+func (w *writer) dropRemovedReads(ctx context.Context, gen uint64) {
 	_ = w.dropAbandonedReads(ctx, func(l label, _ string) bool {
-		return w.streams[l.Stream].Mode != destination.Overwrite
+		return l.Generation <= gen && w.streams[l.Stream].Mode != destination.Overwrite && w.fenceAt(ctx, gen) == nil
 	})
 }
 
