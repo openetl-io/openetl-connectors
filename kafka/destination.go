@@ -410,9 +410,9 @@ func (w *writer) Write(ctx context.Context, e destination.Epoch, stream string, 
 	}
 	vals := make([]any, len(enc.cols))
 	keyVals := make([]any, len(enc.key))
-	promise := func(_ *kgo.Record, err error) {
+	promise := func(r *kgo.Record, err error) {
 		if err != nil {
-			s.fail(err)
+			s.fail(produceFailed(r, err))
 		}
 	}
 	for i := range int(batch.NumRows()) {
@@ -444,6 +444,15 @@ func (w *writer) Write(ctx context.Context, e destination.Epoch, stream string, 
 		}
 	}
 	return nil
+}
+
+// produceFailed is a record's failed produce, naming its topic, and for a
+// record too large, the limits it passed.
+func produceFailed(r *kgo.Record, err error) error {
+	if errors.Is(err, kerr.MessageTooLarge) || errors.Is(err, kerr.RecordListTooLarge) {
+		return fmt.Errorf("kafka: a record for %s: %w: a row's record, with its key and headers, must fit in the client's batch limit of 1000012 bytes and in the topic's max.message.bytes", r.Topic, err)
+	}
+	return fmt.Errorf("kafka: a record for %s: %w", r.Topic, err)
 }
 
 // marker is a writer lane's record of an epoch on the marker topic, in
