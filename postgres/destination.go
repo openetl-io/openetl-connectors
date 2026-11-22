@@ -602,7 +602,8 @@ func (w *writer) patch(s stagedStream, p prepared) []string {
 // other columns as they were, with its metadata columns updated, or with
 // hard deletes removes the row. A column in unchanged that the latest
 // version didn't send takes its value from the key's latest staged version
-// that did, or else keeps the target's.
+// that did, unless the target's row is newer than that version, or else
+// keeps the target's.
 func (w *writer) merge(s stagedStream, p prepared) []string {
 	cols, unchanged := p.cols, p.unchanged
 	q := func(c string) string { return pgx.Identifier{c}.Sanitize() }
@@ -679,7 +680,8 @@ func (w *writer) merge(s stagedStream, p prepared) []string {
 
 // latestResolved is merge's CTE of each key's latest staged version, whose
 // unchanged columns come from the key's latest earlier version that sent
-// them, if any; its _openetl_unchanged then leaves them out.
+// them and isn't older than the target's row, if any; its
+// _openetl_unchanged then leaves them out.
 func (w *writer) latestResolved(s stagedStream, prep prepared, hasSeq bool) string {
 	cols, unchanged := prep.cols, prep.unchanged
 	q := func(c string) string { return pgx.Identifier{c}.Sanitize() }
@@ -694,8 +696,15 @@ func (w *writer) latestResolved(s stagedStream, prep prepared, hasSeq bool) stri
 		latestFirst = es + " DESC NULLS LAST, " + latestFirst
 	}
 	match := make([]string, len(s.Key))
+	target := make([]string, len(s.Key))
 	for i, k := range s.Key {
 		match[i] = "e." + q(k) + " = l." + q(k)
+		target[i] = "cur." + q(k) + " = l." + q(k)
+	}
+	if hasSeq {
+		// Nor older than the target's row, whose value is newer; a missing
+		// seq doesn't stop it, as in merge.
+		before += " AND NOT EXISTS (SELECT 1 FROM " + w.ident(s.Table) + " cur WHERE " + strings.Join(target, " AND ") + " AND cur." + q(seqColumn) + " > e." + q(seqColumn) + ")"
 	}
 	sel := make([]string, len(cols))
 	for i, c := range cols {

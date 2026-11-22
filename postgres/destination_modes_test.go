@@ -479,3 +479,28 @@ func TestMergeUnchangedWithoutSeq(t *testing.T) {
 		t.Errorf("users = %s", got)
 	}
 }
+
+// A column the latest version didn't send keeps the target's value where
+// the staged version that sent it is older than the target's row, or where
+// no staged version sent it.
+func TestMergeUnchangedOlderThanTarget(t *testing.T) {
+	env := newEnv(t)
+	w := env.openStreams(1, destination.ScopePipeline, destination.Stream{Name: "users", Mode: destination.Merge, PrimaryKey: []string{"id"}})
+	recov(t, w, 1, destination.Epoch{}, nil)
+	fields := []arrow.Field{idField, nameField, nField, opField, seqField, unchangedField, deletedField}
+	write(t, w, destination.Epoch{Generation: 1, N: 1}, "users", batch(t, fields, `[
+		{"id": 1, "name": "current", "n": 10, "_openetl_op": "insert", "_openetl_seq": 10, "_openetl_deleted": false},
+		{"id": 2, "name": "current", "n": 10, "_openetl_op": "insert", "_openetl_seq": 10, "_openetl_deleted": false},
+		{"id": 3, "name": "current", "n": 10, "_openetl_op": "insert", "_openetl_seq": 10, "_openetl_deleted": false}]`))
+	commit(t, w, destination.Epoch{Generation: 1, N: 1})
+	write(t, w, destination.Epoch{Generation: 1, N: 2}, "users", batch(t, fields, `[
+		{"id": 1, "name": "old", "n": 5, "_openetl_op": "update", "_openetl_seq": 5, "_openetl_deleted": false},
+		{"id": 1, "name": null, "n": 11, "_openetl_op": "update", "_openetl_seq": 11, "_openetl_unchanged": ["name"], "_openetl_deleted": false},
+		{"id": 2, "name": "newer", "n": 12, "_openetl_op": "update", "_openetl_seq": 12, "_openetl_deleted": false},
+		{"id": 2, "name": null, "n": 13, "_openetl_op": "update", "_openetl_seq": 13, "_openetl_unchanged": ["name"], "_openetl_deleted": false},
+		{"id": 3, "name": null, "n": 11, "_openetl_op": "update", "_openetl_seq": 11, "_openetl_unchanged": ["name"], "_openetl_deleted": false}]`))
+	commit(t, w, destination.Epoch{Generation: 1, N: 2})
+	if got := env.text(usersN); got != "1:current:11:-,2:newer:13:-,3:current:11:-" {
+		t.Errorf("users = %s", got)
+	}
+}
