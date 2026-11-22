@@ -530,3 +530,41 @@ func TestFencedKeepsNewerReads(t *testing.T) {
 		t.Error("the fenced generation dropped the newer one's read")
 	}
 }
+
+// An epoch whose batches have no columns lands their rows, which hold
+// nothing, appended or overwritten, as Commit applies it and as a new
+// generation's Recover redoes it: its staging has no columns, and is there.
+func TestEpochOfBatchesWithoutColumns(t *testing.T) {
+	env := newEnv(t)
+	empty := func() arrow.RecordBatch {
+		rec := array.NewRecordBatch(arrow.NewSchema(nil, nil), nil, 3)
+		t.Cleanup(rec.Release)
+		return rec
+	}
+	streams := []destination.Stream{{Name: "added", Mode: destination.Append}, {Name: "over", Mode: destination.Overwrite}}
+	w := env.openStreams(1, destination.ScopePipeline, streams...)
+	recov(t, w, 1, destination.Epoch{}, nil)
+	rt := startReads(t, w, map[string]time.Time{"over": time.UnixMicro(1000)})
+	e1, e2 := destination.Epoch{Generation: 1, N: 1}, destination.Epoch{Generation: 1, N: 2}
+	write(t, w, e1, "added", empty())
+	write(t, w, e1, "over", empty())
+	commit(t, w, e1)
+	if n := env.count("SELECT count(*) FROM $schema.added"); n != 3 {
+		t.Errorf("committed: %d rows, want 3", n)
+	}
+
+	write(t, w, e2, "added", empty())
+	write(t, w, e2, "over", empty())
+	endRead(t, rt, e2, "over")
+	st2 := precommit(t, w, e2)
+	w2 := env.openStreams(2, destination.ScopePipeline, streams...)
+	if r := recov(t, w2, 2, e2, st2); r != destination.Redone {
+		t.Fatalf("Recover = %v, want redone", r)
+	}
+	if n := env.count("SELECT count(*) FROM $schema.added"); n != 6 {
+		t.Errorf("redone: %d rows, want 6", n)
+	}
+	if n := env.count("SELECT count(*) FROM $schema.over"); n != 6 {
+		t.Errorf("the read that ended: %d rows, want 6", n)
+	}
+}
