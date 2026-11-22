@@ -57,6 +57,7 @@ func fakeConfig(t *testing.T, addrs []string, extra map[string]any) []byte {
 // lanes is a pipeline's destination on a fake broker, writing table.
 type lanes struct {
 	t        *testing.T
+	c        *kfake.Cluster
 	addrs    []string
 	d        *Destination
 	pipeline string
@@ -65,12 +66,13 @@ type lanes struct {
 
 func newLanes(t *testing.T) *lanes {
 	t.Helper()
-	addrs := fake(t)
+	c := fakeCluster(t)
+	addrs := c.ListenAddrs()
 	d, err := NewDestination(fakeConfig(t, addrs, nil))
 	if err != nil {
 		t.Fatal(err)
 	}
-	return &lanes{t: t, addrs: addrs, d: d, pipeline: "6f1c2b9e-0d4a-4c51-9a37-2f1e8b7d3c10", table: "items"}
+	return &lanes{t: t, c: c, addrs: addrs, d: d, pipeline: "6f1c2b9e-0d4a-4c51-9a37-2f1e8b7d3c10", table: "items"}
 }
 
 // open opens writer lane lane of generation gen, which an attempt closes
@@ -393,6 +395,8 @@ type splitEvents struct {
 	// Each split's last state; events show states without their topic
 	// IDs, which a fake cluster makes up.
 	states map[string][]byte
+	// The IDs of the splits the read added, in order.
+	added []string
 }
 
 func (c *splitEvents) add(id string, events ...string) {
@@ -446,8 +450,13 @@ func (s splitLog) Rows(rows []json.RawMessage) error {
 	return nil
 }
 func (s splitLog) Records(arrow.RecordBatch) error { return errors.New("records") }
-func (s splitLog) ResumePoint(state []byte, _ ...source.Split) error {
+func (s splitLog) ResumePoint(state []byte, added ...source.Split) error {
 	s.c.state(s.id, "resume", state)
+	s.c.mu.Lock()
+	for _, a := range added {
+		s.c.added = append(s.c.added, a.ID)
+	}
+	s.c.mu.Unlock()
 	return nil
 }
 func (s splitLog) Complete(next []byte, _ ...source.Split) error {

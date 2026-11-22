@@ -149,6 +149,8 @@ func (d *Destination) Open(ctx context.Context, cfg destination.OpenConfig) (des
 		streams: map[string]destination.Stream{},
 		encs:    map[string]*streamEncoder{},
 		topics:  map[string]bool{},
+		held:    map[destination.Epoch][]*kgo.Record{},
+		aborted: map[destination.Epoch]error{},
 	}
 	for _, s := range cfg.Streams {
 		w.streams[s.Name] = s
@@ -175,6 +177,13 @@ type writer struct {
 	// Only the goroutine that calls Write and PreCommit uses these.
 	encs   map[string]*streamEncoder
 	topics map[string]bool
+	// The records of epochs whose slot still has an earlier epoch's
+	// transaction open, which go into the epoch's own once it begins.
+	held map[destination.Epoch][]*kgo.Record
+	// Only Commit uses this: the epochs whose transaction ended aborted
+	// though no newer writer fenced this one, with the error a Commit of
+	// one gives until its marker is found.
+	aborted map[destination.Epoch]error
 }
 
 // slot is one transactional producer.
@@ -189,12 +198,32 @@ type slot struct {
 	begun time.Time
 	// The transaction's first failed produce.
 	err error
+	// Closed once the Commit that is ending the transaction has ended it;
+	// nil while none is.
+	ending chan struct{}
 }
 
 func (s *slot) fail(err error) {
 	s.mu.Lock()
 	if s.err == nil {
 		s.err = err
+	}
+	s.mu.Unlock()
+}
+
+func (s *slot) produced(r *kgo.Record, err error) {
+	if err != nil {
+		s.fail(produceFailed(r, err))
+	}
+}
+
+// end marks the slot's transaction ended by Commit.
+func (s *slot) end() {
+	s.mu.Lock()
+	s.epoch = destination.Epoch{}
+	if s.ending != nil {
+		close(s.ending)
+		s.ending = nil
 	}
 	s.mu.Unlock()
 }
@@ -380,22 +409,51 @@ func (w *writer) encoder(ctx context.Context, stream string, sc *arrow.Schema) (
 	return e, nil
 }
 
-// txn returns epoch e's slot, with its transaction begun.
-func (w *writer) txn(e destination.Epoch) (*slot, error) {
+// txn returns epoch e's slot, with its transaction begun and e's held
+// records in it. While the slot's transaction is an earlier epoch's, it
+// waits for the Commit that is ending it. Before that Commit has begun,
+// with hold, it returns nil: the caller holds e's records, since the
+// platform may send that Commit after them, on the stream that brings
+// them, which a wait would stop reading. A transform lets the platform
+// have one epoch more in flight than a lane has slots.
+func (w *writer) txn(ctx context.Context, e destination.Epoch, hold bool) (*slot, error) {
 	s := w.slots[e.N%slots]
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.epoch == e {
-		return s, nil
+	for {
+		s.mu.Lock()
+		open, ending := s.epoch, s.ending
+		if open == e {
+			s.mu.Unlock()
+			return s, nil
+		}
+		if open.IsZero() {
+			err := s.cl.BeginTransaction()
+			if err == nil {
+				s.epoch, s.begun, s.err = e, time.Now(), nil
+			}
+			s.mu.Unlock()
+			if err != nil {
+				return nil, fmt.Errorf("kafka: begin a transaction on %s: %w", s.id, err)
+			}
+			for _, r := range w.held[e] {
+				s.cl.Produce(w.ctx, r, s.produced)
+			}
+			delete(w.held, e)
+			return s, nil
+		}
+		s.mu.Unlock()
+		switch {
+		case ending != nil:
+			select {
+			case <-ending:
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		case hold:
+			return nil, nil
+		default:
+			return nil, fmt.Errorf("kafka: producer %s still has epoch %d open, writing %d", s.id, open.N, e.N)
+		}
 	}
-	if !s.epoch.IsZero() {
-		return nil, fmt.Errorf("kafka: producer %s still has epoch %d open, writing %d", s.id, s.epoch.N, e.N)
-	}
-	if err := s.cl.BeginTransaction(); err != nil {
-		return nil, fmt.Errorf("kafka: begin a transaction on %s: %w", s.id, err)
-	}
-	s.epoch, s.begun, s.err = e, time.Now(), nil
-	return s, nil
 }
 
 // outlived: s's transaction has been open as long as its timeout, so the
@@ -432,17 +490,19 @@ func (w *writer) Write(ctx context.Context, e destination.Epoch, stream string, 
 	if err != nil {
 		return err
 	}
-	s, err := w.txn(e)
+	s, err := w.txn(ctx, e, true)
 	if err != nil {
 		return err
 	}
+	produce := func(r *kgo.Record) {
+		if s == nil {
+			w.held[e] = append(w.held[e], r)
+			return
+		}
+		s.cl.Produce(w.ctx, r, s.produced)
+	}
 	vals := make([]any, len(enc.cols))
 	keyVals := make([]any, len(enc.key))
-	promise := func(r *kgo.Record, err error) {
-		if err != nil {
-			s.fail(produceFailed(r, err))
-		}
-	}
 	for i := range int(batch.NumRows()) {
 		for j := range enc.cols {
 			if vals[j], err = enc.cols[j].At(batch.Column(j), i); err != nil {
@@ -466,9 +526,9 @@ func (w *writer) Write(ctx context.Context, e destination.Epoch, stream string, 
 				rec.Headers = []kgo.RecordHeader{{Key: idHeader, Value: []byte(id)}}
 			}
 		}
-		s.cl.Produce(w.ctx, rec, promise)
+		produce(rec)
 		if w.d.cfg.Tombstones && rec.Key != nil && enc.op >= 0 && vals[enc.op] == "delete" {
-			s.cl.Produce(w.ctx, &kgo.Record{Topic: enc.topic, Key: rec.Key}, promise)
+			produce(&kgo.Record{Topic: enc.topic, Key: rec.Key})
 		}
 	}
 	return nil
@@ -527,7 +587,8 @@ type staged struct {
 // PreCommit adds the lane's marker of the epoch to its transaction and
 // flushes it.
 func (w *writer) PreCommit(ctx context.Context, e destination.Epoch) (destination.Staged, error) {
-	s, err := w.txn(e)
+	// The platform asks for epoch N's pre-commit once N-3 has committed.
+	s, err := w.txn(ctx, e, false)
 	if err != nil {
 		return nil, err
 	}
@@ -575,7 +636,9 @@ func (w *writer) committable(e destination.Epoch, committables []destination.Sta
 // is settled by aborting it on the same producer, which leaves a commit
 // that reached the broker in place; Commit then looks for the lane's marker
 // of the epoch, as it does without a transaction open for the epoch, after
-// an earlier Commit.
+// an earlier Commit. Without the marker, an epoch that outlived its timeout
+// or that this abort ended fails as transient, in a Commit again too; one
+// aborted otherwise was fenced.
 func (w *writer) Commit(ctx context.Context, e destination.Epoch, committables []destination.Staged) (destination.Committed, error) {
 	desc, err := w.committable(e, committables)
 	if err != nil {
@@ -584,26 +647,23 @@ func (w *writer) Commit(ctx context.Context, e destination.Epoch, committables [
 	s := w.slots[desc.Slot%slots]
 	s.mu.Lock()
 	open := s.epoch == e
+	if open {
+		s.ending = make(chan struct{})
+	}
 	s.mu.Unlock()
 	outlived := open && w.outlived(s)
-	var ended error
 	if open {
-		ended = s.cl.EndTransaction(ctx, kgo.TryCommit)
-		if ended != nil && !fenced(ended) {
-			// The abort's success says nothing of the commit's: the marker
-			// does.
-			if aerr := s.cl.EndTransaction(ctx, kgo.TryAbort); fenced(aerr) {
-				ended = aerr
-			}
-		}
-		s.mu.Lock()
-		s.epoch = destination.Epoch{}
-		s.mu.Unlock()
+		ended, settled := endTxn(ctx, s)
+		s.end()
 		switch {
 		case ended == nil:
 			return destination.Committed{}, nil
-		case fenced(ended) && !outlived:
+		case outlived:
+			w.aborted[e] = w.timedOut(e, ended)
+		case fenced(ended):
 			return destination.Committed{}, fmt.Errorf("%w: kafka: commit epoch %d: %w", destination.ErrFenced, e.N, ended)
+		case settled:
+			w.aborted[e] = sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_TRANSIENT, fmt.Errorf("kafka: epoch %d's commit failed, and its transaction was aborted: %w", e.N, ended))
 		}
 	}
 	ok, err := w.applied(ctx, e, desc)
@@ -611,11 +671,31 @@ func (w *writer) Commit(ctx context.Context, e destination.Epoch, committables [
 	case err != nil:
 		return destination.Committed{}, err
 	case ok:
+		delete(w.aborted, e)
 		return destination.Committed{}, nil
-	case outlived:
-		return destination.Committed{}, w.timedOut(e, ended)
+	case w.aborted[e] != nil:
+		return destination.Committed{}, w.aborted[e]
 	}
 	return destination.Committed{}, fmt.Errorf("%w: kafka: epoch %d's transaction was aborted", destination.ErrFenced, e.N)
+}
+
+// endTxn commits the slot's transaction, and settles a commit that failed
+// other than by a fence by aborting the transaction. settled: that abort
+// ended a transaction still this producer's, which INVALID_TXN_STATE, as
+// after a newer writer's or the brokers' abort, says it wasn't.
+func endTxn(ctx context.Context, s *slot) (ended error, settled bool) {
+	ended = s.cl.EndTransaction(ctx, kgo.TryCommit)
+	if ended == nil || fenced(ended) {
+		return ended, false
+	}
+	// The abort's success says nothing of the commit's: the marker does.
+	if aerr := s.cl.EndTransaction(ctx, kgo.TryAbort); aerr != nil {
+		if fenced(aerr) {
+			return aerr, false
+		}
+		return ended, false
+	}
+	return ended, !errors.Is(ended, kerr.InvalidTxnState)
 }
 
 func fenced(err error) bool {
