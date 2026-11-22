@@ -251,3 +251,15 @@ func TestPartialRowImagesFail(t *testing.T) {
 		})
 	}
 }
+
+// TestUnexpectedBinlogValuesFail reads a value of a Go type the binlog's
+// decoder doesn't give, as a newer one might: the read fails, as the binlog
+// no longer reads as it did.
+func TestUnexpectedBinlogValuesFail(t *testing.T) {
+	r, _ := binlogReader(t, false)
+	err := feed(t, r, at(100, replication.QUERY_EVENT, query("BEGIN")), at(150, replication.TABLE_MAP_EVENT, itemsMap()),
+		at(200, replication.WRITE_ROWS_EVENTv2, itemRows([]any{int32(1), struct{}{}})))
+	if connectortest.CodeOf(err) != protocolv1.ErrorCode_ERROR_CODE_CONTRACT_CHANGED || !strings.Contains(err.Error(), "items.v") {
+		t.Fatalf("%v (%v)", err, connectortest.CodeOf(err))
+	}
+}
