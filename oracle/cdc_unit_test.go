@@ -7,6 +7,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/memory"
 
 	"github.com/openetl-io/openetl-connectors/connectortest"
+	protocolv1 "github.com/openetl-io/openetl/sdk/go/protocol/v1"
 )
 
 // cdcReaderOf is a reader of table T, (ID NUMBER(10) PRIMARY KEY, V
@@ -75,5 +76,39 @@ func TestCDCReadsACommitWrittenLate(t *testing.T) {
 	// Past every commit sent, so a read from it sends none again.
 	if p := r.position(st); p.SCN < 160 {
 		t.Errorf("the position is at SCN %d, before the last commit sent, 160", p.SCN)
+	}
+}
+
+// Truncating, dropping or exchanging a partition removes rows the redo log
+// doesn't name, as TRUNCATE does: the read fails as lost.
+func TestCDCPartitionRemovedRows(t *testing.T) {
+	for _, stmt := range []string{
+		"truncate table s.t",
+		`ALTER TABLE "S"."T" TRUNCATE PARTITION p1 UPDATE INDEXES`,
+		"alter table t truncate subpartition sp1",
+		"ALTER TABLE t DROP PARTITION p1",
+		"alter table t drop partitions p1, p2",
+		"ALTER TABLE t\n  EXCHANGE PARTITION p1 WITH TABLE x",
+	} {
+		r, _, _ := cdcReaderOf(t, 50)
+		err := r.ddl(logRow{scn: 100, op: 5, table: "T", redo: stmt})
+		if code := connectortest.CodeOf(err); code != protocolv1.ErrorCode_ERROR_CODE_POSITION_LOST {
+			t.Errorf("%q: got %v, want POSITION_LOST", stmt, err)
+		}
+	}
+}
+
+// Changes of partitions that keep their rows don't match.
+func TestPartitionRowsKeepsRows(t *testing.T) {
+	for _, stmt := range []string{
+		"alter table t drop column partition_id",
+		"alter table t add (partitions number)",
+		"alter table t split partition p1 at (10) into (partition p1a, partition p1b)",
+		"alter table t move partition p1",
+		"alter table t merge partitions p1, p2 into partition p3",
+	} {
+		if partitionRows.MatchString(stmt) {
+			t.Errorf("%q matches", stmt)
+		}
 	}
 }

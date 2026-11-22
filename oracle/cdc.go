@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"maps"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -831,6 +832,8 @@ func (r *cdcReader) ddl(x logRow) error {
 	switch {
 	case strings.HasPrefix(stmt, "truncate"):
 		return positionLost("oracle: %s was truncated at SCN %d, and the redo log doesn't say which rows that deleted: read the stream again from a snapshot", x.table, x.scn)
+	case partitionRows.MatchString(stmt):
+		return positionLost("oracle: a partition of %s was truncated, dropped or exchanged at SCN %d, and the redo log doesn't say which rows that deleted: read the stream again from a snapshot", x.table, x.scn)
 	case strings.HasPrefix(stmt, "drop table"):
 		return configInvalid("oracle: %s was dropped at SCN %d", x.table, x.scn)
 	}
@@ -846,6 +849,10 @@ func (r *cdcReader) ddl(x logRow) error {
 	}
 	return nil
 }
+
+// partitionRows matches, in lower case, a statement that truncates, drops
+// or exchanges a table's partitions or subpartitions.
+var partitionRows = regexp.MustCompile(`(?s)^alter\s+table\s.*\b(truncate|drop|exchange)\s+(sub)?partitions?\b`)
 
 func sameColumn(a, b column) bool {
 	return a.name == b.name && a.dataType == b.dataType && a.precision == b.precision && a.scale == b.scale && a.seg == b.seg
