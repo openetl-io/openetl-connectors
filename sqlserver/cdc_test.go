@@ -5,6 +5,7 @@ package sqlserver
 import (
 	"context"
 	"crypto/rand"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math/big"
@@ -472,6 +473,69 @@ func TestSnapshotRedo(t *testing.T) {
 			resumed := read(t, s, source.CDC, map[string]string{"t": from})
 			if got := changes(resumed, "t", "id", "v"); !slices.Equal(got[:3], []string{"insert,4,4", "insert,5,5", "insert,6,6"}) || got[len(got)-1] != "update,3,30" {
 				t.Errorf("read on from %s: %v", from, got)
+			}
+		})
+	}
+}
+
+// A read again from no state, as of a new stream's first part, to a resume
+// point past its snapshot, reads the snapshot with the seq of the position
+// the first read's started at, then the changes from there up to the resume
+// point: a row deleted since comes back as its delete. An end that doesn't
+// say where its snapshot started fails with POSITION_LOST, as nothing else
+// can tell; one in the snapshot still says it by its position.
+func TestCDCRedoFromNoState(t *testing.T) {
+	for _, method := range []string{methodTracking, methodCapture} {
+		t.Run(method, func(t *testing.T) {
+			e := newSourceEnv(t)
+			e.exec("CREATE TABLE $schema.t (id int PRIMARY KEY, v int)")
+			e.exec("INSERT INTO $schema.t VALUES (1, 1), (2, 2), (3, 3)")
+			harvested := func() {}
+			if method == methodTracking {
+				e.exec("ALTER TABLE $schema.t ENABLE CHANGE_TRACKING")
+			} else {
+				e.capture("t")
+				harvested = e.harvested
+			}
+			harvested()
+			s := e.source(`, "snapshotChunkRows": 2, "cdcMethod": "` + method + `"`)
+			first := read(t, s, source.CDC, map[string]string{"t": ""})
+			snapSeq := first.column("t", "openetl.seq")[0]
+			e.exec("UPDATE $schema.t SET v = 10 WHERE id = 1")
+			e.exec("DELETE FROM $schema.t WHERE id = 2")
+			e.exec("INSERT INTO $schema.t VALUES (4, 4)")
+			harvested()
+			second := read(t, s, source.CDC, map[string]string{"t": first.last("t")})
+			until := second.last("t")
+			redo := readReq(t, s, source.ReadRequest{Streams: []source.ConfiguredStream{{Name: "t", SyncMode: source.CDC, Until: []byte(until)}}})
+			want := append([]string{"insert,1,10," + snapSeq, "insert,3,3," + snapSeq, "insert,4,4," + snapSeq}, changes(second, "t", "id", "v", "openetl.seq")...)
+			if got := changes(redo, "t", "id", "v", "openetl.seq"); !slices.Equal(got, want) {
+				t.Errorf("redo from no state to %s: %v, want %v", until, got, want)
+			}
+			if got := redo.last("t"); got != until || redo.next["t"] != until {
+				t.Errorf("redo ended at %s, completed at %s, want %s", got, redo.next["t"], until)
+			}
+
+			var spelled map[string]any
+			if err := json.Unmarshal([]byte(until), &spelled); err != nil {
+				t.Fatal(err)
+			}
+			delete(spelled, "origin")
+			old, err := json.Marshal(spelled)
+			if err != nil {
+				t.Fatal(err)
+			}
+			c := &capturer{}
+			t.Cleanup(c.release)
+			err = s.Read(t.Context(), source.ReadRequest{Streams: []source.ConfiguredStream{{Name: "t", SyncMode: source.CDC, Until: old}}}, c)
+			if codeOf(err) != protocolv1.ErrorCode_ERROR_CODE_POSITION_LOST {
+				t.Errorf("redo from no state to %s, which doesn't say where its snapshot started: %v, read %v", old, err, changes(c, "t", "id", "v"))
+			}
+
+			inSnapshot := first.states["t"][0]
+			redo = readReq(t, s, source.ReadRequest{Streams: []source.ConfiguredStream{{Name: "t", SyncMode: source.CDC, Until: []byte(inSnapshot)}}})
+			if got := changes(redo, "t", "id", "v", "openetl.seq"); !slices.Equal(got, []string{"insert,1,10," + snapSeq}) || redo.next["t"] != inSnapshot {
+				t.Errorf("redo from no state to %s: %v, completed at %s", inSnapshot, got, redo.next["t"])
 			}
 		})
 	}

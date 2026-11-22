@@ -50,6 +50,10 @@ type cdcState struct {
 	Snapshot *snapshotCursor `json:"snapshot,omitempty"`
 	// Change tracking: a read of the changes up to a version, partly done.
 	Poll *trackingPoll `json:"poll,omitempty"`
+	// The position the table's snapshot started at, where a read again
+	// from no state reads it from. Empty in a state from before the source
+	// kept it.
+	Origin string `json:"origin,omitempty"`
 }
 
 type snapshotCursor struct {
@@ -128,46 +132,10 @@ func (s *Source) readCDC(ctx context.Context, req source.ReadRequest, cfgs []sou
 		}
 	}()
 	for _, cs := range cfgs {
-		cs := wholeStream(cs)
-		t := tables[slices.IndexFunc(tables, func(t table) bool { return t.name == cs.Name })]
-		if len(t.key) == 0 {
-			return configInvalid("sqlserver: %s has no primary key, so it can't be read with cdc", t.name)
-		}
-		t, err := declaredOnly(t, cs.Columns)
+		ct, err := r.open(ctx, cs, tables)
 		if err != nil {
 			return err
 		}
-		ct := &cdcTable{t: t, out: streamEmitter(out, t.name), until: cs.Until}
-		if err := unmarshalState(t.name, cs.State, &ct.st); err != nil {
-			return err
-		}
-		if cs.Until != nil {
-			ct.stop = &cdcState{}
-			if err := unmarshalState(t.name, cs.Until, ct.stop); err != nil {
-				return err
-			}
-		}
-		switch {
-		case ct.st.Method != "" && ct.st.Method != m.name():
-			return positionLost("sqlserver: %s was read with %s, and the source now reads with %s", t.name, ct.st.Method, m.name())
-		case ct.st.Method != "":
-		case ct.stop != nil:
-			// The first part of a read again: the snapshot, from the same
-			// position.
-			ct.st = cdcState{Method: m.name(), Position: ct.stop.Position, At: ct.stop.At, Snapshot: &snapshotCursor{}}
-		default:
-			// A new table, or a state from a full refresh, which has no
-			// position: the table starts again.
-			pos, at, err := m.start(ctx, t)
-			if err != nil {
-				return err
-			}
-			ct.st = cdcState{Method: m.name(), Position: pos, At: at, Snapshot: &snapshotCursor{}}
-		}
-		if ct.b, err = newBatcher(memory.DefaultAllocator, t.cols, true); err != nil {
-			return fmt.Errorf("sqlserver: %s: %w", t.name, err)
-		}
-		ct.resumed, ct.resumedAt = cs.State, time.Now()
 		reading = append(reading, ct)
 	}
 	var target string
@@ -213,6 +181,67 @@ func (s *Source) readCDC(ctx context.Context, req source.ReadRequest, cfgs []sou
 			}
 		}
 	}
+}
+
+// open sets up a stream's read: from its state, or where its table starts,
+// to its end, if it has one.
+func (r *cdcReader) open(ctx context.Context, cs source.ConfiguredStream, tables []table) (*cdcTable, error) {
+	m := r.m
+	cs = wholeStream(cs)
+	t := tables[slices.IndexFunc(tables, func(t table) bool { return t.name == cs.Name })]
+	if len(t.key) == 0 {
+		return nil, configInvalid("sqlserver: %s has no primary key, so it can't be read with cdc", t.name)
+	}
+	t, err := declaredOnly(t, cs.Columns)
+	if err != nil {
+		return nil, err
+	}
+	ct := &cdcTable{t: t, out: streamEmitter(r.out, t.name), until: cs.Until}
+	if err := unmarshalState(t.name, cs.State, &ct.st); err != nil {
+		return nil, err
+	}
+	if cs.Until != nil {
+		ct.stop = &cdcState{}
+		if err := unmarshalState(t.name, cs.Until, ct.stop); err != nil {
+			return nil, err
+		}
+	}
+	switch {
+	case ct.st.Method != "" && ct.st.Method != m.name():
+		return nil, positionLost("sqlserver: %s was read with %s, and the source now reads with %s", t.name, ct.st.Method, m.name())
+	case ct.st.Method != "":
+	case ct.stop != nil:
+		if ct.st, err = redoFrom(t.name, m.name(), ct.stop); err != nil {
+			return nil, err
+		}
+	default:
+		// A new table, or a state from a full refresh, which has no
+		// position: the table starts again.
+		pos, at, err := m.start(ctx, t)
+		if err != nil {
+			return nil, err
+		}
+		ct.st = cdcState{Method: m.name(), Position: pos, At: at, Snapshot: &snapshotCursor{}, Origin: pos}
+	}
+	if ct.b, err = newBatcher(memory.DefaultAllocator, t.cols, true); err != nil {
+		return nil, fmt.Errorf("sqlserver: %s: %w", t.name, err)
+	}
+	ct.resumed, ct.resumedAt = cs.State, time.Now()
+	return ct, nil
+}
+
+// redoFrom is where a read again from no state to stop starts: the
+// snapshot, at the position the first read's started at, which a stop in
+// the snapshot has as its position.
+func redoFrom(name, method string, stop *cdcState) (cdcState, error) {
+	switch {
+	case stop.Snapshot != nil:
+		return cdcState{Method: method, Position: stop.Position, At: stop.At, Snapshot: &snapshotCursor{}, Origin: stop.Position}, nil
+	case stop.Origin == "":
+		return cdcState{}, positionLost("sqlserver: %s: its read again from the start ends past its snapshot, at a state that doesn't say where the snapshot started, "+
+			"so the changes after it can't be read again; the stream needs a new snapshot", name)
+	}
+	return cdcState{Method: method, Position: stop.Origin, Snapshot: &snapshotCursor{}, Origin: stop.Origin}, nil
 }
 
 // step reads a chunk of the table's snapshot, or its changes up to the
