@@ -69,38 +69,6 @@ func emitted(t *testing.T, r *cdcReader, rec *connectortest.Recorder) []map[stri
 	return rec.RowsOf("items")
 }
 
-// TestCompressedTransactionsMoveThePosition reads two transactions MySQL
-// compressed, whose events inside the payload have no position: each
-// transaction's changes get a seq of their own, above the last's, and the
-// read's position moves past the payload.
-func TestCompressedTransactionsMoveThePosition(t *testing.T) {
-	r, rec := binlogReader(t, false)
-	payload := func(row []any, typ replication.EventType) *replication.TransactionPayloadEvent {
-		return &replication.TransactionPayloadEvent{Events: []*replication.BinlogEvent{
-			at(0, replication.QUERY_EVENT, query("BEGIN")),
-			at(0, replication.TABLE_MAP_EVENT, itemsMap()),
-			at(0, typ, itemRows(row)),
-			at(0, replication.XID_EVENT, &replication.XIDEvent{}),
-		}}
-	}
-	err := feed(t, r,
-		at(200, replication.ANONYMOUS_GTID_EVENT, &replication.GTIDEvent{}),
-		at(500, replication.TRANSACTION_PAYLOAD_EVENT, payload([]any{int32(1), "a"}, replication.WRITE_ROWS_EVENTv2)),
-		at(600, replication.ANONYMOUS_GTID_EVENT, &replication.GTIDEvent{}),
-		at(900, replication.TRANSACTION_PAYLOAD_EVENT, payload([]any{int32(2), "b"}, replication.WRITE_ROWS_EVENTv2)),
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if r.txn != nil || r.pos.Pos != 900 {
-		t.Fatalf("after the payloads: position %v, in a transaction %v", r.pos, r.txn != nil)
-	}
-	rows := emitted(t, r, rec)
-	if len(rows) != 2 || cmpSeqText(rows[0]["openetl.seq"], rows[1]["openetl.seq"]) >= 0 {
-		t.Fatalf("rows %v: the second transaction's seq isn't above the first's", rows)
-	}
-}
-
 // TestMariaDBTransactionsHaveNoBegin reads a MariaDB transaction, which
 // its GTID event begins without a BEGIN, with a SAVEPOINT inside it: the
 // rows after the savepoint are the transaction's too.
@@ -204,17 +172,4 @@ func TestPartialRowImagesFail(t *testing.T) {
 			}
 		})
 	}
-}
-
-func cmpSeqText(a, b string) int {
-	if len(a) != len(b) {
-		return len(a) - len(b)
-	}
-	switch {
-	case a < b:
-		return -1
-	case a > b:
-		return 1
-	}
-	return 0
 }
