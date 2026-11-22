@@ -1025,9 +1025,8 @@ func TestCDCKeepsTaggedGTIDs(t *testing.T) {
 }
 
 // TestCDCReadsCompressedTransactions reads changes MySQL wrote to the binlog
-// compressed, two transactions each in a Transaction_payload event, whose
-// events have no position: the second's update of a key comes after the
-// first's.
+// compressed, two transactions each in a Transaction_payload event: the
+// second's update of a key comes after the first's.
 func TestCDCReadsCompressedTransactions(t *testing.T) {
 	e := newSourceEnv(t, servers()[0])
 	e.exec("CREATE TABLE $db.items (id int PRIMARY KEY, v varchar(20))")
