@@ -19,7 +19,9 @@ All three write modes work:
 - **Overwrite** keeps a read's files out of the table until the read ends, then replaces the table's files with them. From 0.2.0, a stream paused in the middle of a read goes on with it once it's resumed: the read's end replaces the table's files with those written before the pause too.
 - **Merge** writes equality deletes for the keys an epoch changes, with the keys' new rows, so the table holds each key's latest version. Query engines that read Iceberg v2 apply the deletes.
 
-Each epoch is one snapshot per table, with the epoch's marker in the snapshot's summary and in a table property. The commit checks the fence and the marker on the snapshot it builds on, and the catalog refuses it if another commit landed first, so a replaced attempt can't commit and no epoch lands twice.
+Each epoch is one snapshot per table, with the epoch's marker in the snapshot's summary and in a table property. The commit checks the marker on the snapshot it builds on, and the catalog refuses it if another commit landed first, so no epoch lands twice. From 0.2.0, a marker property, `openetl.loaded.PIPELINE`, that isn't one the destination wrote fails the commit, and the run without a retry, rather than having the epoch applied again: set it to `EPOCH:GENERATION`, the `openetl.epoch` and `openetl.generation` of the last snapshot the pipeline committed.
+
+The commit checks the fence too, a table property that each attempt's recovery raises. An Iceberg commit can't be made to depend on a property, though, and raising it changes no snapshot, so a replaced attempt that checked the fence before it was raised can still commit, and an older recovery can lower it again. What keeps a replaced attempt from committing an epoch the newer one doesn't know of is the [checkpoint log](https://github.com/openetl-io/openetl/blob/main/docs/internals/commits.md#checkpoints), in which it can't record one; an epoch they both apply lands once, by its marker.
 
 On a REST catalog, an epoch's tables commit together, in one multi-table commit. Glue commits one table at a time, so a pipeline into Glue has to say so:
 

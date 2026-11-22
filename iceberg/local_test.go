@@ -16,6 +16,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/memory"
+	ice "github.com/apache/iceberg-go"
 	"github.com/apache/iceberg-go/catalog"
 	"github.com/apache/iceberg-go/catalog/hadoop"
 	"github.com/apache/iceberg-go/catalog/rest"
@@ -220,6 +221,16 @@ func TestCloseDropsAFailedPreCommitsFiles(t *testing.T) {
 	}
 }
 
+func errorCode(err error) protocolv1.ErrorCode {
+	if c, ok := errors.AsType[interface {
+		error
+		ErrorCode() protocolv1.ErrorCode
+	}](err); ok {
+		return c.ErrorCode()
+	}
+	return protocolv1.ErrorCode_ERROR_CODE_UNSPECIFIED
+}
+
 // deniedCatalog refuses to load a table, as a REST catalog does a principal
 // without the privilege.
 type deniedCatalog struct{ catalog.Catalog }
@@ -240,24 +251,59 @@ func TestWriterErrorsHaveCodes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	code := func(err error) protocolv1.ErrorCode {
-		if c, ok := errors.AsType[interface {
-			error
-			ErrorCode() protocolv1.ErrorCode
-		}](err); ok {
-			return c.ErrorCode()
-		}
-		return protocolv1.ErrorCode_ERROR_CODE_UNSPECIFIED
-	}
 	denied := localWriter(t, deniedCatalog{cat}, 2, streams...)
-	if err := denied.Write(t.Context(), destination.Epoch{Generation: 2, N: 2}, "users", localBatch(t, `[{"id": 2, "name": "b"}]`)); code(err) != protocolv1.ErrorCode_ERROR_CODE_PERMISSION_DENIED {
-		t.Errorf("write: %v, coded %v; want permission denied", err, code(err))
+	if err := denied.Write(t.Context(), destination.Epoch{Generation: 2, N: 2}, "users", localBatch(t, `[{"id": 2, "name": "b"}]`)); errorCode(err) != protocolv1.ErrorCode_ERROR_CODE_PERMISSION_DENIED {
+		t.Errorf("write: %v, coded %v; want permission denied", err, errorCode(err))
 	}
-	if _, err := denied.Commit(t.Context(), e, []destination.Staged{st}); code(err) != protocolv1.ErrorCode_ERROR_CODE_PERMISSION_DENIED {
-		t.Errorf("commit: %v, coded %v; want permission denied", err, code(err))
+	if _, err := denied.Commit(t.Context(), e, []destination.Staged{st}); errorCode(err) != protocolv1.ErrorCode_ERROR_CODE_PERMISSION_DENIED {
+		t.Errorf("commit: %v, coded %v; want permission denied", err, errorCode(err))
 	}
-	if _, err := denied.Recover(t.Context(), 2, e, []destination.Staged{st}); code(err) != protocolv1.ErrorCode_ERROR_CODE_PERMISSION_DENIED {
-		t.Errorf("recover: %v, coded %v; want permission denied", err, code(err))
+	if _, err := denied.Recover(t.Context(), 2, e, []destination.Staged{st}); errorCode(err) != protocolv1.ErrorCode_ERROR_CODE_PERMISSION_DENIED {
+		t.Errorf("recover: %v, coded %v; want permission denied", err, errorCode(err))
+	}
+}
+
+// A marker that isn't one the destination wrote fails the epoch's commit and
+// its recovery, without a retry, rather than have them take the epoch for one
+// the table doesn't hold and apply it again.
+func TestMalformedMarkerFails(t *testing.T) {
+	cat := localCatalog(t)
+	streams := []destination.Stream{{Name: "users", Mode: destination.Append}}
+	e := destination.Epoch{Generation: 1, N: 1}
+	w := localWriter(t, cat, 1, streams...)
+	localWrite(t, w, e, "users", `[{"id": 1, "name": "a"}]`)
+	st, err := w.PreCommit(t.Context(), e)
+	if err != nil {
+		t.Fatal(err)
+	}
+	staged := []destination.Staged{st}
+	if _, err := w.Commit(t.Context(), e, staged); err != nil {
+		t.Fatal(err)
+	}
+	tbl, err := cat.LoadTable(t.Context(), table.Identifier{"default", "users"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx := tbl.NewTransaction()
+	if err := tx.SetProperties(ice.Properties{loadedKey("p"): "1"}); err != nil {
+		t.Fatal(err)
+	}
+	if tbl, err = tx.Commit(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	snapshot := tbl.CurrentSnapshot().SnapshotID
+
+	if _, err := w.Commit(t.Context(), e, staged); errorCode(err) != protocolv1.ErrorCode_ERROR_CODE_CONFIG_INVALID {
+		t.Errorf("commit: %v, coded %v; want config invalid", err, errorCode(err))
+	}
+	if _, err := localWriter(t, cat, 2, streams...).Recover(t.Context(), 2, e, staged); errorCode(err) != protocolv1.ErrorCode_ERROR_CODE_CONFIG_INVALID {
+		t.Errorf("recover: %v, coded %v; want config invalid", err, errorCode(err))
+	}
+	if tbl, err = cat.LoadTable(t.Context(), table.Identifier{"default", "users"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := tbl.CurrentSnapshot().SnapshotID; got != snapshot {
+		t.Errorf("users is at snapshot %d, want %d", got, snapshot)
 	}
 }
 

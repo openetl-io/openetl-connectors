@@ -1149,8 +1149,8 @@ func (w *writer) prepareStream(ctx context.Context, desc staged, s stagedStream,
 	if err := w.checkFence(tbl.Properties(), w.cfg.Generation); err != nil {
 		return nil, err
 	}
-	if applied(tbl.Properties(), w.cfg.Pipeline, desc) {
-		return nil, nil
+	if done, err := applied(tbl, w.cfg.Pipeline, desc); err != nil || done {
+		return nil, err
 	}
 	paths := s.adds()
 	if len(s.Manifests) > 0 {
@@ -1287,24 +1287,26 @@ func (w *writer) checkFence(props ice.Properties, gen uint64) error {
 	return nil
 }
 
-// applied reports whether the table holds the epoch: its last committed
-// epoch is this one or a later one. Epochs commit in order, and only the
-// one at the log's HEAD is ever recovered.
-func applied(props ice.Properties, pipeline string, desc staged) bool {
-	v, ok := props[loadedKey(pipeline)]
+// applied reports whether tbl, nil if there's no such table, holds the
+// epoch: its last committed epoch is this one or a later one. Epochs commit
+// in order, and only the one at the log's HEAD is ever recovered. A marker it
+// can't read fails, rather than have the epoch applied again.
+func applied(tbl *table.Table, pipeline string, desc staged) (bool, error) {
+	if tbl == nil {
+		return false, nil
+	}
+	key := loadedKey(pipeline)
+	v, ok := tbl.Properties()[key]
 	if !ok {
-		return false
+		return false, nil
 	}
 	n, g, ok := strings.Cut(v, ":")
-	if !ok {
-		return false
-	}
 	epoch, err1 := strconv.ParseUint(n, 10, 64)
 	gen, err2 := strconv.ParseUint(g, 10, 64)
-	if err1 != nil || err2 != nil {
-		return false
+	if !ok || err1 != nil || err2 != nil {
+		return false, configInvalid(fmt.Errorf("iceberg: %s's property %s is %q, not the EPOCH:GENERATION the destination writes; set it to the %s and %s of the last snapshot the pipeline committed", strings.Join(tbl.Identifier(), "."), key, v, epochKey, generationKey))
 	}
-	return epoch > desc.Epoch || (epoch == desc.Epoch && gen == desc.Generation)
+	return epoch > desc.Epoch || (epoch == desc.Epoch && gen == desc.Generation), nil
 }
 
 // parallelism is how many tables Recover fences and cleans up and Commit
@@ -1416,7 +1418,12 @@ func (w *writer) Recover(ctx context.Context, gen uint64, e destination.Epoch, c
 		applying++
 		// Nil: there's no such table.
 		tbl := fenced[st.Table]
-		if tbl != nil && applied(tbl.Properties(), w.cfg.Pipeline, desc) {
+		done, err := applied(tbl, w.cfg.Pipeline, desc)
+		if err != nil {
+			_ = cleanup.Wait()
+			return 0, err
+		}
+		if done {
 			cleanup.Go(func() error {
 				if st.Mode == modeMerge {
 					w.removeFiles(w.ctx, tbl, st.Files)

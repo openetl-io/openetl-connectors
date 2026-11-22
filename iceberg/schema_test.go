@@ -7,6 +7,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/memory"
+	ice "github.com/apache/iceberg-go"
 	"github.com/apache/iceberg-go/table"
 )
 
@@ -86,22 +87,39 @@ func TestConformCastsAndFills(t *testing.T) {
 	}
 }
 
+// markedTable is a table whose marker of pipeline p is v; none if v is empty.
+func markedTable(t *testing.T, v string) *table.Table {
+	t.Helper()
+	props := ice.Properties{}
+	if v != "" {
+		props[loadedKey("p")] = v
+	}
+	meta, err := table.NewMetadata(ice.NewSchema(0), ice.UnpartitionedSpec, table.UnsortedSortOrder, "file:///t", props)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return table.New(table.Identifier{"default", "t"}, meta, "", nil, nil)
+}
+
 func TestApplied(t *testing.T) {
 	desc := staged{Generation: 3, Epoch: 7}
 	for v, want := range map[string]bool{
-		"":     false,
-		"6:3":  false,
-		"7:3":  true,
-		"7:2":  false, // epoch 7 of an earlier generation, which was lost
-		"8:4":  true,
-		"junk": false,
+		"":    false,
+		"6:3": false,
+		"7:3": true,
+		"7:2": false, // epoch 7 of an earlier generation, which was lost
+		"8:4": true,
 	} {
-		props := map[string]string{}
-		if v != "" {
-			props[loadedKey("p")] = v
+		if got, err := applied(markedTable(t, v), "p", desc); err != nil || got != want {
+			t.Errorf("%q: %v, %v; want %v", v, got, err, want)
 		}
-		if got := applied(props, "p", desc); got != want {
-			t.Errorf("%q: %v, want %v", v, got, want)
+	}
+	if got, err := applied(nil, "p", desc); err != nil || got {
+		t.Errorf("no table: %v, %v; want false", got, err)
+	}
+	for _, v := range []string{"junk", "7", "7:", ":3", "7:x"} {
+		if got, err := applied(markedTable(t, v), "p", desc); err == nil {
+			t.Errorf("%q: %v, want an error", v, got)
 		}
 	}
 }
