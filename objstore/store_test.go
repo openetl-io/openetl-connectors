@@ -97,6 +97,10 @@ func TestVersions(t *testing.T) {
 	if got := values(mustRead(t, s, "v", source.FullRefresh, pos).rows["v/"], "id"); !slices.Equal(got, []string{"3", "4"}) {
 		t.Errorf("resumed in another version: %v", got)
 	}
+	pos, _ = json.Marshal(readState{At: &filePos{Key: "v/a.jsonl", Modified: at.UnixNano(), Size: 18, Offset: 9, Records: 1}})
+	if got := values(mustRead(t, s, "v", source.FullRefresh, pos).rows["v/"], "id"); !slices.Equal(got, []string{"4"}) {
+		t.Errorf("resumed from a point of before versions: %v", got)
+	}
 
 	st.read = "v5"
 	_, err = read(t, s, "v", source.FullRefresh, nil)

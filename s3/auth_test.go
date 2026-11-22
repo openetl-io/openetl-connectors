@@ -143,6 +143,16 @@ func TestWrongRegion(t *testing.T) {
 					t.Errorf("%s failed, not store.bucket", it.Name)
 				}
 			}
+			b, _ = json.Marshal(map[string]any{"url": "s3://lake/files", "region": "us-east-1", "endpoint": srv.URL, "accessKeyId": "a", "secretAccessKey": "b",
+				"streams": []map[string]any{{"name": "e", "glob": "e/*", "format": "jsonl"}}})
+			s, err := NewSource(b)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = s.Discover(t.Context())
+			if codeOf(err) != protocolv1.ErrorCode_ERROR_CODE_CONFIG_INVALID || !strings.Contains(err.Error(), "set region to eu-west-1") {
+				t.Errorf("Discover: %s (%v)", codeOf(err), err)
+			}
 		})
 	}
 }

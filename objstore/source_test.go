@@ -705,9 +705,12 @@ func testStoreVersions(t *testing.T, cfg map[string]any) {
 	}
 	for _, o := range files {
 		r, err := open(t.Context(), b, o, o.Size-1)
-		if o.Version == "" || err != nil {
-			t.Errorf("%s: version %q, %v", o.Key, o.Version, err)
+		if err != nil {
+			t.Errorf("%s: %v", o.Key, err)
 			continue
+		}
+		if read := o.version(r.As); o.Version == "" || read != o.Version {
+			t.Errorf("%s: listed version %q, read %q", o.Key, o.Version, read)
 		}
 		_ = r.Close()
 	}
