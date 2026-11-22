@@ -435,6 +435,30 @@ func TestCDCRefusesPartialRowImages(t *testing.T) {
 	})
 }
 
+// TestCDCColumnsChangedBehindTheRead reads a change from before a column
+// was renamed, one added with a default and one dropped, which the read
+// reaches after: the renamed and the added column are unchanged in it, not
+// null, and the dropped one is left out.
+func TestCDCColumnsChangedBehindTheRead(t *testing.T) {
+	eachServer(t, func(t *testing.T, srv testServer) {
+		e := newSourceEnv(t, srv)
+		e.exec("CREATE TABLE $db.items (id int PRIMARY KEY, a varchar(20), d varchar(20))")
+		e.exec("INSERT INTO $db.items VALUES (1, 'x', 'p')")
+		s := e.source("")
+		first := read(t, s, cdc("columns", nil, "items"))
+		e.exec("UPDATE $db.items SET a = 'y', d = 'q' WHERE id = 1")
+		e.exec("ALTER TABLE $db.items RENAME COLUMN a TO b")
+		e.exec("ALTER TABLE $db.items ADD COLUMN w int DEFAULT 5")
+		e.exec("ALTER TABLE $db.items DROP COLUMN d")
+		e.exec("INSERT INTO $db.items (id, b) VALUES (2, 'z')")
+		rows := read(t, s, cdc("columns", map[string]string{"items": first.state("items")}, "items")).rows("items")
+		if len(rows) != 2 || rows[0]["openetl.unchanged"] != `["b","w"]` || rows[0]["d"] != "" ||
+			rows[1]["b"] != "z" || rows[1]["w"] != "5" || rows[1]["openetl.unchanged"] != array.NullValueStr {
+			t.Fatalf("rows %v", rows)
+		}
+	})
+}
+
 // TestCDCRefusesStatementChanges reads a session's change logged with
 // binlog_format = STATEMENT, which has no rows: it fails the read rather
 // than go unread.

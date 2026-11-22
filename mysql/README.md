@@ -182,7 +182,7 @@ A zero date, `0000-00-00`, or one with a zero month or day, which MySQL keeps wh
 
 ### Schema changes
 
-A column added to a table read with CDC fails the read once, retryably, and the next attempt declares it. A column that was added and dropped again before the read reached it is left out. A column whose type changed so that the binlog's values no longer fit the type the read declared fails the read the same way. The binlog names columns as they were: changes from before a column was renamed, or added, that the read reaches after it, don't have it, and arrive with it null, which a merge then sets on their rows until they change again. `TRUNCATE` isn't in the binlog as rows: the source logs a warning, and the destination keeps the rows; a new snapshot of the table brings it back in step.
+A column added to a table read with CDC fails the read once, retryably, and the next attempt declares it. A column that was added and dropped again before the read reached it is left out. A column whose type changed so that the binlog's values no longer fit the type the read declared fails the read the same way. The binlog names columns as they were: a change from before a column was renamed, or added, that the read reaches after it, doesn't have it, and sends it as unchanged, so a merge keeps the value the destination has rather than setting it null. No change carries what the rename or the add did to existing rows, such as an added column's default: the destination has it once the row changes again, or a new snapshot of the table brings it. `TRUNCATE` isn't in the binlog as rows: the source logs a warning, and the destination keeps the rows; a new snapshot of the table brings it back in step.
 
 ### Delivery
 

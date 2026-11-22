@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/apache/arrow-go/v18/arrow"
+	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/decimal128"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	gomysql "github.com/go-mysql-org/go-mysql/mysql"
@@ -147,6 +148,9 @@ type relation struct {
 	// The stream's column of each of the binlog's, or -1.
 	at   []int
 	cols []binlogColumn
+	// The stream's columns the binlog's lack, as one added or renamed after
+	// it: a change sends them as unchanged.
+	absent []string
 }
 
 type txn struct {
@@ -340,7 +344,7 @@ func (r *cdcReader) finish(st *cdcStream) error {
 			seq = seqOf(r.epoch, r.pos, 0)
 		}
 		err := scan(r.ctx, r.conn, q, append(fromArgs, toArgs...), len(st.t.cols), func(vals []any) error {
-			return r.add(st, source.OpInsert, seq, vals)
+			return r.add(st, source.OpInsert, seq, vals, nil)
 		})
 		if err != nil {
 			return fmt.Errorf("mysql: snapshot of %s: %w", st.t.name, err)
@@ -1021,6 +1025,11 @@ func (r *cdcReader) relation(ctx context.Context, m *replication.TableMapEvent) 
 			return fmt.Errorf("mysql: %s's binlog lacks its primary key column %q", st.t.name, st.t.cols[k].name)
 		}
 	}
+	for j, c := range st.t.cols {
+		if !slices.Contains(rel.at, j) {
+			rel.absent = append(rel.absent, c.name)
+		}
+	}
 	return nil
 }
 
@@ -1079,13 +1088,13 @@ func (r *cdcReader) rows(t replication.EventType, e *replication.RowsEvent) erro
 				return err
 			}
 			if keyOf(st.t, vals) != keyOf(st.t, after) {
-				if err := r.emit(st, source.OpDelete, vals); err != nil {
+				if err := r.emit(st, source.OpDelete, vals, rel.absent); err != nil {
 					return err
 				}
 			}
 			vals = after
 		}
-		if err := r.emit(st, op, vals); err != nil {
+		if err := r.emit(st, op, vals, rel.absent); err != nil {
 			return err
 		}
 	}
@@ -1131,17 +1140,27 @@ func (rel *relation) values(row []any, skipped []int, keyOnly bool) ([]any, erro
 	return vals, nil
 }
 
-func (r *cdcReader) emit(st *cdcStream, op string, vals []any) error {
+func (r *cdcReader) emit(st *cdcStream, op string, vals []any, unchanged []string) error {
 	r.txn.n++
-	return r.add(st, op, seqOf(r.epoch, r.txn.start, r.txn.n), vals)
+	return r.add(st, op, seqOf(r.epoch, r.txn.start, r.txn.n), vals, unchanged)
 }
 
-func (r *cdcReader) add(st *cdcStream, op string, seq decimal128.Num, vals []any) error {
+// add appends a change, with the columns it didn't send as unchanged.
+func (r *cdcReader) add(st *cdcStream, op string, seq decimal128.Num, vals []any, unchanged []string) error {
 	if err := st.b.add(vals); err != nil {
 		return sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_TRANSIENT, fmt.Errorf("mysql: %s: %w", st.t.name, err))
 	}
 	st.b.rb.Field(len(vals)).(interface{ Append(string) }).Append(op)
 	st.b.rb.Field(len(vals) + 1).(interface{ Append(decimal128.Num) }).Append(seq)
+	lb := st.b.rb.Field(len(vals) + 2).(*array.ListBuilder)
+	if len(unchanged) == 0 {
+		lb.AppendNull()
+	} else {
+		lb.Append(true)
+		for _, c := range unchanged {
+			lb.ValueBuilder().(*array.StringBuilder).Append(c)
+		}
+	}
 	st.dirty = true
 	if st.b.bytes >= r.s.cfg.BatchBytes {
 		return st.flush(r.out)
@@ -1166,7 +1185,7 @@ func (r *cdcReader) passed() error {
 		st := c.stream
 		seq := seqOf(r.epoch, c.at, 0)
 		for _, row := range c.rows {
-			if err := r.add(st, source.OpInsert, seq, row); err != nil {
+			if err := r.add(st, source.OpInsert, seq, row, nil); err != nil {
 				return err
 			}
 		}

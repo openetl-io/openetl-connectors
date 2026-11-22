@@ -134,6 +134,25 @@ func TestStatementChangesFail(t *testing.T) {
 	}
 }
 
+// TestColumnsTheBinlogLacksAreUnchanged reads a change logged before the
+// stream's column v was added, or renamed to v: the change has no v, which
+// it sends as unchanged rather than null.
+func TestColumnsTheBinlogLacksAreUnchanged(t *testing.T) {
+	r, rec := binlogReader(t, false)
+	before := &replication.TableMapEvent{TableID: 1, Schema: []byte("app"), Table: []byte("items"), ColumnCount: 1, ColumnName: [][]byte{[]byte("id")}}
+	err := feed(t, r, at(100, replication.QUERY_EVENT, query("BEGIN")), at(150, replication.TABLE_MAP_EVENT, before),
+		at(200, replication.UPDATE_ROWS_EVENTv2, &replication.RowsEvent{TableID: 1, ColumnCount: 1, Rows: [][]any{{int32(1)}, {int32(1)}}}),
+		at(250, replication.TABLE_MAP_EVENT, itemsMap()), at(300, replication.WRITE_ROWS_EVENTv2, itemRows([]any{int32(2), "b"})),
+		at(350, replication.XID_EVENT, &replication.XIDEvent{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows := emitted(t, r, rec)
+	if len(rows) != 2 || rows[0]["openetl.unchanged"] != `["v"]` || rows[1]["openetl.unchanged"] != "" || rows[1]["v"] != "b" {
+		t.Fatalf("rows %v", rows)
+	}
+}
+
 // TestTaggedGTIDsAreKept reads a transaction whose GTID has a tag, as MySQL
 // logs from 8.3: the read's GTIDs have it, so that a read on another server
 // after a failover doesn't read it again.
