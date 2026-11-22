@@ -201,6 +201,8 @@ The apply isn't one transaction, which MongoDB limits in size and time:
 - An overwrite's `renameCollection` can't be fenced, since MongoDB runs no rename in a transaction. A replaced attempt still applying an overwrite's last epoch after the next attempt has swapped its read in writes its last rows to a new `_openetl_read_…` collection, which stays until the stream's next overwrite read starts. If the next attempt crashed between the swap and its marker, the attempt after it swaps that collection in again, and the target then holds only those rows until the stream is read again.
 - With `destination.deletes: hard`, nothing is kept of a deleted document, so a version of its key older than the delete that lands after it, as a source that repeats rows can send, brings the document back.
 
+The destination reads from the primary, whatever read preference and read concern the `uri` gives, so that a commit finds every row it staged. Its writes take the `uri`'s write concern, or the server's default, and `majority` in place of an unacknowledged `w=0`. MongoDB's default is `majority`, but `w=1` where the replica set has an arbiter. A write concern of `w=1` acknowledges a write before the other members have it, so a failover can roll back an epoch that was committed.
+
 Up to 16 writer lanes write at once. A continuous pipeline commits every 10 seconds unless it sets its own `delivery.commit.interval`.
 
 ### Set it up
