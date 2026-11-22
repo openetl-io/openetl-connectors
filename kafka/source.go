@@ -451,7 +451,7 @@ func (s *Source) Read(ctx context.Context, req source.ReadRequest, out source.Em
 			switch {
 			case errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled):
 			case errors.Is(err, kerr.OffsetOutOfRange):
-				ferr = errors.Join(ferr, positionLost(fmt.Errorf("kafka: %s partition %d: retention deleted records the read hadn't reached (offset %d); the stream needs a re-sync", topic, p, reads[topic].next[p])))
+				ferr = errors.Join(ferr, positionLost(fmt.Errorf("kafka: %s partition %d no longer has offset %d: retention deleted records the read hadn't reached, or the topic was deleted and created again, or the brokers lost records; the stream needs a re-sync", topic, p, reads[topic].next[p])))
 			default:
 				ferr = errors.Join(ferr, classify(fmt.Errorf("kafka: fetch %s partition %d: %w", topic, p, err)))
 			}
@@ -697,7 +697,9 @@ func completeAt(em source.SplitEmitter, state []byte, until bool) error {
 // position gives each partition read its next offset: the state's, or else
 // its start's, or for a topic never read, the configured start's. A state's
 // offset below its partition's start means retention deleted records the
-// read never reached.
+// read never reached; one past its partition's end, or of a partition the
+// topic no longer has, means the topic was deleted and created again, or
+// the brokers lost records the read had read.
 func (s *Source) position(ctx context.Context, adm *kadm.Client, reads map[string]*topicRead, topics []string) error {
 	tds, err := adm.ListTopics(ctx, topics...)
 	if err != nil {
@@ -712,16 +714,23 @@ func (s *Source) position(ctx context.Context, adm *kadm.Client, reads map[strin
 	if err != nil {
 		return classify(fmt.Errorf("kafka: list start offsets: %w", err))
 	}
+	ends, err := adm.ListEndOffsets(ctx, topics...)
+	if err != nil {
+		return classify(fmt.Errorf("kafka: list end offsets: %w", err))
+	}
 	firsts := starts
 	if s.cfg.StartOffset == "latest" {
-		if firsts, err = adm.ListEndOffsets(ctx, topics...); err != nil {
-			return classify(fmt.Errorf("kafka: list end offsets: %w", err))
-		}
+		firsts = ends
 	}
 	for _, t := range topics {
 		r := reads[t]
 		fresh := r.splits == nil && len(r.next) == 0
 		r.partitions = tds[t].Partitions.Numbers()
+		for p, o := range r.next {
+			if !slices.Contains(r.partitions, p) {
+				return positionLost(fmt.Errorf("kafka: %s has no partition %d, which the read was at offset %d of: the topic was deleted and created again; the stream needs a re-sync", t, p, o))
+			}
+		}
 		for _, p := range r.partitions {
 			if r.splits != nil && r.splits[p] == nil {
 				continue
@@ -733,6 +742,13 @@ func (s *Source) position(ctx context.Context, adm *kadm.Client, reads map[strin
 			if o, ok := r.next[p]; ok {
 				if o < start.Offset {
 					return positionLost(fmt.Errorf("kafka: %s partition %d starts at %d, past the read's offset %d: retention deleted records the read hadn't reached; the stream needs a re-sync", t, p, start.Offset, o))
+				}
+				end, ok := ends.Lookup(t, p)
+				if !ok || end.Err != nil {
+					return classify(fmt.Errorf("kafka: %s partition %d's end: %w", t, p, end.Err))
+				}
+				if o > end.Offset {
+					return positionLost(fmt.Errorf("kafka: %s partition %d ends at %d, before the read's offset %d: the topic was deleted and created again, or the brokers lost records the read had read; the stream needs a re-sync", t, p, end.Offset, o))
 				}
 				continue
 			}

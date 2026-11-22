@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/twmb/franz-go/pkg/kadm"
 	"github.com/twmb/franz-go/pkg/kgo"
 	"github.com/twmb/franz-go/pkg/kmsg"
 
@@ -279,6 +280,60 @@ func TestASourceStopsWhereCleanupRemovedTheLastRecords(t *testing.T) {
 	if r := rowsIn(got["p0"]); len(r) > 0 || !lastIs(got["p0"], "complete "+end) {
 		t.Errorf("with the read's fetches held, a read from 5 to %s read %v, and ended with %v", end, r, got["p0"])
 	}
+}
+
+// A topic deleted and created again, whose partitions end before the
+// offsets a read resumes from, has lost the read's position: the read and
+// the splits fail with POSITION_LOST rather than skip the new topic's
+// records up to the old offsets. A partition that ends at its offset still
+// completes there.
+func TestASourceRefusesAPositionPastThePartitionsEnd(t *testing.T) {
+	addrs := fake(t)
+	topic := "events"
+	produceRecords(t, addrs, topic, 1, 30, 10)
+	s, err := NewSource(fakeConfig(t, addrs, map[string]any{"topics": []string{topic}}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := readEvents(t, s, source.ConfiguredStream{Name: topic, State: encodeState(map[int32]int64{0: 30})})
+	if !lastIs(got[source.WholeStream], "complete "+string(encodeState(map[int32]int64{0: 30}))) {
+		t.Fatalf("a read from the partition's end ended with %v", got[source.WholeStream])
+	}
+
+	cl, err := kgo.NewClient(kgo.SeedBrokers(addrs...))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cl.Close()
+	if _, err := kadm.NewClient(cl).DeleteTopic(t.Context(), topic); err != nil {
+		t.Fatal(err)
+	}
+	produceRecords(t, addrs, topic, 1, 5, 5)
+
+	lost := func(what string, err error) {
+		t.Helper()
+		var coded interface{ ErrorCode() protocolv1.ErrorCode }
+		if !errors.As(err, &coded) || coded.ErrorCode() != protocolv1.ErrorCode_ERROR_CODE_POSITION_LOST {
+			t.Errorf("%s: %v, want POSITION_LOST", what, err)
+		}
+	}
+	for _, cs := range []source.ConfiguredStream{
+		{Name: topic, State: encodeState(map[int32]int64{0: 30})},
+		{Name: topic, Splits: []source.Split{{ID: "p0", State: encodeOffset(30)}}},
+	} {
+		for _, continuous := range []bool{false, true} {
+			out := &splitEvents{events: map[string][]string{}}
+			ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+			err := s.Read(ctx, source.ReadRequest{Streams: []source.ConfiguredStream{cs}, Pipeline: "p", Lanes: 1, Continuous: continuous}, out)
+			cancel()
+			lost(fmt.Sprintf("a read (continuous %v) from offset 30 of a partition ending at 5", continuous), err)
+			if len(out.events) > 0 {
+				t.Errorf("the read emitted %v", out.events)
+			}
+		}
+	}
+	_, err = s.Splits(t.Context(), source.ConfiguredStream{Name: topic}, []source.Split{{ID: "p0", State: encodeOffset(30)}})
+	lost("splits from offset 30 of a partition ending at 5", err)
 }
 
 // offsets are the offsets a read-committed fetch of partition 0 returns up
