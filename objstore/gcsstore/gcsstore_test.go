@@ -1,14 +1,42 @@
 package gcsstore
 
 import (
+	"context"
 	"encoding/json"
 	"strings"
 	"testing"
 
+	"cloud.google.com/go/storage"
 	"gocloud.dev/blob"
 
 	sdk "github.com/openetl-io/openetl/sdk/go"
 )
+
+// The buckets a store opens share its one client, which no Open's end stops.
+func TestOneClient(t *testing.T) {
+	s, err := New(Config{Endpoint: "http://127.0.0.1:1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var clients []*storage.Client
+	for range 2 {
+		ctx, cancel := context.WithCancel(t.Context())
+		b, err := s.Open(ctx, "b")
+		cancel()
+		if err != nil {
+			t.Fatal(err)
+		}
+		var c *storage.Client
+		if !b.As(&c) {
+			t.Fatal("no client")
+		}
+		clients = append(clients, c)
+		_ = b.Close()
+	}
+	if clients[0] != clients[1] {
+		t.Error("each Open made a client of its own")
+	}
+}
 
 // A service account key is refused with an endpoint over plain HTTP, which
 // would carry its tokens as they are, and taken over HTTPS.

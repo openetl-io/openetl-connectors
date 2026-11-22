@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 
 	"cloud.google.com/go/storage"
 	"gocloud.dev/blob"
@@ -31,7 +32,14 @@ type Config struct {
 	ServiceAccountKey sdk.Secret `json:"serviceAccountKey"`
 }
 
-type Store struct{ cfg Config }
+type Store struct {
+	cfg Config
+	mu  sync.Mutex
+	// The client of every bucket the store opens, made by the first Open
+	// that succeeds. It lives as long as the store: gocloud's bucket.Close
+	// leaves a client it was given open, and a store has no Close.
+	client *storage.Client
+}
 
 func New(cfg Config) (*Store, error) {
 	// The key's tokens go in each request's headers, as they are.
@@ -49,6 +57,20 @@ func (s *Store) Container() string { return "bucket" }
 const attempts = 4
 
 func (s *Store) Open(ctx context.Context, bucket string) (*blob.Bucket, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.client == nil {
+		// Not ctx, whose end would end the client's later token fetches.
+		c, err := s.newClient(context.WithoutCancel(ctx))
+		if err != nil {
+			return nil, err
+		}
+		s.client = c
+	}
+	return gcsblob.OpenBucket(ctx, nil, bucket, &gcsblob.Options{Client: s.client})
+}
+
+func (s *Store) newClient(ctx context.Context) (*storage.Client, error) {
 	var opts []option.ClientOption
 	if s.cfg.Endpoint != "" {
 		opts = append(opts, option.WithEndpoint(strings.TrimSuffix(s.cfg.Endpoint, "/")+"/storage/v1/"))
@@ -65,7 +87,7 @@ func (s *Store) Open(ctx context.Context, bucket string) (*blob.Bucket, error) {
 			fmt.Errorf("gcs: Google Cloud credentials: set serviceAccountKey to a service account's JSON key: %w", err))
 	}
 	c.SetRetry(storage.WithMaxAttempts(attempts))
-	return gcsblob.OpenBucket(ctx, nil, bucket, &gcsblob.Options{Client: c})
+	return c, nil
 }
 
 func (s *Store) Endpoint() (endpoint, setting string) {
