@@ -140,7 +140,7 @@ Append and overwrite skip rows a source sends again, by their `_openetl_id`, whe
 
 ClickHouse has no transactions across statements, so a commit is built from steps that are each atomic, or that do nothing the second time:
 
-1. Each writer lane inserts its rows into staging tables of its own, `_openetl_stage_…`, in column batches straight from Arrow.
+1. Each writer lane inserts its rows into staging tables of its own, `_openetl_stage_…`, in column batches straight from Arrow. It keeps a stream's batches until it has 32 MiB of them, and inserts its largest stream's first when it keeps 256 MiB of all its streams'.
 2. The commit builds the stream's part of the epoch, as the target will hold it, into a new table, and renames it `_openetl_ready_…` once it's whole.
 3. It moves that table's partitions into the target with `ALTER TABLE … MOVE PARTITION`. A partition moves at once; one moved already isn't there to move again. A table the destination creates has one partition, so its part of the epoch moves at once; a table its user made with `PARTITION BY` takes it partition by partition.
 4. It applies the epoch's patches, if the stream has any, in one `ALTER TABLE … UPDATE` ([Holds](#holds)).

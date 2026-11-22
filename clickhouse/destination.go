@@ -118,6 +118,7 @@ type writer struct {
 // for each shape its batches came in, the rows numbered in the order they
 // came.
 type laneStaging struct {
+	epoch  destination.Epoch
 	base   string
 	target string
 	// Merge: the key's columns.
@@ -142,6 +143,10 @@ type rawTable struct {
 // How many bytes of batches a lane keeps before it inserts them, so that
 // each insert makes a part of a reasonable size.
 const flushBytes = 32 << 20
+
+// How many bytes of batches a lane keeps in all, of every stream and epoch:
+// past it, it inserts its largest stream's first.
+const maxPendingBytes = 256 << 20
 
 const (
 	idColumn      = "_openetl_id"
@@ -282,7 +287,7 @@ func (w *writer) laneStaging(tables map[uint64]map[string]*laneStaging, base str
 	}
 	ls := byStream[stream]
 	if ls == nil {
-		ls = &laneStaging{base: base, target: target, key: key}
+		ls = &laneStaging{epoch: e, base: base, target: target, key: key}
 		byStream[stream] = ls
 	}
 	return ls
@@ -301,7 +306,32 @@ func (w *writer) add(ctx context.Context, e destination.Epoch, ls *laneStaging, 
 	if ls.pendingBytes >= flushBytes {
 		return w.flush(ctx, e, ls)
 	}
-	return nil
+	return w.bound(ctx)
+}
+
+// bound inserts the largest stream's batches while the lane keeps more than
+// maxPendingBytes in all.
+func (w *writer) bound(ctx context.Context) error {
+	for {
+		var total int64
+		var largest *laneStaging
+		for _, tables := range []map[uint64]map[string]*laneStaging{w.staging, w.patches} {
+			for _, byStream := range tables {
+				for _, ls := range byStream {
+					total += ls.pendingBytes
+					if largest == nil || ls.pendingBytes > largest.pendingBytes {
+						largest = ls
+					}
+				}
+			}
+		}
+		if total <= maxPendingBytes {
+			return nil
+		}
+		if err := w.flush(ctx, largest.epoch, largest); err != nil {
+			return err
+		}
+	}
 }
 
 // batchBytes is the size of a batch's buffers, with its columns' children

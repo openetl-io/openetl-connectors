@@ -956,3 +956,49 @@ func TestDestinationStaleDropsNoNewerRead(t *testing.T) {
 	k.commit(w2, epoch(2, 3))
 	wantRows(t, "o after generation 2's read", k.rows("o", "id", "v"), "2|b")
 }
+
+// A lane keeps at most maxPendingBytes of batches in all, whatever its
+// number of streams: past it, it inserts its largest stream's.
+func TestDestinationPendingBound(t *testing.T) {
+	k := newKit(t)
+	var streams []destination.Stream
+	var schemas []*arrow.Schema
+	for i := range 9 {
+		streams = append(streams, destination.Stream{Name: fmt.Sprintf("s%d", i), Mode: destination.Append})
+		schemas = append(schemas, schemaOf(fmt.Sprintf("s%d", i), idCol, vCol))
+	}
+	w, _ := k.open(1, streams, destination.Epoch{}, nil)
+	k.apply(w, schemas...)
+	big := strings.Repeat("x", 1<<20)
+	var batches []arrow.RecordBatch
+	for _, s := range schemas {
+		var rows []row
+		for i := range 30 {
+			rows = append(rows, ins(int64(i), int64(i), big))
+		}
+		batches = append(batches, batchOf(s, rows...))
+	}
+	for i, b := range batches {
+		if err := w.Write(t.Context(), epoch(1, 1), streams[i].Name, b); err != nil {
+			t.Fatal(err)
+		}
+		b.Release()
+	}
+	var pending int64
+	for _, ls := range w.staging[1] {
+		pending += ls.pendingBytes
+	}
+	if pending > maxPendingBytes {
+		t.Errorf("the lane keeps %d bytes of 9 streams' batches", pending)
+	}
+	st, err := w.PreCommit(t.Context(), epoch(1, 1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Commit(t.Context(), epoch(1, 1), []destination.Staged{st}); err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range streams {
+		wantRows(t, s.Name, k.query("SELECT toString(count()) FROM $db."+ident(s.Name)), "30")
+	}
+}
