@@ -221,7 +221,8 @@ func (s *Source) readTables(rows tableRows) ([]table, error) {
 
 // sortingColumns returns the leading columns of a sorting key that a read
 // can order and resume by: plain columns of scalar types that hold no
-// null. all says the whole key is.
+// null, nor a NaN, which compares false with every value, so a read can't
+// resume past one. all says the whole key is.
 func sortingColumns(cols []sourceColumn, sortingKey string) (key []int, all bool) {
 	if strings.TrimSpace(sortingKey) == "" {
 		return nil, false
@@ -230,7 +231,7 @@ func sortingColumns(cols []sourceColumn, sortingKey string) (key []int, all bool
 	for _, p := range parts {
 		p = strings.Trim(p, "`")
 		i := slices.IndexFunc(cols, func(c sourceColumn) bool { return c.name == p })
-		if i < 0 || cols[i].nullable || cols[i].opaque || !scalar(cols[i].dt) {
+		if i < 0 || cols[i].nullable || cols[i].opaque || !scalar(cols[i].dt) || arrow.IsFloating(cols[i].dt.ID()) {
 			return key, false
 		}
 		key = append(key, i)
@@ -364,9 +365,13 @@ func (s *Source) from(t table) string {
 
 // untilQuery selects the highest value of the cursor c in from, as a state
 // keeps it; NULL if it has none. from is a read's, so that the value is of
-// the rows the read sees.
+// the rows the read sees. A NaN is left out: no value is at or below one.
 func untilQuery(from string, c sourceColumn) string {
-	return "SELECT if(count() > 0, " + stateText(c, "max("+ident(c.name)+")") + ", NULL) FROM " + from + " WHERE " + ident(c.name) + " IS NOT NULL"
+	q := "SELECT if(count() > 0, " + stateText(c, "max("+ident(c.name)+")") + ", NULL) FROM " + from + " WHERE " + ident(c.name) + " IS NOT NULL"
+	if t, _ := parseType(c.typ).unwrap(); strings.HasPrefix(t.name, "Float") || t.name == "BFloat16" {
+		q += " AND NOT isNaN(" + ident(c.name) + ")"
+	}
+	return q
 }
 
 func (r *tableRead) selectList() string {

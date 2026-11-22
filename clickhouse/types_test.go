@@ -112,15 +112,20 @@ func TestSortingColumns(t *testing.T) {
 		{name: "b c", dt: arrow.BinaryTypes.String},
 		{name: "n", dt: arrow.PrimitiveTypes.Int64, nullable: true},
 		{name: "l", dt: arrow.ListOf(arrow.PrimitiveTypes.Int64)},
+		{name: "f", dt: arrow.PrimitiveTypes.Float64},
 	}
 	for key, want := range map[string]struct {
 		key []int
 		all bool
 	}{
-		"a, `b c`":        {[]int{0, 1}, true},
-		"a, toDate(b)":    {[]int{0}, false},
-		"n, a":            {nil, false},
-		"a, l":            {[]int{0}, false},
+		"a, `b c`":     {[]int{0, 1}, true},
+		"a, toDate(b)": {[]int{0}, false},
+		"n, a":         {nil, false},
+		"a, l":         {[]int{0}, false},
+		// A NaN compares false with every value, so a read can't resume
+		// after one, or past one in order.
+		"a, f":            {[]int{0}, false},
+		"f, a":            {nil, false},
 		"":                {nil, false},
 		"toStartOfDay(a)": {nil, false},
 	} {
@@ -194,6 +199,13 @@ func TestUntilQuery(t *testing.T) {
 		if got := untilQuery(s.from(c.t), at); got != c.want {
 			t.Errorf("%s:\n got %s\nwant %s", c.t.name, got, c.want)
 		}
+	}
+	// A NaN is never the highest: no row is at or below it, so a read up to
+	// it, and every read after, would read nothing.
+	f := sourceColumn{name: "f", typ: "Nullable(Float64)"}
+	want := "SELECT if(count() > 0, hex(toString(max(`f`))), NULL) FROM `db`.`m` WHERE `f` IS NOT NULL AND NOT isNaN(`f`)"
+	if got := untilQuery(s.from(table{name: "m"}), f); got != want {
+		t.Errorf("float cursor:\n got %s\nwant %s", got, want)
 	}
 }
 

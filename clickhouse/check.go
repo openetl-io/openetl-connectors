@@ -366,7 +366,7 @@ func (s *Source) Preflight(req source.PreflightRequest) []check.Check {
 					return err
 				}
 				if len(t.key) == 0 {
-					p.Found("{stream} has no sorting key that starts with plain columns that hold no null, so it's read in one query, which a stopped read starts again.")
+					p.Found("{stream} has no sorting key that starts with plain columns, other than floats and UUIDs, that hold no null, so it's read in one query, which a stopped read starts again.")
 					return nil
 				}
 				var key []string
@@ -401,7 +401,7 @@ func (s *Source) Preflight(req source.PreflightRequest) []check.Check {
 				if !cursorType(t.cols[i].typ) {
 					return badCursor.Fail()
 				}
-				p.Found("{stream} is read by {cursor}, of type {type}; rows whose {cursor} is NULL are never read.")
+				p.Found("{stream} is read by {cursor}, of type {type}; rows whose {cursor} is NULL, or NaN, are never read.")
 				return nil
 			})
 			c.Params, c.Needs = check.Params{"stream": st.Name, "cursor": st.Cursor}, []string{read.Name}

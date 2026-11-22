@@ -477,3 +477,46 @@ func TestSourceDateTimeArrays(t *testing.T) {
 		t.Errorf("read %s, not %s", b, want)
 	}
 }
+
+// A sorting key's float column, which can hold NaN, isn't one a read orders
+// and resumes by: NaN sorts last and compares false with every value, so a
+// chunk after one with a NaN, or with the value before it, left it out.
+// Rows whose float cursor is NaN aren't read, and a cursor all NaN reads
+// later rows once they come.
+func TestSourceNaN(t *testing.T) {
+	db := newDatabase(t)
+	e := sourceEnv{t: t, db: db, conn: testConn(t)}
+	e.exec("CREATE TABLE $db.fk (id Int64, f Float64) ENGINE = MergeTree ORDER BY f")
+	e.exec("CREATE TABLE $db.gk (id Int64, g Int64, f Float64) ENGINE = MergeTree ORDER BY (g, f)")
+	e.exec("INSERT INTO $db.fk SELECT number + 1, if(number % 4 = 3, nan, number) FROM numbers(40)")
+	e.exec("INSERT INTO $db.gk SELECT number + 1, intDiv(number, 4), if(number % 4 = 3, nan, number) FROM numbers(40)")
+	e.exec("CREATE TABLE $db.fc (id Int64, f Float64) ENGINE = MergeTree ORDER BY id")
+	e.exec("INSERT INTO $db.fc VALUES (1, nan), (2, nan)")
+	s := newTestSource(t, db, `, "chunkRows": 3`)
+	for _, name := range []string{"fk", "gk"} {
+		c := newCollector()
+		if err := s.Read(t.Context(), source.ReadRequest{Streams: []source.ConfiguredStream{{Name: name, SyncMode: source.FullRefresh}}}, c); err != nil {
+			t.Fatal(err)
+		}
+		if got := c.ids(name); !slices.Equal(got, span(1, 40)) {
+			t.Errorf("%s read ids %v, not 1 to 40 once", name, got)
+		}
+	}
+	cs := source.ConfiguredStream{Name: "fc", SyncMode: source.Incremental, Cursor: "f"}
+	c := newCollector()
+	if err := s.Read(t.Context(), source.ReadRequest{Streams: []source.ConfiguredStream{cs}}, c); err != nil {
+		t.Fatal(err)
+	}
+	if got := c.ids("fc"); len(got) != 0 {
+		t.Errorf("read ids %v whose cursor is NaN", got)
+	}
+	e.exec("INSERT INTO $db.fc VALUES (3, 1.5), (4, nan)")
+	cs.State = c.complete["fc"]
+	c = newCollector()
+	if err := s.Read(t.Context(), source.ReadRequest{Streams: []source.ConfiguredStream{cs}}, c); err != nil {
+		t.Fatal(err)
+	}
+	if got := c.ids("fc"); !slices.Equal(got, []int64{3}) {
+		t.Errorf("the next read read ids %v, not 3", got)
+	}
+}
