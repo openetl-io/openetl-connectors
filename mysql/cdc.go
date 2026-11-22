@@ -755,7 +755,11 @@ func (r *cdcReader) run(ctx context.Context, streamer *replication.BinlogStreame
 
 func (r *cdcReader) event(ctx context.Context, ev *replication.BinlogEvent) error {
 	h := ev.Header
-	switch e := ev.Event.(type) {
+	event := ev.Event
+	if tagged, ok := event.(*replication.GtidTaggedLogEvent); ok {
+		event = &tagged.GTIDEvent
+	}
+	switch e := event.(type) {
 	case *replication.FormatDescriptionEvent:
 		// Sent again where a read starts in a file, with MariaDB's position
 		// after it filled in, which isn't one.
@@ -771,7 +775,7 @@ func (r *cdcReader) event(ctx context.Context, ev *replication.BinlogEvent) erro
 		return nil
 	case *replication.GTIDEvent:
 		var g gomysql.GTIDSet
-		if h.EventType == replication.GTID_EVENT {
+		if h.EventType != replication.ANONYMOUS_GTID_EVENT {
 			var err error
 			if g, err = e.GTIDNext(); err != nil {
 				return err

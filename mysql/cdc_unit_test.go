@@ -1,6 +1,7 @@
 package mysql
 
 import (
+	"encoding/hex"
 	"strings"
 	"testing"
 
@@ -97,6 +98,31 @@ func TestMariaDBTransactionsHaveNoBegin(t *testing.T) {
 	}
 	if r.txn != nil || r.pos.Pos != 500 {
 		t.Fatalf("after a DDL: position %v, in a transaction %v", r.pos, r.txn != nil)
+	}
+}
+
+// TestTaggedGTIDsAreKept reads a transaction whose GTID has a tag, as MySQL
+// logs from 8.3: the read's GTIDs have it, so that a read on another server
+// after a failover doesn't read it again.
+func TestTaggedGTIDsAreKept(t *testing.T) {
+	r, _ := binlogReader(t, false)
+	const sid = "3e11fa47-71ca-11e1-9e33-c80aa9429562"
+	var err error
+	if r.gset, err = gomysql.ParseMysqlGTIDSet(sid + ":1-6"); err != nil {
+		t.Fatal(err)
+	}
+	b, _ := hex.DecodeString(strings.ReplaceAll(sid, "-", ""))
+	tagged := &replication.GtidTaggedLogEvent{GTIDEvent: replication.GTIDEvent{SID: b, GNO: 7, Tag: gomysql.NewTag("t1")}}
+	err = feed(t, r, at(100, replication.GTID_TAGGED_LOG_EVENT, tagged), at(150, replication.QUERY_EVENT, query("BEGIN")), at(200, replication.XID_EVENT, &replication.XIDEvent{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err := gomysql.ParseMysqlGTIDSet(sid + ":t1:7")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !r.gset.Contain(want) || r.txn != nil || r.pos.Pos != 200 {
+		t.Fatalf("GTIDs %s, position %v, in a transaction %v", r.gset, r.pos, r.txn != nil)
 	}
 }
 

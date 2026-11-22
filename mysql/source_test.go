@@ -929,6 +929,40 @@ func TestCDCContinuesOnAnotherServerByGTID(t *testing.T) {
 	})
 }
 
+// TestCDCKeepsTaggedGTIDs reads a transaction with a tagged GTID, then
+// reads on from its state on another server, as after a failover: the
+// transaction isn't read again.
+func TestCDCKeepsTaggedGTIDs(t *testing.T) {
+	e := newSourceEnv(t, servers()[0])
+	e.exec("CREATE TABLE $db.items (id int PRIMARY KEY)")
+	s := e.source("")
+	first := read(t, s, cdc("tagged", nil, "items"))
+	conn, err := e.db.Conn(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close() }()
+	if _, err := conn.ExecContext(t.Context(), "SET gtid_next = 'AUTOMATIC:openetl'"); err != nil {
+		t.Skipf("no tagged GTIDs: %v", err)
+	}
+	if _, err := conn.ExecContext(t.Context(), "INSERT INTO "+quoteIdent(e.database)+".items VALUES (1)"); err != nil {
+		t.Fatal(err)
+	}
+	next := read(t, s, cdc("tagged", map[string]string{"items": first.state("items")}, "items"))
+	if rows := next.rows("items"); len(rows) != 1 {
+		t.Fatalf("the tagged transaction's rows: %v", rows)
+	}
+	var st map[string]any
+	if err := json.Unmarshal([]byte(next.state("items")), &st); err != nil {
+		t.Fatal(err)
+	}
+	st["server"] = "another"
+	moved, _ := json.Marshal(st)
+	if rows := read(t, s, cdc("tagged", map[string]string{"items": string(moved)}, "items")).rows("items"); len(rows) != 0 {
+		t.Fatalf("on another server, read again: %v", rows)
+	}
+}
+
 // TestCDCReadsCompressedTransactions reads changes MySQL wrote to the binlog
 // compressed, two transactions each in a Transaction_payload event, whose
 // events have no position: the second's update of a key comes after the
