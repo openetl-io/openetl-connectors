@@ -15,6 +15,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/apache/arrow-go/v18/parquet/pqarrow"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/openetl-io/openetl-connectors/sqlstage"
 	"github.com/openetl-io/openetl/sdk/go/check"
@@ -412,6 +413,24 @@ func TestPatchSharedHeldColumn(t *testing.T) {
 	for i, want := range []bool{false, true} {
 		if got := strings.Contains(stmts[i], unhold); got != want {
 			t.Errorf("statement %d takes the held column out: %v, want %v\n%s", i, got, want, stmts[i])
+		}
+	}
+}
+
+// Redshift's own errors are XX000, and say what they are in their message
+// or, as a serializable isolation violation does, in its detail.
+func TestClassify(t *testing.T) {
+	for _, c := range []struct {
+		err  *pgconn.PgError
+		want protocolv1.ErrorCode
+	}{
+		{&pgconn.PgError{Code: "XX000", Message: "1023", Detail: "Serializable isolation violation on table - 119371, transactions forming the cycle are: 1745830, 1745762 (pid:15021)"}, protocolv1.ErrorCode_ERROR_CODE_TRANSIENT},
+		{&pgconn.PgError{Code: "XX000", Message: "Disk Full", Detail: "error:  Disk Full\ncode:      1016"}, protocolv1.ErrorCode_ERROR_CODE_DESTINATION_QUOTA},
+		{&pgconn.PgError{Code: "40001", Message: "could not serialize access"}, protocolv1.ErrorCode_ERROR_CODE_TRANSIENT},
+		{&pgconn.PgError{Code: "42501", Message: "permission denied for schema s"}, protocolv1.ErrorCode_ERROR_CODE_PERMISSION_DENIED},
+	} {
+		if f := check.Classify(classify(c.err)); f == nil || f.Code != c.want {
+			t.Errorf("%s %s: %v, want %s", c.err.Message, c.err.Detail, f, c.want)
 		}
 	}
 }

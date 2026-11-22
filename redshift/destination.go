@@ -1747,7 +1747,8 @@ func classify(err error) error {
 	case pe.Code == "53100" || strings.Contains(pe.Message, "Disk Full"):
 		return sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_DESTINATION_QUOTA, err)
 	case strings.HasPrefix(pe.Code, "08") || pe.Code == "40001" || pe.Code == "53300" || pe.Code == "57P01" || pe.Code == "57P03" ||
-		strings.Contains(pe.Message, "Serializable isolation violation"):
+		// Error 1023, whose message is its number.
+		strings.Contains(pe.Detail, "Serializable isolation violation"):
 		return sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_TRANSIENT, err)
 	}
 	return err
