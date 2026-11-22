@@ -27,6 +27,8 @@ type memDB struct {
 	tables map[string]*memTable
 	// Every Scan's input.
 	scans []*dynamodb.ScanInput
+	// What the next GetItem runs after it has read, and before it returns.
+	afterGet func()
 }
 
 type memTable struct {
@@ -68,11 +70,33 @@ func (t *memTable) all() []map[string]types.AttributeValue {
 	return out
 }
 
-// eval says whether it meets an expression of terms joined by OR:
-// attribute_not_exists(a), begins_with(a, v), and a OP v.
+// eval says whether it meets an expression of terms joined by OR, each of
+// factors joined by AND, in parentheses or not: attribute_not_exists(a),
+// begins_with(a, v), a OP v, and NOT of one of them.
 func eval(expr *string, names map[string]string, values map[string]types.AttributeValue, it map[string]types.AttributeValue) bool {
 	if expr == nil {
 		return true
+	}
+	for term := range strings.SplitSeq(*expr, " OR ") {
+		term = strings.TrimSpace(term)
+		if strings.HasPrefix(term, "(") && strings.HasSuffix(term, ")") {
+			term = term[1 : len(term)-1]
+		}
+		all := true
+		for f := range strings.SplitSeq(term, " AND ") {
+			all = all && factor(f, names, values, it)
+		}
+		if all {
+			return true
+		}
+	}
+	return false
+}
+
+func factor(f string, names map[string]string, values map[string]types.AttributeValue, it map[string]types.AttributeValue) bool {
+	f = strings.TrimSpace(f)
+	if g, ok := strings.CutPrefix(f, "NOT "); ok {
+		return !factor(g, names, values, it)
 	}
 	name := func(s string) string {
 		s = strings.TrimSpace(s)
@@ -81,42 +105,45 @@ func eval(expr *string, names map[string]string, values map[string]types.Attribu
 		}
 		return s
 	}
-	for term := range strings.SplitSeq(*expr, " OR ") {
-		term = strings.TrimSpace(term)
-		if a, ok := strings.CutPrefix(term, "attribute_not_exists("); ok {
-			if _, has := it[name(strings.TrimSuffix(a, ")"))]; !has {
-				return true
-			}
+	if a, ok := strings.CutPrefix(f, "attribute_not_exists("); ok {
+		_, has := it[name(strings.TrimSuffix(a, ")"))]
+		return !has
+	}
+	if a, ok := strings.CutPrefix(f, "begins_with("); ok {
+		attr, v, _ := strings.Cut(strings.TrimSuffix(a, ")"), ",")
+		s, _ := it[name(attr)].(*types.AttributeValueMemberS)
+		return s != nil && strings.HasPrefix(s.Value, values[strings.TrimSpace(v)].(*types.AttributeValueMemberS).Value)
+	}
+	for _, op := range []string{"<=", ">=", "<>", "="} {
+		l, r, ok := strings.Cut(f, " "+op+" ")
+		if !ok {
 			continue
 		}
-		if a, ok := strings.CutPrefix(term, "begins_with("); ok {
-			attr, v, _ := strings.Cut(strings.TrimSuffix(a, ")"), ",")
-			s, _ := it[name(attr)].(*types.AttributeValueMemberS)
-			if s != nil && strings.HasPrefix(s.Value, values[strings.TrimSpace(v)].(*types.AttributeValueMemberS).Value) {
-				return true
-			}
-			continue
+		a, has := it[name(l)]
+		if !has {
+			return false
 		}
-		for _, op := range []string{"<=", ">=", "<>", "="} {
-			l, r, ok := strings.Cut(term, " "+op+" ")
-			if !ok {
-				continue
-			}
-			a, has := it[name(l)]
-			if !has {
-				break
-			}
-			c, ok := compareValues(a, values[strings.TrimSpace(r)])
-			if !ok {
-				c = 1
-			}
-			if op == "<=" && c <= 0 || op == ">=" && c >= 0 || op == "<>" && c != 0 || op == "=" && c == 0 {
-				return true
-			}
-			break
+		c, ok := compareValues(a, values[strings.TrimSpace(r)])
+		if !ok {
+			c = 1
 		}
+		return op == "<=" && c <= 0 || op == ">=" && c >= 0 || op == "<>" && c != 0 || op == "=" && c == 0
 	}
 	return false
+}
+
+// clone copies an item and the maps in it, as a call to DynamoDB does.
+func clone(it map[string]types.AttributeValue) map[string]types.AttributeValue {
+	if it == nil {
+		return nil
+	}
+	out := maps.Clone(it)
+	for k, v := range out {
+		if m, ok := v.(*types.AttributeValueMemberM); ok {
+			out[k] = &types.AttributeValueMemberM{Value: clone(m.Value)}
+		}
+	}
+	return out
 }
 
 func failed() error {
@@ -160,12 +187,19 @@ func (m *memDB) BatchWriteItem(_ context.Context, in *dynamodb.BatchWriteItemInp
 
 func (m *memDB) GetItem(_ context.Context, in *dynamodb.GetItemInput, _ ...func(*dynamodb.Options)) (*dynamodb.GetItemOutput, error) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	t, err := m.table(in.TableName)
 	if err != nil {
+		m.mu.Unlock()
 		return nil, err
 	}
-	return &dynamodb.GetItemOutput{Item: maps.Clone(t.items[t.id(in.Key)])}, nil
+	out := &dynamodb.GetItemOutput{Item: clone(t.items[t.id(in.Key)])}
+	after := m.afterGet
+	m.afterGet = nil
+	m.mu.Unlock()
+	if after != nil {
+		after()
+	}
+	return out, nil
 }
 
 func (m *memDB) PutItem(_ context.Context, in *dynamodb.PutItemInput, _ ...func(*dynamodb.Options)) (*dynamodb.PutItemOutput, error) {
@@ -179,7 +213,7 @@ func (m *memDB) PutItem(_ context.Context, in *dynamodb.PutItemInput, _ ...func(
 	if !eval(in.ConditionExpression, in.ExpressionAttributeNames, in.ExpressionAttributeValues, t.items[id]) {
 		return nil, failed()
 	}
-	t.items[id] = maps.Clone(in.Item)
+	t.items[id] = clone(in.Item)
 	return &dynamodb.PutItemOutput{}, nil
 }
 

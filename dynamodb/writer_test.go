@@ -180,3 +180,59 @@ func TestUnchangedKeepsHold(t *testing.T) {
 		t.Errorf("after the held version's patch: %v", it)
 	}
 }
+
+// A replaced attempt's put of a merged row, after the next attempt has
+// applied the row and filled a cell an earlier version held, leaves the cell
+// filled: a put that reads nothing, one that keeps a column, and a soft
+// delete, whose read comes before the next attempt's writes.
+func TestLatePutKeepsFill(t *testing.T) {
+	cfg := destination.Stream{Name: "t", Mode: destination.Merge, PrimaryKey: []string{"id"}}
+	version := func(id, op, seq string) map[string]types.AttributeValue {
+		return map[string]types.AttributeValue{"id": str("1"), idColumn: str(id), opColumn: str(op), seqColumn: &types.AttributeValueMemberN{Value: seq}}
+	}
+	first := func() map[string]types.AttributeValue {
+		it := version("1-10", "insert", "10")
+		it[heldColumn] = &types.AttributeValueMemberM{Value: map[string]types.AttributeValue{"c": str("1-10")}}
+		return it
+	}
+	for name, tc := range map[string]struct {
+		row  func() map[string]types.AttributeValue
+		keep []string
+	}{
+		"put":         {row: first},
+		"keep":        {row: func() map[string]types.AttributeValue { return version("1-20", "update", "20") }, keep: []string{"c"}},
+		"soft delete": {row: func() map[string]types.AttributeValue { return version("1-30", "delete", "30") }},
+	} {
+		t.Run(name, func(t *testing.T) {
+			db := newMemDB(map[string][]string{controlTable: {"p", "n"}, "t": {"id"}})
+			w := memWriter(t, db, cfg)
+			if _, err := db.PutItem(t.Context(), &dynamodb.PutItemInput{TableName: aws.String("t"), Item: first()}); err != nil {
+				t.Fatal(err)
+			}
+			next := func() {
+				if _, err := w.applyRow(t.Context(), cfg, "t", tc.row(), tc.keep, ""); err != nil {
+					t.Error(err)
+				}
+				cur, err := w.get(t.Context(), "t", map[string]types.AttributeValue{"id": str("1")})
+				if err != nil {
+					t.Error(err)
+				}
+				if err := w.fill(t.Context(), "t", cur, "1-10", map[string]types.AttributeValue{"c": str("filled")}); err != nil {
+					t.Error(err)
+				}
+			}
+			if name == "put" {
+				next()
+			} else {
+				db.afterGet = next
+			}
+			if _, err := w.applyRow(t.Context(), cfg, "t", tc.row(), tc.keep, ""); err != nil {
+				t.Fatal(err)
+			}
+			it := db.items("t")[0]
+			if stringOf(it["c"]) != "filled" || it[heldColumn] != nil || stringOf(it[idColumn]) != stringOf(tc.row()[idColumn]) {
+				t.Errorf("after the replaced attempt's put, the item is %v; want %s with c filled and no hold", it, stringOf(tc.row()[idColumn]))
+			}
+		})
+	}
+}
