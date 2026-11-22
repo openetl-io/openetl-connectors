@@ -474,13 +474,25 @@ func (w *writer) Write(ctx context.Context, e destination.Epoch, stream string, 
 	return nil
 }
 
-// produceFailed is a record's failed produce, naming its topic, and for a
-// record too large, the limits it passed.
+// batchLimit is the most bytes a batch of records holds: franz-go's
+// default ProducerBatchMaxBytes.
+const batchLimit = 1000012
+
+// produceFailed is a record's failed produce, naming its topic, and for one
+// too large, the limit it passed: the client's, which a record over it
+// never fits, or the topic's max.message.bytes, below the client's batches.
 func produceFailed(r *kgo.Record, err error) error {
-	if errors.Is(err, kerr.MessageTooLarge) || errors.Is(err, kerr.RecordListTooLarge) {
-		return sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_DATA_INVALID, fmt.Errorf("kafka: a record for %s: %w: a row's record, with its key and headers, must fit in the client's batch limit of 1000012 bytes and in the topic's max.message.bytes", r.Topic, err))
+	if !errors.Is(err, kerr.MessageTooLarge) && !errors.Is(err, kerr.RecordListTooLarge) {
+		return fmt.Errorf("kafka: a record for %s: %w", r.Topic, err)
 	}
-	return fmt.Errorf("kafka: a record for %s: %w", r.Topic, err)
+	size := len(r.Key) + len(r.Value)
+	for _, h := range r.Headers {
+		size += len(h.Key) + len(h.Value)
+	}
+	if size >= batchLimit {
+		return sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_DATA_INVALID, fmt.Errorf("kafka: a record of %d bytes for %s: %w: a row's record, with its key and headers, must fit in the client's batch limit of %d bytes", size, r.Topic, err, batchLimit))
+	}
+	return sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_CONFIG_INVALID, fmt.Errorf("kafka: a batch of records for %s: %w: the topic's max.message.bytes is below the client's batches of up to %d bytes; raise it to at least that", r.Topic, err, batchLimit))
 }
 
 // marker is a writer lane's record of an epoch on the marker topic, in

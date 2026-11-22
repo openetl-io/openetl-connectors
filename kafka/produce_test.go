@@ -9,6 +9,8 @@ import (
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/memory"
+	"github.com/twmb/franz-go/pkg/kadm"
+	"github.com/twmb/franz-go/pkg/kgo"
 
 	"github.com/openetl-io/openetl-connectors/records"
 	"github.com/openetl-io/openetl/sdk/go/destination"
@@ -32,8 +34,33 @@ func TestARowTooLargeNamesItsTopicAndTheLimit(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, err := w.PreCommit(t.Context(), e)
-	if err == nil || !strings.Contains(err.Error(), l.table) || !strings.Contains(err.Error(), "max.message.bytes") || codeOf(err) != "ERROR_CODE_DATA_INVALID" {
+	if err == nil || !strings.Contains(err.Error(), l.table) || !strings.Contains(err.Error(), "1000012") || codeOf(err) != "ERROR_CODE_DATA_INVALID" {
 		t.Errorf("a row of 1.1 MB pre-committed with %s %v", codeOf(err), err)
+	}
+}
+
+// A topic whose max.message.bytes is below the client's batches refuses
+// batches of rows that each fit: its config is to change, not the rows.
+func TestATopicLimitBelowTheClientsBatchesIsConfig(t *testing.T) {
+	l := newLanes(t)
+	cl, err := kgo.NewClient(kgo.SeedBrokers(l.addrs...))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cl.Close()
+	if _, err := kadm.NewClient(cl).CreateTopic(t.Context(), 1, 1, map[string]*string{"max.message.bytes": kadm.StringPtr("1000")}, l.table); err != nil {
+		t.Fatal(err)
+	}
+	w := l.open(1, 0)
+	e := epochOf(1, 1)
+	b := idRows(l.table, 0, 2000)
+	defer b.Release()
+	if err := w.Write(t.Context(), e, l.table, b); err != nil {
+		t.Fatal(err)
+	}
+	_, err = w.PreCommit(t.Context(), e)
+	if codeOf(err) != "ERROR_CODE_CONFIG_INVALID" || !strings.Contains(err.Error(), "max.message.bytes") {
+		t.Errorf("pre-commit: %s %v", codeOf(err), err)
 	}
 }
 
