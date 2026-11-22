@@ -62,6 +62,8 @@ The binlog connection presents a server ID, which must differ from every replica
 
 > [!WARNING]
 > MySQL and MariaDB keep binlog files for `binlog_expire_logs_seconds`, whatever a pipeline has read. A pipeline that's paused or failing for longer finds its position purged: its read fails, and its tables have to be read again from a new snapshot. OpenETL reports how long the server keeps the file the pipeline's position is in, so it can warn before that happens, and a pipeline's preflight fails if the server keeps them for less than the time between its scheduled syncs.
+>
+> Amazon RDS and Aurora keep binlog files for their `binlog retention hours` instead, which is unset by default, so the files go as soon as they can, whatever `binlog_expire_logs_seconds` says, and what OpenETL reports and checks from it doesn't hold there. Set it: `CALL mysql.rds_set_configuration('binlog retention hours', 168);`.
 
 With GTIDs (`gtid_mode = ON` on MySQL; MariaDB always has them), a stream's state keeps the GTIDs it has read too, and after a failover to another server of the same replication topology the read continues from them on the new server. Without them, a read of another server fails as lost, and the check and a CDC pipeline's preflight warn.
 
@@ -180,7 +182,7 @@ A zero date, `0000-00-00`, or one with a zero month or day, which MySQL keeps wh
 
 ### Schema changes
 
-A column added to a table read with CDC fails the read once, retryably, and the next attempt declares it. A column that was added and dropped again before the read reached it is left out. A column whose type changed so that the binlog's values no longer fit the type the read declared fails the read the same way. `TRUNCATE` isn't in the binlog as rows: the source logs a warning, and the destination keeps the rows; a new snapshot of the table brings it back in step.
+A column added to a table read with CDC fails the read once, retryably, and the next attempt declares it. A column that was added and dropped again before the read reached it is left out. A column whose type changed so that the binlog's values no longer fit the type the read declared fails the read the same way. The binlog names columns as they were: changes from before a column was renamed, or added, that the read reaches after it, don't have it, and arrive with it null, which a merge then sets on their rows until they change again. `TRUNCATE` isn't in the binlog as rows: the source logs a warning, and the destination keeps the rows; a new snapshot of the table brings it back in step.
 
 ### Delivery
 
@@ -206,7 +208,7 @@ All three write modes work:
 
 - **Append** inserts each epoch's rows.
 - **Overwrite** writes a read's rows to a table of its own, which replaces the target's rows when the read ends, so the target keeps its old rows until then.
-- **Merge** upserts each key's latest version, ordered by `_openetl_seq`, so an older version never overwrites a newer one. Deletes are soft unless the pipeline sets `destination.deletes: hard`: the row stays, with `_openetl_deleted` true. Merge adds a unique index on the key's columns if the table has none; it fails, saying so, if the table has two rows with one key.
+- **Merge** upserts each key's latest version, ordered by `_openetl_seq`, so an older version never overwrites a newer one. Deletes are soft unless the pipeline sets `destination.deletes: hard`: the row stays, with `_openetl_deleted` true, and the values it had before the epoch, so an update in the delete's own epoch doesn't land; a key that's new in the epoch takes the delete's values. A hard delete leaves nothing of the row to order by, so a version older than the delete that comes in a later epoch puts the row back. Merge adds a unique index on the key's columns if the table has none; it fails, saying so, if the table has two rows with one key.
 
 Each epoch is staged into tables of its own, one per stream and writer lane. MySQL commits before each DDL statement, so the destination makes every table, column and index an epoch needs first, then applies its rows in one transaction that only changes rows: it checks the fence row in `_openetl_fence`, applies each stream, and writes a marker per stream in `_openetl_loads`, all or nothing. A replaced attempt can't apply, and an epoch is never applied twice. Append and overwrite also skip rows a source sends again, by their `_openetl_id`, and merge keeps each key's latest version. So a stream lands exactly once, or effectively once when it's merged from a source that may repeat rows, unless the pipeline asks for less. Leave `_openetl_fence` and `_openetl_loads` in place.
 
