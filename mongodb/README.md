@@ -275,5 +275,5 @@ A validator whose `validationAction` is `warn`, or whose `validationLevel` is `o
 ### Limits
 
 - Filling held cells uses `$getField` and `$setField`, which need MongoDB 5.0 or later.
-- Overwrite's `renameCollection` doesn't work on sharded collections.
+- Overwrite's `renameCollection` isn't tested on a sharded cluster.
 - A document is at most 16 MB, as MongoDB allows.
