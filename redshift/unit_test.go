@@ -397,3 +397,21 @@ func TestMergePicks(t *testing.T) {
 		t.Errorf("without a seq: %s", q)
 	}
 }
+
+// Of two patch columns that fill one held column, the first's UPDATE leaves
+// it held for the second's to match, and the second's takes it out.
+func TestPatchSharedHeldColumn(t *testing.T) {
+	w := &writer{schema: "s"}
+	s := stagedStream{Table: "t", Mode: modeMerge, Key: []string{"id"}, Fills: map[string]string{"price__v2": "price"}}
+	patch := []column{{name: "id", typ: "bigint"}, {name: "price__v2", typ: "bigint"}, {name: "price", typ: "integer"}, {name: idColumn, typ: "varchar(36)"}, {name: heldColumn, typ: varcharMax}}
+	stmts := w.patch(s, prepared{patch: patch, patches: `"s"."p"`})
+	if len(stmts) != 2 {
+		t.Fatalf("%d statements: %q", len(stmts), stmts)
+	}
+	unhold := `"` + heldColumn + `" = NULLIF(`
+	for i, want := range []bool{false, true} {
+		if got := strings.Contains(stmts[i], unhold); got != want {
+			t.Errorf("statement %d takes the held column out: %v, want %v\n%s", i, got, want, stmts[i])
+		}
+	}
+}
