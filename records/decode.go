@@ -9,11 +9,14 @@ import (
 	"fmt"
 	"math"
 	"math/big"
+	"net/http"
+	"net/url"
 	"sync"
 	"time"
 	"unicode/utf8"
 
 	"github.com/apache/arrow-go/v18/arrow"
+	"github.com/bufbuild/protocompile/linker"
 	"github.com/google/uuid"
 	"github.com/twmb/avro"
 	"github.com/twmb/franz-go/pkg/sr"
@@ -31,7 +34,7 @@ type Decoder struct {
 
 	mu     sync.Mutex
 	avros  map[int]*avroSchema
-	protos map[int]protoreflect.FileDescriptor
+	protos map[int]linker.File
 }
 
 type avroSchema struct {
@@ -40,7 +43,7 @@ type avroSchema struct {
 }
 
 func NewDecoder(format string, reg *sr.Client) *Decoder {
-	return &Decoder{format: format, reg: reg, avros: map[int]*avroSchema{}, protos: map[int]protoreflect.FileDescriptor{}}
+	return &Decoder{format: format, reg: reg, avros: map[int]*avroSchema{}, protos: map[int]linker.File{}}
 }
 
 var errNotRegistry = errors.New("not in the schema registry's wire format")
@@ -90,9 +93,27 @@ func (d *Decoder) Decode(ctx context.Context, b []byte) (json.RawMessage, error)
 		if err := proto.Unmarshal(rest, m); err != nil {
 			return nil, fmt.Errorf("protobuf with schema %d: %w", id, err)
 		}
-		return protojson.MarshalOptions{UseProtoNames: true, EmitUnpopulated: true}.Marshal(m)
+		// An Any is of a message the schema has, or one of its imports.
+		return protojson.MarshalOptions{UseProtoNames: true, EmitUnpopulated: true, Resolver: linker.ResolverFromFile(fd)}.Marshal(m)
 	}
 	return JSONText(b), nil
+}
+
+// Unanswered says whether err, from Decode, is the schema registry's not
+// answering: no response, a server error, too many requests, or credentials
+// it refused. Any other error is an answer about the bytes: not in the
+// registry's wire format, a schema ID it doesn't have, or a body that
+// doesn't decode.
+func Unanswered(err error) bool {
+	if re, ok := errors.AsType[*sr.ResponseError](err); ok {
+		switch re.StatusCode {
+		case http.StatusUnauthorized, http.StatusForbidden, http.StatusRequestTimeout, http.StatusTooManyRequests:
+			return true
+		}
+		return re.StatusCode >= http.StatusInternalServerError
+	}
+	_, ok := errors.AsType[*url.Error](err)
+	return ok || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 }
 
 // JSONText is b as a JSON string: its text, or base64 if it isn't UTF-8.
@@ -163,7 +184,7 @@ func parseAvro(ctx context.Context, reg *sr.Client, sc sr.Schema) (*avroSchema, 
 	return &avroSchema{schema: s, root: s.Root().ExpandReferences()}, nil
 }
 
-func (d *Decoder) proto(ctx context.Context, id int) (protoreflect.FileDescriptor, error) {
+func (d *Decoder) proto(ctx context.Context, id int) (linker.File, error) {
 	d.mu.Lock()
 	fd := d.protos[id]
 	d.mu.Unlock()
@@ -185,7 +206,7 @@ func (d *Decoder) proto(ctx context.Context, id int) (protoreflect.FileDescripto
 }
 
 // protoFile compiles sc with the files it imports from the registry.
-func protoFile(ctx context.Context, reg *sr.Client, sc sr.Schema) (protoreflect.FileDescriptor, error) {
+func protoFile(ctx context.Context, reg *sr.Client, sc sr.Schema) (linker.File, error) {
 	files := map[string]string{}
 	var add func(name string, s sr.Schema) error
 	add = func(name string, s sr.Schema) error {
@@ -366,8 +387,14 @@ func avroArrow(node *avro.SchemaNode) (arrow.DataType, arrow.Metadata) {
 		}
 		return arrow.BinaryTypes.String, arrow.Metadata{}
 	case "uuid":
-		if node.Type == "string" {
+		// A fixed(16)'s, like a string's, is spelled as text.
+		if node.Type == "string" || (node.Type == "fixed" && node.Size == 16) {
 			return &arrow.FixedSizeBinaryType{ByteWidth: 16}, arrow.NewMetadata([]string{ExtensionNameKey}, []string{UUIDExtension})
+		}
+	case "duration":
+		// Its months, days and milliseconds, as an object.
+		if node.Type == "fixed" && node.Size == 12 {
+			return jsonField()
 		}
 	}
 	switch node.Type {

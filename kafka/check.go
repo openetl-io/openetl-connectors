@@ -84,6 +84,11 @@ var (
 		Message: "The topic {topic} doesn't exist, and createTopics is off.",
 		Fix:     "Create {topic}, or set createTopics to true.",
 	}
+	clearPassword = check.Reason{
+		Name: "credentials_unencrypted", Code: configInvalid,
+		Message: "PLAIN without TLS sends the password across the network as it is, and the records unencrypted.",
+		Fix:     "Set tls to true, on a listener that has it, or use scram-sha-256 or scram-sha-512.",
+	}
 	notCompacted = check.Reason{
 		Name: "marker_topic_not_compacted", Code: configInvalid,
 		Message: "{topic}'s cleanup.policy is {policy}, so the destination's markers expire with its retention, and recovery can't find an epoch's marker once it has.",
@@ -237,6 +242,9 @@ func (c *Connection) connectionChecks(cp *clusterProbe) []check.Check {
 				p.Param("brokers", len(m.Brokers))
 				p.Param("cluster", m.Cluster)
 				p.Found("The cluster {cluster} answered. Brokers: {brokers}.")
+				if c.SASLMechanism == saslPlain && !c.usesTLS() {
+					return check.Warn(clearPassword.Fail())
+				}
 				return nil
 			},
 		},

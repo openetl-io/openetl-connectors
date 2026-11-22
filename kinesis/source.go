@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"net/http"
 	"regexp"
 	"slices"
 	"strconv"
@@ -1207,6 +1208,25 @@ func (s *Source) rows(ctx context.Context, shard string, recs []types.Record) ([
 	return out, nil
 }
 
+// decodeFailed is the error of a record's data that didn't decode: the
+// schema registry's, if it didn't answer, else invalid data.
+func decodeFailed(shard, seq string, err error) error {
+	code := protocolv1.ErrorCode_ERROR_CODE_DATA_INVALID
+	if records.Unanswered(err) {
+		code = protocolv1.ErrorCode_ERROR_CODE_TRANSIENT
+		if re, ok := errors.AsType[*sr.ResponseError](err); ok {
+			switch re.StatusCode {
+			case http.StatusUnauthorized:
+				code = protocolv1.ErrorCode_ERROR_CODE_AUTH_INVALID
+			case http.StatusForbidden:
+				code = protocolv1.ErrorCode_ERROR_CODE_PERMISSION_DENIED
+			}
+			err = fmt.Errorf("the schema registry answered %d: %w", re.StatusCode, err)
+		}
+	}
+	return sdk.WithCode(code, fmt.Errorf("kinesis: shard %s sequence %s: %w", shard, seq, err))
+}
+
 // row is a record, or its user record sub, as a JSON object: its data's
 // fields, or its data as "value", and the record's own columns.
 func (s *Source) row(ctx context.Context, shard string, rec *types.Record, sub int, key string, data []byte) (json.RawMessage, error) {
@@ -1216,7 +1236,7 @@ func (s *Source) row(ctx context.Context, shard string, rec *types.Record, sub i
 	if len(data) > 0 {
 		v, err := s.values.Decode(ctx, data)
 		if err != nil {
-			return nil, sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_DATA_INVALID, fmt.Errorf("kinesis: shard %s sequence %s: %w", shard, seq, err))
+			return nil, decodeFailed(shard, seq, err)
 		}
 		b = records.AppendFields(b, v)
 	}

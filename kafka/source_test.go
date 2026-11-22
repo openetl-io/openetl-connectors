@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/twmb/franz-go/pkg/kadm"
 	"github.com/twmb/franz-go/pkg/kgo"
 	"github.com/twmb/franz-go/pkg/kmsg"
 
@@ -41,11 +42,11 @@ func TestProgress(t *testing.T) {
 }
 
 func TestSplitOffsets(t *testing.T) {
-	got, err := splitOffsets([]source.Split{{ID: "p0", State: encodeOffset(5)}, {ID: "p12", State: encodeOffset(0)}, {ID: "p3"}})
+	got, err := splitOffsets([]source.Split{{ID: "p0", State: encodeOffset(5, "")}, {ID: "p12", State: encodeOffset(0, "")}, {ID: "p3"}})
 	if err != nil || !maps.Equal(got, map[int32]int64{0: 5, 12: 0}) {
 		t.Errorf("splits: %v, %v", got, err)
 	}
-	got, err = splitOffsets([]source.Split{{ID: source.WholeStream, State: encodeState(map[int32]int64{1: 7, 2: 9})}})
+	got, err = splitOffsets([]source.Split{{ID: source.WholeStream, State: encodeState(map[int32]int64{1: 7, 2: 9}, "")}})
 	if err != nil || !maps.Equal(got, map[int32]int64{1: 7, 2: 9}) {
 		t.Errorf("whole: %v, %v", got, err)
 	}
@@ -116,8 +117,8 @@ func TestASourceCompletesWhereItIsAsked(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	first := readEvents(t, s, source.ConfiguredStream{Name: topic, Splits: []source.Split{{ID: "p0", State: encodeOffset(5)}, {ID: "p1", State: encodeOffset(0)}}})
-	end := "complete " + string(encodeOffset(30))
+	first := readEvents(t, s, source.ConfiguredStream{Name: topic, Splits: []source.Split{{ID: "p0", State: encodeOffset(5, "")}, {ID: "p1", State: encodeOffset(0, "")}}})
+	end := "complete " + string(encodeOffset(30, ""))
 	if !lastIs(first["p0"], end) || !lastIs(first["p1"], end) {
 		t.Fatalf("the first read ended with %v and %v", first["p0"], first["p1"])
 	}
@@ -125,8 +126,8 @@ func TestASourceCompletesWhereItIsAsked(t *testing.T) {
 	produceMore(t, addrs, topic, 1, 5)
 
 	got := readEvents(t, s, source.ConfiguredStream{Name: topic, Splits: []source.Split{
-		{ID: "p0", State: encodeOffset(5), CompleteAt: encodeOffset(30)},
-		{ID: "p1", State: encodeOffset(0), CompleteAt: encodeOffset(30)},
+		{ID: "p0", State: encodeOffset(5, ""), CompleteAt: encodeOffset(30, "")},
+		{ID: "p1", State: encodeOffset(0, ""), CompleteAt: encodeOffset(30, "")},
 	}})
 	if r := rowsIn(got["p0"]); !slices.Equal(r, rowsIn(at(0, 5, 30))) {
 		t.Errorf("split p0 read %v", r)
@@ -138,7 +139,7 @@ func TestASourceCompletesWhereItIsAsked(t *testing.T) {
 		t.Errorf("the splits ended with %v and %v", got["p0"], got["p1"])
 	}
 
-	from, completed := encodeState(map[int32]int64{0: 2, 1: 3}), encodeState(map[int32]int64{0: 30, 1: 30})
+	from, completed := encodeState(map[int32]int64{0: 2, 1: 3}, ""), encodeState(map[int32]int64{0: 30, 1: 30}, "")
 	got = readEvents(t, s, source.ConfiguredStream{Name: topic, State: from, CompleteAt: completed})
 	ev := got[source.WholeStream]
 	if r := rowsIn(ev); !slices.Equal(r, rowsIn(append(at(0, 2, 30), at(1, 3, 30)...))) {
@@ -154,7 +155,7 @@ func TestASourceCompletesWhereItIsAsked(t *testing.T) {
 	out := &splitEvents{events: map[string][]string{}}
 	done := make(chan error, 1)
 	go func() {
-		done <- s.Read(ctx, source.ReadRequest{Streams: []source.ConfiguredStream{{Name: topic, Splits: []source.Split{{ID: "p0", State: encodeOffset(28), CompleteAt: encodeOffset(30)}}}}, Pipeline: "p", Lanes: 1, Continuous: true}, out)
+		done <- s.Read(ctx, source.ReadRequest{Streams: []source.ConfiguredStream{{Name: topic, Splits: []source.Split{{ID: "p0", State: encodeOffset(28, ""), CompleteAt: encodeOffset(30, "")}}}}, Pipeline: "p", Lanes: 1, Continuous: true}, out)
 	}()
 	deadline := time.Now().Add(20 * time.Second)
 	for {
@@ -220,7 +221,7 @@ func TestASourceStopsWhereCleanupRemovedTheLastRecords(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	first := readEvents(t, s, source.ConfiguredStream{Name: topic, Splits: []source.Split{{ID: "p0", State: encodeOffset(0)}}})
+	first := readEvents(t, s, source.ConfiguredStream{Name: topic, Splits: []source.Split{{ID: "p0", State: encodeOffset(0, "")}}})
 	want := rowsIn(at(0, 0, 5))
 	if r := rowsIn(first["p0"]); !slices.Equal(r, want) {
 		t.Fatalf("the first read read %v", r)
@@ -240,8 +241,8 @@ func TestASourceStopsWhereCleanupRemovedTheLastRecords(t *testing.T) {
 	}
 
 	for _, sp := range []source.Split{
-		{ID: "p0", State: encodeOffset(0), CompleteAt: []byte(end)},
-		{ID: "p0", State: encodeOffset(0), Until: []byte(end)},
+		{ID: "p0", State: encodeOffset(0, ""), CompleteAt: []byte(end)},
+		{ID: "p0", State: encodeOffset(0, ""), Until: []byte(end)},
 	} {
 		begun := time.Now()
 		got := readEvents(t, s, source.ConfiguredStream{Name: topic, Splits: []source.Split{sp}})
@@ -258,7 +259,7 @@ func TestASourceStopsWhereCleanupRemovedTheLastRecords(t *testing.T) {
 			t.Errorf("a read to %s waited %v for the records cleanup removed", end, d)
 		}
 	}
-	from, whole := encodeState(map[int32]int64{0: 0}), encodeState(map[int32]int64{0: st.Offset})
+	from, whole := encodeState(map[int32]int64{0: 0}, ""), encodeState(map[int32]int64{0: st.Offset}, "")
 	got := readEvents(t, s, source.ConfiguredStream{Name: topic, State: from, CompleteAt: whole})
 	if r := rowsIn(got[source.WholeStream]); !slices.Equal(r, want) || !lastIs(got[source.WholeStream], "complete "+string(whole)) {
 		t.Errorf("the whole stream read %v, and ended with %v", r, got[source.WholeStream])
@@ -275,9 +276,173 @@ func TestASourceStopsWhereCleanupRemovedTheLastRecords(t *testing.T) {
 		}
 		return nil, errors.New("held"), true
 	})
-	got = readEvents(t, s, source.ConfiguredStream{Name: topic, Splits: []source.Split{{ID: "p0", State: encodeOffset(5), CompleteAt: []byte(end)}}})
+	got = readEvents(t, s, source.ConfiguredStream{Name: topic, Splits: []source.Split{{ID: "p0", State: encodeOffset(5, ""), CompleteAt: []byte(end)}}})
 	if r := rowsIn(got["p0"]); len(r) > 0 || !lastIs(got["p0"], "complete "+end) {
 		t.Errorf("with the read's fetches held, a read from 5 to %s read %v, and ended with %v", end, r, got["p0"])
+	}
+}
+
+// A topic deleted and created again, whose partitions end before the
+// offsets a read resumes from, has lost the read's position: the read and
+// the splits fail with POSITION_LOST rather than skip the new topic's
+// records up to the old offsets. A partition that ends at its offset still
+// completes there.
+func TestASourceRefusesAPositionPastThePartitionsEnd(t *testing.T) {
+	addrs := fake(t)
+	topic := "events"
+	produceRecords(t, addrs, topic, 1, 30, 10)
+	s, err := NewSource(fakeConfig(t, addrs, map[string]any{"topics": []string{topic}}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := readEvents(t, s, source.ConfiguredStream{Name: topic, State: encodeState(map[int32]int64{0: 30}, "")})
+	if !lastIs(got[source.WholeStream], "complete "+string(encodeState(map[int32]int64{0: 30}, ""))) {
+		t.Fatalf("a read from the partition's end ended with %v", got[source.WholeStream])
+	}
+
+	cl, err := kgo.NewClient(kgo.SeedBrokers(addrs...))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cl.Close()
+	if _, err := kadm.NewClient(cl).DeleteTopic(t.Context(), topic); err != nil {
+		t.Fatal(err)
+	}
+	produceRecords(t, addrs, topic, 1, 5, 5)
+
+	lost := func(what string, err error) {
+		t.Helper()
+		var coded interface{ ErrorCode() protocolv1.ErrorCode }
+		if !errors.As(err, &coded) || coded.ErrorCode() != protocolv1.ErrorCode_ERROR_CODE_POSITION_LOST {
+			t.Errorf("%s: %v, want POSITION_LOST", what, err)
+		}
+	}
+	for _, cs := range []source.ConfiguredStream{
+		{Name: topic, State: encodeState(map[int32]int64{0: 30}, "")},
+		{Name: topic, Splits: []source.Split{{ID: "p0", State: encodeOffset(30, "")}}},
+	} {
+		for _, continuous := range []bool{false, true} {
+			out := &splitEvents{events: map[string][]string{}}
+			ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+			err := s.Read(ctx, source.ReadRequest{Streams: []source.ConfiguredStream{cs}, Pipeline: "p", Lanes: 1, Continuous: continuous}, out)
+			cancel()
+			lost(fmt.Sprintf("a read (continuous %v) from offset 30 of a partition ending at 5", continuous), err)
+			if len(out.events) > 0 {
+				t.Errorf("the read emitted %v", out.events)
+			}
+		}
+	}
+	_, err = s.Splits(t.Context(), source.ConfiguredStream{Name: topic}, []source.Split{{ID: "p0", State: encodeOffset(30, "")}})
+	lost("splits from offset 30 of a partition ending at 5", err)
+}
+
+// A read again that stops at a state, as OpenETL's redo of an epoch does,
+// ends with that state as it was given, with the topic's ID or, from
+// before 0.2.0, without one: OpenETL finds the position it asked for by
+// its bytes.
+func TestARedoEndsWithTheStateItWasGiven(t *testing.T) {
+	addrs := fake(t)
+	topic := "events"
+	produceRecords(t, addrs, topic, 1, 30, 10)
+	s, err := NewSource(fakeConfig(t, addrs, map[string]any{"topics": []string{topic}}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	read := func(cs source.ConfiguredStream) map[string][]byte {
+		t.Helper()
+		out := &splitEvents{events: map[string][]string{}}
+		ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+		defer cancel()
+		if err := s.Read(ctx, source.ReadRequest{Streams: []source.ConfiguredStream{cs}, Pipeline: "p", Lanes: 1}, out); err != nil {
+			t.Fatal(err)
+		}
+		return out.states
+	}
+	id := topicIDOf(read(source.ConfiguredStream{Name: topic})[source.WholeStream])
+	if id == "" {
+		t.Fatal("a read's state has no topic ID")
+	}
+	for _, tid := range []string{"", id} {
+		from, stop := encodeState(map[int32]int64{0: 2}, tid), encodeState(map[int32]int64{0: 8}, tid)
+		fromP0, stopP0 := encodeOffset(2, tid), encodeOffset(8, tid)
+		for _, cs := range []source.ConfiguredStream{
+			{Name: topic, State: from, Until: stop},
+			{Name: topic, State: from, CompleteAt: stop},
+			{Name: topic, Splits: []source.Split{{ID: "p0", State: fromP0, Until: stopP0}}},
+			{Name: topic, Splits: []source.Split{{ID: "p0", State: fromP0, CompleteAt: stopP0}}},
+		} {
+			split, want := source.WholeStream, stop
+			if cs.Splits != nil {
+				split, want = "p0", stopP0
+			}
+			if got := read(cs)[split]; string(got) != string(want) {
+				t.Errorf("a read to %s ended with %s", want, got)
+			}
+		}
+	}
+}
+
+// A topic deleted and created again is another topic, even once it has
+// grown past the read's offsets: a state that names the old topic's ID has
+// lost its position. A state without an ID, from before 0.2.0, reads on
+// and takes the topic's ID.
+func TestASourceRefusesATopicCreatedAgain(t *testing.T) {
+	addrs := fake(t)
+	topic := "events"
+	produceRecords(t, addrs, topic, 1, 10, 10)
+	s, err := NewSource(fakeConfig(t, addrs, map[string]any{"topics": []string{topic}}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	read := func(cs source.ConfiguredStream, continuous bool) (*splitEvents, error) {
+		out := &splitEvents{events: map[string][]string{}}
+		ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+		defer cancel()
+		err := s.Read(ctx, source.ReadRequest{Streams: []source.ConfiguredStream{cs}, Pipeline: "p", Lanes: 1, Continuous: continuous}, out)
+		return out, err
+	}
+	first, err := read(source.ConfiguredStream{Name: topic}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	whole := first.states[source.WholeStream]
+	old := topicIDOf(whole)
+	if old == "" {
+		t.Fatalf("the state %s has no topic ID", whole)
+	}
+
+	cl, err := kgo.NewClient(kgo.SeedBrokers(addrs...))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cl.Close()
+	if _, err := kadm.NewClient(cl).DeleteTopic(t.Context(), topic); err != nil {
+		t.Fatal(err)
+	}
+	produceRecords(t, addrs, topic, 1, 15, 15)
+
+	for _, cs := range []source.ConfiguredStream{
+		{Name: topic, State: whole},
+		{Name: topic, Splits: []source.Split{{ID: "p0", State: encodeOffset(10, old)}}},
+	} {
+		for _, continuous := range []bool{false, true} {
+			out, err := read(cs, continuous)
+			if codeOf(err) != "ERROR_CODE_POSITION_LOST" || len(out.events) > 0 {
+				t.Errorf("a read (continuous %v) of a topic created again: %v, emitting %v", continuous, err, out.events)
+			}
+		}
+	}
+	_, err = s.Splits(t.Context(), source.ConfiguredStream{Name: topic}, []source.Split{{ID: "p0", State: encodeOffset(10, old)}})
+	if codeOf(err) != "ERROR_CODE_POSITION_LOST" {
+		t.Errorf("splits of a topic created again: %v", err)
+	}
+
+	out, err := read(source.ConfiguredStream{Name: topic, State: encodeState(map[int32]int64{0: 10}, "")}, false)
+	if err != nil || len(rowsIn(out.events[source.WholeStream])) != 5 {
+		t.Fatalf("a state without an ID: %v, emitting %v", err, out.events)
+	}
+	if id := topicIDOf(out.states[source.WholeStream]); id == "" || id == old {
+		t.Errorf("a state without an ID took ID %q, the old topic's %q", id, old)
 	}
 }
 
@@ -335,8 +500,8 @@ func TestAStopIsReachedOnlyWhenTheBrokerShowsIt(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, sp := range []source.Split{
-		{ID: "p0", State: encodeOffset(0), Until: encodeOffset(30)},
-		{ID: "p0", State: encodeOffset(0), CompleteAt: encodeOffset(30)},
+		{ID: "p0", State: encodeOffset(0, ""), Until: encodeOffset(30, "")},
+		{ID: "p0", State: encodeOffset(0, ""), CompleteAt: encodeOffset(30, "")},
 	} {
 		out := &splitEvents{events: map[string][]string{}}
 		err := s.Read(t.Context(), source.ReadRequest{Streams: []source.ConfiguredStream{{Name: topic, Splits: []source.Split{sp}}}, Pipeline: "p", Lanes: 1}, out)
@@ -354,8 +519,8 @@ func TestAStopIsReachedOnlyWhenTheBrokerShowsIt(t *testing.T) {
 
 	shortWaits(t, 100*time.Millisecond, 10*time.Second)
 	time.AfterFunc(time.Second, func() { held.Store(false) })
-	got := readEvents(t, s, source.ConfiguredStream{Name: topic, Splits: []source.Split{{ID: "p0", State: encodeOffset(0), CompleteAt: encodeOffset(30)}}})
-	if r := rowsIn(got["p0"]); !slices.Equal(r, rowsIn(at(0, 0, 30))) || !lastIs(got["p0"], "complete "+string(encodeOffset(30))) {
+	got := readEvents(t, s, source.ConfiguredStream{Name: topic, Splits: []source.Split{{ID: "p0", State: encodeOffset(0, ""), CompleteAt: encodeOffset(30, "")}}})
+	if r := rowsIn(got["p0"]); !slices.Equal(r, rowsIn(at(0, 0, 30))) || !lastIs(got["p0"], "complete "+string(encodeOffset(30, ""))) {
 		t.Errorf("once the broker answered, the split read %v, and ended with %v", r, got["p0"])
 	}
 }

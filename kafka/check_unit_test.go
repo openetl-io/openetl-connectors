@@ -22,6 +22,7 @@ import (
 
 	"github.com/twmb/franz-go/pkg/kadm"
 	"github.com/twmb/franz-go/pkg/kerr"
+	"github.com/twmb/franz-go/pkg/kfake"
 	"github.com/twmb/franz-go/pkg/kgo"
 	"github.com/twmb/franz-go/pkg/kmsg"
 
@@ -271,5 +272,30 @@ func TestTransactionLimit(t *testing.T) {
 	}
 	if _, err := limit(kerr.InvalidRequest.Code); !errors.Is(err, kerr.InvalidRequest) {
 		t.Errorf("a broker's error = %v", err)
+	}
+}
+
+// PLAIN without TLS signs in with a warning: its password crosses the
+// network as it is. SCRAM's doesn't.
+func TestPlainWithoutTLSWarns(t *testing.T) {
+	c, err := kfake.NewCluster(kfake.NumBrokers(1), kfake.EnableSASL(), kfake.Superuser("PLAIN", "alice", "s3cret"), kfake.Superuser("SCRAM-SHA-256", "alice", "s3cret"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	for mech, want := range map[string]string{saslPlain: "warning:credentials_unencrypted", saslScram256: "passed"} {
+		s, err := NewSource(fakeConfig(t, c.ListenAddrs(), map[string]any{"topicPattern": ".*", "saslMechanism": mech, "saslUsername": "alice", "saslPassword": "s3cret"}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, it := range check.Run(t.Context(), s.Checks()).Items {
+			got := it.Status.String()
+			if it.Failure != nil {
+				got += ":" + it.Failure.Reason
+			}
+			if it.Name == "kafka.auth" && got != want {
+				t.Errorf("%s: kafka.auth %s, want %s", mech, got, want)
+			}
+		}
 	}
 }

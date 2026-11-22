@@ -16,7 +16,7 @@ The source and the destination share their connection settings:
 - `region`: the streams' AWS region. Unset, the AWS default configuration's.
 - `accessKeyId` and `secretAccessKey`, together. Without them, the AWS SDK's default credential chain, which finds only what the runner gives the connector: by default, nothing. Name an IAM role in the source's or destination's `aws.role`, which the runner assumes for the connector, on EC2 and EKS alike. [Run on AWS](https://github.com/openetl-io/openetl/blob/main/docs/self-host/aws.md#credentials-for-connectors) explains the setup. Keys in the config are used even if a role is named.
 - `endpoint`: a Kinesis-compatible endpoint, such as a VPC endpoint or an emulator.
-- `format`: how each record's data is encoded: `json` (the default), `avro` or `protobuf`, the same as the [Kafka connectors](../kafka/README.md). Avro and Protobuf need `schemaRegistryUrl`.
+- `format`: how each record's data is encoded: `json` (the default), `avro` or `protobuf`, the same as the [Kafka connectors](../kafka/README.md). Avro and Protobuf need `schemaRegistryUrl`, and `schemaRegistryUsername` and `schemaRegistryPassword` if it asks for basic authentication. Basic authentication sends the password as it is, so use an `https` URL: over `http`, the credentials cross the network unencrypted, and from 0.2.0 the `registry.reach` check warns. Credentials in the URL, as `https://user:password@registry.internal`, sign in the same way; from 0.2.0, errors and the `registry.reach` check's title don't show them, even a password with a `#`, `?` or `/` in it.
 
 Keep `accessKeyId`, `secretAccessKey` and `schemaRegistryPassword` in secrets, as `{ secret: NAME }`.
 
@@ -34,7 +34,7 @@ A **check** is about the connection alone, and runs from a source's or a destina
 |---|---|
 | `net.dns`, `net.connect` | With `endpoint` set, and no proxy to reach it: its host resolves, and its port takes a connection. |
 | `kinesis.sign-in` | The connector finds AWS credentials, and Kinesis takes them to list a stream. The destination doesn't list streams, so for it, Kinesis refusing the list for want of a permission passes. |
-| `registry.reach` | With `format` `avro` or `protobuf`: the schema registry lists its subjects. |
+| `registry.reach` | With `format` `avro` or `protobuf`: the schema registry lists its subjects. From 0.2.0, it warns if credentials for the registry, from the settings or the URL, go over `http`. |
 | `streams.offered` | The source only: the streams it offers. It warns if `streams` and `streamPattern` match none, or if `streams` names one that isn't among them. |
 
 A **preflight** is about a pipeline: OpenETL runs it with the streams a sync of the pipeline would read and write, after both checks pass. Its items for a stream start with `stream.NAME.`, where NAME is the stream's name in lowercase with each run of other characters than letters and digits replaced by `-`, followed by a hash if two streams' NAMEs would be the same.
@@ -99,6 +99,10 @@ Each record becomes a row, as in the [Kafka source](../kafka/README.md#rows): an
 | `_kinesis_subsequence` | From 0.2.0: its user record's number within an aggregated record; 0 for a record that isn't one |
 | `_kinesis_arrival` | When Kinesis received it, in UTC |
 | `_kinesis_partition_key` | Its partition key |
+
+With `avro` or `protobuf`, each record's data is decoded with the schema whose ID it carries, and each field of the latest schema under `<stream>-value` is declared as in the [Kafka source](../kafka/README.md#types). From 0.2.0, a `uuid` on a `fixed` of 16 is declared a UUID, and a `duration` JSON of its `months`, `days` and `milliseconds`; before, both were declared binary, which their values didn't fit. From 0.2.0 too, a Protobuf `google.protobuf.Any` decodes when its message is in the schema or a file it imports; one of a message neither has stops the read, as every `Any` did before.
+
+Data that doesn't decode in the configured `format` stops the read with `DATA_INVALID`, naming its shard and sequence number. From 0.2.0, data whose schema the registry doesn't serve for now, as when it doesn't answer, answers with a server error or too many requests, or refuses the credentials, stops the read with the registry's error instead: `TRANSIENT`, or `AUTH_INVALID` or `PERMISSION_DENIED` for credentials it refuses. Before 0.2.0, that was `DATA_INVALID` too. A schema ID the registry doesn't have is still `DATA_INVALID`.
 
 ### Set it up
 

@@ -233,6 +233,30 @@ func TestDestinationCommitsEpochs(t *testing.T) {
 	wantIDs(t, ids(t, committed(t, table)), 0, 80)
 }
 
+// A transaction the brokers abort on its timeout fails its epoch as
+// transient, not as a fence, at the pre-commit or the commit, whichever
+// meets the abort first: the brokers look for such transactions every 10
+// seconds by default.
+func TestDestinationTransactionTimedOut(t *testing.T) {
+	defer func(s time.Duration) { txnSlack = s }(txnSlack)
+	txnSlack = 3 * time.Second
+	d := newDest(t, nil)
+	pipeline, table := uniq("p"), uniq("items")
+	createTopic(t, table, 1)
+	w := openWriter(t, d, pipeline, 1, table)
+	e := destination.Epoch{Generation: 1, N: 1}
+	write(t, w, e, table, 0, 20)
+	st, err := w.PreCommit(t.Context(), e)
+	if err == nil {
+		time.Sleep(timeout(time.Second) + 12*time.Second)
+		_, err = w.Commit(t.Context(), e, []destination.Staged{st})
+	}
+	if errors.Is(err, destination.ErrFenced) || codeOf(err) != "ERROR_CODE_TRANSIENT" {
+		t.Errorf("%s %v", codeOf(err), err)
+	}
+	wantIDs(t, ids(t, committed(t, table)), 0, 0)
+}
+
 // A replacement's Open fences the old attempt's producers: the epoch the
 // old one had pre-committed is aborted and reported lost, and the old
 // attempt can't commit it.
@@ -584,6 +608,70 @@ func TestSourcePositionLost(t *testing.T) {
 	var coded interface{ ErrorCode() protocolv1.ErrorCode }
 	if !errors.As(err, &coded) || coded.ErrorCode() != protocolv1.ErrorCode_ERROR_CODE_POSITION_LOST {
 		t.Errorf("Read = %v, want POSITION_LOST", err)
+	}
+}
+
+// A topic deleted and created again, shorter than where the read was, has
+// lost the read's position, scheduled or continuous.
+func TestSourcePositionLostWithTheTopic(t *testing.T) {
+	topic := uniq("recreated")
+	createTopic(t, topic, 1)
+	produce(t, topic, 0, 10)
+	cl, _ := kgo.NewClient(kgo.SeedBrokers(brokers()))
+	defer cl.Close()
+	if _, err := kadm.NewClient(cl).DeleteTopic(t.Context(), topic); err != nil {
+		t.Fatal(err)
+	}
+	awaitFor(t, "the topic to be created again", 30*time.Second, func() bool {
+		_, err := kadm.NewClient(cl).CreateTopic(t.Context(), 1, 1, nil, topic)
+		return err == nil
+	})
+	produce(t, topic, 0, 3)
+	s := newSource(t, map[string]any{"topics": []string{topic}})
+	for _, continuous := range []bool{false, true} {
+		ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+		err := s.Read(ctx, source.ReadRequest{Pipeline: "p", Continuous: continuous, Streams: []source.ConfiguredStream{{Name: topic, SyncMode: source.Stream, State: []byte(`{"offsets":{"0":10}}`)}}}, newCapture())
+		cancel()
+		var coded interface{ ErrorCode() protocolv1.ErrorCode }
+		if !errors.As(err, &coded) || coded.ErrorCode() != protocolv1.ErrorCode_ERROR_CODE_POSITION_LOST {
+			t.Errorf("Read (continuous %v) = %v, want POSITION_LOST", continuous, err)
+		}
+	}
+}
+
+// A topic deleted and created again that has grown past the read's offset
+// has lost the read's position too: its ID isn't the state's.
+func TestSourcePositionLostWithATopicGrownPast(t *testing.T) {
+	topic := uniq("regrown")
+	createTopic(t, topic, 1)
+	produce(t, topic, 0, 10)
+	s := newSource(t, map[string]any{"topics": []string{topic}})
+	c := newCapture()
+	if err := s.Read(t.Context(), source.ReadRequest{Pipeline: "p", Streams: []source.ConfiguredStream{{Name: topic, SyncMode: source.Stream}}}, c); err != nil {
+		t.Fatal(err)
+	}
+	st := c.complete[topic]
+	if topicIDOf(st) == "" {
+		t.Fatalf("the state %s has no topic ID", st)
+	}
+	cl, _ := kgo.NewClient(kgo.SeedBrokers(brokers()))
+	defer cl.Close()
+	if _, err := kadm.NewClient(cl).DeleteTopic(t.Context(), topic); err != nil {
+		t.Fatal(err)
+	}
+	awaitFor(t, "the topic to be created again", 30*time.Second, func() bool {
+		_, err := kadm.NewClient(cl).CreateTopic(t.Context(), 1, 1, nil, topic)
+		return err == nil
+	})
+	produce(t, topic, 0, 15)
+	for _, continuous := range []bool{false, true} {
+		ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+		c := newCapture()
+		err := s.Read(ctx, source.ReadRequest{Pipeline: "p", Continuous: continuous, Streams: []source.ConfiguredStream{{Name: topic, SyncMode: source.Stream, State: st}}}, c)
+		cancel()
+		if codeOf(err) != "ERROR_CODE_POSITION_LOST" || len(c.rows[topic]) > 0 {
+			t.Errorf("Read (continuous %v) = %v with %d rows, want POSITION_LOST", continuous, err, len(c.rows[topic]))
+		}
 	}
 }
 
@@ -953,7 +1041,7 @@ func TestSourceResumesAMixOfSplits(t *testing.T) {
 			want[int64(r["id"].(float64))]++
 		}
 	}
-	c := readSplits(t, s, topic, []source.Split{{ID: "p1", State: encodeOffset(mid)}, {ID: "p2"}})
+	c := readSplits(t, s, topic, []source.Split{{ID: "p1", State: encodeOffset(mid, "")}, {ID: "p2"}})
 	if c.has(topic, "p0") {
 		t.Error("read a split that had completed")
 	}
@@ -1023,7 +1111,7 @@ func TestSourceSplitsGainNewPartitions(t *testing.T) {
 	added := append(slices.Clone(c.splits[topic]["p0"].added), c.splits[topic]["p1"].added...)
 	nrows := len(rec.rows)
 	c.mu.Unlock()
-	if len(added) != 1 || added[0].ID != "p2" || string(added[0].State) != string(encodeOffset(0)) {
+	if len(added) != 1 || added[0].ID != "p2" || string(added[0].State) != string(encodeOffset(0, topicIDOf(splits[0].State))) {
 		t.Errorf("added %v", added)
 	}
 	if nrows != 5 {
@@ -1158,7 +1246,7 @@ func TestSourceSplitPositionLost(t *testing.T) {
 		t.Fatal(err)
 	}
 	s := newSource(t, map[string]any{"topics": []string{topic}})
-	lost := []source.Split{{ID: "p0", State: encodeOffset(3)}}
+	lost := []source.Split{{ID: "p0", State: encodeOffset(3, "")}}
 	wantLost := func(err error) {
 		t.Helper()
 		var coded interface{ ErrorCode() protocolv1.ErrorCode }
