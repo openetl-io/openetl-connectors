@@ -274,9 +274,10 @@ type inferred struct {
 }
 
 var (
-	dateText  = regexp.MustCompile(`^\d{4}-\d{2}-\d{2}$`)
-	stampText = regexp.MustCompile(`^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(\.\d+)?(Z|z|[+-]\d{2}(:?\d{2})?)?$`)
-	zoneText  = regexp.MustCompile(`(Z|z|[+-]\d{2}(:?\d{2})?)$`)
+	dateText    = regexp.MustCompile(`^\d{4}-\d{2}-\d{2}$`)
+	stampText   = regexp.MustCompile(`^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(\.\d+)?(Z|z|[+-]\d{2}(:?\d{2})?)?$`)
+	zoneText    = regexp.MustCompile(`(Z|z|[+-]\d{2}(:?\d{2})?)$`)
+	leadingZero = regexp.MustCompile(`^[+-]?0\d`)
 )
 
 // text adds a CSV value, or a JSON string's, to what the column has seen.
@@ -290,6 +291,10 @@ func (in *inferred) text(s string) {
 	}
 	if !exactFloat(s) || strings.ContainsAny(s, "xXpP_") {
 		in.notFloat = true
+	}
+	// A leading zero, as a code like 007 has, which a number would drop.
+	if leadingZero.MatchString(s) {
+		in.notInt, in.notFloat = true, true
 	}
 	if _, err := time.Parse(time.DateOnly, s); err != nil || !dateText.MatchString(s) {
 		in.notDate = true

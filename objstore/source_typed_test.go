@@ -596,6 +596,29 @@ func TestPreflightNames(t *testing.T) {
 	}
 }
 
+// A CSV column with a value of a leading zero, as a code like 007 has, is
+// text, which keeps the zero; 0 itself and decimals like 0.5 aren't such.
+func TestInferLeadingZeros(t *testing.T) {
+	for _, c := range []struct {
+		values []string
+		want   string
+	}{
+		{[]string{"1", "007"}, "utf8"},
+		{[]string{"-007", "1"}, "utf8"},
+		{[]string{"00.5", "1.5"}, "utf8"},
+		{[]string{"0", "10", "-3"}, "int64"},
+		{[]string{"0.5", "-0.25", "0"}, "float64"},
+	} {
+		in := &inferred{}
+		for _, v := range c.values {
+			in.text(v)
+		}
+		if got := in.field("n").Type.String(); got != c.want {
+			t.Errorf("%v: %s, want %s", c.values, got, c.want)
+		}
+	}
+}
+
 // A text or JSON column of numbers that a 64-bit float can't hold exactly,
 // such as IDs past int64's range, is text, which keeps their digits, not
 // number, which would round them.
