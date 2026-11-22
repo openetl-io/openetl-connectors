@@ -57,16 +57,18 @@ func TestSourceConformance(t *testing.T) {
 				return fmt.Appendf(nil, `{"dsn": %q, "schema": %q, "chunkRows": 25, "snapshotChunkRows": 20, "cdcMethod": %q}`, dsn, e.schema, method)
 			}
 			conformance.SourceSuite{
-				Launch:         conformance.Exec(conformance.Build(t, "../cmd/source-sqlserver")),
-				Config:         cfg(dsn()),
-				BadCredentials: cfg(badPassword(t)),
-				Unreachable:    cfg(closedPort),
-				StopsAtUntil:   true,
+				Launch:            conformance.Exec(conformance.Build(t, "../cmd/source-sqlserver")),
+				Config:            cfg(dsn()),
+				BadCredentials:    cfg(badPassword(t)),
+				Unreachable:       cfg(closedPort),
+				StopsAtUntil:      true,
+				StopsAtCompletion: true,
 				AddRecords: func(ctx context.Context, stream string) (int, error) {
 					switch stream {
 					case "events":
-						_, err := e.db.ExecContext(ctx, "INSERT INTO "+qualified(e.schema, "events")+
-							" SELECT n, DATEADD(minute, n, '2026-02-01'), N'{}' FROM (SELECT TOP (10) 1000 + ROW_NUMBER() OVER (ORDER BY (SELECT 1)) AS n FROM sys.all_objects) x")
+						// Each call adds new events, later than those before.
+						_, err := e.db.ExecContext(ctx, "DECLARE @from bigint = (SELECT coalesce(max(id), 0) FROM "+qualified(e.schema, "events")+"); INSERT INTO "+qualified(e.schema, "events")+
+							" SELECT @from + n, DATEADD(minute, @from + n, '2026-02-01'), N'{}' FROM (SELECT TOP (10) ROW_NUMBER() OVER (ORDER BY (SELECT 1)) AS n FROM sys.all_objects) x")
 						return 10, err
 					case "orders":
 						// Each call adds new orders, as a continuous read is

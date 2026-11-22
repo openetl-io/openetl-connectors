@@ -96,7 +96,9 @@ type cdcTable struct {
 	b   *batcher
 	out source.SplitEmitter
 	st  cdcState
-	// Where the read ends, and as the request spelled it; nil to read on.
+	// Where the read ends, and as the request spelled it: its until, or the
+	// completion it completes at again, which a completion's position says
+	// as an until's does; nil to read on.
 	stop  *cdcState
 	until []byte
 	// The state of its last resume point, and when.
@@ -196,13 +198,17 @@ func (r *cdcReader) open(ctx context.Context, cs source.ConfiguredStream, tables
 	if err != nil {
 		return nil, err
 	}
-	ct := &cdcTable{t: t, out: streamEmitter(r.out, t.name), until: cs.Until}
+	end := cs.Until
+	if end == nil {
+		end = cs.CompleteAt
+	}
+	ct := &cdcTable{t: t, out: streamEmitter(r.out, t.name), until: end}
 	if err := unmarshalState(t.name, cs.State, &ct.st); err != nil {
 		return nil, err
 	}
-	if cs.Until != nil {
+	if end != nil {
 		ct.stop = &cdcState{}
-		if err := unmarshalState(t.name, cs.Until, ct.stop); err != nil {
+		if err := unmarshalState(t.name, end, ct.stop); err != nil {
 			return nil, err
 		}
 	}

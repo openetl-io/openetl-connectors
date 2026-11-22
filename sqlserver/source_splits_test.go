@@ -159,6 +159,68 @@ func TestIncremental(t *testing.T) {
 	}
 }
 
+// An incremental read asked to complete where a read completed, as a redo of
+// a part of an epoch that ended there is, reads up to the highest cursor
+// value that read did, not the column's highest now, and completes with the
+// completion's bytes: from no state, and from the read before's completion,
+// neither of which says that value.
+func TestIncrementalCompleteAt(t *testing.T) {
+	for _, keyed := range []bool{true, false} {
+		t.Run(map[bool]string{true: "keyed", false: "keyless"}[keyed], func(t *testing.T) {
+			e := newSourceEnv(t)
+			key := ""
+			if keyed {
+				key = " PRIMARY KEY"
+			}
+			e.exec("CREATE TABLE $schema.t (id int" + key + ", at datetime2)")
+			e.exec("INSERT INTO $schema.t VALUES (1, '2026-01-01'), (2, '2026-01-02'), (3, '2026-01-03')")
+			s := e.source(`, "chunkRows": 2`)
+			read := func(state, completeAt string) *splitCapture {
+				t.Helper()
+				cs := source.ConfiguredStream{Name: "t", SyncMode: source.Incremental, Cursor: "at"}
+				if state != "" {
+					cs.State = []byte(state)
+				}
+				if completeAt != "" {
+					cs.CompleteAt = []byte(completeAt)
+				}
+				c := &splitCapture{Col: "id"}
+				if err := s.Read(t.Context(), source.ReadRequest{Streams: []source.ConfiguredStream{cs}}, c); err != nil {
+					t.Fatal(err)
+				}
+				return c
+			}
+			completion := func(c *splitCapture) string {
+				ev := c.Of(source.WholeStream)
+				if len(ev) == 0 || !ev[len(ev)-1].Complete {
+					t.Fatalf("no completion: %+v", ev)
+				}
+				return ev[len(ev)-1].State
+			}
+			first := read("", "")
+			end1 := completion(first)
+			e.exec("INSERT INTO $schema.t VALUES (4, '2026-01-04'), (5, '2026-01-05')")
+			second := read(end1, "")
+			end2 := completion(second)
+			e.exec("INSERT INTO $schema.t VALUES (6, '2026-01-06')")
+			for _, c := range []struct{ from, to string }{{"", end1}, {end1, end2}} {
+				want := first
+				if c.from != "" {
+					want = second
+				}
+				redo := read(c.from, c.to)
+				// A table without a key is read in no order.
+				if got := redo.Values(); !slices.Equal(slices.Sorted(slices.Values(got)), slices.Sorted(slices.Values(want.Values()))) {
+					t.Errorf("from %q to its completion %s: %v, want %v", c.from, c.to, got, want.Values())
+				}
+				if got := completion(redo); got != c.to {
+					t.Errorf("from %q, asked to complete at %s, completed at %s", c.from, c.to, got)
+				}
+			}
+		})
+	}
+}
+
 // A varchar cursor's highest value is kept whole, past 4000 characters, so
 // the row that holds it is read.
 func TestIncrementalLongTextCursor(t *testing.T) {

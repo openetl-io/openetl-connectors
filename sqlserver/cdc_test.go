@@ -541,6 +541,60 @@ func TestCDCRedoFromNoState(t *testing.T) {
 	}
 }
 
+// A read asked to complete where a read completed, as a redo of a part of an
+// epoch that ended there is, reads the changes up to that completion and
+// none past it, and completes with its bytes: from the state the first read
+// started at, and, a stream's first part, from no state, with the snapshot
+// from where the first read's started.
+func TestCDCCompleteAt(t *testing.T) {
+	for _, method := range []string{methodTracking, methodCapture} {
+		t.Run(method, func(t *testing.T) {
+			e := newSourceEnv(t)
+			e.exec("CREATE TABLE $schema.t (id int PRIMARY KEY, v int)")
+			e.exec("INSERT INTO $schema.t VALUES (1, 1), (2, 2)")
+			harvested := func() {}
+			if method == methodTracking {
+				e.exec("ALTER TABLE $schema.t ENABLE CHANGE_TRACKING")
+			} else {
+				e.capture("t")
+				harvested = e.harvested
+			}
+			harvested()
+			s := e.source(`, "cdcMethod": "` + method + `"`)
+			first := read(t, s, source.CDC, map[string]string{"t": ""})
+			snapSeq := first.column("t", "openetl.seq")[0]
+			end1 := first.next["t"]
+			e.exec("UPDATE $schema.t SET v = 10 WHERE id = 1")
+			e.exec("INSERT INTO $schema.t VALUES (3, 3)")
+			harvested()
+			second := read(t, s, source.CDC, map[string]string{"t": end1})
+			end2 := second.next["t"]
+			e.exec("UPDATE $schema.t SET v = 20 WHERE id = 2")
+			e.exec("INSERT INTO $schema.t VALUES (4, 4)")
+			harvested()
+
+			redo := readReq(t, s, source.ReadRequest{Streams: []source.ConfiguredStream{{Name: "t", SyncMode: source.CDC, State: []byte(end1), CompleteAt: []byte(end2)}}})
+			if got, want := changes(redo, "t", "id", "v", "openetl.seq"), changes(second, "t", "id", "v", "openetl.seq"); !slices.Equal(got, want) {
+				t.Errorf("from %s to its completion %s: %v, want %v", end1, end2, got, want)
+			}
+			if redo.next["t"] != end2 {
+				t.Errorf("asked to complete at %s, completed at %s", end2, redo.next["t"])
+			}
+
+			redo = readReq(t, s, source.ReadRequest{Streams: []source.ConfiguredStream{{Name: "t", SyncMode: source.CDC, CompleteAt: []byte(end1)}}})
+			for _, seq := range redo.column("t", "openetl.seq") {
+				if seq != snapSeq {
+					t.Errorf("from no state to its completion %s: a record with seq %s, past the snapshot's %s: %v", end1, seq, snapSeq, changes(redo, "t", "id", "v", "openetl.seq"))
+					break
+				}
+			}
+			if redo.next["t"] != end1 {
+				t.Errorf("from no state, asked to complete at %s, completed at %s", end1, redo.next["t"])
+			}
+		})
+	}
+}
+
 // Change data capture keeps every change: a read again up to a resume point
 // has the same changes, with the same seqs, after the rows changed again.
 func TestCaptureRedo(t *testing.T) {
