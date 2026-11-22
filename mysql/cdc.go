@@ -813,9 +813,9 @@ func (r *cdcReader) event(ctx context.Context, ev *replication.BinlogEvent) erro
 		case q == "COMMIT":
 			return r.commit(h)
 		}
-		if statementChange(q) && (string(e.Schema) == r.s.cfg.Database || namesWord(q, strings.ToUpper(r.s.cfg.Database))) {
+		if schema, name, ok := statementTarget(q); ok && cmp.Or(schema, strings.ToUpper(string(e.Schema))) == strings.ToUpper(r.s.cfg.Database) {
 			for _, st := range r.streams {
-				if !st.finished && (r.txn == nil || !r.txn.skip[st]) && namesWord(q, strings.ToUpper(st.t.name)) {
+				if !st.finished && (r.txn == nil || !r.txn.skip[st]) && name == strings.ToUpper(st.t.name) {
 					return configInvalid("mysql: binlog: a change to %s logged as a statement, which has no rows to read: a session set binlog_format to STATEMENT or MIXED; "+
 						"log changes with binlog_format = ROW, and read %[1]s again", st.t.name)
 				}
@@ -866,35 +866,61 @@ func (r *cdcReader) event(ctx context.Context, ev *replication.BinlogEvent) erro
 	return nil
 }
 
-// statementChange is whether q, a statement in upper case, changes rows,
-// which in the binlog means a session logged it as a statement.
-func statementChange(q string) bool {
+// statementTarget is the table that q, a statement in upper case that
+// changes rows, writes, which in the binlog means a session logged it as a
+// statement: the first table it names after INSERT, REPLACE, UPDATE or
+// DELETE and their modifiers, with its schema if q names one. ok is false
+// for another statement. A multi-table UPDATE or DELETE writes more.
+func statementTarget(q string) (schema, name string, ok bool) {
 	for strings.HasPrefix(q, "/*") {
 		_, q, _ = strings.Cut(q, "*/")
 		q = strings.TrimSpace(q)
 	}
-	for _, verb := range []string{"INSERT", "UPDATE", "DELETE", "REPLACE"} {
-		if strings.HasPrefix(q, verb) && (len(q) == len(verb) || !nameChar(q[len(verb)])) {
-			return true
-		}
+	verb, rest := nextName(q)
+	switch verb {
+	case "INSERT", "REPLACE", "UPDATE", "DELETE":
+	default:
+		return "", "", false
 	}
-	return false
+	for {
+		name, rest = nextName(rest)
+		switch name {
+		case "LOW_PRIORITY", "DELAYED", "HIGH_PRIORITY", "IGNORE", "QUICK", "INTO", "FROM":
+			continue
+		}
+		break
+	}
+	if strings.HasPrefix(rest, ".") {
+		schema = name
+		name, _ = nextName(rest[1:])
+	}
+	return schema, name, name != ""
 }
 
-// namesWord is whether q has w other than inside a longer name.
-func namesWord(q, w string) bool {
-	for i := 0; w != ""; {
-		j := strings.Index(q[i:], w)
-		if j < 0 {
-			return false
+// nextName is the name s starts with, after spaces, bare or quoted with
+// backticks, and what follows it.
+func nextName(s string) (name, rest string) {
+	s = strings.TrimLeft(s, " \t\r\n")
+	if !strings.HasPrefix(s, "`") {
+		i := 0
+		for i < len(s) && nameChar(s[i]) {
+			i++
 		}
-		j += i
-		if end := j + len(w); (j == 0 || !nameChar(q[j-1])) && (end == len(q) || !nameChar(q[end])) {
-			return true
-		}
-		i = j + 1
+		return s[:i], s[i:]
 	}
-	return false
+	var b strings.Builder
+	for i := 1; i < len(s); i++ {
+		switch {
+		case s[i] != '`':
+			b.WriteByte(s[i])
+		case i+1 < len(s) && s[i+1] == '`':
+			b.WriteByte('`')
+			i++
+		default:
+			return b.String(), s[i+1:]
+		}
+	}
+	return "", ""
 }
 
 func nameChar(c byte) bool {

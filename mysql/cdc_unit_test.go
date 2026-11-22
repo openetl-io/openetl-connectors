@@ -102,30 +102,34 @@ func TestMariaDBTransactionsHaveNoBegin(t *testing.T) {
 }
 
 // TestStatementChangesFail reads changes a session logged as statements,
-// with binlog_format STATEMENT or MIXED, which have no rows: one to a table
-// the read has fails it, and others are no concern of it.
+// with binlog_format STATEMENT or MIXED, which have no rows: one that writes
+// a table the read has fails it, and others, which may name the table
+// without writing it, are no concern of it.
 func TestStatementChangesFail(t *testing.T) {
-	for q, fails := range map[string]bool{
-		"INSERT INTO items VALUES (3, 's')":                  true,
-		"update `items` set v = 'x' where id = 1":            true,
-		"DELETE FROM app.items WHERE id = 1":                 true,
-		"REPLACE INTO items (id, v) VALUES (1, 'x')":         true,
-		"INSERT INTO items_log VALUES (1)":                   false,
-		"INSERT INTO other.items VALUES (1)":                 false,
-		"SAVEPOINT items":                                    false,
-		"ALTER TABLE items ADD COLUMN w int":                 false,
-		"/* app */ INSERT INTO items VALUES (3, 's')":        true,
-		"INSERT INTO other.log SELECT * FROM app.items_x":    false,
-		"UPDATE other.log JOIN app.items USING (id) SET n=1": true,
+	for _, c := range []struct {
+		schema, q string
+		fails     bool
+	}{
+		{"app", "INSERT INTO items VALUES (3, 's')", true},
+		{"app", "update `items` set v = 'x' where id = 1", true},
+		{"other", "DELETE FROM app.items WHERE id = 1", true},
+		{"app", "REPLACE INTO items (id, v) VALUES (1, 'x')", true},
+		{"app", "INSERT IGNORE INTO items(id) VALUES (1)", true},
+		{"app", "/* app */ INSERT INTO items VALUES (3, 's')", true},
+		{"other", "DELETE LOW_PRIORITY QUICK FROM `app`.`items` WHERE id = 1", true},
+		{"app", "INSERT INTO items_log VALUES (1)", false},
+		{"other", "INSERT INTO items VALUES (1)", false},
+		{"app", "INSERT INTO other.items VALUES (1)", false},
+		{"app", "SAVEPOINT items", false},
+		{"app", "ALTER TABLE items ADD COLUMN w int", false},
+		{"app", "REPLACE INTO other.checksums SELECT COUNT(*) FROM app.items", false},
+		{"app", "INSERT INTO audit VALUES ('items')", false},
+		{"other", "UPDATE log JOIN app.items USING (id) SET n = 1", false},
 	} {
 		r, _ := binlogReader(t, false)
-		schema := "app"
-		if strings.Contains(q, "other.") {
-			schema = "other"
-		}
-		err := feed(t, r, at(100, replication.QUERY_EVENT, query("BEGIN")), at(200, replication.QUERY_EVENT, &replication.QueryEvent{Schema: []byte(schema), Query: []byte(q)}))
-		if fails != (connectortest.CodeOf(err) == protocolv1.ErrorCode_ERROR_CODE_CONFIG_INVALID) || fails && !strings.Contains(err.Error(), "binlog_format") {
-			t.Errorf("%s: %v", q, err)
+		err := feed(t, r, at(100, replication.QUERY_EVENT, query("BEGIN")), at(200, replication.QUERY_EVENT, &replication.QueryEvent{Schema: []byte(c.schema), Query: []byte(c.q)}))
+		if c.fails != (connectortest.CodeOf(err) == protocolv1.ErrorCode_ERROR_CODE_CONFIG_INVALID) || c.fails && !strings.Contains(err.Error(), "binlog_format") {
+			t.Errorf("%s in %s: %v", c.q, c.schema, err)
 		}
 	}
 }
