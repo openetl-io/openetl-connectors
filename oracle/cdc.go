@@ -567,7 +567,8 @@ func (r *cdcReader) mineRange(lo, e uint64) error {
 	  nvl(data_objv#, 0), thread#
 	FROM v$logmnr_contents
 	WHERE `+thisContainer+` AND (operation_code IN (7, 36)
-	  OR (seg_owner = :1 AND table_name IN (`+strings.Join(names, ", ")+`) AND operation_code IN (1, 2, 3, 5, 9, 68, 255)))`, r.schema)
+	  OR (seg_owner = :1 AND table_name IN (`+strings.Join(names, ", ")+`) AND operation_code IN (1, 2, 3, 5, 9, 68, 255))
+	  OR (operation_code = 5 AND csf = 0 AND upper(sql_redo) LIKE '%EXCHANGE%PARTITION%WITH%TABLE%'))`, r.schema)
 	if err != nil {
 		return mining(fmt.Errorf("oracle: read LogMiner's changes from SCN %d: %w", lo, err))
 	}
@@ -859,11 +860,16 @@ func (r *cdcReader) lobs(st *cdcStream, vals []any, unchanged []string, scn uint
 // ddl handles a change of a table read's definition: one that changes its
 // columns stops the read there, and the next starts again with them.
 func (r *cdcReader) ddl(x logRow) error {
+	if m := exchangedWith.FindStringSubmatch(x.redo); m != nil && (m[1] == "" || ident(m[1]) == r.schema) {
+		if st := r.streams[ident(m[2])]; st != nil && !st.finished && x.scn > st.state.SCN {
+			return positionLost("oracle: %s's rows were exchanged with a partition of %s at SCN %d, and the redo log doesn't say which: read the stream again from a snapshot", st.t.name, x.table, x.scn)
+		}
+	}
 	st := r.streams[x.table]
 	if st == nil || st.finished || x.scn <= st.state.SCN {
 		return nil
 	}
-	stmt := strings.ToLower(x.redo)
+	stmt := strings.ToLower(leading.ReplaceAllString(x.redo, ""))
 	switch {
 	case strings.HasPrefix(stmt, "truncate"):
 		return positionLost("oracle: %s was truncated at SCN %d, and the redo log doesn't say which rows that deleted: read the stream again from a snapshot", x.table, x.scn)
@@ -888,6 +894,23 @@ func (r *cdcReader) ddl(x logRow) error {
 // partitionRows matches, in lower case, a statement that truncates, drops
 // or exchanges a table's partitions or subpartitions.
 var partitionRows = regexp.MustCompile(`(?s)^alter\s+table\s.*\b(truncate|drop|exchange)\s+(sub)?partitions?\b`)
+
+// leading matches a statement's leading whitespace and comments, which
+// LogMiner keeps in SQL_REDO.
+var leading = regexp.MustCompile(`^(?:\s+|(?s:/\*.*?\*/)|--[^\n]*)*`)
+
+// exchangedWith matches a statement that exchanges a partition or
+// subpartition with a table: its schema, if named, and its name.
+var exchangedWith = regexp.MustCompile(`(?is)\bexchange\s+(?:sub)?partition\b.*\bwith\s+table\s+(?:("[^"]+"|[\w$#]+)\s*\.\s*)?("[^"]+"|[\w$#]+)`)
+
+// ident is an identifier as the dictionary names it: a quoted one as it is,
+// another in upper case.
+func ident(s string) string {
+	if q, ok := strings.CutPrefix(s, `"`); ok {
+		return strings.TrimSuffix(q, `"`)
+	}
+	return strings.ToUpper(s)
+}
 
 func sameColumn(a, b column) bool {
 	return a.name == b.name && a.dataType == b.dataType && a.precision == b.precision && a.scale == b.scale && a.seg == b.seg

@@ -450,6 +450,24 @@ func TestCDCPartitionTruncated(t *testing.T) {
 	}
 }
 
+// Exchanging another table's partition with a table read swaps the table's
+// rows, which the redo log doesn't name either.
+func TestCDCPartitionExchangedIn(t *testing.T) {
+	db := testDB(t)
+	cdcTable(t, db, "CDC_XIN", `(id NUMBER(10), v VARCHAR2(10), CONSTRAINT cdc_xin_pk PRIMARY KEY (id))`)
+	dropTable(t, db, "CDC_XOTHER")
+	exec(t, db, `CREATE TABLE cdc_xother (id NUMBER(10), v VARCHAR2(10), CONSTRAINT cdc_xother_pk PRIMARY KEY (id) USING INDEX LOCAL)
+	  PARTITION BY RANGE (id) (PARTITION p1 VALUES LESS THAN (100), PARTITION p2 VALUES LESS THAN (MAXVALUE))`)
+	t.Cleanup(func() { dropTable(t, db, "CDC_XOTHER") })
+	exec(t, db, `INSERT INTO cdc_xin VALUES (1, 'a')`, `INSERT INTO cdc_xother VALUES (50, 'other')`)
+	s := cdcSource(t, "")
+	first := mustRead(t, s, nil, "CDC_XIN")
+	exec(t, db, `INSERT INTO cdc_xin VALUES (2, 'b')`, `ALTER TABLE cdc_xother EXCHANGE PARTITION p1 WITH TABLE cdc_xin INCLUDING INDEXES`)
+	if _, err := readCDCOnce(t, s, map[string][]byte{"CDC_XIN": first.state("CDC_XIN")}, "CDC_XIN"); cdcCode(err) != protocolv1.ErrorCode_ERROR_CODE_POSITION_LOST {
+		t.Errorf("a partition exchanged in: got %v, want POSITION_LOST", err)
+	}
+}
+
 func TestCDCNeedsSupplementalLogging(t *testing.T) {
 	db := testDB(t)
 	dropTable(t, db, "CDC_NOSUP")

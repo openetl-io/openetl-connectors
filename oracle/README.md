@@ -166,7 +166,7 @@ Columns are listed as nullable unless they're `NOT NULL`.
 
 A change to a table's columns that CDC reads, a column added, renamed, modified or set unused, ends the read where it's in the redo log: the read sends the changes before it, then fails retryably, and the next attempt declares the table's columns as they are now. A column the run didn't declare, one added since its Discover, fails the read retryably before it sends a change, so the next attempt declares it too. LogMiner reads a change made before such a DDL with the table's definition as it is when it reads it, so it names that change's columns by their place in the row; the source reads them by their place, with the columns added after the change as unchanged.
 
-A column dropped moves the columns after it, so a change made before the drop can't be read: the read fails as lost, and the stream has to be read again from a new snapshot. So do `TRUNCATE`, and `ALTER TABLE` truncating, dropping or exchanging a partition or subpartition, since the redo log doesn't say which rows they removed. `DROP TABLE` fails the read as misconfigured.
+A column dropped moves the columns after it, so a change made before the drop can't be read: the read fails as lost, and the stream has to be read again from a new snapshot. So do `TRUNCATE`, `ALTER TABLE` truncating, dropping or exchanging a partition or subpartition, and exchanging another table's partition or subpartition with the table, since the redo log doesn't say which rows they removed. `DROP TABLE` fails the read as misconfigured.
 
 ### Delivery
 

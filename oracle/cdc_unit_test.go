@@ -98,11 +98,35 @@ func TestCDCPartitionRemovedRows(t *testing.T) {
 		"ALTER TABLE t DROP PARTITION p1",
 		"alter table t drop partitions p1, p2",
 		"ALTER TABLE t\n  EXCHANGE PARTITION p1 WITH TABLE x",
+		// LogMiner keeps a statement's leading comments.
+		"/* x */ ALTER TABLE t TRUNCATE PARTITION p1;",
+		"  -- y\n ALTER TABLE t TRUNCATE PARTITION p2;",
+		"/* a\n b */ -- c\n/**/TRUNCATE TABLE t",
 	} {
 		r, _, _ := cdcReaderOf(t, 50)
 		err := r.ddl(logRow{scn: 100, op: 5, table: "T", redo: stmt})
 		if code := connectortest.CodeOf(err); code != protocolv1.ErrorCode_ERROR_CODE_POSITION_LOST {
 			t.Errorf("%q: got %v, want POSITION_LOST", stmt, err)
+		}
+	}
+}
+
+// Exchanging another table's partition with a table read swaps the table's
+// rows: the read fails as lost. Exchanging one with another table doesn't.
+func TestCDCPartitionExchangedWith(t *testing.T) {
+	for stmt, lost := range map[string]bool{
+		"ALTER TABLE other EXCHANGE PARTITION p1 WITH TABLE t INCLUDING INDEXES;":  true,
+		`alter table "S"."OTHER" exchange subpartition for (5) with table "S"."T"`: true,
+		"ALTER TABLE x.other EXCHANGE PARTITION p1 WITH TABLE s . t;":              true,
+		`ALTER TABLE other EXCHANGE PARTITION p1 WITH TABLE "t"`:                   false,
+		"ALTER TABLE other EXCHANGE PARTITION p1 WITH TABLE t2":                    false,
+		"ALTER TABLE other EXCHANGE PARTITION p1 WITH TABLE z.t":                   false,
+		"ALTER TABLE other TRUNCATE PARTITION p1":                                  false,
+	} {
+		r, _, _ := cdcReaderOf(t, 50)
+		err := r.ddl(logRow{scn: 100, op: 5, table: "OTHER", redo: stmt})
+		if got := connectortest.CodeOf(err) == protocolv1.ErrorCode_ERROR_CODE_POSITION_LOST; got != lost {
+			t.Errorf("%q: got %v, want lost %v", stmt, err, lost)
 		}
 	}
 }
