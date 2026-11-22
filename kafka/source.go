@@ -297,6 +297,9 @@ type topicRead struct {
 	name string
 	// The topic's ID: the state's, then the brokers', if they have IDs.
 	id string
+	// A read again to a state from before 0.2.0, which has no ID: its
+	// states keep none, so they are the first read's.
+	bare bool
 	// Where it's read whole, its emitter; else its partitions' splits. Only
 	// splits' partitions are read.
 	whole  source.SplitEmitter
@@ -361,6 +364,7 @@ func (s *Source) Read(ctx context.Context, req source.ReadRequest, out source.Em
 				if r.until, err = parseState(stop); err != nil {
 					return err
 				}
+				r.bare = topicIDOf(stop) == ""
 			}
 		} else {
 			if r.next, err = splitOffsets(st.Splits); err != nil {
@@ -383,6 +387,7 @@ func (s *Source) Read(ctx context.Context, req source.ReadRequest, out source.Em
 						r.until = map[int32]int64{}
 					}
 					r.until[p] = u.Offset
+					r.bare = r.bare || u.TopicID == ""
 				}
 			}
 		}
@@ -758,7 +763,9 @@ func (s *Source) position(ctx context.Context, adm *kadm.Client, reads map[strin
 			if r.id != "" && r.id != id.String() {
 				return positionLost(fmt.Errorf("kafka: %s has ID %s, and the read was of %s: the topic was deleted and created again; the stream needs a re-sync", t, id, r.id))
 			}
-			r.id = id.String()
+			if !r.bare {
+				r.id = id.String()
+			}
 		}
 		fresh := r.splits == nil && len(r.next) == 0
 		r.partitions = tds[t].Partitions.Numbers()

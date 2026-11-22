@@ -336,6 +336,52 @@ func TestASourceRefusesAPositionPastThePartitionsEnd(t *testing.T) {
 	lost("splits from offset 30 of a partition ending at 5", err)
 }
 
+// A read again that stops at a state, as OpenETL's redo of an epoch does,
+// ends with that state as it was given, with the topic's ID or, from
+// before 0.2.0, without one: OpenETL finds the position it asked for by
+// its bytes.
+func TestARedoEndsWithTheStateItWasGiven(t *testing.T) {
+	addrs := fake(t)
+	topic := "events"
+	produceRecords(t, addrs, topic, 1, 30, 10)
+	s, err := NewSource(fakeConfig(t, addrs, map[string]any{"topics": []string{topic}}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	read := func(cs source.ConfiguredStream) map[string][]byte {
+		t.Helper()
+		out := &splitEvents{events: map[string][]string{}}
+		ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+		defer cancel()
+		if err := s.Read(ctx, source.ReadRequest{Streams: []source.ConfiguredStream{cs}, Pipeline: "p", Lanes: 1}, out); err != nil {
+			t.Fatal(err)
+		}
+		return out.states
+	}
+	id := topicIDOf(read(source.ConfiguredStream{Name: topic})[source.WholeStream])
+	if id == "" {
+		t.Fatal("a read's state has no topic ID")
+	}
+	for _, tid := range []string{"", id} {
+		from, stop := encodeState(map[int32]int64{0: 2}, tid), encodeState(map[int32]int64{0: 8}, tid)
+		fromP0, stopP0 := encodeOffset(2, tid), encodeOffset(8, tid)
+		for _, cs := range []source.ConfiguredStream{
+			{Name: topic, State: from, Until: stop},
+			{Name: topic, State: from, CompleteAt: stop},
+			{Name: topic, Splits: []source.Split{{ID: "p0", State: fromP0, Until: stopP0}}},
+			{Name: topic, Splits: []source.Split{{ID: "p0", State: fromP0, CompleteAt: stopP0}}},
+		} {
+			split, want := source.WholeStream, stop
+			if cs.Splits != nil {
+				split, want = "p0", stopP0
+			}
+			if got := read(cs)[split]; string(got) != string(want) {
+				t.Errorf("a read to %s ended with %s", want, got)
+			}
+		}
+	}
+}
+
 // A topic deleted and created again is another topic, even once it has
 // grown past the read's offsets: a state that names the old topic's ID has
 // lost its position. A state without an ID, from before 0.2.0, reads on
