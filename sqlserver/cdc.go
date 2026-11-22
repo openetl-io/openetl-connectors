@@ -820,8 +820,8 @@ func instanceRanges(ins []captureInstance, lo, hi *big.Int) []instanceRange {
 	return out
 }
 
-// The ops of __$operation, with 'all': a delete's row, an insert's, and an
-// update's row after it.
+// The ops of __$operation: a delete's row, an insert's, and an update's row
+// after it; 3, its row before, is skipped.
 var captureOps = map[int64]string{1: source.OpDelete, 2: source.OpInsert, 4: source.OpUpdate}
 
 // read emits the changes one capture instance has from lo to hi, with a
@@ -839,8 +839,12 @@ func (m *capture) read(ctx context.Context, r *cdcReader, ct *cdcTable, in captu
 			unchanged = append(unchanged, c.name)
 		}
 	}
-	q := "SELECT " + strings.Join(sel, ", ") + ", c.__$start_lsn, CONVERT(bigint, c.__$operation) FROM cdc." + quote("fn_cdc_get_all_changes_"+in.name) +
-		"(@p1, @p2, N'all') AS c ORDER BY c.__$start_lsn, c.__$seqval, c.__$operation"
+	// In a transaction's order, __$command_id's, as fn_cdc_get_all_changes
+	// can't give it: a statement's deletes come before its inserts, and an
+	// insert shares its __$seqval with the delete of the row it was, which
+	// in a heap has another key.
+	q := "SELECT " + strings.Join(sel, ", ") + ", c.__$start_lsn, CONVERT(bigint, c.__$operation) FROM cdc." + quote(in.name+"_CT") +
+		" AS c WHERE c.__$start_lsn BETWEEN @p1 AND @p2 ORDER BY c.__$start_lsn, c.__$command_id, c.__$seqval, c.__$operation"
 	rows, err := r.s.db.QueryContext(ctx, q, lsnBytes(lo), lsnBytes(hi))
 	if err != nil {
 		return 0, classify(fmt.Errorf("sqlserver: read %s's changes: %w", t.name, err))

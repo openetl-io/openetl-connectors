@@ -392,7 +392,7 @@ func (s *Source) cdcCheck(k *sqlcheck.Kit, name, ident string) check.Check {
 		if s.cfg.CDCMethod == methodCapture {
 			q = `SELECT coalesce(OBJECTPROPERTY(OBJECT_ID(@p1), 'TableHasPrimaryKey'), 0),
 				(SELECT TOP (1) 1 FROM cdc.change_tables ct WHERE ct.source_object_id = OBJECT_ID(@p1)
-					AND HAS_PERMS_BY_NAME(N'cdc.' + QUOTENAME(N'fn_cdc_get_all_changes_' + ct.capture_instance), 'OBJECT', 'SELECT') = 1)`
+					AND HAS_PERMS_BY_NAME(N'cdc.' + QUOTENAME(ct.capture_instance + N'_CT'), 'OBJECT', 'SELECT') = 1)`
 		}
 		if err := db.QueryRowContext(ctx, q, ident).Scan(&keyed, &ok); err != nil {
 			if f := k.Failure(err); s.cfg.CDCMethod == methodCapture && f.Code == protocolv1.ErrorCode_ERROR_CODE_PERMISSION_DENIED {

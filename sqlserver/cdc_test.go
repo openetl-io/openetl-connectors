@@ -205,6 +205,47 @@ func TestCDCSnapshotHandoff(t *testing.T) {
 	}
 }
 
+// Updates of the key land, merged by seq, as the table has them: keys
+// shifted, swapped and moved, and a key freed and taken again in one
+// transaction. Change data capture records each as a delete and an insert,
+// all of a statement's deletes first, and an insert shares its __$seqval
+// with the delete of the row it was, which in a heap isn't the delete of
+// its key.
+func TestCDCKeyChanges(t *testing.T) {
+	for _, method := range []string{methodTracking, methodCapture} {
+		for name, ddl := range map[string]string{
+			"clustered": "CREATE TABLE $schema.t (id int PRIMARY KEY, v int)",
+			"heap":      "CREATE TABLE $schema.t (id int NOT NULL, v int, CONSTRAINT pk_t PRIMARY KEY NONCLUSTERED (id))",
+		} {
+			t.Run(method+"/"+name, func(t *testing.T) {
+				e := newSourceEnv(t)
+				e.exec(ddl)
+				e.exec("INSERT INTO $schema.t VALUES (1, 1), (2, 2), (3, 3)")
+				harvested := func() {}
+				if method == methodTracking {
+					e.exec("ALTER TABLE $schema.t ENABLE CHANGE_TRACKING")
+				} else {
+					e.capture("t")
+					harvested = e.harvested
+				}
+				harvested()
+				s := e.source(`, "cdcMethod": "` + method + `"`)
+				snap := read(t, s, source.CDC, map[string]string{"t": ""})
+				e.exec("UPDATE $schema.t SET id = id + 1")
+				e.exec("UPDATE $schema.t SET id = CASE id WHEN 2 THEN 3 WHEN 3 THEN 2 ELSE id END")
+				e.exec("UPDATE $schema.t SET id = 10 WHERE id = 4")
+				e.exec("BEGIN TRAN; DELETE FROM $schema.t WHERE id = 10; INSERT INTO $schema.t VALUES (10, 99); UPDATE $schema.t SET id = 11 WHERE id = 10; INSERT INTO $schema.t VALUES (10, 100); COMMIT")
+				harvested()
+				c := read(t, s, source.CDC, map[string]string{"t": snap.last("t")})
+				got := fold(changes(snap, "t", "id", "v", "openetl.seq"), changes(c, "t", "id", "v", "openetl.seq"))
+				if want := e.table(); !slices.Equal(got, want) {
+					t.Errorf("merged by seq: %v, the table %v; changes %v", got, want, changes(c, "t", "id", "v", "openetl.seq"))
+				}
+			})
+		}
+	}
+}
+
 // A capture instance made for a new column is read from its start, and the
 // old one up to it.
 func TestCaptureSchemaChange(t *testing.T) {
