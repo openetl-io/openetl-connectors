@@ -67,12 +67,12 @@ Each record becomes a row. A value that decodes to an object gives its fields as
 | `_kafka_partition` | The record's partition |
 | `_kafka_offset` | Its offset in the partition |
 | `_kafka_timestamp` | Its timestamp, in UTC |
-| `_kafka_key` | Its key as text: a string key's text, or a structured key as JSON |
+| `_kafka_key` | Its key as text: a string key's text, or a structured key as JSON. A key that isn't in the configured format is its bytes' text, or their base64 if they aren't UTF-8 |
 | `_kafka_headers` | Its headers, as a JSON object |
 
 With `avro` or `protobuf`, the catalog declares the value's fields as the latest schema under `<topic>-value` has them; with `json`, columns and their types come from the records. `format: string` reads each value as text, into `value`.
 
-A value that doesn't decode in the configured format stops the read, with an error naming its topic, partition and offset.
+A value that doesn't decode in the configured format stops the read, with an error naming its topic, partition and offset. From 0.2.0, a value or key whose schema the registry doesn't serve for now, as when it doesn't answer, answers with a server error or refuses the credentials, stops the read with the registry's error, as a transient failure that OpenETL tries again, or as refused credentials. Before 0.2.0, such a key landed in `_kafka_key` as its encoded bytes.
 
 ### Example
 

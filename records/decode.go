@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"math"
 	"math/big"
+	"net/http"
+	"net/url"
 	"sync"
 	"time"
 	"unicode/utf8"
@@ -93,6 +95,23 @@ func (d *Decoder) Decode(ctx context.Context, b []byte) (json.RawMessage, error)
 		return protojson.MarshalOptions{UseProtoNames: true, EmitUnpopulated: true}.Marshal(m)
 	}
 	return JSONText(b), nil
+}
+
+// Unanswered says whether err, from Decode, is the schema registry's not
+// answering: no response, a server error, too many requests, or credentials
+// it refused. Any other error is an answer about the bytes: not in the
+// registry's wire format, a schema ID it doesn't have, or a body that
+// doesn't decode.
+func Unanswered(err error) bool {
+	if re, ok := errors.AsType[*sr.ResponseError](err); ok {
+		switch re.StatusCode {
+		case http.StatusUnauthorized, http.StatusForbidden, http.StatusRequestTimeout, http.StatusTooManyRequests:
+			return true
+		}
+		return re.StatusCode >= http.StatusInternalServerError
+	}
+	_, ok := errors.AsType[*url.Error](err)
+	return ok || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 }
 
 // JSONText is b as a JSON string: its text, or base64 if it isn't UTF-8.

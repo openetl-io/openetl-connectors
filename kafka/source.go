@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"maps"
+	"net/http"
 	"regexp"
 	"slices"
 	"strconv"
@@ -904,7 +905,7 @@ func (s *Source) row(ctx context.Context, rec *kgo.Record) (json.RawMessage, err
 	if rec.Value != nil {
 		v, err := s.values.Decode(ctx, rec.Value)
 		if err != nil {
-			return nil, sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_DATA_INVALID, fmt.Errorf("kafka: %s partition %d offset %d: %w", rec.Topic, rec.Partition, rec.Offset, err))
+			return nil, decodeFailed(rec, "value", err)
 		}
 		b = records.AppendFields(b, v)
 	}
@@ -922,7 +923,11 @@ func (s *Source) row(ctx context.Context, rec *kgo.Record) (json.RawMessage, err
 	b = append(b, ',')
 	b = records.AppendJSONString(b, keyColumn)
 	b = append(b, ':')
-	b = append(b, s.key(ctx, rec.Key)...)
+	k, err := s.key(ctx, rec.Key)
+	if err != nil {
+		return nil, decodeFailed(rec, "key", err)
+	}
+	b = append(b, k...)
 	b = append(b, ',')
 	b = records.AppendJSONString(b, headersColumn)
 	b = append(b, ':')
@@ -943,19 +948,41 @@ func (s *Source) row(ctx context.Context, rec *kgo.Record) (json.RawMessage, err
 }
 
 // key is a record's key as a JSON string: a string key's text, a structured
-// one's JSON, or null.
-func (s *Source) key(ctx context.Context, k []byte) []byte {
+// one's JSON, or null. A key that doesn't decode is its bytes' text, unless
+// the schema registry didn't answer for it.
+func (s *Source) key(ctx context.Context, k []byte) ([]byte, error) {
 	if k == nil {
-		return []byte("null")
+		return []byte("null"), nil
 	}
 	v, err := s.keys.Decode(ctx, k)
-	if err != nil {
-		return records.JSONText(k)
+	switch {
+	case err != nil && records.Unanswered(err):
+		return nil, err
+	case err != nil:
+		return records.JSONText(k), nil
+	case len(v) > 0 && v[0] == '"':
+		return v, nil
 	}
-	if len(v) > 0 && v[0] == '"' {
-		return v
+	return records.AppendJSONString(nil, string(v)), nil
+}
+
+// decodeFailed is the error of a record's value or key that didn't decode:
+// the schema registry's, if it didn't answer, else invalid data.
+func decodeFailed(rec *kgo.Record, part string, err error) error {
+	code := protocolv1.ErrorCode_ERROR_CODE_DATA_INVALID
+	if records.Unanswered(err) {
+		code = protocolv1.ErrorCode_ERROR_CODE_TRANSIENT
+		if re, ok := errors.AsType[*sr.ResponseError](err); ok {
+			switch re.StatusCode {
+			case http.StatusUnauthorized:
+				code = protocolv1.ErrorCode_ERROR_CODE_AUTH_INVALID
+			case http.StatusForbidden:
+				code = protocolv1.ErrorCode_ERROR_CODE_PERMISSION_DENIED
+			}
+			err = fmt.Errorf("the schema registry answered %d: %w", re.StatusCode, err)
+		}
 	}
-	return records.AppendJSONString(nil, string(v))
+	return sdk.WithCode(code, fmt.Errorf("kafka: %s partition %d offset %d: %s: %w", rec.Topic, rec.Partition, rec.Offset, part, err))
 }
 
 // Committed commits the checkpoint's offsets to the consumer group, so
