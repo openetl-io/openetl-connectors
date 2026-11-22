@@ -544,16 +544,30 @@ func (w *writer) PatchSQL(s stagedStream, p prepared) []string {
 	} else {
 		match = []string{"t." + q(idColumn) + " = p." + q(idColumn)}
 	}
+	heldOf := func(c string) string {
+		if f, ok := s.Fills[c]; ok {
+			return f
+		}
+		return c
+	}
+	// The last column that fills each held column, whose UPDATE takes it out
+	// of the target's _openetl_held: an UPDATE before it needs it there.
+	last := map[string]string{}
+	for _, c := range cols {
+		if !slices.Contains(metadataColumns, c) && !slices.Contains(s.Key, c) {
+			last[heldOf(c)] = c
+		}
+	}
 	var out []string
 	for _, c := range cols {
 		if slices.Contains(metadataColumns, c) || slices.Contains(s.Key, c) {
 			continue
 		}
-		held := c
-		if f, ok := s.Fills[c]; ok {
-			held = f
+		held := heldOf(c)
+		set := "t." + q(c) + " = p." + q(c)
+		if last[held] == c {
+			set += ", t." + q(heldColumn) + " = NULLIF(JSON_REMOVE(t." + q(heldColumn) + ", " + jsonPath(held) + "), JSON_OBJECT())"
 		}
-		set := "t." + q(c) + " = p." + q(c) + ", t." + q(heldColumn) + " = NULLIF(JSON_REMOVE(t." + q(heldColumn) + ", " + jsonPath(held) + "), JSON_OBJECT())"
 		if slices.Contains(cols, syncedColumn) {
 			set += ", t." + q(syncedColumn) + " = p." + q(syncedColumn)
 		}

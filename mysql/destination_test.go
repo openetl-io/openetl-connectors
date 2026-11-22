@@ -199,3 +199,43 @@ func TestDestinationWithLeastPrivileges(t *testing.T) {
 		}
 	})
 }
+
+// TestPatchFillsAHeldColumnTwice holds a merge's price, then patches it from
+// two columns, price__v2 that fills it and price itself: both land, and the
+// cell is held no more.
+func TestPatchFillsAHeldColumnTwice(t *testing.T) {
+	eachServer(t, func(t *testing.T, srv testServer) {
+		e := newDestEnv(t, srv)
+		w := e.open(destination.Stream{Name: "users", Mode: destination.Merge, PrimaryKey: []string{"id"}})
+		id := arrow.Field{Name: "id", Type: arrow.PrimitiveTypes.Int64}
+		rowID := arrow.Field{Name: idColumn, Type: &arrow.FixedSizeBinaryType{ByteWidth: 16}, Metadata: arrow.NewMetadata([]string{extensionNameKey}, []string{uuidExtension})}
+		op := arrow.Field{Name: opColumn, Type: arrow.BinaryTypes.String}
+		seq := arrow.Field{Name: seqColumn, Type: seqType, Nullable: true}
+		held := arrow.Field{Name: heldColumn, Type: arrow.ListOf(arrow.BinaryTypes.String), Nullable: true}
+		price := arrow.Field{Name: "price", Type: arrow.BinaryTypes.String, Nullable: true}
+		v2 := arrow.Field{Name: "price__v2", Type: arrow.PrimitiveTypes.Float64, Nullable: true}
+		const uid = `"AQEBAQEBAQEBAQEBAQEBAQ=="`
+		e.commit(w, 1, "users", batchOf(t, []arrow.Field{id, rowID, op, seq, price, v2, held},
+			`[{"id": 1, "_openetl_id": `+uid+`, "_openetl_op": "update", "_openetl_seq": "1", "price": null, "_openetl_held": ["price"]}]`))
+		fills := v2
+		fills.Metadata = arrow.NewMetadata([]string{destination.FillsKey}, []string{"price"})
+		ep := destination.Epoch{Generation: 1, N: 2}
+		err := w.(destination.Patcher).Patch(t.Context(), ep, "users", batchOf(t, []arrow.Field{id, rowID, seq, held, fills, price},
+			`[{"id": 1, "_openetl_id": `+uid+`, "_openetl_seq": "1", "_openetl_held": ["price"], "price__v2": 2.5, "price": "2.50"}]`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		st, err := w.PreCommit(t.Context(), ep)
+		if err == nil {
+			_, err = w.Commit(t.Context(), ep, []destination.Staged{st})
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got string
+		err = e.db.QueryRowContext(t.Context(), "SELECT CONCAT(coalesce(price, '-'), ':', price__v2, ':', coalesce(_openetl_held, '-')) FROM "+quoteIdent(e.database)+".users").Scan(&got)
+		if want := "2.50:2.5:-"; err != nil || got != want {
+			t.Fatalf("price:price__v2:held %s %v, want %s", got, err, want)
+		}
+	})
+}
