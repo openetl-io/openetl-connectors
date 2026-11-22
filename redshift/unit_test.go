@@ -3,6 +3,7 @@ package redshift
 import (
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"regexp"
@@ -13,8 +14,12 @@ import (
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/memory"
+	"github.com/apache/arrow-go/v18/parquet"
+	"github.com/apache/arrow-go/v18/parquet/file"
 	"github.com/apache/arrow-go/v18/parquet/pqarrow"
+	pqschema "github.com/apache/arrow-go/v18/parquet/schema"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/openetl-io/openetl-connectors/sqlstage"
 	"github.com/openetl-io/openetl/sdk/go/check"
@@ -285,6 +290,29 @@ func TestStage(t *testing.T) {
 	if ord := tbl.Column(len(p.cols)).Data().Chunk(0).ValueStr(1); ord != "2" {
 		t.Errorf("_openetl_ord of row 2: %s", ord)
 	}
+	// Parquet 1.0, which Redshift documents, with times and decimals as
+	// their logical types still.
+	pf, err := file.OpenParquetFile(p.file.Name(), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = pf.Close() }()
+	if v := pf.MetaData().Version(); v != parquet.V1_0 {
+		t.Errorf("Parquet %s", v)
+	}
+	for i, c := range p.cols {
+		lt := pf.MetaData().Schema.Column(i).LogicalType()
+		switch l := c.load.(type) {
+		case *arrow.TimestampType:
+			if ts, ok := lt.(pqschema.TimestampLogicalType); !ok || ts.TimeUnit() != pqschema.TimeUnitMicros {
+				t.Errorf("%s: %s", c.name, lt)
+			}
+		case *arrow.Decimal128Type:
+			if d, ok := lt.(pqschema.DecimalLogicalType); !ok || d.Precision() != l.Precision || d.Scale() != l.Scale {
+				t.Errorf("%s: %s", c.name, lt)
+			}
+		}
+	}
 
 	// Another batch's columns start the next staging table.
 	narrow, _, err := array.RecordFromJSON(memory.DefaultAllocator, arrow.NewSchema(fields[:2], nil), strings.NewReader(`[{"b": false}]`))
@@ -395,5 +423,97 @@ func TestMergePicks(t *testing.T) {
 	}
 	if q := picks(slices.Delete(slices.Clone(cols), 2, 3)); q == "" || strings.Contains(q, "cur") {
 		t.Errorf("without a seq: %s", q)
+	}
+}
+
+// Of two patch columns that fill one held column, the first's UPDATE leaves
+// it held for the second's to match, and the second's takes it out.
+func TestPatchSharedHeldColumn(t *testing.T) {
+	w := &writer{schema: "s"}
+	s := stagedStream{Table: "t", Mode: modeMerge, Key: []string{"id"}, Fills: map[string]string{"price__v2": "price"}}
+	patch := []column{{name: "id", typ: "bigint"}, {name: "price__v2", typ: "bigint"}, {name: "price", typ: "integer"}, {name: idColumn, typ: "varchar(36)"}, {name: heldColumn, typ: varcharMax}}
+	stmts := w.patch(s, prepared{patch: patch, patches: `"s"."p"`})
+	if len(stmts) != 2 {
+		t.Fatalf("%d statements: %q", len(stmts), stmts)
+	}
+	unhold := `"` + heldColumn + `" = NULLIF(`
+	for i, want := range []bool{false, true} {
+		if got := strings.Contains(stmts[i], unhold); got != want {
+			t.Errorf("statement %d takes the held column out: %v, want %v\n%s", i, got, want, stmts[i])
+		}
+	}
+}
+
+// Redshift's own errors are XX000, and say what they are in their message
+// or, as a serializable isolation violation does, in its detail.
+func TestClassify(t *testing.T) {
+	for _, c := range []struct {
+		err  *pgconn.PgError
+		want protocolv1.ErrorCode
+	}{
+		{&pgconn.PgError{Code: "XX000", Message: "1023", Detail: "Serializable isolation violation on table - 119371, transactions forming the cycle are: 1745830, 1745762 (pid:15021)"}, protocolv1.ErrorCode_ERROR_CODE_TRANSIENT},
+		{&pgconn.PgError{Code: "XX000", Message: "Disk Full", Detail: "error:  Disk Full\ncode:      1016"}, protocolv1.ErrorCode_ERROR_CODE_DESTINATION_QUOTA},
+		{&pgconn.PgError{Code: "40001", Message: "could not serialize access"}, protocolv1.ErrorCode_ERROR_CODE_TRANSIENT},
+		{&pgconn.PgError{Code: "42501", Message: "permission denied for schema s"}, protocolv1.ErrorCode_ERROR_CODE_PERMISSION_DENIED},
+		// COPY's: a load that logged error rows, before and since SYS views.
+		{&pgconn.PgError{Code: "XX000", Message: "Load into table '_openetl_load' failed.  Check 'stl_load_errors' system table for details."}, protocolv1.ErrorCode_ERROR_CODE_DATA_INVALID},
+		{&pgconn.PgError{Code: "XX000", Message: "Load into table '_openetl_load' failed. Check 'sys_load_error_detail' system table for details."}, protocolv1.ErrorCode_ERROR_CODE_DATA_INVALID},
+		// A Parquet COPY's, read by Spectrum, whose reason is in the detail.
+		{&pgconn.PgError{Code: "XX000", Message: "Spectrum Scan Error", Detail: spectrumDetail("The length of the data column display_name is longer than the length defined in the table. Table: 256, Data: 1020")}, protocolv1.ErrorCode_ERROR_CODE_DATA_INVALID},
+		{&pgconn.PgError{Code: "XX000", Message: "Spectrum Scan Error", Detail: spectrumDetail("\nError: HTTP response error code: 403 Message: AccessDenied Access Denied\nx-amz-request-id: 9A5F3F8BB1C6AD5C")}, protocolv1.ErrorCode_ERROR_CODE_PERMISSION_DENIED},
+	} {
+		if f := check.Classify(classify(c.err)); f == nil || f.Code != c.want {
+			t.Errorf("%s %s: %v, want %s", c.err.Message, c.err.Detail, f, c.want)
+		}
+	}
+}
+
+func spectrumDetail(context string) string {
+	return "\n  -----------------------------------------------\n  error:  Spectrum Scan Error\n  code:      15001\n  context:   " + context +
+		"\n  query:     20027980\n  location:  dory_util.cpp:929\n  process:   fetchtask_thread [pid=527]\n  -----------------------------------------------\n"
+}
+
+// A failed COPY's error says the stream's column, the line and the reason
+// of the row its load logged, or else the context Spectrum gave.
+func TestCopyError(t *testing.T) {
+	cols := []column{{name: "id"}, {name: "price"}}
+	copyErr := classify(&pgconn.PgError{Code: "XX000", Message: "Load into table '_openetl_load' failed. Check 'sys_load_error_detail' system table for details."})
+	err := copyError(copyErr, &loadError{column: "c1", line: 3, reason: "Invalid digit, Value 'a', Pos 0, Type: Integer"}, cols)
+	if f := check.Classify(err); f == nil || f.Code != protocolv1.ErrorCode_ERROR_CODE_DATA_INVALID || !strings.Contains(err.Error(), `column "price", line 3: Invalid digit, Value 'a'`) {
+		t.Errorf("a logged row: %v (%v)", err, f)
+	}
+	spectrum := &pgconn.PgError{Code: "XX000", Message: "Spectrum Scan Error", Detail: spectrumDetail("File 'https://s3.us-west-2.amazonaws.com/b/k' has an incompatible Parquet schema for column 's3://b/k.c1'.\n  Column type: VARCHAR, Parquet schema:\noptional int64 c1 [i:1 d:1 r:0]")}
+	err = copyError(classify(spectrum), nil, cols)
+	if !strings.Contains(err.Error(), "has an incompatible Parquet schema for column 's3://b/k.c1'. Column type: VARCHAR, Parquet schema: optional int64 c1 [i:1 d:1 r:0]: ") || !errors.Is(err, spectrum) {
+		t.Errorf("Spectrum's context: %v", err)
+	}
+	if err := copyError(copyErr, nil, cols); err != copyErr {
+		t.Errorf("no row and no context: %v", err)
+	}
+	// A stream's column may have a load column's name.
+	err = copyError(copyErr, &loadError{column: "c0", line: 1, reason: "r"}, []column{{name: "c1"}, {name: "price"}})
+	if !strings.Contains(err.Error(), `column "c1", line 1`) {
+		t.Errorf("a stream column named c1: %v", err)
+	}
+}
+
+// Each load's object is its own, though another deployment of a pipeline of
+// the same name stages a table of the same name in the same bucket, and no
+// key is a prefix of another, whose object COPY would read too.
+func TestStoreKeys(t *testing.T) {
+	s := &store{bucket: "b", prefix: "p"}
+	var keys []string
+	for _, name := range []string{"_openetl_stage_a", "_openetl_stage_a", "_openetl_stage_a_2", "_openetl_stage_a_20"} {
+		keys = append(keys, s.key(name))
+	}
+	for i, a := range keys {
+		if !strings.HasPrefix(a, "p/") || !strings.HasSuffix(a, ".parquet") {
+			t.Errorf("key %q", a)
+		}
+		for j, b := range keys {
+			if i != j && strings.HasPrefix(b, a) {
+				t.Errorf("COPY of %q reads %q too", a, b)
+			}
+		}
 	}
 }

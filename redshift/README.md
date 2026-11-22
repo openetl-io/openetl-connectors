@@ -34,6 +34,7 @@ The cluster or workgroup needs:
 - An S3 bucket in the cluster's region. A lifecycle rule that expires objects under `prefix` after a day cleans up a file whose delete failed.
 - An IAM role associated with the cluster or workgroup, named by `iamRole` (`default` for its default role), with `s3:GetObject` and `s3:ListBucket` on the bucket. `COPY` reads Parquet files only as a role, and through S3's presigned URLs, so a bucket policy mustn't refuse those.
 - An identity that uploads the files, with `s3:PutObject` and `s3:DeleteObject` on the bucket's keys under `prefix`: `accessKeyId` and `secretAccessKey`, or else the AWS default credentials where the connector runs.
+- If the bucket encrypts its objects with a KMS key, `kms:Decrypt` on the key for the role, and `kms:GenerateDataKey` and `kms:Decrypt` for the identity that uploads the files, whose large files go up in parts.
 
 ```sql
 CREATE USER openetl PASSWORD '...';
@@ -119,3 +120,4 @@ Run them, then release the hold. Or let the destination make such changes itself
 - Redshift has no upsert, and the merge works out each key's row in temporary tables, so a merge's cost grows with the target's rows that the epoch touches as well as with the epoch's.
 - Each epoch is one `COPY` per stream and lane. Many small streams commit slowly.
 - `VARCHAR` compares without trailing blanks, so the destination matches text keys by their bytes too: `'a'` and `'a '` are different keys.
+- When a `COPY` fails on a file's data, the error names the column, the line and the reason that Redshift logged in `SYS_LOAD_ERROR_DETAIL`, or else in `STL_LOAD_ERRORS`, and is `DATA_INVALID`. A Parquet `COPY` logs only some of its errors; for the rest, the error has the reason Redshift's own error gives. Like the rest of the destination, this hasn't run against a cluster.

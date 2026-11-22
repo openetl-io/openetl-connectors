@@ -47,6 +47,9 @@ type SQL[T interface{ Base() *Table }] interface {
 	DropStaging(ctx context.Context, streams []Stream)
 	TrimMarkers(ctx context.Context, applied uint64)
 	DropStale(ctx context.Context, gen uint64)
+	// Drops the read tables of streams that no longer overwrite while it
+	// holds the fence, as Own.Fenced does: a newer generation, for which
+	// such a stream overwrites, may have raised the fence since Fence did.
 	DropRemovedReads(ctx context.Context)
 }
 

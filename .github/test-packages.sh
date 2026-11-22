@@ -736,7 +736,8 @@ SH
   check source-kinesis kinesis --role source \
     --config "$work/kinesis-source.json" \
     --unreachable "$work/kinesis-source-closed.json" \
-    --add-records-command "$work/kinesis-add"
+    --add-records-command "$work/kinesis-add" \
+    $(stops kinesis --stops-at-until --stops-at-completion)
   config kinesis-dest "$(kinesis_config "$kinesis" "")"
   config kinesis-dest-closed "$(kinesis_config http://127.0.0.1:1 "")"
   check destination-kinesis kinesis --role destination \
