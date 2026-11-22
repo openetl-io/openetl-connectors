@@ -1516,12 +1516,23 @@ func (w *writer) dropAbandonedReads(ctx context.Context, q querier, drop func(l 
 }
 
 // DropRemovedReads drops the read tables of streams that no longer
-// overwrite, once Recover has raised the fence. Best effort, like
-// dropStaging.
+// overwrite, once Recover has raised the fence, and while it holds it: a
+// newer generation that overwrites such a stream may have raised it since.
+// Best effort, like dropStaging.
 func (w *writer) DropRemovedReads(ctx context.Context) {
-	_ = w.dropAbandonedReads(ctx, w.db, func(l sqlstage.ReadLabel, _ string) bool {
+	tx, err := w.db.BeginTx(ctx, nil)
+	if err != nil {
+		return
+	}
+	defer func() { _ = tx.Rollback() }()
+	if w.LockFence(ctx, tx, "HOLDLOCK, ROWLOCK") != nil {
+		return
+	}
+	if w.dropAbandonedReads(ctx, tx, func(l sqlstage.ReadLabel, _ string) bool {
 		return w.streams[l.Stream].Mode != destination.Overwrite
-	})
+	}) == nil {
+		_ = tx.Commit()
+	}
 }
 
 func (w *writer) Close(context.Context) error { return w.db.Close() }

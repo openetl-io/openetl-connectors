@@ -11,6 +11,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
@@ -449,6 +450,42 @@ func TestMergeCompositeKeyPastIndexLimit(t *testing.T) {
 	}
 	if got := env.rows("SELECT LEN(a) + LEN(b) FROM $schema.m"); !slices.Equal(got, []string{"850"}) {
 		t.Errorf("m = %v", got)
+	}
+}
+
+// An older generation, for which the stream appends, doesn't drop the read
+// table of a newer one that overwrites it once the newer has raised the
+// fence.
+func TestFencedKeepsNewerReads(t *testing.T) {
+	env := newEnv(t)
+	old := env.openStreams(1, destination.ScopePipeline, destination.Stream{Name: "users", Mode: destination.Append})
+	recov(t, old, 1, destination.Epoch{})
+	newer := env.openStreams(2, destination.ScopePipeline, destination.Stream{Name: "users", Mode: destination.Overwrite})
+	recov(t, newer, 2, destination.Epoch{})
+	if err := newer.(destination.ReadTracker).StartReads(t.Context(), map[string]time.Time{"users": time.UnixMicro(1000)}); err != nil {
+		t.Fatal(err)
+	}
+	e := destination.Epoch{Generation: 2, N: 1}
+	if err := newer.Write(t.Context(), e, "users", batch(t, []arrow.Field{idField}, `[{"id": 1}]`)); err != nil {
+		t.Fatal(err)
+	}
+	st, err := newer.PreCommit(t.Context(), e)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := newer.Commit(t.Context(), e, []destination.Staged{st}); err != nil {
+		t.Fatal(err)
+	}
+	read := sqlstage.ReadName("p1", "users", time.UnixMicro(1000))
+	exists := func() bool {
+		return env.rows("SELECT count(*) FROM sys.tables WHERE schema_id = SCHEMA_ID('" + env.schema + "') AND name = '" + read + "'")[0] == "1"
+	}
+	if !exists() {
+		t.Fatal("the newer generation's read has no table")
+	}
+	old.(*writer).DropRemovedReads(t.Context())
+	if !exists() {
+		t.Error("the fenced generation dropped the newer one's read")
 	}
 }
 
