@@ -21,7 +21,7 @@ A stream can be read three ways, which the pipeline picks with each stream's `sy
 | `incremental` | Tables, and from 0.2.0 views, with a column of type `smallint`, `integer`, `bigint`, `numeric`, `date`, `timestamp`, `timestamptz`, `text` or `varchar` | The rows whose `cursor` column is at or above where the last read got to, up to the column's highest value when this read starts, in chunks ordered by the cursor, then the read order. |
 | `cdc` | Tables with a primary key, whose replica identity is the default or `FULL` | First a snapshot of the table, in chunks of `snapshotChunkRows`, then every change from the write-ahead log, through a replication slot with the `pgoutput` plugin. |
 
-A table's read order is its primary key. From 0.2.0, a table without one is read in the order of a unique index instead, if it has one whose columns are all `NOT NULL`, each in its column's collation, with no `WHERE` and no expressions, and that has finished building; of several, the one with the fewest columns, then the first by name. A table that other tables inherit from has no such index, since a read of it reads their rows too, which its indexes don't cover; a partitioned table's unique index covers its partitions. No two rows share such a key, so a chunked read is exact as it is with a primary key. The index doesn't make the stream keyed: the catalog gives it no primary key, and it can't be read with `cdc`. A read resumed in another order than it started in, after the index is dropped or another takes its place, fails with `POSITION_LOST`: only a read from the start goes on from there. So does a split of the table that hasn't started yet, since its range is of the old order's first column. A table or view with neither is read in one query, and a stopped read reads it again from the start; that includes every view and materialized view, whose columns are never `NOT NULL`. Reading by physical position (`ctid`) instead isn't sound: an update can move a row to a page the read has passed, and it's then missed.
+A table's read order is its primary key. From 0.2.0, a table without one is read in the order of a unique index instead, if it has one whose columns are all `NOT NULL`, each in its column's collation, with no `WHERE` and no expressions, and that has finished building; of several, the one with the fewest columns, then the first by name. A table that other tables inherit from has no such index, since a read of it reads their rows too, which its indexes don't cover; a partitioned table's unique index covers its partitions. Nor does such a table's primary key cover them, though it's still the read order and the stream's key: their rows can repeat a key, and then a chunked read misses a row whose key the chunk before it ended on, and a merge keeps one row of each key. A CDC read of such a table reads their rows in its snapshot, but none of their changes after it. No two rows share such a key, so a chunked read is exact as it is with a primary key. The index doesn't make the stream keyed: the catalog gives it no primary key, and it can't be read with `cdc`. A read resumed in another order than it started in, after the index is dropped or another takes its place, fails with `POSITION_LOST`: only a read from the start goes on from there. So does a split of the table that hasn't started yet, since its range is of the old order's first column. A table or view with neither is read in one query, and a stopped read reads it again from the start; that includes every view and materialized view, whose columns are never `NOT NULL`. Reading by physical position (`ctid`) instead isn't sound: an update can move a row to a page the read has passed, and it's then missed.
 
 The catalog names no default cursor: nothing in Postgres's catalog shows that a column orders new and changed rows, so a pipeline names its `cursor`. An incremental read starts at the last read's highest cursor value, not after it, so the rows that had that value are read again. Rows whose cursor is `NULL` are never read, and deleted rows aren't seen: CDC is the mode that sees deletes. A value from a sequence or the clock is taken before its transaction commits, so a row can commit with a value below one a read has already passed, and be missed.
 
@@ -29,14 +29,17 @@ A table with a read order, read in full or incrementally, is split into ranges o
 
 From 0.2.0, a column added to a table since the run discovered it fails the read with `TRANSIENT` before it reads, in any mode: the next attempt discovers the column and declares its type. Before 0.2.0, a full or incremental read sent such a column without a declared type, so a `numeric` landed as a string, and a CDC read left it out of the table's snapshot, so the rows the snapshot read arrived without its values. A column added while a CDC read runs fails the read the same way, at the first change that has it.
 
+`TRUNCATE` isn't carried as a CDC read's deletes: the source logs a warning, and the destination keeps the rows; a new snapshot of the table brings it back in step.
+
 A read holds up to `maxConnections` connections, one for each lane it runs, and CDC holds one replication connection besides.
 
 ### Set it up
 
-The user in `dsn` needs `USAGE` on the schema and `SELECT` on every table, and from 0.2.0 view, the source offers (every one in the schema, or those `tables` lists): the source's check fails otherwise, naming what it can't read.
+The user in `dsn` needs `USAGE` on the schema and `SELECT` on every table, and from 0.2.0 view, the source offers: the source's check fails otherwise, naming what it can't read. From 0.2.0, the check looks only at those `tables` lists, where it's set; before, it asked for `SELECT` on every table and view in the schema.
 
 For CDC, the server must be Postgres 13 or later, and the server and the user need more:
 
+- A `dsn` that reaches the primary: the read takes the log's position with `pg_current_wal_lsn()`, which a standby can't give.
 - `wal_level = logical` in the server's configuration, which takes a restart. Without it, creating the slot fails with an error that says so.
 - A role with the `REPLICATION` attribute, to create the slot and stream from it, or on Amazon RDS, the `rds_replication` role.
 - A publication of the tables read with CDC, named by `publication` (`openetl` unless set). The source creates it, or adds the tables it lacks, if the user may. If not, create it yourself:
@@ -74,7 +77,7 @@ A preflight is about the streams a pipeline reads:
 | `cdc.wal-level`, `cdc.replication` | As in the check, and they fail when a stream is read with CDC. |
 | `cdc.wal-keep` | Warns when `max_slot_wal_keep_size` is `-1`, so a slot can keep the log without a limit. |
 | `cdc.publication` | The publication has the tables, or the user can create it or add them. |
-| `cdc.slot` | The pipeline's slot is a `pgoutput` slot of the database, or the server has a slot free to create it. It warns when the slot was invalidated, since its tables are then read again from a snapshot. |
+| `cdc.slot` | The pipeline's slot is a `pgoutput` slot of the database, or the server has a slot free to create it. It warns when the slot was invalidated, since a read with a position in it then fails with `POSITION_LOST` until its tables are read again from a new snapshot. |
 
 ### Example
 
@@ -141,7 +144,7 @@ config:
 | `smallint`, `integer`, `bigint` | 16-, 32- and 64-bit integers |
 | `oid` | 64-bit integer |
 | `real`, `double precision` | 32- and 64-bit floats |
-| `numeric(p,s)` | a decimal of the same precision and scale, up to a precision of 38 with a scale from 0 to the precision; otherwise, and without a precision, `decimal(38, 9)`, since OpenETL's decimals hold up to 38 digits. A value it can't hold exactly is quarantined. |
+| `numeric(p,s)` | a decimal of the same precision and scale, up to a precision of 38 with a scale from 0 to the precision; otherwise, and without a precision, `decimal(38, 9)`, since OpenETL's decimals hold up to 38 digits. A value it can't hold exactly is quarantined, as are `NaN` and the infinities. |
 | `text`, `varchar`, `name` | string |
 | `char(n)` | string, without the trailing spaces Postgres pads it with, as casting it to `text` gives it |
 | `bytea` | binary |
@@ -152,7 +155,7 @@ config:
 | `interval` | From 0.2.0, interval of months, days and nanoseconds, the parts Postgres keeps |
 | Arrays of `boolean`, `smallint`, `integer`, `bigint`, `real`, `double precision`, `text`, `varchar` and `char(n)`, in a table column declared with one dimension (`int[]`) | From 0.2.0, a list of the item's type, with nulls where the array has them |
 | Enums | string: the label |
-| Anything else, such as arrays of other types, arrays declared with more than one dimension (`int[][]`) or none, as a view's are, network types, ranges and geometric types | string, in Postgres's text form |
+| Anything else, such as domains, even of a type above, arrays of other types, arrays declared with more than one dimension (`int[][]`) or none, as a view's are, network types, ranges and geometric types | string, in Postgres's text form |
 
 `openetl discover` lists a column as nullable unless it's `NOT NULL`. In a table CDC can read, only the key's columns are listed as not nullable, since a deleted row carries only its key.
 
@@ -207,7 +210,7 @@ All three write modes work:
 
 - **Append** inserts each epoch's rows.
 - **Overwrite** writes a read's rows to a table of its own, which replaces the target's rows when the read ends, so the target keeps its old rows until then.
-- **Merge** upserts each key's latest version, ordered by `_openetl_seq`, so an older version never overwrites a newer one. Deletes are soft unless the pipeline sets `destination.deletes: hard`: the row stays, with `_openetl_deleted` true.
+- **Merge** upserts each key's latest version, ordered by `_openetl_seq`, so an older version never overwrites a newer one. Deletes are soft unless the pipeline sets `destination.deletes: hard`: the row stays, with `_openetl_deleted` true and the columns it had before the delete's epoch, so a change in that epoch before the delete doesn't reach them, and a row new in that epoch has only what the delete carried, which from CDC under the default replica identity is its key. A hard delete removes the row, and with it the version that kept older ones out: a version older than the delete that arrives in a later epoch inserts the row again.
 
 Each epoch is staged into tables of its own, then applied behind a fence row in `_openetl_fence` with a marker per stream in `_openetl_loads`: in one transaction for the epoch, or one per stream under the pipeline's `delivery.commit.scope: stream`. Before it takes the fence, it creates any missing target and read tables, adds new columns and builds indexes (`CREATE INDEX CONCURRENTLY`), outside that transaction. A replaced attempt can't apply, and an epoch is never applied twice. Append and overwrite also skip rows a source sends again, by their `_openetl_id`, and merge keeps each key's latest version. So a stream lands exactly once, or effectively once when it's merged from a source that may repeat rows, unless the pipeline asks for less. Leave `_openetl_fence` and `_openetl_loads` in place.
 
@@ -254,6 +257,8 @@ spec:
 | interval | `interval` |
 | UUID | `uuid` |
 | JSON, lists, structs and maps | `jsonb` |
+
+Postgres's `text` and `jsonb` can't hold the NUL character, so a string or JSON value with one (`\u0000`) fails the epoch.
 
 ### Schema changes
 

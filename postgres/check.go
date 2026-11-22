@@ -87,8 +87,8 @@ var (
 	}
 	slotInvalidated = check.Reason{
 		Name: "replication_slot_invalidated", Code: protocolv1.ErrorCode_ERROR_CODE_POSITION_LOST,
-		Message: "The replication slot {slot} was invalidated, so the tables read with cdc are read again from a new snapshot.",
-		Fix:     "Sync more often, or raise max_slot_wal_keep_size, so that the slot keeps up.",
+		Message: "The replication slot {slot} was invalidated, so a read with a position in it fails with POSITION_LOST until its tables are read again from a new snapshot.",
+		Fix:     "Reset the pipeline's positions with openetl reset; then sync more often, or raise max_slot_wal_keep_size, so that the slot keeps up.",
 	}
 	slotsFull = check.Reason{
 		Name: "replication_slots_full", Code: protocolv1.ErrorCode_ERROR_CODE_RESOURCE_EXHAUSTED,
