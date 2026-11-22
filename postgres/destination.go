@@ -229,12 +229,29 @@ func (w *writer) Stage(ctx context.Context, tables map[uint64]map[string]*stagin
 		_, err = w.pool.CopyFrom(ctx, pgx.Identifier{w.schema, st.Name}, names(cols), src)
 	}
 	if err != nil {
-		return nil, fmt.Errorf("postgres: stage %s: %w", stream, err)
+		return nil, stageError(stream, cols, err)
 	}
 	if n > 0 {
 		st.Rows += uint64(n)
 	}
 	return st, nil
+}
+
+// stageError is the error of staging stream's cols. A string or JSON value
+// that text and jsonb can't hold, with a NUL or bytes that aren't UTF-8, is
+// DATA_INVALID, naming its column, which COPY's context ends with.
+func stageError(stream string, cols []column, err error) error {
+	pe := (*pgconn.PgError)(nil)
+	if !errors.As(err, &pe) || pe.Code != "22021" && pe.Code != "22P05" {
+		return fmt.Errorf("postgres: stage %s: %w", stream, err)
+	}
+	for _, c := range cols {
+		if strings.HasSuffix(pe.Where, ", column "+c.name) {
+			err = fmt.Errorf("column %q: %w", c.name, err)
+			break
+		}
+	}
+	return sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_DATA_INVALID, fmt.Errorf("postgres: stage %s: %w", stream, err))
 }
 
 func (w *writer) createLabelled(ctx context.Context, name string, label any, cols []column) error {

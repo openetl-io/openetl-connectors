@@ -22,6 +22,7 @@ import (
 
 	"github.com/openetl-io/openetl-connectors/sqlstage"
 	"github.com/openetl-io/openetl/sdk/go/destination"
+	protocolv1 "github.com/openetl-io/openetl/sdk/go/protocol/v1"
 )
 
 // Runs against the compose Postgres (make deps-up) or
@@ -686,5 +687,32 @@ func TestDedupeNeedsRowIDs(t *testing.T) {
 	err := w.Write(t.Context(), destination.Epoch{Generation: 1, N: 1}, "events", batch(t, []arrow.Field{idField}, `[{"id": 1}]`))
 	if err == nil || !strings.Contains(err.Error(), "no _openetl_id") {
 		t.Fatalf("Write = %v, want it to need _openetl_id", err)
+	}
+}
+
+// A string or JSON value Postgres can't hold, with a NUL or with bytes that
+// aren't UTF-8, fails the write with DATA_INVALID, naming its stream and
+// column.
+func TestUnstorableTextIsDataInvalid(t *testing.T) {
+	env := newEnv(t)
+	w := env.openStreams(1, destination.ScopePipeline, destination.Stream{Name: "users", Mode: destination.Append})
+	recov(t, w, 1, destination.Epoch{}, nil)
+	b := array.NewRecordBuilder(memory.DefaultAllocator, arrow.NewSchema([]arrow.Field{idField, nameField}, nil))
+	defer b.Release()
+	b.Field(0).(*array.Int64Builder).Append(1)
+	b.Field(1).(*array.StringBuilder).BinaryBuilder.Append([]byte{'a', 0xff})
+	notUTF8 := b.NewRecordBatch()
+	for _, c := range []struct {
+		col string
+		b   arrow.RecordBatch
+	}{
+		{"name", batch(t, []arrow.Field{idField, nameField}, `[{"id": 1, "name": "a"}, {"id": 2, "name": "a\u0000b"}]`)},
+		{"name", notUTF8},
+		{"tags", batch(t, []arrow.Field{idField, tagsField}, `[{"id": 1, "tags": "{\"a\": \"\\u0000\"}"}]`)},
+	} {
+		err := w.Write(t.Context(), destination.Epoch{Generation: 1, N: 1}, "users", c.b)
+		if codeOf(err) != protocolv1.ErrorCode_ERROR_CODE_DATA_INVALID || !strings.Contains(err.Error(), "users") || !strings.Contains(err.Error(), `"`+c.col+`"`) {
+			t.Errorf("%s: %v", c.col, err)
+		}
 	}
 }

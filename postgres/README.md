@@ -258,7 +258,7 @@ spec:
 | UUID | `uuid` |
 | JSON, lists, structs and maps | `jsonb` |
 
-Postgres's `text` and `jsonb` can't hold the NUL character, so a string or JSON value with one (`\u0000`) fails the epoch.
+Postgres's `text` and `jsonb` can't hold the NUL character, or bytes that aren't UTF-8, so a string or JSON value with one (`\u0000` in JSON) fails the epoch's write. From 0.2.0, it fails with `DATA_INVALID`, naming the stream and the column.
 
 ### Schema changes
 
