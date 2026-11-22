@@ -1347,13 +1347,15 @@ func (w *writer) ddlOnce(ctx context.Context, stmt string) error {
 // lists as longtext with a json_valid check, is json, whose collation differs
 // from the table's.
 func (w *writer) columnTypes(ctx context.Context, table string) ([]column, error) {
-	typ := "COLUMN_TYPE"
+	var rows *sql.Rows
+	var err error
 	if w.srv.mariadb {
-		typ = "IF(EXISTS (SELECT 1 FROM information_schema.CHECK_CONSTRAINTS k WHERE k.CONSTRAINT_SCHEMA = c.TABLE_SCHEMA AND k.TABLE_NAME = c.TABLE_NAME" +
-			" AND k.CHECK_CLAUSE = CONCAT('json_valid(`', c.COLUMN_NAME, '`)')), 'json', COLUMN_TYPE)"
-	}
-	rows, err := w.db.QueryContext(ctx, `SELECT COLUMN_NAME, `+typ+` FROM information_schema.COLUMNS c
+		// One literal, not concatenated, as its backticks rule out a raw string.
+		rows, err = w.db.QueryContext(ctx, "SELECT COLUMN_NAME, IF(EXISTS (SELECT 1 FROM information_schema.CHECK_CONSTRAINTS k WHERE k.CONSTRAINT_SCHEMA = c.TABLE_SCHEMA AND k.TABLE_NAME = c.TABLE_NAME AND k.CHECK_CLAUSE = CONCAT('json_valid(`', c.COLUMN_NAME, '`)')), 'json', COLUMN_TYPE) FROM information_schema.COLUMNS c WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND COLUMN_NAME <> ? ORDER BY ORDINAL_POSITION", w.schema, table, ordColumn)
+	} else {
+		rows, err = w.db.QueryContext(ctx, `SELECT COLUMN_NAME, COLUMN_TYPE FROM information_schema.COLUMNS c
 		WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND COLUMN_NAME <> ? ORDER BY ORDINAL_POSITION`, w.schema, table, ordColumn)
+	}
 	if err != nil {
 		return nil, classify(fmt.Errorf("mysql: read the columns of %s: %w", table, err))
 	}

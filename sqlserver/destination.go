@@ -1168,7 +1168,13 @@ func (w *writer) catalog(ctx context.Context, tables []string) (map[string]*tabl
 	list, _ := json.Marshal(idents)
 	var out map[string]*tableInfo
 	err := w.victim(ctx, func(conn *sql.Conn) error {
-		rows, err := conn.QueryContext(ctx, `SELECT CONVERT(int, j.[key]), c.name, TYPE_NAME(c.system_type_id), c.max_length, c.precision, c.scale, c.is_nullable, `+ownIndexes+`, coalesce(c.collation_name, ''), `+theirIndex+`
+		// One literal, with ownIndexes and theirIndex written out.
+		rows, err := conn.QueryContext(ctx, `SELECT CONVERT(int, j.[key]), c.name, TYPE_NAME(c.system_type_id), c.max_length, c.precision, c.scale, c.is_nullable,
+			coalesce((SELECT STRING_AGG(i.name, N',') FROM sys.index_columns ic JOIN sys.indexes i ON i.object_id = ic.object_id AND i.index_id = ic.index_id
+				WHERE ic.object_id = c.object_id AND ic.column_id = c.column_id AND i.name LIKE N'\_openetl\_%' ESCAPE N'\'), N''),
+			coalesce(c.collation_name, ''),
+			coalesce((SELECT TOP (1) i.name FROM sys.index_columns ic JOIN sys.indexes i ON i.object_id = ic.object_id AND i.index_id = ic.index_id
+				WHERE ic.object_id = c.object_id AND ic.column_id = c.column_id AND i.name NOT LIKE N'\_openetl\_%' ESCAPE N'\'), N'')
 			FROM OPENJSON(@p1) AS j JOIN sys.columns c ON c.object_id = OBJECT_ID(j.value)
 			ORDER BY CONVERT(int, j.[key]), c.column_id`, string(list))
 		if err != nil {
