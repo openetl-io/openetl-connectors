@@ -652,15 +652,15 @@ func TestCDCNewColumnsAndTruncates(t *testing.T) {
 	}
 }
 
-// A column added after the run's Discover isn't read, though the table has
-// it when the read starts: its values would land as text. The change that
-// shows it fails the read, and the attempt that declares it reads it.
+// A column added after the run's Discover fails the read before its
+// snapshot, which would otherwise send the table's rows without it, and the
+// attempt that declares it reads it, in the snapshot and in the changes.
 func TestCDCReadsOnlyDeclaredColumns(t *testing.T) {
 	e := newSourceEnv(t)
 	e.exec("CREATE TABLE $schema.users (id int PRIMARY KEY, name text, doc text)")
 	e.exec("INSERT INTO $schema.users VALUES (1, 'a', NULL)")
 	s, pipeline := e.cdcSource("")
-	e.exec("ALTER TABLE $schema.users ADD COLUMN w bigint")
+	e.exec("ALTER TABLE $schema.users ADD COLUMN w bigint DEFAULT 5")
 	read := func(state string, columns ...string) (*capture, error) {
 		req := cdcRequest(pipeline, false, map[string]string{"users": state})
 		req.Streams[0].Columns = columns
@@ -669,26 +669,23 @@ func TestCDCReadsOnlyDeclaredColumns(t *testing.T) {
 		return c, s.Read(t.Context(), req, c)
 	}
 	c, err := read("", "id", "name", "doc")
+	if codeOf(err) != protocolv1.ErrorCode_ERROR_CODE_TRANSIENT || !strings.Contains(err.Error(), `new column "w"`) {
+		t.Fatalf("a read that has a column it didn't declare: %v", err)
+	}
+	if got := c.column("users", "id"); got != nil {
+		t.Errorf("the read sent rows: %q", got)
+	}
+
+	c, err = read("", "id", "name", "doc", "w")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := c.column("users", "id"); !slices.Equal(got, []string{"1"}) {
-		t.Fatalf("the snapshot's ids: %q", got)
-	}
-	if got := c.column("users", "w"); got != nil {
-		t.Errorf("the snapshot read w: %q", got)
+	if got := c.column("users", "w"); !slices.Equal(got, []string{"5"}) {
+		t.Errorf("the snapshot's w is %q", got)
 	}
 	state := c.last("users")
 
 	e.exec("INSERT INTO $schema.users VALUES (2, 'b', NULL, 7)")
-	c, err = read(state, "id", "name", "doc")
-	if codeOf(err) != protocolv1.ErrorCode_ERROR_CODE_TRANSIENT || !strings.Contains(err.Error(), `new column "w"`) {
-		t.Fatalf("a read that saw a column it didn't declare: %v", err)
-	}
-	if got := c.column("users", "w"); got != nil {
-		t.Errorf("the read sent w: %q", got)
-	}
-
 	c, err = read(state, "id", "name", "doc", "w")
 	if err != nil {
 		t.Fatal(err)

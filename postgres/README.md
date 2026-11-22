@@ -25,7 +25,7 @@ A table's read order is its primary key. From 0.2.0, a table without one is read
 
 The catalog names no default cursor: nothing in Postgres's catalog shows that a column orders new and changed rows, so a pipeline names its `cursor`. An incremental read starts at the last read's highest cursor value, not after it, so the rows that had that value are read again. Rows whose cursor is `NULL` are never read, and deleted rows aren't seen: CDC is the mode that sees deletes. A value from a sequence or the clock is taken before its transaction commits, so a row can commit with a value below one a read has already passed, and be missed.
 
-From 0.2.0, a column added to a table since the run discovered it fails a full or incremental read with `TRANSIENT` before it reads, as it fails a CDC read: the next attempt discovers the column and declares its type. Before 0.2.0, such a read sent the column without a declared type, so a `numeric` landed as a string.
+From 0.2.0, a column added to a table since the run discovered it fails the read with `TRANSIENT` before it reads, in any mode: the next attempt discovers the column and declares its type. Before 0.2.0, a full or incremental read sent such a column without a declared type, so a `numeric` landed as a string, and a CDC read left it out of the table's snapshot, so the rows the snapshot read arrived without its values. A column added while a CDC read runs fails the read the same way, at the first change that has it.
 
 A read holds up to `maxConnections` connections, one for each lane it runs, and CDC holds one replication connection besides.
 

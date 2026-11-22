@@ -35,3 +35,18 @@ func TestReadSplitFailsOnAnUndeclaredColumn(t *testing.T) {
 		}
 	}
 }
+
+// A CDC read of a table with a column the run didn't declare fails,
+// retryably, before it reads the table's snapshot without the column.
+func TestReadCDCFailsOnAnUndeclaredColumn(t *testing.T) {
+	s, err := NewSource([]byte(`{"dsn": "postgres://u:p@127.0.0.1:1/db?connect_timeout=1"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	users := table{name: "users", cols: []sourceColumn{{name: "id", oid: pgtype.Int4OID}, {name: "w", oid: pgtype.Int8OID}}, key: []int{0}, order: []int{0}, replident: 'd'}
+	cs := source.ConfiguredStream{Name: "users", SyncMode: source.CDC, Columns: []string{"id"}}
+	err = s.readCDC(t.Context(), newConnPool(s.conn, 1), source.ReadRequest{Pipeline: "p", Streams: []source.ConfiguredStream{cs}}, []source.ConfiguredStream{cs}, []table{users}, nil)
+	if !isTransient(err) || !strings.Contains(err.Error(), `"w"`) {
+		t.Errorf("a cdc read with w undeclared: %v", err)
+	}
+}
