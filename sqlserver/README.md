@@ -162,7 +162,7 @@ A read that OpenETL gives an end, as it does to read a writer lane's part of an 
 - `cdc` reads only tables with a primary key, never views.
 - Change tracking sends net changes, as its rows are at the time of the read: an update and the delete after it arrive as the delete alone, and an update's row can be newer than the version it's sent with.
 - `sql_variant` values arrive as text, losing their base type.
-- A primary key with a `sql_variant` column that holds anything but text can't order a read in chunks: SQL Server compares a variant's type family before its value, and the text a read goes on from has lost it, so a read of `chunkRows` rows or more, or a CDC snapshot of `snapshotChunkRows` or more, reads its first chunk again and again. Read such a table through a view of it, which is read in a single query.
+- A primary key with a `sql_variant` column that holds anything but text can't order a read in chunks: SQL Server compares a variant's type family before its value, and the text a read goes on from has lost it. A read of `chunkRows` rows or more, a CDC snapshot of `snapshotChunkRows` or more, or a change tracking poll of `chunkRows` changes or more, reads its first chunk again and again past a date, time or number, and ends after the chunk at a binary or `uniqueidentifier` value, without the rows after it. Read such a table through a view of it, which is read in a single query.
 - Under change data capture, a computed column's value arrives only in the snapshot; changes leave it out, so a merge keeps the snapshot's value at the destination, which goes stale as the row changes.
 
 ## Destination
