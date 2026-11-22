@@ -77,7 +77,7 @@ A DynamoDB stream keeps records for 24 hours. The source reports each CDC stream
 - the table's stream was turned off and on again, so it has another ARN;
 - the snapshot, or a shard to be read from its start, began more than 24 hours ago.
 
-Re-sync the stream to recover. Syncs less than 24 hours apart don't fail this way, however idle a shard is, with one exception. If two syncs run within a minute of each other, a sync within a minute of 24 hours after them can fail on a trimmed position though nothing was lost. A trimmed position that a sync within the last 24 hours found nothing after loses nothing, and the read goes on from the shard's oldest record. A shard that left the stream had nothing after its position in that case either, and the read goes on without it.
+Re-sync the stream to recover. Syncs less than 24 hours apart don't fail this way, however idle a shard is, with three exceptions. If two syncs run within a minute of each other, a sync within a minute of 24 hours after them can fail on a trimmed position though nothing was lost. A sync whose `AT_TIMESTAMP` check fails past its retries records nothing for that shard, as if it hadn't run. On DynamoDB Local, as above, a shard with no records fails 24 hours after the snapshot began. A trimmed position that a sync within the last 24 hours found nothing after loses nothing, and the read goes on from the shard's oldest record. A shard that left the stream had nothing after its position in that case either, and the read goes on without it.
 
 ### Fields and types
 

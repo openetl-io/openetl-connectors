@@ -15,6 +15,8 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/decimal128"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsmiddleware "github.com/aws/aws-sdk-go-v2/aws/middleware"
+	"github.com/aws/aws-sdk-go-v2/aws/ratelimit"
+	"github.com/aws/aws-sdk-go-v2/aws/retry"
 	"github.com/aws/aws-sdk-go-v2/feature/dynamodb/attributevalue"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
@@ -687,7 +689,8 @@ func (r *cdcRead) poll(ctx context.Context, id string) (ended bool, err error) {
 // created before at, which empty pages don't prove: it looks for the first
 // record created since Since with an AT_TIMESTAMP iterator, from the second
 // after the position's record's where Since is its time. An endpoint that
-// refuses AT_TIMESTAMP, as one without it does, has the empty pages stand.
+// refuses AT_TIMESTAMP, as one without it does, has the empty pages stand;
+// any other failure, past the throttling it retries, proves nothing.
 func (r *cdcRead) nothingSince(ctx context.Context, id string, st shardState, at time.Time) bool {
 	from := st.Since
 	if st.After != "" && !st.Checked {
@@ -696,18 +699,26 @@ func (r *cdcRead) nothingSince(ctx context.Context, id string, st shardState, at
 	if !from.Before(at) {
 		return false
 	}
-	once := func(o *dynamodbstreams.Options) { o.RetryMaxAttempts = 1 }
 	it, err := r.streams.GetShardIterator(ctx, &dynamodbstreams.GetShardIteratorInput{
 		StreamArn: aws.String(r.st.Stream), ShardId: aws.String(id), ShardIteratorType: streamtypes.ShardIteratorTypeAtTimestamp, Timestamp: aws.Time(from),
-	}, once)
+	}, throttled)
 	if apiCode(err) == "ValidationException" {
 		return true
 	}
 	if err != nil {
 		return false
 	}
-	res, err := r.streams.GetRecords(ctx, &dynamodbstreams.GetRecordsInput{ShardIterator: it.ShardIterator, Limit: aws.Int32(1)}, once)
+	res, err := r.streams.GetRecords(ctx, &dynamodbstreams.GetRecordsInput{ShardIterator: it.ShardIterator, Limit: aws.Int32(1)}, throttled)
 	return err == nil && (len(res.Records) == 0 || res.Records[0].Dynamodb != nil && !aws.ToTime(res.Records[0].Dynamodb.ApproximateCreationDateTime).Before(at))
+}
+
+// throttled retries a call while it's throttled, as the client does, but
+// not on a server error, which is how DynamoDB Local fails AT_TIMESTAMP.
+func throttled(o *dynamodbstreams.Options) {
+	o.Retryer = retry.NewStandard(func(s *retry.StandardOptions) {
+		s.MaxAttempts, s.MaxBackoff, s.RateLimiter = 10, 10*time.Second, ratelimit.None
+		s.Retryables = []retry.IsErrorRetryable{retry.RetryableErrorCode{Codes: retry.DefaultThrottleErrorCodes}}
+	})
 }
 
 // trimmed says the stream refused a read of records it has trimmed.
