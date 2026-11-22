@@ -388,6 +388,28 @@ func TestDestinationMergeUnchangedOlderThanTarget(t *testing.T) {
 	})
 }
 
+// With held columns too, a held column comes with its hold from a newer
+// version than the target's row, and not from an older one.
+func TestDestinationMergeHeldUnchangedOlderThanTarget(t *testing.T) {
+	e := newDestEnv(t, "OPENETL_D_HELDOLD", ownGrants...)
+	w := e.open(1, destination.OpenConfig{Streams: []destination.Stream{{Name: "U", Mode: destination.Merge, PrimaryKey: []string{"k"}}}})
+	heldField := arrow.Field{Name: destination.HeldColumn, Type: arrow.ListOf(arrow.BinaryTypes.String), Nullable: true}
+	fields := []arrow.Field{{Name: "k", Type: arrow.PrimitiveTypes.Int64}, {Name: "v", Type: arrow.BinaryTypes.String, Nullable: true},
+		{Name: "n", Type: arrow.PrimitiveTypes.Int64, Nullable: true}, idField, opField, seqField, unchField, heldField}
+	commit := func(n uint64, rows string) { e.commit(w, n, streamBatch{"U", batchOf(t, fields, rows)}) }
+	commit(1, fmt.Sprintf(`[{"k": 1, "v": "current", "n": 10, "_openetl_id": %q, "_openetl_op": "insert", "_openetl_seq": "10"},
+		{"k": 2, "v": "current", "n": 10, "_openetl_id": %q, "_openetl_op": "insert", "_openetl_seq": "10"}]`, rowID(1), rowID(2)))
+	commit(2, fmt.Sprintf(`[{"k": 1, "v": null, "n": 5, "_openetl_id": %q, "_openetl_op": "update", "_openetl_seq": "5", "_openetl_held": ["v"]},
+		{"k": 1, "v": null, "n": 11, "_openetl_id": %q, "_openetl_op": "update", "_openetl_seq": "11", "_openetl_unchanged": ["v"]},
+		{"k": 2, "v": null, "n": 12, "_openetl_id": %q, "_openetl_op": "update", "_openetl_seq": "12", "_openetl_held": ["v"]},
+		{"k": 2, "v": null, "n": 13, "_openetl_id": %q, "_openetl_op": "update", "_openetl_seq": "13", "_openetl_unchanged": ["v"]}]`, rowID(3), rowID(4), rowID(5), rowID(6)))
+	got := e.rows(e.user, "U", "k", "v", "n", colUnchanged, destination.HeldColumn)
+	if len(got) != 2 || got[0] != "k=1, v=current, n=11, _openetl_unchanged=<null>, _openetl_held=<null>" ||
+		!strings.HasPrefix(got[1], "k=2, v=<null>, n=13, _openetl_unchanged=<null>, _openetl_held={") {
+		t.Fatalf("got %q", got)
+	}
+}
+
 // textOf is a value as readTable gives it, as text: times in UTC, and long
 // text and binary values by their length.
 func textOf(v any) string {
