@@ -68,7 +68,7 @@ Each record becomes a row. A value that decodes to an object gives its fields as
 | `_kafka_offset` | Its offset in the partition |
 | `_kafka_timestamp` | Its timestamp, in UTC |
 | `_kafka_key` | Its key as text: a string key's text, or a structured key as JSON. A key that isn't in the configured format is its bytes' text, or their base64 if they aren't UTF-8 |
-| `_kafka_headers` | Its headers, as a JSON object |
+| `_kafka_headers` | Its headers, as a JSON object of their values' text: from 0.2.0, the base64 of a value that isn't UTF-8, whose bytes that aren't were replaced before. A header key that the record repeats keeps only its last value, and a null value is an empty string |
 
 With `avro` or `protobuf`, the catalog declares the value's fields as the latest schema under `<topic>-value` has them; with `json`, columns and their types come from the records. `format: string` reads each value as text, into `value`.
 

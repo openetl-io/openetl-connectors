@@ -934,9 +934,10 @@ func (s *Source) row(ctx context.Context, rec *kgo.Record) (json.RawMessage, err
 	if len(rec.Headers) == 0 {
 		b = append(b, "null"...)
 	} else {
-		h := map[string]string{}
+		// A key's last value, as text, or base64 if it isn't UTF-8.
+		h := map[string]json.RawMessage{}
 		for _, hd := range rec.Headers {
-			h[hd.Key] = string(hd.Value)
+			h[hd.Key] = records.JSONText(hd.Value)
 		}
 		hb, err := json.Marshal(h)
 		if err != nil {

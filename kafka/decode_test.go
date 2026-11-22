@@ -195,3 +195,25 @@ func TestAValueTheRegistryDoesntAnswerForIsTransient(t *testing.T) {
 		t.Errorf("a value that doesn't decode ended the read with %v (%v)", err, codeOf(err))
 	}
 }
+
+// A header value that isn't UTF-8 lands as its bytes' base64, as a key
+// does, rather than with its bytes replaced.
+func TestABinaryHeaderLandsWhole(t *testing.T) {
+	addrs := fake(t)
+	topic := "events"
+	produceOne(t, addrs, topic, &kgo.Record{Value: []byte(`{"n":1}`), Headers: []kgo.RecordHeader{
+		{Key: "text", Value: []byte("é")}, {Key: "bin", Value: []byte{0xff, 0x00, 0xfe}},
+	}})
+	s, err := NewSource(fakeConfig(t, addrs, map[string]any{"topics": []string{topic}}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows, err := readRows(t, s, topic)
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("%v, %v", rows, err)
+	}
+	h, ok := rows[0][headersColumn].(map[string]any)
+	if !ok || h["text"] != "é" || h["bin"] != "/wD+" {
+		t.Errorf("headers landed as %v", rows[0][headersColumn])
+	}
+}
