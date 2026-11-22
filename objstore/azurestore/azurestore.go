@@ -75,7 +75,10 @@ func (s *Store) Scheme() string    { return "azblob" }
 func (s *Store) Container() string { return "container" }
 
 func (s *Store) Open(ctx context.Context, bucket string) (*blob.Bucket, error) {
-	opts := &container.ClientOptions{ClientOptions: policy.ClientOptions{Retry: policy.RetryOptions{MaxRetries: 3, TryTimeout: time.Minute}}}
+	opts := &container.ClientOptions{ClientOptions: policy.ClientOptions{
+		Retry:            policy.RetryOptions{MaxRetries: 3, TryTimeout: time.Minute},
+		PerRetryPolicies: []policy.Policy{hideQuery{}},
+	}}
 	service := s.cfg.Endpoint
 	if service == "" {
 		service = "https://" + s.cfg.AccountName + ".blob.core.windows.net"
@@ -104,6 +107,18 @@ func (s *Store) Open(ctx context.Context, bucket string) (*blob.Bucket, error) {
 			fmt.Errorf("azureblob: Azure credentials: set accountKey, sasToken or connectionString: %w", err))
 	}
 	return azureblob.OpenBucket(ctx, c, nil)
+}
+
+// hideQuery drops a request's query, which holds a SAS, from the error of
+// one that got no answer: net/http's error shows the whole URL.
+type hideQuery struct{}
+
+func (hideQuery) Do(req *policy.Request) (*http.Response, error) {
+	resp, err := req.Next()
+	if ue, ok := errors.AsType[*url.Error](err); ok {
+		ue.URL, _, _ = strings.Cut(ue.URL, "?")
+	}
+	return resp, err
 }
 
 // accountName is the configured account's, or the one an emulator's

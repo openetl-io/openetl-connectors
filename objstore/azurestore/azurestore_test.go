@@ -2,7 +2,12 @@ package azurestore
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
+
+	"gocloud.dev/blob"
+
+	sdk "github.com/openetl-io/openetl/sdk/go"
 )
 
 const key = "a2V5"
@@ -31,6 +36,32 @@ func TestCredentialsOverHTTP(t *testing.T) {
 		if _, err := New(cfg); (err == nil) != c.ok {
 			t.Errorf("%s: %v", c.config, err)
 		}
+	}
+}
+
+// A request that fails before the store answers doesn't show its URL's
+// query, which holds the SAS, in its error.
+func TestSASNotShown(t *testing.T) {
+	for name, cfg := range map[string]Config{
+		"sasToken":         {Endpoint: "https://127.0.0.1:1/a", SASToken: sdk.NewSecret("sv=2024-11-04&sig=SECRETSIG")},
+		"connectionString": {ConnectionString: sdk.NewSecret("BlobEndpoint=https://127.0.0.1:1/a;SharedAccessSignature=sv=2024-11-04&sig=SECRETSIG")},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			s, err := New(cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			b, err := s.Open(t.Context(), "c")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = b.Close() }()
+			_, _, err = b.ListPage(t.Context(), blob.FirstPageToken, 1, nil)
+			if err == nil || strings.Contains(err.Error(), "SECRETSIG") || !strings.Contains(err.Error(), "127.0.0.1:1") {
+				t.Errorf("list: %v", err)
+			}
+		})
 	}
 }
 

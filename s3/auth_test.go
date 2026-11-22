@@ -72,6 +72,36 @@ func TestCredentialsUnreachable(t *testing.T) {
 	}
 }
 
+// No item or error of a check shows the keys' values: S3 gets the secret
+// key's signature, not the key, and the access key's ID that its answer
+// echoes isn't in its error's message.
+func TestKeysNotShown(t *testing.T) {
+	noAWS(t)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/xml")
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = fmt.Fprint(w, `<?xml version="1.0" encoding="UTF-8"?><Error><Code>SignatureDoesNotMatch</Code><Message>refused</Message>`+
+			`<AWSAccessKeyId>AKIAKEYID</AWSAccessKeyId><RequestId>r</RequestId></Error>`)
+	}))
+	t.Cleanup(srv.Close)
+	for _, endpoint := range []string{srv.URL, "http://127.0.0.1:1"} {
+		b, _ := json.Marshal(map[string]any{"url": "s3://lake/files", "region": "us-east-1", "endpoint": endpoint,
+			"accessKeyId": "AKIAKEYID", "secretAccessKey": "SECRETKEY"})
+		d, err := NewDestination(b)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rep := check.Run(t.Context(), d.Checks())
+		shown := fmt.Sprint(rep.Err())
+		for _, it := range rep.Items {
+			shown += fmt.Sprint(it)
+		}
+		if rep.Err() == nil || strings.Contains(shown, "AKIAKEYID") || strings.Contains(shown, "SECRETKEY") {
+			t.Errorf("%s: %s", endpoint, shown)
+		}
+	}
+}
+
 // noAWS gives the test no AWS credentials, as the runner gives a connector
 // by default.
 func noAWS(t *testing.T) {
