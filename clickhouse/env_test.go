@@ -18,6 +18,9 @@ import (
 
 func testAddr() string { return cmp.Or(os.Getenv("OPENETL_TEST_CLICKHOUSE_ADDR"), "127.0.0.1:9000") }
 
+// testPassword is the user openetl's, as .github/actions/services sets it.
+const testPassword = "clickhouse-test-password"
+
 func testConfig(addr, password, database string) []byte {
 	return fmt.Appendf(nil, `{"addr": %q, "user": "openetl", "password": %q, "database": %q}`, addr, password, database)
 }
@@ -26,7 +29,7 @@ func testConn(t *testing.T) driver.Conn {
 	t.Helper()
 	conn, err := ch.Open(&ch.Options{
 		Addr:     []string{testAddr()},
-		Auth:     ch.Auth{Database: "openetl", Username: "openetl", Password: "openetl"},
+		Auth:     ch.Auth{Database: "openetl", Username: "openetl", Password: testPassword},
 		Settings: ch.Settings{"async_insert": 0, "mutations_sync": 2},
 	})
 	if err != nil {

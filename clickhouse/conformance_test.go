@@ -27,9 +27,9 @@ func TestSourceConformance(t *testing.T) {
 	}
 	conformance.SourceSuite{
 		Launch:         conformance.Exec(conformance.Build(t, "../cmd/source-clickhouse")),
-		Config:         cfg(testAddr(), "openetl"),
+		Config:         cfg(testAddr(), testPassword),
 		BadCredentials: cfg(testAddr(), "not-the-password"),
-		Unreachable:    cfg("127.0.0.1:1", "openetl"),
+		Unreachable:    cfg("127.0.0.1:1", testPassword),
 		AddRecords: func(ctx context.Context, stream string) (int, error) {
 			switch stream {
 			case "events":
@@ -52,7 +52,7 @@ func TestSourceConformance(t *testing.T) {
 }
 
 func TestDestinationConformance(t *testing.T) {
-	destinationSuite(t, testConfig(testAddr(), "openetl", "openetl"))
+	destinationSuite(t, testConfig(testAddr(), testPassword, "openetl"))
 }
 
 // TestDestinationConformanceGranted runs the suite as a user with only the
@@ -69,7 +69,7 @@ func destinationSuite(t *testing.T, config []byte) {
 		Launch:         conformance.Exec(conformance.Build(t, "../cmd/destination-clickhouse")),
 		Config:         config,
 		BadCredentials: testConfig(testAddr(), "not-the-password", "openetl"),
-		Unreachable:    testConfig("127.0.0.1:1", "openetl", "openetl"),
+		Unreachable:    testConfig("127.0.0.1:1", testPassword, "openetl"),
 		Read: func(ctx context.Context, namespace, stream string) ([]map[string]any, error) {
 			return readTable(ctx, conn, namespace, stream)
 		},

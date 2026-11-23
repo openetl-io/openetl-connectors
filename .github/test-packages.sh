@@ -30,7 +30,10 @@ kafka_sasl=${OPENETL_TEST_KAFKA_SASL_BROKERS:-127.0.0.1:9094}
 kinesis=${OPENETL_TEST_KINESIS_ENDPOINT:-http://127.0.0.1:4568}
 s3=${OPENETL_TEST_S3_ENDPOINT:-http://127.0.0.1:8333}
 iceberg=${OPENETL_TEST_ICEBERG_URI:-http://127.0.0.1:8181}
-export AWS_ACCESS_KEY_ID=openetl AWS_SECRET_ACCESS_KEY=openetl AWS_DEFAULT_REGION=us-east-1
+# The AWS key of the CLI and of the configs. The emulators take any, but
+# DynamoDB Local's access key is letters and digits, and the kit refuses a
+# secret shorter than 12 characters or one another value of its config holds.
+export AWS_ACCESS_KEY_ID=openetlTestAccessKey AWS_SECRET_ACCESS_KEY=openetl-test-secret-access-key AWS_DEFAULT_REGION=us-east-1
 run=pkg$(date +%s)
 work=$(mktemp -d)
 export RUN=$run WORK=$work KINESIS=$kinesis
@@ -457,8 +460,11 @@ SH
 # back over HTTP.
 checks_clickhouse() {
   export CH_HTTP=${OPENETL_TEST_CLICKHOUSE_HTTP:-http://127.0.0.1:8123}
+  # The user openetl's password, as .github/actions/services sets it.
+  local password=clickhouse-test-password
+  export CH_AUTH=openetl:$password
   local addr=${OPENETL_TEST_CLICKHOUSE_ADDR:-127.0.0.1:9000} q
-  ch() { curl -sf -u openetl:openetl "$CH_HTTP" --data-binary "$1"; }
+  ch() { curl -sf -u "$CH_AUTH" "$CH_HTTP" --data-binary "$1"; }
   for q in "CREATE DATABASE $run" \
     "CREATE TABLE $run.users (id Int64, name String, joined Date) ENGINE = MergeTree ORDER BY id" \
     "INSERT INTO $run.users SELECT number + 1, concat('u', toString(number + 1)), toDate('2020-01-01') + number FROM numbers(120)" \
@@ -470,7 +476,7 @@ checks_clickhouse() {
   script ch-add <<'SH'
 case $OPENETL_STREAM in
 events)
-  curl -sf -u openetl:openetl "$CH_HTTP" --data-binary "INSERT INTO $RUN.events
+  curl -sf -u "$CH_AUTH" "$CH_HTTP" --data-binary "INSERT INTO $RUN.events
     SELECT number + toUInt64(now()) * 100, now64(3, 'UTC'), '{}' FROM numbers(5)" && echo 5 ;;
 *) echo 0 ;;
 esac
@@ -478,7 +484,7 @@ SH
   # Reads with FINAL, and a String that isn't UTF-8 as \x and its hex.
   script ch-read <<'SH'
 q() {
-  curl -sf -u openetl:openetl --data-binary "$1" \
+  curl -sf -u "$CH_AUTH" --data-binary "$1" \
     "$CH_HTTP/?param_ns=$OPENETL_NAMESPACE&param_st=$OPENETL_STREAM&output_format_json_quote_denormals=1"
 }
 [ "$(q 'EXISTS TABLE {ns:Identifier}.{st:Identifier}')" = 1 ] || exit 0
@@ -492,20 +498,20 @@ SQL
 q "SELECT $cols FROM {ns:Identifier}.{st:Identifier} SETTINGS final = 1 FORMAT JSONEachRow"
 SH
   script ch-drop <<'SH'
-curl -sf -u openetl:openetl "$CH_HTTP/?param_ns=$OPENETL_NAMESPACE" --data-binary 'DROP DATABASE IF EXISTS {ns:Identifier} SYNC' >/dev/null
+curl -sf -u "$CH_AUTH" "$CH_HTTP/?param_ns=$OPENETL_NAMESPACE" --data-binary 'DROP DATABASE IF EXISTS {ns:Identifier} SYNC' >/dev/null
 SH
-  config ch-source "$(ch_config "$addr" openetl "$run" ', "chunkRows": 25')"
+  config ch-source "$(ch_config "$addr" "$password" "$run" ', "chunkRows": 25')"
   config ch-source-bad "$(ch_config "$addr" not-the-password "$run" ', "chunkRows": 25')"
-  config ch-source-closed "$(ch_config 127.0.0.1:1 openetl "$run" ', "chunkRows": 25')"
+  config ch-source-closed "$(ch_config 127.0.0.1:1 "$password" "$run" ', "chunkRows": 25')"
   check source-clickhouse clickhouse --role source \
     --config "$work/ch-source.json" \
     --bad-credentials "$work/ch-source-bad.json" \
     --unreachable "$work/ch-source-closed.json" \
     --stream users:full_refresh --stream events:incremental:at --add-records-command "$work/ch-add" \
     --stops-at-until
-  config ch-dest "$(ch_config "$addr" openetl openetl)"
+  config ch-dest "$(ch_config "$addr" "$password" openetl)"
   config ch-dest-bad "$(ch_config "$addr" not-the-password openetl)"
-  config ch-dest-closed "$(ch_config 127.0.0.1:1 openetl openetl)"
+  config ch-dest-closed "$(ch_config 127.0.0.1:1 "$password" openetl)"
   check destination-clickhouse clickhouse --role destination \
     --config "$work/ch-dest.json" \
     --bad-credentials "$work/ch-dest-bad.json" \
@@ -642,21 +648,21 @@ for t in $(aws --endpoint-url "$DYNAMODB" dynamodb list-tables --output text --q
   case $t in "$OPENETL_NAMESPACE".*) aws --endpoint-url "$DYNAMODB" dynamodb delete-table --table-name "$t" >/dev/null ;; esac
 done
 SH
-  ddb_config() { printf '{"region": "us-east-1", "endpoint": "%s", "accessKeyId": "%s", "secretAccessKey": "openetl"%s}' "$1" "$2" "$3"; }
+  ddb_config() { printf '{"region": "us-east-1", "endpoint": "%s", "accessKeyId": "%s", "secretAccessKey": "%s"%s}' "$1" "$2" "$AWS_SECRET_ACCESS_KEY" "$3"; }
   tables=", \"tables\": [\"$run-users\", \"$run-events\", \"$run-orders\"], \"scanLimit\": 25, \"segments\": 3"
   # DynamoDB Local takes any key of letters and digits.
-  config ddb-source "$(ddb_config "$DYNAMODB" openetl "$tables")"
-  config ddb-source-bad "$(ddb_config "$DYNAMODB" not-a-key! "$tables")"
-  config ddb-source-closed "$(ddb_config http://127.0.0.1:1 openetl "$tables")"
+  config ddb-source "$(ddb_config "$DYNAMODB" "$AWS_ACCESS_KEY_ID" "$tables")"
+  config ddb-source-bad "$(ddb_config "$DYNAMODB" not-a-valid-key! "$tables")"
+  config ddb-source-closed "$(ddb_config http://127.0.0.1:1 "$AWS_ACCESS_KEY_ID" "$tables")"
   check source-dynamodb dynamodb --role source \
     --config "$work/ddb-source.json" \
     --bad-credentials "$work/ddb-source-bad.json" \
     --unreachable "$work/ddb-source-closed.json" \
     --stream "$run-users:full_refresh" --stream "$run-events:incremental:at" --stream "$run-orders:cdc" \
     --add-records-command "$work/ddb-add" --stops-at-until
-  config ddb-dest "$(ddb_config "$DYNAMODB" openetl "")"
-  config ddb-dest-bad "$(ddb_config "$DYNAMODB" not-a-key! "")"
-  config ddb-dest-closed "$(ddb_config http://127.0.0.1:1 openetl "")"
+  config ddb-dest "$(ddb_config "$DYNAMODB" "$AWS_ACCESS_KEY_ID" "")"
+  config ddb-dest-bad "$(ddb_config "$DYNAMODB" not-a-valid-key! "")"
+  config ddb-dest-closed "$(ddb_config http://127.0.0.1:1 "$AWS_ACCESS_KEY_ID" "")"
   check destination-dynamodb dynamodb --role destination \
     --config "$work/ddb-dest.json" \
     --bad-credentials "$work/ddb-dest-bad.json" \
@@ -685,7 +691,7 @@ SH
   config kafka-source "{\"brokers\": [\"$kafka\"], \"topics\": [\"$run.a\", \"$run.b\"]}"
   config kafka-source-closed "{\"brokers\": [\"127.0.0.1:1\"], \"topics\": [\"$run.a\", \"$run.b\"]}"
   # The SASL_SSL broker, with a password it rejects.
-  kafka_rejected() { printf '{"brokers": ["%s"], "tls": true, "tlsInsecureSkipVerify": true, "saslMechanism": "scram-sha-512", "saslUsername": "scram", "saslPassword": "wrong"%s}' "$kafka_sasl" "$1"; }
+  kafka_rejected() { printf '{"brokers": ["%s"], "tls": true, "tlsInsecureSkipVerify": true, "saslMechanism": "scram-sha-512", "saslUsername": "scram", "saslPassword": "not-the-sasl-password"%s}' "$kafka_sasl" "$1"; }
   config kafka-source-rejected "$(kafka_rejected ", \"topics\": [\"$run.a\", \"$run.b\"]")"
   check source-kafka kafka --role source \
     --config "$work/kafka-source.json" \
@@ -719,7 +725,7 @@ checks_kinesis() {
   records 0 100 >"$work/kinesis-a.json" && records 0 40 >"$work/kinesis-b.json"
   kinesis_cli put-records --stream-name "$run-a" --records "file://$work/kinesis-a.json" >/dev/null &&
     kinesis_cli put-records --stream-name "$run-b" --records "file://$work/kinesis-b.json" >/dev/null || exit 1
-  kinesis_config() { printf '{"region": "us-east-1", "endpoint": "%s", "accessKeyId": "openetl", "secretAccessKey": "openetl"%s}' "$1" "$2"; }
+  kinesis_config() { printf '{"region": "us-east-1", "endpoint": "%s", "accessKeyId": "%s", "secretAccessKey": "%s"%s}' "$1" "$AWS_ACCESS_KEY_ID" "$AWS_SECRET_ACCESS_KEY" "$2"; }
   streams=", \"streams\": [\"$run-a\", \"$run-b\"]"
   script kinesis-add <<'SH'
 n=$(date +%s)
@@ -796,7 +802,7 @@ SH
   local url endpoint creds closed
   case $store in
   s3) url=s3://packages/$run endpoint=$s3 closed=http://127.0.0.1:1
-    creds='"region": "us-east-1", "accessKeyId": "openetl", "secretAccessKey": "openetl"' ;;
+    creds="\"region\": \"us-east-1\", \"accessKeyId\": \"$AWS_ACCESS_KEY_ID\", \"secretAccessKey\": \"$AWS_SECRET_ACCESS_KEY\"" ;;
   gcs) url=gs://packages/$run endpoint=$gcs closed=http://127.0.0.1:1 creds="" ;;
   azure) url=azblob://packages/$run endpoint=$azure closed=http://127.0.0.1:1/devstoreaccount1
     creds="\"accountName\": \"devstoreaccount1\", \"accountKey\": \"$azure_key\"" ;;
@@ -844,7 +850,7 @@ checks_azureblob() { files_checks azure azureblob; }
 
 # Iceberg: tables through the REST catalog, in the S3 store's iceberg bucket.
 checks_iceberg() {
-  iceberg_config() { printf '{"uri": "%s", "s3Endpoint": "%s", "region": "us-east-1", "accessKeyId": "openetl", "secretAccessKey": "openetl"}' "$1" "$s3"; }
+  iceberg_config() { printf '{"uri": "%s", "s3Endpoint": "%s", "region": "us-east-1", "accessKeyId": "%s", "secretAccessKey": "%s"}' "$1" "$s3" "$AWS_ACCESS_KEY_ID" "$AWS_SECRET_ACCESS_KEY"; }
   config iceberg "$(iceberg_config "$iceberg")"
   config iceberg-closed "$(iceberg_config http://127.0.0.1:1)"
   check destination-iceberg iceberg --role destination \

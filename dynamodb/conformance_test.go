@@ -71,11 +71,11 @@ func sourceConformance(t *testing.T, extra string) {
 	}
 	conformance.SourceSuite{
 		Launch: conformance.Exec(conformance.Build(t, "../cmd/source-dynamodb")),
-		Config: cfg(endpoint(), "openetl"),
+		Config: cfg(endpoint(), testAccessKeyID),
 		// DynamoDB Local takes any key of letters and digits; it refuses
 		// others as AWS refuses a key it doesn't know.
-		BadCredentials: cfg(endpoint(), "not-a-key!"),
-		Unreachable:    cfg(closedPort, "openetl"),
+		BadCredentials: cfg(endpoint(), "not-a-valid-key!"),
+		Unreachable:    cfg(closedPort, testAccessKeyID),
 		StopsAtUntil:   true,
 		AddRecords: func(ctx context.Context, stream string) (int, error) {
 			mu.Lock()
@@ -114,9 +114,9 @@ func TestDestinationConformance(t *testing.T) {
 	cfg := func(endpoint, key string) []byte { return []byte("{" + connConfig(endpoint, key) + "}") }
 	conformance.DestinationSuite{
 		Launch:         conformance.Exec(conformance.Build(t, "../cmd/destination-dynamodb")),
-		Config:         cfg(endpoint(), "openetl"),
-		BadCredentials: cfg(endpoint(), "not-a-key!"),
-		Unreachable:    cfg(closedPort, "openetl"),
+		Config:         cfg(endpoint(), testAccessKeyID),
+		BadCredentials: cfg(endpoint(), "not-a-valid-key!"),
+		Unreachable:    cfg(closedPort, testAccessKeyID),
 		// An item's attributes take values of any type.
 		Untyped: true,
 		Read: func(ctx context.Context, namespace, stream string) ([]map[string]any, error) {

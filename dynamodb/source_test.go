@@ -19,7 +19,7 @@ import (
 
 func testSource(t *testing.T, extra string) *Source {
 	t.Helper()
-	s, err := NewSource([]byte("{" + connConfig(endpoint(), "openetl") + extra + "}"))
+	s, err := NewSource([]byte("{" + connConfig(endpoint(), testAccessKeyID) + extra + "}"))
 	if err != nil {
 		t.Fatal(err)
 	}

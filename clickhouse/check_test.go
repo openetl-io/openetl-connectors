@@ -17,13 +17,16 @@ import (
 	"github.com/openetl-io/openetl/sdk/go/source"
 )
 
+// userPassword is the password of each user testUser creates.
+const userPassword = "test-user-password"
+
 // testUser creates a user with settings and grants, dropped when t ends,
 // and gives its name; $db in a grant is database.
 func testUser(t *testing.T, database, settings string, grants ...string) string {
 	t.Helper()
 	conn := testConn(t)
 	user := fmt.Sprintf("u_%d", time.Now().UnixNano())
-	q := "CREATE USER " + ident(user) + " IDENTIFIED BY 'pw'"
+	q := "CREATE USER " + ident(user) + " IDENTIFIED BY '" + userPassword + "'"
 	if settings != "" {
 		q += " SETTINGS " + settings
 	}
@@ -40,7 +43,7 @@ func testUser(t *testing.T, database, settings string, grants ...string) string 
 }
 
 func userConfig(user, database string) []byte {
-	return fmt.Appendf(nil, `{"addr": %q, "user": %q, "password": "pw", "database": %q}`, testAddr(), user, database)
+	return fmt.Appendf(nil, `{"addr": %q, "user": %q, "password": %q, "database": %q}`, testAddr(), user, userPassword, database)
 }
 
 func TestSourceCheckItems(t *testing.T) {
@@ -49,7 +52,7 @@ func TestSourceCheckItems(t *testing.T) {
 	e.exec("CREATE TABLE $db.items (id Int64, at DateTime, j JSON) ENGINE = MergeTree ORDER BY id")
 	e.exec("CREATE TABLE $db.nokey (v Int64) ENGINE = MergeTree ORDER BY tuple()")
 	e.exec("CREATE VIEW $db.v AS SELECT id FROM $db.items")
-	s, err := NewSource(testConfig(testAddr(), "openetl", db))
+	s, err := NewSource(testConfig(testAddr(), testPassword, db))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -119,7 +122,7 @@ func TestSourceCheckItems(t *testing.T) {
 	if got := c.ids("items"); !slices.Equal(got, []int64{1, 2}) {
 		t.Errorf("a readonly user read %v", got)
 	}
-	s, err = NewSource(testConfig(testAddr(), "openetl", db+"_none"))
+	s, err = NewSource(testConfig(testAddr(), testPassword, db+"_none"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -161,7 +164,7 @@ func TestSourceReadonlyDeadline(t *testing.T) {
 
 func TestDestinationCheckItems(t *testing.T) {
 	db := newDatabase(t)
-	d, err := NewDestination(testConfig(testAddr(), "openetl", db))
+	d, err := NewDestination(testConfig(testAddr(), testPassword, db))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -221,7 +224,7 @@ func TestDestinationCheckItems(t *testing.T) {
 	if err := conn.Exec(t.Context(), "CREATE TABLE "+qualified(db, "keyed")+" (id Int32, v Int64) ENGINE = MergeTree ORDER BY id"); err != nil {
 		t.Fatal(err)
 	}
-	d, err = NewDestination(testConfig(testAddr(), "openetl", db))
+	d, err = NewDestination(testConfig(testAddr(), testPassword, db))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -269,7 +272,7 @@ func TestCheckErrors(t *testing.T) {
 		"grant.tables": "skipped", "grant.rows": "skipped", "grant.columns": "skipped", "grant.partitions": "skipped",
 		"grant.update": "skipped", "grant.system": "skipped", "settings.write": "skipped",
 	})
-	s, err := NewSource(testConfig("127.0.0.1:1", "openetl", db))
+	s, err := NewSource(testConfig("127.0.0.1:1", testPassword, db))
 	if err != nil {
 		t.Fatal(err)
 	}
