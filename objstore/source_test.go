@@ -659,6 +659,8 @@ func TestUntilPastChangedFiles(t *testing.T) {
 		{name: "after a file new since, before it", mode: source.Incremental, until: 2, added: "n.jsonl", want: map[string]int{"a.jsonl": 1, "n.jsonl": 3, "b.jsonl": batchRecords + 1}},
 		{name: "from after a file deleted since", mode: source.Incremental, from: 1, until: 2, deleted: "a.jsonl", want: map[string]int{"b.jsonl": batchRecords + 1}},
 		{name: "before a file deleted since", mode: source.Incremental, until: 0, deleted: "b.jsonl", want: map[string]int{"a.jsonl": 1}},
+		{name: "from within a file", mode: source.FullRefresh, from: 2, until: 2, want: map[string]int{"b.jsonl": 1}},
+		{name: "from within a file written again since", mode: source.FullRefresh, from: 2, until: 2, rewritten: "b.jsonl", lost: true},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			dir := t.TempDir()

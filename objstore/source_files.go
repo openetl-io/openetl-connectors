@@ -246,7 +246,7 @@ func neededOf(from, until readState, incremental bool) []needed {
 	}
 	a := until.At
 	if f := from.At; !incremental && f != nil && (a == nil || a.Key != f.Key) {
-		out = append(out, needed{key: f.Key})
+		out = append(out, needed{key: f.Key, at: f})
 	}
 	if a != nil && (from.At == nil || *from.At != *a) {
 		out = append(out, needed{key: a.Key, at: a})
