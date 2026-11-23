@@ -97,7 +97,7 @@ func (s *Source) Splits(ctx context.Context, cs source.ConfiguredStream, ended [
 	}
 	return keysplit.Of(ended, len(ranges), func(i int) any {
 		if i >= 0 {
-			st.keyRange = ranges[i]
+			st.keyRange, st.Key = ranges[i], orderKey(t)
 		}
 		return st
 	})

@@ -713,6 +713,64 @@ func TestIncrementalCompletesAtCompleteAt(t *testing.T) {
 	}
 }
 
+// A read resumed, or read again up to, a state made before its table's key
+// was added, dropped or changed: one read in a single query, and done,
+// completes without reading the table again, and read again up to that
+// state reads it in one query as it did; one read in key order fails as
+// lost, its position being in an order the table no longer has.
+func TestReadOrderChangedBetweenAttempts(t *testing.T) {
+	db := testDB(t)
+	srcTable(t, db, "ST_LOOSE", "(id NUMBER(10) NOT NULL, at NUMBER(10))", "INSERT INTO ST_LOOSE SELECT level, level FROM dual CONNECT BY level <= 5")
+	srcTable(t, db, "ST_KEYED", "(id NUMBER(10) PRIMARY KEY, at NUMBER(10))", "INSERT INTO ST_KEYED SELECT level, level FROM dual CONNECT BY level <= 5")
+	srcTable(t, db, "ST_REKEY", "(id NUMBER(10) PRIMARY KEY, at NUMBER(10) NOT NULL)", "INSERT INTO ST_REKEY SELECT level, 6 - level FROM dual CONNECT BY level <= 5")
+	s := srcSource(t, testDSN(), `, "tables": ["ST_LOOSE", "ST_KEYED", "ST_REKEY"], "chunkRows": 2`)
+	// Each read's first resume point, and how many rows came before it.
+	type part struct {
+		cs    source.ConfiguredStream
+		state string
+		rows  int
+	}
+	var parts []part
+	for _, cs := range []source.ConfiguredStream{
+		fullRefresh("ST_LOOSE"),
+		{Name: "ST_LOOSE", SyncMode: source.Incremental, Cursor: "AT"},
+		fullRefresh("ST_KEYED"),
+		{Name: "ST_KEYED", SyncMode: source.Incremental, Cursor: "AT"},
+		fullRefresh("ST_REKEY"),
+	} {
+		first := srcRead(t, s, 1, cs)
+		j := first.resumes()[0]
+		parts = append(parts, part{cs, first.events[j].state, len(srcRows(first.events, -1, j))})
+	}
+	exec(t, db, "ALTER TABLE ST_LOOSE ADD PRIMARY KEY (id)", "ALTER TABLE ST_KEYED DROP PRIMARY KEY", "ALTER TABLE ST_REKEY DROP PRIMARY KEY", "ALTER TABLE ST_REKEY ADD PRIMARY KEY (at)")
+	for _, p := range parts[:2] {
+		cs := p.cs
+		cs.State = []byte(p.state)
+		again := srcRead(t, s, 1, cs)
+		if again.completed(t); len(again.rows()) > 0 {
+			t.Fatalf("%v from %s, once the table has a key: read %d rows again", cs.SyncMode, p.state, len(again.rows()))
+		}
+		cs.State, cs.Until = nil, []byte(p.state)
+		again = srcRead(t, s, 1, cs)
+		endsAt(t, again.events, p.state)
+		if n := len(again.rows()); n != p.rows {
+			t.Fatalf("%v until %s, once the table has a key: %d rows, not %d", cs.SyncMode, p.state, n, p.rows)
+		}
+	}
+	for _, p := range parts[2:] {
+		for _, until := range []bool{false, true} {
+			cs := p.cs
+			if cs.State = []byte(p.state); until {
+				cs.State, cs.Until = nil, []byte(p.state)
+			}
+			err := s.Read(t.Context(), source.ReadRequest{Streams: []source.ConfiguredStream{cs}, Lanes: 1}, &srcLog{})
+			if code := cdcCode(err); code.String() != "ERROR_CODE_POSITION_LOST" {
+				t.Errorf("%s %v from %s, until %t, once its key changed: got %v, want POSITION_LOST", cs.Name, cs.SyncMode, p.state, until, err)
+			}
+		}
+	}
+}
+
 // endsAt fails unless a read's last events are a resume point at until and
 // its completion there, with no records after them.
 func endsAt(t *testing.T, events []srcEvent, until string) {

@@ -238,6 +238,8 @@ type sourceState struct {
 	// The key of the last row read, spelled as keyText spells it; in an
 	// incremental read, its cursor value first.
 	After []string `json:"after,omitempty"`
+	// The key's columns that After and the key range are of: see orderKey.
+	Key []string `json:"key,omitempty"`
 	// Set once a table read in one query has been read.
 	Done bool `json:"done,omitempty"`
 	// An incremental read's cursor floor, inclusive, and the highest value
@@ -247,6 +249,31 @@ type sourceState struct {
 	Until *string `json:"until,omitempty"`
 	// A split's key range.
 	keyRange
+}
+
+// orderKey is what a state names a table's read order by: its key's
+// columns, or none for a table read in one query.
+func orderKey(t table) []string {
+	if !chunked(t) {
+		return nil
+	}
+	var names []string
+	for _, k := range t.key {
+		names = append(names, t.cols[k].name)
+	}
+	return names
+}
+
+// sameOrder fails a read resumed in another order than the one its state
+// was read in, as once the table's key has been added, dropped or changed,
+// which only a read from the start carries on from. A split's range is of
+// its order's first column, so it holds before its first row.
+func sameOrder(t table, st sourceState) error {
+	positioned := st.After != nil || st.Lo != nil || st.Hi != nil
+	if now := orderKey(t); positioned && (now == nil || !slices.Equal(st.Key, now)) {
+		return positionLost("oracle: %s was read in the order of columns %v, and is now read in the order of %v: read it again from the start", t.name, st.Key, now)
+	}
+	return nil
 }
 
 // keyText spells a key's or a cursor's value, as go-ora reads it, for a
@@ -546,12 +573,15 @@ func (s *Source) readSplit(ctx context.Context, conns *connPool, schema string, 
 			return fmt.Errorf("oracle: %s state: %w", cs.Name, err)
 		}
 	}
+	t, _ := findTable(tables, cs.Name)
+	if err := sameOrder(t, st); err != nil {
+		return err
+	}
 	conn, err := conns.Get(ctx)
 	if err != nil {
 		return err
 	}
 	defer conns.Put(conn)
-	t, _ := findTable(tables, cs.Name)
 	b := newBatcher(memory.DefaultAllocator, t.cols, false)
 	defer b.release()
 	r := &tableReader{s: s, conn: conn, schema: schema, t: t, b: b, out: out}
@@ -602,6 +632,9 @@ func (r *tableReader) readUntil(ctx context.Context, cs source.ConfiguredStream,
 	if err := json.Unmarshal(until, &u); err != nil {
 		return fmt.Errorf("oracle: %s until: %w", cs.Name, err)
 	}
+	if err := sameOrder(r.t, u); err != nil {
+		return err
+	}
 	order := r.t.key
 	bounds := func(w *where) error { return nil }
 	if cs.SyncMode == source.Incremental {
@@ -613,8 +646,9 @@ func (r *tableReader) readUntil(ctx context.Context, cs source.ConfiguredStream,
 		order = incrementalOrder(r.t, ci)
 	}
 	switch {
-	case !chunked(r.t):
-		if !st.Done && u.Done {
+	case u.Done:
+		// A read in one query, as of a table that may have had no key then.
+		if !st.Done {
 			if _, _, err := r.query(ctx, nil, bounds, nil); err != nil {
 				return err
 			}
@@ -670,7 +704,9 @@ func cursorBounds(c column, st sourceState) func(*where) error {
 }
 
 func (r *tableReader) readTable(ctx context.Context, id string, st sourceState) error {
-	if !chunked(r.t) {
+	// A read in one query, as of a table before it had a key, is done once
+	// that query is.
+	if !chunked(r.t) || st.Done {
 		if !st.Done {
 			if _, _, err := r.query(ctx, nil, nil, nil); err != nil {
 				return err
@@ -684,7 +720,7 @@ func (r *tableReader) readTable(ctx context.Context, id string, st sourceState) 
 	if st.After != nil && len(st.After) != len(r.t.key) {
 		return fmt.Errorf("oracle: %s state has %d key columns, the table has %d", r.t.name, len(st.After), len(r.t.key))
 	}
-	st = sourceState{After: st.After, keyRange: st.keyRange}
+	st = sourceState{After: st.After, Key: orderKey(r.t), keyRange: st.keyRange}
 	reading := r.s.Start(r.t.name, id, true)
 	defer r.s.End(r.t.name, id)
 	for {
@@ -738,7 +774,7 @@ func (r *tableReader) readIncremental(ctx context.Context, id, cursor string, st
 		st = sourceState{Since: st.Since, Until: until}
 	}
 	bounds := cursorBounds(r.t.cols[ci], st)
-	if !chunked(r.t) {
+	if !chunked(r.t) || st.Done {
 		if !st.Done {
 			if _, _, err := r.query(ctx, nil, bounds, nil); err != nil {
 				return err
@@ -754,6 +790,7 @@ func (r *tableReader) readIncremental(ctx context.Context, id, cursor string, st
 	if st.After != nil && len(st.After) != len(order) {
 		return fmt.Errorf("oracle: %s state has %d cursor and key columns, the read has %d", r.t.name, len(st.After), len(order))
 	}
+	st.Key = orderKey(r.t)
 	reading := r.s.Start(r.t.name, id, true)
 	defer r.s.End(r.t.name, id)
 	for {

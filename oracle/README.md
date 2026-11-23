@@ -25,6 +25,8 @@ An incremental read starts at the last read's highest cursor value, not after it
 
 A table whose key starts with a `NUMBER` column is read in up to 32 key ranges at once, between the column's least and greatest values, as many as its statistics' row count (or else a count) fills at `chunkRows` a range. A range that falls behind is divided again at the midpoint of what it has left. A read holds up to `maxConnections` connections, one for each lane it runs; a CDC read's LogMiner session holds one of them.
 
+A stopped full refresh or incremental read resumes in the order it started in. If the table's key was added, dropped or changed in between, a read that had got part of the way in key order fails with `POSITION_LOST`, and so does a key range that hadn't started yet, since its range is of the old key's first column: only a read from the start goes on from there. A table read in a single query that has been read is done, even if it has been given a key since.
+
 Queries compare text in binary (`NLS_SORT` and `NLS_COMP` `BINARY`), so a character key is read in the order of its bytes, and an `NCHAR` or `NVARCHAR2` key in the order of its UTF-16 code units.
 
 ### How CDC reads the redo log
