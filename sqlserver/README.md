@@ -25,7 +25,7 @@ A table with a `rowversion` column offers it as the default cursor: SQL Server r
 
 A keyed table read in full or incrementally is split into ranges of its key's first column, from the statistics of its primary key's index, which OpenETL reads in parallel on up to `maxConnections` connections. Small tables, and tables without statistics, are read whole. A range being read can be split again while it's read.
 
-A column added to a table since the run discovered it fails the read, in any mode, with `TRANSIENT`: the next attempt discovers the column and declares its type.
+A column added to a table since the run discovered it fails the read, in any mode, with `TRANSIENT`: the next attempt discovers the column and declares its type. So does a column whose type changed since then so that it's declared as another type; one declared as the same, as `nvarchar(20)` to `nvarchar(40)`, reads on. That needs an OpenETL that gives a read the types the run declared.
 
 `cdcMethod` picks how `cdc` reads changes, for every stream of the source:
 

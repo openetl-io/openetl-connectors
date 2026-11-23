@@ -301,6 +301,54 @@ func TestSourceReadsTypes(t *testing.T) {
 	}
 }
 
+// A column whose type changed since the run's Discover, as a bytea altered
+// to text, fails the read retryably before it reads: its text would land as
+// other bytes. A read that declares the types as they are now reads it,
+// extension types among them.
+func TestSourceFailsOnATypeChangedSinceDiscover(t *testing.T) {
+	e := newSourceEnv(t)
+	e.exec("CREATE TABLE $schema.files (id int PRIMARY KEY, uid uuid, doc jsonb, body bytea)")
+	e.exec(`INSERT INTO $schema.files VALUES (1, '0b0e1f2a-3c4d-4e5f-8a9b-0c1d2e3f4a5b', '{"a": 1}', '\x6869')`)
+	s := e.source("")
+	declared := func() *arrow.Schema {
+		cat, err := s.Discover(t.Context())
+		if err != nil {
+			t.Fatal(err)
+		}
+		i := slices.IndexFunc(cat.Streams, func(cs source.CatalogStream) bool { return cs.Name == "files" })
+		if i < 0 {
+			t.Fatalf("no files in %v", cat.Streams)
+		}
+		fields, _ := source.SplitDeclared(cat.Streams[i].Schema)
+		return fields
+	}
+	read := func(sc *arrow.Schema) (*capture, error) {
+		c := &capture{}
+		t.Cleanup(c.release)
+		cs := source.ConfiguredStream{Name: "files", SyncMode: source.FullRefresh, Columns: []string{"id", "uid", "doc", "body"}, Schema: sc}
+		return c, s.Read(t.Context(), source.ReadRequest{Streams: []source.ConfiguredStream{cs}}, c)
+	}
+	was := declared()
+	if _, err := read(was); err != nil {
+		t.Fatalf("a read of the types as declared: %v", err)
+	}
+	e.exec("ALTER TABLE $schema.files ALTER COLUMN body TYPE text USING convert_from(body, 'UTF8')")
+	c, err := read(was)
+	if codeOf(err) != protocolv1.ErrorCode_ERROR_CODE_TRANSIENT || !strings.Contains(err.Error(), `"body"`) {
+		t.Fatalf("a read of body changed to text: %v", err)
+	}
+	if got := c.column("files", "id"); got != nil {
+		t.Errorf("the read sent rows: %q", got)
+	}
+	c, err = read(declared())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := c.column("files", "body"); !slices.Equal(got, []string{"hi"}) {
+		t.Errorf("body %q, want hi", got)
+	}
+}
+
 func TestSourceDeclaresNumericsAndPassesInfinities(t *testing.T) {
 	e := newSourceEnv(t)
 	e.exec(`CREATE TABLE $schema.edges (id int PRIMARY KEY, amount numeric(12, 2), any_num numeric, huge numeric(50, 2),

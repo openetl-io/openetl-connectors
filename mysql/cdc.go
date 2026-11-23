@@ -236,6 +236,9 @@ func (s *Source) readCDC(ctx context.Context, conns *connPool, srv server, req s
 		if !chunked(t) {
 			return configInvalid("mysql: %s has no primary key whose columns order as they compare, so it can't be read with cdc", t.name)
 		}
+		if err := retyped(t, cs.Schema); err != nil {
+			return err
+		}
 		if t, err = declaredOnly(t, cs.Columns); err != nil {
 			return err
 		}
@@ -1754,6 +1757,28 @@ func declaredOnly(t table, columns []string) (table, error) {
 	}
 	t.cols, t.key = cols, key
 	return t, nil
+}
+
+// retyped fails, retryably, on a column of t declared as another type than
+// the run declared it, as an ALTER TABLE ... MODIFY since its Discover
+// leaves it: its values would be read as the type the run declared. The
+// next attempt declares the new type. Nil declared: the request doesn't say.
+func retyped(t table, declared *arrow.Schema) error {
+	if declared == nil {
+		return nil
+	}
+	now, err := declaredSchema(t)
+	if err != nil {
+		return fmt.Errorf("mysql: %s: %w", t.name, err)
+	}
+	changed, err := source.ChangedTypes(declared, now)
+	if err != nil {
+		return fmt.Errorf("mysql: %s's declared types: %w", t.name, err)
+	}
+	if len(changed) > 0 {
+		return sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_TRANSIENT, fmt.Errorf("mysql: %s's column %q changed type since the run declared it; the read starts again to declare it", t.name, changed[0]))
+	}
+	return nil
 }
 
 var errNoBinlog = errors.New("mysql: the server has no binlog; cdc needs log_bin = ON")

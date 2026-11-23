@@ -462,3 +462,28 @@ func TestBatcherCountsNulls(t *testing.T) {
 		t.Error("three rows of nulls have no bytes")
 	}
 }
+
+// A column declared as another type than the run declared it fails the read,
+// retryably, before it reads: its values would be read as the declared type.
+// Columns declared as the run declared them read on, a JSON column's
+// extension type among them.
+func TestRetyped(t *testing.T) {
+	col := func(name, dataType string, precision, scale int) column {
+		c := column{name: name, dataType: dataType, precision: precision, scale: scale}
+		c.kind = kindOf(c)
+		return c
+	}
+	id, doc := col("ID", "NUMBER", 9, 0), col("DOC", "JSON", -1, -1)
+	was := declaredSchema(table{name: "T", cols: []column{id, doc, col("AMOUNT", "NUMBER", 10, 2), col("V", "VARCHAR2", -1, -1)}})
+	wider := table{name: "T", key: []int{0}, cols: []column{id, doc, col("AMOUNT", "NUMBER", 12, 2), col("V", "VARCHAR2", -1, -1)}}
+	if err := retyped(wider, was); connectortest.CodeOf(err) != protocolv1.ErrorCode_ERROR_CODE_TRANSIENT || !strings.Contains(err.Error(), "AMOUNT") {
+		t.Errorf("AMOUNT changed to NUMBER(12, 2): %v", err)
+	}
+	same := table{name: "T", key: []int{0}, cols: []column{id, doc, col("AMOUNT", "NUMBER", 10, 2), col("V", "VARCHAR2", -1, -1)}}
+	if err := retyped(same, was); err != nil {
+		t.Errorf("no type changed: %v", err)
+	}
+	if err := retyped(wider, nil); err != nil {
+		t.Errorf("a request that doesn't say: %v", err)
+	}
+}

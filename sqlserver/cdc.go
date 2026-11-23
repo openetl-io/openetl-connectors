@@ -198,6 +198,9 @@ func (r *cdcReader) open(ctx context.Context, cs source.ConfiguredStream, tables
 	if err != nil {
 		return nil, err
 	}
+	if err := retyped(t, cs.Schema); err != nil {
+		return nil, err
+	}
 	end := cs.Until
 	if end == nil {
 		end = cs.CompleteAt

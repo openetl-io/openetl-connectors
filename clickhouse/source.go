@@ -309,6 +309,9 @@ func (s *Source) Read(ctx context.Context, req source.ReadRequest, out source.Em
 		if err := undeclaredText(tables[i], cs.Columns); err != nil {
 			return err
 		}
+		if err := retyped(tables[i], cs.Schema); err != nil {
+			return err
+		}
 	}
 	return source.ReadSplits(ctx, source.ReadRequest{Streams: req.Streams, Lanes: limit}, out, func(ctx context.Context, cs source.ConfiguredStream, sp source.Split, e source.SplitEmitter) error {
 		st, err := stateOf(cs.Name, sp.State)
@@ -347,6 +350,25 @@ func undeclaredText(t table, columns []string) error {
 		if (c.text || canBePast(c.dt)) && !slices.Contains(columns, c.name) {
 			return sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_TRANSIENT, fmt.Errorf("clickhouse: %s has a column %q the read didn't declare, which can come as text; the read starts again to declare it", t.name, c.name))
 		}
+	}
+	return nil
+}
+
+// retyped fails a read, retryably, on a column of t declared as another type
+// than the run declared it, as an ALTER TABLE ... MODIFY COLUMN since its
+// Discover leaves it: a value sent as text would be parsed as the type the
+// run declared. The next attempt declares the new type. Nil declared: the
+// request doesn't say.
+func retyped(t table, declared *arrow.Schema) error {
+	if declared == nil {
+		return nil
+	}
+	changed, err := source.ChangedTypes(declared, t.schema())
+	if err != nil {
+		return fmt.Errorf("clickhouse: %s's declared types: %w", t.name, err)
+	}
+	if len(changed) > 0 {
+		return sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_TRANSIENT, fmt.Errorf("clickhouse: %s's column %q changed type since the run declared it; the read starts again to declare it", t.name, changed[0]))
 	}
 	return nil
 }

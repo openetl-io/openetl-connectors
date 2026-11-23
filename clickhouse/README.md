@@ -105,7 +105,7 @@ spec:
 
 In that JSON, such as a `Map`'s, a `Tuple`'s or a `DateTime64(7)` to `(9)` array's, a date and time is wall-clock text in the column's time zone, or the server's if it has none, with no UTC offset: `"2026-11-03 10:00:00.123456789"`. A float's NaN or infinity is `null` there, unless the user's profile turns `output_format_json_quote_denormals` on.
 
-As a `DateTime64(7)` to `(9)` column, and a `Time` or `Time64` one, can arrive as text, a read whose run didn't declare such a column, as one added to the table since, fails before it reads a row, with an error the platform retries, and the next attempt declares it.
+As a `DateTime64(7)` to `(9)` column, and a `Time` or `Time64` one, can arrive as text, a read whose run didn't declare such a column, as one added to the table since, fails before it reads a row, with an error the platform retries, and the next attempt declares it. So does a read of a column whose type changed since the run declared it, as `ALTER TABLE … MODIFY COLUMN` from `Int32` to `Int64` does, whatever its type. That needs an OpenETL that gives a read the types the run declared.
 
 ### Delivery
 

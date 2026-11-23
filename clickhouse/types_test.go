@@ -363,3 +363,22 @@ func TestIPText(t *testing.T) {
 		}
 	}
 }
+
+// A read whose request declared types fails, retryably, before it reads a
+// column declared as another type than the run declared it; one declared as
+// the run declared it reads on, a JSON column's extension type among them.
+func TestRetyped(t *testing.T) {
+	id := sourceColumn{name: "id", dt: arrow.PrimitiveTypes.Int64}
+	doc := sourceColumn{name: "doc", dt: jsonType, opaque: true}
+	was := table{name: "e", cols: []sourceColumn{id, doc, {name: "v", dt: arrow.PrimitiveTypes.Int32}}}
+	if err := retyped(was, was.schema()); err != nil {
+		t.Errorf("no type changed: %v", err)
+	}
+	wider := table{name: "e", cols: []sourceColumn{id, doc, {name: "v", dt: arrow.PrimitiveTypes.Int64}}}
+	if err := retyped(wider, was.schema()); connectortest.CodeOf(err) != protocolv1.ErrorCode_ERROR_CODE_TRANSIENT || !strings.Contains(err.Error(), `"v"`) {
+		t.Errorf("v changed to Int64: %v", err)
+	}
+	if err := retyped(wider, nil); err != nil {
+		t.Errorf("a request that doesn't say: %v", err)
+	}
+}

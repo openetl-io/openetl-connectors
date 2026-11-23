@@ -455,6 +455,9 @@ func (s *Source) readSplit(ctx context.Context, conns *connPool, tables []table,
 		}
 	}
 	t, _ := findTable(tables, cs.Name)
+	if err := retyped(t, cs.Schema); err != nil {
+		return err
+	}
 	if err := sameOrder(t, st); err != nil {
 		return err
 	}
