@@ -11,6 +11,7 @@ import (
 	"maps"
 	"math/big"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -503,6 +504,70 @@ func TestCDCUntil(t *testing.T) {
 	log := again.log["CDC_UNTIL"]
 	if n := len(log); n < 2 || log[n-2] != "resume "+string(until) || log[n-1] != "complete "+string(until) {
 		t.Errorf("read again didn't end at until: %q", log)
+	}
+}
+
+// A read again from no state, as of a new stream's first part, up to a
+// resume point its first read sent, sends what that read sent before it:
+// the snapshot as of the same SCN, then the changes after it, with the same
+// sequence numbers, though the table has changed since.
+func TestCDCUntilFromNoState(t *testing.T) {
+	db := testDB(t)
+	cdcTable(t, db, "CDC_AGAIN", `(id NUMBER(10) PRIMARY KEY, v VARCHAR2(20))`)
+	exec(t, db, `INSERT INTO cdc_again VALUES (10, 'a')`, `INSERT INTO cdc_again VALUES (20, 'b')`, `INSERT INTO cdc_again VALUES (30, 'c')`)
+	s := cdcSource(t, "")
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	first := newCDCOut()
+	done := make(chan error, 1)
+	go func() {
+		done <- s.Read(ctx, source.ReadRequest{Continuous: true, Lanes: 1, Streams: []source.ConfiguredStream{{Name: "CDC_AGAIN", SyncMode: source.CDC}}}, first)
+	}()
+	// Until the first read has sent n rows, and a resume point after them.
+	sent := func(n int) {
+		t.Helper()
+		for deadline := time.Now().Add(time.Minute); ; time.Sleep(200 * time.Millisecond) {
+			first.mu.Lock()
+			log, rows := slices.Clone(first.log["CDC_AGAIN"]), len(first.rows["CDC_AGAIN"])
+			first.mu.Unlock()
+			if rows >= n && len(log) > 0 && strings.HasPrefix(log[len(log)-1], "resume ") {
+				return
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("the first read sent %q", log)
+			}
+		}
+	}
+	sent(3)
+	exec(t, db, `INSERT INTO cdc_again VALUES (15, 'd')`, `UPDATE cdc_again SET v = 'e' WHERE id = 10`)
+	sent(5)
+	cancel()
+	<-done
+	exec(t, db, `INSERT INTO cdc_again VALUES (5, 'past')`, `INSERT INTO cdc_again VALUES (25, 'past')`, `UPDATE cdc_again SET v = 'past' WHERE id = 30`, `DELETE FROM cdc_again WHERE id = 20`)
+	rows, n := first.records("CDC_AGAIN"), 0
+	for _, e := range first.log["CDC_AGAIN"] {
+		if k, ok := strings.CutPrefix(e, "rows "); ok {
+			c, _ := strconv.Atoi(k)
+			n += c
+			continue
+		}
+		until, ok := strings.CutPrefix(e, "resume ")
+		if !ok {
+			continue
+		}
+		again := newCDCOut()
+		if err := s.Read(t.Context(), source.ReadRequest{Lanes: 1, Streams: []source.ConfiguredStream{{Name: "CDC_AGAIN", SyncMode: source.CDC, Until: []byte(until)}}}, again); err != nil {
+			t.Fatalf("until %s: %v", until, err)
+		}
+		if got, want := again.records("CDC_AGAIN"), rows[:n]; !slices.EqualFunc(got, want, maps.Equal) {
+			t.Errorf("until %s: read again %v, want %v", until, got, want)
+		}
+		if log := again.log["CDC_AGAIN"]; len(log) < 2 || log[len(log)-2] != e || log[len(log)-1] != "complete "+until {
+			t.Errorf("until %s: read again didn't end there: %q", until, log)
+		}
+	}
+	if n != 5 {
+		t.Fatalf("the first read sent %d rows before its last resume point: %q", n, first.log["CDC_AGAIN"])
 	}
 }
 

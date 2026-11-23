@@ -189,3 +189,23 @@ func TestCDCMissingLog(t *testing.T) {
 		t.Errorf("another error: got %v, want it as it is", err)
 	}
 }
+
+// A read again from no state up to a position starts where the stream's
+// first read did, its snapshot as of the same SCN; a position that doesn't
+// say where, or of another database, fails it as lost rather than take a
+// new snapshot.
+func TestCDCStartedAt(t *testing.T) {
+	st, err := startedAt("T", "1:1", cdcState{SCN: 90, From: 80, DB: "1:1", Start: 50, StartFrom: 40})
+	if err != nil || st.SCN != 50 || st.From != 40 || st.Snapshot == nil || st.Snapshot.After != nil || st.DB != "1:1" || st.Start != 50 || st.StartFrom != 40 {
+		t.Errorf("got %+v, %v; want a snapshot as of SCN 50, from 40", st, err)
+	}
+	for _, stop := range []cdcState{
+		{SCN: 90, From: 80, DB: "1:1"},
+		{SCN: 50, From: 40, Snapshot: &snapshotCursor{After: []string{"1"}}, DB: "1:1"},
+		{SCN: 90, From: 80, DB: "2:1", Start: 50, StartFrom: 40},
+	} {
+		if _, err := startedAt("T", "1:1", stop); connectortest.CodeOf(err) != protocolv1.ErrorCode_ERROR_CODE_POSITION_LOST {
+			t.Errorf("%+v: got %v, want POSITION_LOST", stop, err)
+		}
+	}
+}
