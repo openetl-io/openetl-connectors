@@ -86,6 +86,9 @@ From 0.2.0, `consumer.type` picks how shards are read:
 
 Each shard is a split, which OpenETL can read on its own and spread over a job's lanes and [workers](https://github.com/openetl-io/openetl/blob/main/docs/pipelines/workers.md). From 0.2.0, a read fetches and emits for no more splits at a time than it has lanes. The others wait for a lane between fetches, so every shard still moves. A stream read whole counts as one lane, and its shards fetch together.
 
+> [!WARNING]
+> In a continuous pipeline on more than one worker, the shard that Kinesis merges two shards into can be read twice, and before the last records of one of them, when the two are read on different workers. A read takes a listed shard that isn't one of its splits, nor below one, as read to its end, so each worker reads the merged shard as soon as its own parent ends. A scheduled pipeline's read leaves the merged shard for the next sync, which reads it once, after both parents, and the shards a split makes are read only by the worker that reads their parent. Run a continuous pipeline on a stream whose shards are merged, as `UpdateShardCount` does to lower the count, or that still lists a merge's parents, with `resources.workers: 1`.
+
 When OpenETL can't take rows as fast as the source reads them, sending them waits, and so does the shard's next fetch. With enhanced fan-out, the source takes the next event only once it has sent the last, so Kinesis's flow control holds the subscription back. Nothing is buffered beyond one fetch a shard.
 
 ### Aggregated records
