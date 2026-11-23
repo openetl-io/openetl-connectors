@@ -820,7 +820,7 @@ func within(t *testing.T, what string, f func() error) error {
 
 // Close returns within its context's time though the store stops answering
 // its aborts of open parts' multipart uploads and its deletes of closed
-// parts: what's left stays for a later Recover or DropStale.
+// parts: what's left stays for the Recover of a later generation.
 func TestCloseOfAStoreThatHangs(t *testing.T) {
 	w, deleted := hangingS3(t)
 	// Past the 16 MiB from which an upload is in parts.
@@ -851,8 +851,8 @@ func TestCloseOfAStoreThatHangs(t *testing.T) {
 }
 
 // Commit returns within its context's time though the store stops
-// answering its deletes of the files it staged, which stay for a later
-// Recover or DropStale.
+// answering its deletes of the files it staged, which stay for the
+// Recover of a later generation.
 func TestCommitOfAStoreThatHangs(t *testing.T) {
 	w, deleted := hangingS3(t)
 	desc, _ := json.Marshal(staged{Generation: 1, Epoch: 1, Streams: []stagedStream{{Name: "a", Table: "a", Files: []stagedFile{{Staged: "s/x", Target: "a/x"}}}}})
