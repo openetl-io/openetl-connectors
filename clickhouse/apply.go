@@ -1104,10 +1104,14 @@ func (w *writer) dropAbandonedReads(ctx context.Context, drop func(l label, tabl
 
 // dropRemovedReads drops the read tables of streams that no longer
 // overwrite, once Recover has raised the fence to gen: none a newer
-// generation made, and none once a newer generation has raised the fence,
-// as it may overwrite such a stream and be writing its read. With no
-// transaction to hold the fence in, it reads it again before each drop.
-// Best effort.
+// generation made, and none once it reads a fence a newer generation has
+// raised, as that one may overwrite such a stream and be writing its read.
+// It reads the fence again before each drop, which narrows the window but
+// doesn't close it: with no transaction to hold the fence in, a newer
+// generation that raises it between the read and the drop, and goes on with
+// a read an earlier one started, still has that read's table dropped. Its
+// next commit of the stream's rows makes the table again, empty, and a
+// commit that had built its epoch's table fails to move it. Best effort.
 func (w *writer) dropRemovedReads(ctx context.Context, gen uint64) {
 	_ = w.dropAbandonedReads(ctx, func(l label, _ string) bool {
 		return l.Generation <= gen && w.streams[l.Stream].Mode != destination.Overwrite && w.fenceAt(ctx, gen) == nil
