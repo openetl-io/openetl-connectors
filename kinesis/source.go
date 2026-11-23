@@ -453,9 +453,19 @@ type reading struct {
 	fail    context.CancelCauseFunc
 	// A token for each split that may fetch and emit at once: the read's
 	// lanes. A stream read whole is one lane, its shards fetching together.
+	// Nil: any number may, as readLanes gives a continuous read.
 	lanes chan struct{}
 	// SubscribeToShard, for efo.
 	subscribe func(context.Context, *awskinesis.SubscribeToShardInput) (eventStream, error)
+}
+
+// readLanes are the lanes of a read of req: none in a continuous read, whose
+// splits follow their shards and don't end, so none may wait for a lane.
+func readLanes(req source.ReadRequest) chan struct{} {
+	if req.Continuous {
+		return nil
+	}
+	return make(chan struct{}, max(req.Lanes, 1))
 }
 
 func (s *Source) Read(ctx context.Context, req source.ReadRequest, out source.Emitter) error {
@@ -466,7 +476,7 @@ func (s *Source) Read(ctx context.Context, req source.ReadRequest, out source.Em
 	if err != nil {
 		return err
 	}
-	rd := &reading{s: s, cl: cl, out: out, bounded: !req.Continuous, start: time.Now(), lanes: make(chan struct{}, max(req.Lanes, 1)), subscribe: subscriber(cl)}
+	rd := &reading{s: s, cl: cl, out: out, bounded: !req.Continuous, start: time.Now(), lanes: readLanes(req), subscribe: subscriber(cl)}
 	var reads []*streamRead
 	for _, st := range req.Streams {
 		r := &streamRead{name: st.Name, running: map[string]bool{}, stopped: map[string]bool{}, behind: map[string]time.Duration{}}
@@ -1088,9 +1098,9 @@ func (r *streamRead) parentDone(parent *string) bool {
 
 // lane waits for a lane for one fetch of a split, and returns its release.
 // The shards of a stream read whole share the stream's lane, so they don't
-// wait.
+// wait, nor do the splits of a read without lanes.
 func (rd *reading) lane(ctx context.Context, r *streamRead) (func(), error) {
-	if r.splits == nil {
+	if r.splits == nil || rd.lanes == nil {
 		return func() {}, nil
 	}
 	select {

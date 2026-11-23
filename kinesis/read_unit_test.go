@@ -577,3 +577,76 @@ func TestContinuousReadListsChildrenAgain(t *testing.T) {
 		})
 	}
 }
+
+// A continuous read's splits take no lane: on a read of one lane, two
+// splits emit at once.
+func TestContinuousSplitsTakeNoLanes(t *testing.T) {
+	if readLanes(source.ReadRequest{Lanes: 1, Continuous: true}) != nil {
+		t.Error("a continuous read has lanes")
+	}
+	if l := readLanes(source.ReadRequest{Lanes: 3}); cap(l) != 3 {
+		t.Errorf("a bounded read of 3 lanes has %d", cap(l))
+	}
+	f := &fakeStream{perCall: 5, shards: []*fakeShard{{id: "a"}, {id: "b"}}}
+	old := time.Now().Add(-time.Hour)
+	f.put(f.shards[0], 2, old)
+	f.put(f.shards[1], 2, old)
+	s := newReadSource(t, f)
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+	defer cancel()
+	em := &meetEmitter{in: map[string]bool{}, met: make(chan struct{})}
+	done := make(chan error, 1)
+	go func() {
+		done <- s.Read(ctx, source.ReadRequest{Pipeline: "p", Lanes: 1, Continuous: true,
+			Streams: []source.ConfiguredStream{{Name: "s", SyncMode: source.Stream, Splits: []source.Split{{ID: "a"}, {ID: "b"}}}}}, em)
+	}()
+	select {
+	case <-em.met:
+	case err := <-done:
+		t.Fatalf("the read ended before both splits emitted: %v", err)
+	}
+	cancel()
+	<-done
+}
+
+// meetEmitter's splits each wait in Rows, for up to 5 seconds, until another
+// split is in Rows too, and fail if none comes.
+type meetEmitter struct {
+	mu  sync.Mutex
+	in  map[string]bool
+	met chan struct{}
+}
+
+func (e *meetEmitter) Rows(string, []json.RawMessage) error {
+	return fmt.Errorf("whole stream")
+}
+func (e *meetEmitter) Records(string, arrow.RecordBatch) error { return fmt.Errorf("no typed batches") }
+func (e *meetEmitter) ResumePoint(string, []byte) error        { return nil }
+func (e *meetEmitter) Complete(string, []byte) error           { return nil }
+func (e *meetEmitter) Split(_, id string) source.SplitEmitter  { return meetSplit{e: e, id: id} }
+
+type meetSplit struct {
+	e  *meetEmitter
+	id string
+}
+
+func (s meetSplit) Rows([]json.RawMessage) error {
+	e := s.e
+	e.mu.Lock()
+	if !e.in[s.id] {
+		e.in[s.id] = true
+		if len(e.in) == 2 {
+			close(e.met)
+		}
+	}
+	e.mu.Unlock()
+	select {
+	case <-e.met:
+		return nil
+	case <-time.After(5 * time.Second):
+		return fmt.Errorf("split %s emitted alone", s.id)
+	}
+}
+func (s meetSplit) Records(arrow.RecordBatch) error               { return fmt.Errorf("no typed batches") }
+func (s meetSplit) ResumePoint(_ []byte, _ ...source.Split) error { return nil }
+func (s meetSplit) Complete(_ []byte, _ ...source.Split) error    { return nil }
