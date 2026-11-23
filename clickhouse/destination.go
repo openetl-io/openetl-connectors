@@ -722,6 +722,8 @@ func (w *writer) apply(ctx context.Context, desc staged, s stagedStream) (uint64
 			}
 		}
 	}
+	// The marker is written before the staging is dropped, which Recover's
+	// unapplied relies on.
 	if err := w.exec(ctx, "INSERT INTO "+w.q(loadsTable)+" (pipeline, stream, generation, epoch) VALUES ("+
 		literal(w.cfg.Pipeline)+", "+literal(s.Name)+", "+strconv.FormatUint(desc.Generation, 10)+", "+strconv.FormatUint(desc.Epoch, 10)+")"); err != nil {
 		return 0, fmt.Errorf("clickhouse: write the marker of %s: %w", s.Name, err)
