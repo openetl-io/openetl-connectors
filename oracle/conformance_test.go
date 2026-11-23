@@ -78,15 +78,18 @@ func TestSourceConformance(t *testing.T) {
 		return fmt.Appendf(nil, `{"dsn": %q, "tables": ["CONF_USERS", "CONF_EVENTS", "CONF_KINDS", "CONF_ORDERS"], "chunkRows": 25, "snapshotChunkRows": 20}`, dsn)
 	}
 	conformance.SourceSuite{
-		Launch:         launch,
-		Config:         cfg(testDSN()),
-		BadCredentials: cfg(badPasswordDSN()),
-		Unreachable:    cfg(closedDSN),
-		StopsAtUntil:   true,
+		Launch:            launch,
+		Config:            cfg(testDSN()),
+		BadCredentials:    cfg(badPasswordDSN()),
+		Unreachable:       cfg(closedDSN),
+		StopsAtUntil:      true,
+		StopsAtCompletion: true,
 		AddRecords: func(ctx context.Context, stream string) (int, error) {
 			switch stream {
 			case "CONF_EVENTS":
-				_, err := db.ExecContext(ctx, `INSERT INTO conf_events SELECT 1000 + level, TIMESTAMP '2026-02-01 00:00:00' + NUMTODSINTERVAL(level, 'MINUTE'), '{}' FROM dual CONNECT BY level <= 10`)
+				// Each call adds new events, later than any before.
+				_, err := db.ExecContext(ctx, `INSERT INTO conf_events SELECT m + level, TIMESTAMP '2026-02-01 00:00:00' + NUMTODSINTERVAL(m + level, 'MINUTE'), '{}'
+				  FROM (SELECT max(id) m FROM conf_events) CONNECT BY level <= 10`)
 				return 10, err
 			case "CONF_ORDERS":
 				// Each call adds new orders, as a continuous read is restarted.
