@@ -386,7 +386,7 @@ SH
     --bad-credentials "$work/ora-source-bad.json" \
     --unreachable "$work/ora-source-closed.json" \
     --stream "${up}_USERS:full_refresh" --stream "${up}_EVENTS:incremental:AT" --stream "${up}_ORDERS:cdc" \
-    --add-records-command "$work/ora-add" --stops-at-until
+    --add-records-command "$work/ora-add" --stops-at-until $(stops oracle --stops-at-completion)
   # A table's rows as JSON lines: a time of day as HH:MM:SS.fffffffff, a
   # BINARY_FLOAT or BINARY_DOUBLE as text that keeps every digit, and an
   # interval's JSON text as an object.
