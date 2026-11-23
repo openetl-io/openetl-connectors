@@ -77,7 +77,8 @@ type cdcStream struct {
 	// too.
 	segs map[int]bool
 	lobs bool
-	// A read that stops at a resume point.
+	// A read that stops at a resume point or a completion it sent before:
+	// either is a position the read reached.
 	until    *cdcState
 	untilRaw []byte
 	finished bool
@@ -226,6 +227,9 @@ func (s *Source) readCDC(ctx context.Context, conns *connPool, req source.ReadRe
 			return err
 		}
 		stop := cs.Until
+		if stop == nil {
+			stop = cs.CompleteAt
+		}
 		if req.Continuous {
 			stop = nil
 		}

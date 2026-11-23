@@ -584,7 +584,7 @@ func TestResplitDividesTheRemainder(t *testing.T) {
 			}
 		}
 	}
-	if err := s.readSplit(t.Context(), &connPool{DB: db, Held: make(chan struct{}, 1)}, schema, tables, fullRefresh("ST_RESPLIT"), source.Split{ID: "x"}, nil, srcSplit{out}); err != nil {
+	if err := s.readSplit(t.Context(), &connPool{DB: db, Held: make(chan struct{}, 1)}, schema, tables, fullRefresh("ST_RESPLIT"), source.Split{ID: "x"}, srcSplit{out}); err != nil {
 		t.Fatal(err)
 	}
 	var added []source.Split
@@ -675,6 +675,41 @@ func TestSplitReadStopsAtUntil(t *testing.T) {
 	endsAt(t, again.events, until)
 	if len(again.rows()) != 0 {
 		t.Fatalf("read from its end, %d rows", len(again.rows()))
+	}
+}
+
+// An incremental read asked to complete where an earlier one completed goes
+// up to the highest cursor value that read went up to, not the column's
+// highest now, and completes with that read's state: from no state and from
+// a floor, of a table read in key order, one read in a single query, and
+// one that had no rows.
+func TestIncrementalCompletesAtCompleteAt(t *testing.T) {
+	db := testDB(t)
+	names := []string{"ST_DONE", "ST_DONE_NOKEY", "ST_DONE_EMPTY"}
+	srcTable(t, db, names[0], "(id NUMBER(10) PRIMARY KEY, at NUMBER(10))", "INSERT INTO ST_DONE SELECT level, level FROM dual CONNECT BY level <= 5")
+	srcTable(t, db, names[1], "(id NUMBER(10), at NUMBER(10))", "INSERT INTO ST_DONE_NOKEY SELECT level, level FROM dual CONNECT BY level <= 5")
+	srcTable(t, db, names[2], "(id NUMBER(10) PRIMARY KEY, at NUMBER(10))")
+	s := srcSource(t, testDSN(), `, "tables": ["ST_DONE", "ST_DONE_NOKEY", "ST_DONE_EMPTY"], "chunkRows": 2`)
+	for _, name := range names {
+		var from []byte
+		for round := range 2 {
+			cs := source.ConfiguredStream{Name: name, SyncMode: source.Incremental, Cursor: "AT", State: from}
+			first := srcRead(t, s, 1, cs)
+			at := first.completed(t)
+			exec(t, db, fmt.Sprintf("INSERT INTO %s VALUES (%d, %d)", name, 10+round, 10+round))
+			cs.CompleteAt = []byte(at)
+			again := srcRead(t, s, 1, cs)
+			got, want := rowKeys(again.rows(), "ID"), rowKeys(first.rows(), "ID")
+			slices.Sort(got)
+			slices.Sort(want)
+			if !slices.Equal(got, want) {
+				t.Errorf("%s, round %d: read again %v, want %v", name, round, got, want)
+			}
+			if got := again.completed(t); got != at {
+				t.Errorf("%s, round %d: completed at %s, want %s", name, round, got, at)
+			}
+			from = []byte(at)
+		}
 	}
 }
 

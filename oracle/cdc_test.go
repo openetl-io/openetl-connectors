@@ -571,6 +571,40 @@ func TestCDCUntilFromNoState(t *testing.T) {
 	}
 }
 
+// A read asked to complete where an earlier read completed, from no state
+// or from the state that read started from, sends what that read sent and
+// completes with its state, though the table has changed since.
+func TestCDCCompleteAt(t *testing.T) {
+	db := testDB(t)
+	cdcTable(t, db, "CDC_DONE", `(id NUMBER(10) PRIMARY KEY, v VARCHAR2(20))`)
+	exec(t, db, `INSERT INTO cdc_done VALUES (1, 'a')`, `INSERT INTO cdc_done VALUES (2, 'b')`, `INSERT INTO cdc_done VALUES (3, 'c')`)
+	s := cdcSource(t, "")
+	first := mustRead(t, s, nil, "CDC_DONE")
+	exec(t, db, `INSERT INTO cdc_done VALUES (4, 'd')`, `UPDATE cdc_done SET v = 'e' WHERE id = 1`)
+	second := mustRead(t, s, map[string][]byte{"CDC_DONE": first.state("CDC_DONE")}, "CDC_DONE")
+	exec(t, db, `INSERT INTO cdc_done VALUES (5, 'past')`, `UPDATE cdc_done SET v = 'past' WHERE id = 3`, `DELETE FROM cdc_done WHERE id = 2`)
+	for _, c := range []struct {
+		name string
+		from []byte
+		read *cdcOut
+	}{
+		{"from no state", nil, first},
+		{"from a state", first.state("CDC_DONE"), second},
+	} {
+		at := c.read.complete["CDC_DONE"]
+		again := newCDCOut()
+		if err := s.Read(t.Context(), source.ReadRequest{Lanes: 1, Streams: []source.ConfiguredStream{{Name: "CDC_DONE", SyncMode: source.CDC, State: c.from, CompleteAt: at}}}, again); err != nil {
+			t.Fatalf("%s: %v", c.name, err)
+		}
+		if got, want := again.records("CDC_DONE"), c.read.records("CDC_DONE"); !slices.EqualFunc(got, want, maps.Equal) {
+			t.Errorf("%s: read again %v, want %v", c.name, got, want)
+		}
+		if log := again.log["CDC_DONE"]; len(log) == 0 || log[len(log)-1] != "complete "+string(at) {
+			t.Errorf("%s: read again didn't complete at %s: %q", c.name, at, log)
+		}
+	}
+}
+
 func TestCDCRetention(t *testing.T) {
 	db := testDB(t)
 	cdcTable(t, db, "CDC_RET", `(id NUMBER(10) PRIMARY KEY)`)

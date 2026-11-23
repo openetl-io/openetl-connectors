@@ -507,14 +507,10 @@ func (s *Source) Read(ctx context.Context, req source.ReadRequest, out source.Em
 	}
 	readRest := func(ctx context.Context, lanes int) error {
 		return source.ReadSplits(ctx, source.ReadRequest{Streams: rest, Lanes: lanes}, out, func(ctx context.Context, cs source.ConfiguredStream, sp source.Split, e source.SplitEmitter) error {
-			until := sp.Until
-			if sp.ID == source.WholeStream && len(cs.Splits) == 0 {
-				until = cs.Until
-			}
 			if req.Continuous {
-				until = nil
+				sp.Until, sp.CompleteAt = nil, nil
 			}
-			return s.readSplit(ctx, conns, schema, tables, cs, sp, until, e)
+			return s.readSplit(ctx, conns, schema, tables, cs, sp, e)
 		})
 	}
 	var readCDC func(context.Context) error
@@ -541,9 +537,9 @@ func undeclared(t table, columns []string) error {
 }
 
 // readSplit reads one split of a table read in full or incrementally, on a
-// connection of its own; up to the resume point whose state is until, if
-// it isn't nil.
-func (s *Source) readSplit(ctx context.Context, conns *connPool, schema string, tables []table, cs source.ConfiguredStream, sp source.Split, until []byte, out source.SplitEmitter) error {
+// connection of its own; up to the split's Until, or its CompleteAt, if it
+// has one.
+func (s *Source) readSplit(ctx context.Context, conns *connPool, schema string, tables []table, cs source.ConfiguredStream, sp source.Split, out source.SplitEmitter) error {
 	var st sourceState
 	if sp.State != nil {
 		if err := json.Unmarshal(sp.State, &st); err != nil {
@@ -559,11 +555,11 @@ func (s *Source) readSplit(ctx context.Context, conns *connPool, schema string, 
 	b := newBatcher(memory.DefaultAllocator, t.cols, false)
 	defer b.release()
 	r := &tableReader{s: s, conn: conn, schema: schema, t: t, b: b, out: out}
-	if until != nil {
-		return r.readUntil(ctx, cs, st, until)
+	if sp.Until != nil {
+		return r.readUntil(ctx, cs, st, sp.Until)
 	}
 	if cs.SyncMode == source.Incremental {
-		return r.readIncremental(ctx, sp.ID, cs.Cursor, st)
+		return r.readIncremental(ctx, sp.ID, cs.Cursor, st, sp.CompleteAt)
 	}
 	return r.readTable(ctx, sp.ID, st)
 }
@@ -717,18 +713,27 @@ func (r *tableReader) readTable(ctx context.Context, id string, st sourceState) 
 // to the cursor's highest value when the read started, in (cursor, key)
 // order. It completes with that value as the next read's floor, so the rows
 // that hold it are read again then. Rows with a NULL cursor aren't read.
-func (r *tableReader) readIncremental(ctx context.Context, id, cursor string, st sourceState) error {
+// completeAt, if set, is a completion this source sent before: the read goes
+// up to its floor, which was that read's highest value, and completes with
+// it.
+func (r *tableReader) readIncremental(ctx context.Context, id, cursor string, st sourceState, completeAt []byte) error {
 	ci, err := cursorColumn(r.t, cursor)
 	if err != nil {
 		return err
 	}
+	end := func() error { return complete(r.out, sourceState{Since: st.Until}) }
+	if completeAt != nil {
+		end = func() error { return r.out.Complete(completeAt) }
+	}
 	if st.Until == nil {
-		until, err := maxCursor(ctx, r.conn, r.schema, r.t, ci)
+		until, err := r.upTo(ctx, ci, completeAt)
 		if err != nil {
 			return err
 		}
 		if until == nil {
-			return complete(r.out, sourceState{Since: st.Since})
+			// Nothing to read: the next read keeps the floor.
+			st.Until = st.Since
+			return end()
 		}
 		st = sourceState{Since: st.Since, Until: until}
 	}
@@ -743,7 +748,7 @@ func (r *tableReader) readIncremental(ctx context.Context, id, cursor string, st
 				return err
 			}
 		}
-		return complete(r.out, sourceState{Since: st.Until})
+		return end()
 	}
 	order := incrementalOrder(r.t, ci)
 	if st.After != nil && len(st.After) != len(order) {
@@ -780,7 +785,7 @@ func (r *tableReader) readIncremental(ctx context.Context, id, cursor string, st
 			return err
 		}
 		if ended {
-			return complete(r.out, sourceState{Since: st.Until})
+			return end()
 		}
 	}
 }
@@ -796,6 +801,20 @@ func maxCursor(ctx context.Context, conn *sql.Conn, schema string, t table, ci i
 	}
 	m := keyText(c, v)
 	return &m, nil
+}
+
+// upTo is the highest cursor value an incremental read reads: the floor of
+// completeAt, a completion it sent before, if set, or else the column's
+// highest value now.
+func (r *tableReader) upTo(ctx context.Context, ci int, completeAt []byte) (*string, error) {
+	if completeAt == nil {
+		return maxCursor(ctx, r.conn, r.schema, r.t, ci)
+	}
+	var at sourceState
+	if err := json.Unmarshal(completeAt, &at); err != nil {
+		return nil, fmt.Errorf("oracle: where %s completes: %w", r.t.name, err)
+	}
+	return at.Since, nil
 }
 
 // cursorColumn is the index of a table's column that an incremental read can
