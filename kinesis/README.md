@@ -171,7 +171,7 @@ Each of a job's writer lanes, up to 16, sends its own requests, one at a time, a
 
 ### At least once
 
-The destination sends each epoch's records with `PutRecords` as they come, sends the ones Kinesis fails again until it has accepted all of them, and the epoch commits once it has. A record can't be taken back, so a retried epoch sends its records again: every stream gets at least once, and readers drop the repeats by `_openetl_id`. A pipeline into Kinesis has to accept that, with `delivery: { require: at_least_once }`.
+The destination sends each epoch's records with `PutRecords` as they come, sends the ones Kinesis fails again until it has accepted all of them, and the epoch commits once it has. From 0.2.0, what's left of an epoch's records goes before it commits without the next epoch's that have come: those go once a request fills, or before their own epoch commits. A record can't be taken back, so a retried epoch sends its records again: every stream gets at least once, and readers drop the repeats by `_openetl_id`. A pipeline into Kinesis has to accept that, with `delivery: { require: at_least_once }`.
 
 ### Set it up
 
