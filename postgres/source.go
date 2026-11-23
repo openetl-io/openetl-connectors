@@ -417,6 +417,30 @@ func undeclared(t table, columns []string) error {
 	return nil
 }
 
+// retyped fails, retryably, on a column of t declared as another type than
+// the run declared it, as an ALTER COLUMN ... TYPE since its Discover leaves
+// it: its values would be read as the type the run declared, so a bytea
+// changed to text would land as other bytes. The next attempt declares the
+// new type. Nil declared: the request doesn't say.
+func retyped(t table, declared *arrow.Schema) error {
+	if declared == nil {
+		return nil
+	}
+	b, err := newBatcher(memory.DefaultAllocator, t.cols)
+	if err != nil {
+		return fmt.Errorf("postgres: %s: %w", t.name, err)
+	}
+	b.release()
+	changed, err := source.ChangedTypes(declared, b.declared)
+	if err != nil {
+		return fmt.Errorf("postgres: %s's declared types: %w", t.name, err)
+	}
+	if len(changed) > 0 {
+		return sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_TRANSIENT, fmt.Errorf("postgres: %s's column %q changed type since the run declared it; the read starts again to declare it", t.name, changed[0]))
+	}
+	return nil
+}
+
 // readSplit reads one split of a table read in full or incrementally, on a
 // connection of its own.
 func (s *Source) readSplit(ctx context.Context, conns *connPool, tables []table, cs source.ConfiguredStream, sp source.Split, out source.SplitEmitter) error {
@@ -428,6 +452,9 @@ func (s *Source) readSplit(ctx context.Context, conns *connPool, tables []table,
 	}
 	t := tables[slices.IndexFunc(tables, func(t table) bool { return t.name == cs.Name })]
 	if err := undeclared(t, cs.Columns); err != nil {
+		return err
+	}
+	if err := retyped(t, cs.Schema); err != nil {
 		return err
 	}
 	if err := sameOrder(t, st); err != nil {

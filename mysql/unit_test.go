@@ -472,3 +472,36 @@ func TestPatchSharedHeldColumn(t *testing.T) {
 		}
 	}
 }
+
+// A read of a table with a column declared as another type than the run
+// declared it fails, retryably, before it reads: its values would be read as
+// the declared type. A change to a type declared the same, as varchar(20) to
+// varchar(40), reads on, and so does an extension type declared the same.
+func TestRetyped(t *testing.T) {
+	declared := func(cols ...sourceColumn) *arrow.Schema {
+		sc, err := declaredSchema(table{name: "items", cols: cols})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return sc
+	}
+	id := sourceColumn{name: "id", dataType: "int", columnType: "int", kind: kInt32, notNull: true}
+	ref := sourceColumn{name: "ref", dataType: "uuid", columnType: "uuid", kind: kUUID}
+	v := sourceColumn{name: "v", dataType: "varchar", columnType: "varchar(20)", kind: kString}
+	was := declared(id, ref, v)
+	blob := table{name: "items", key: []int{0}, cols: []sourceColumn{id, ref, {name: "v", dataType: "blob", columnType: "blob", kind: kBinary}}}
+	if err := retyped(blob, was); connectortest.CodeOf(err) != protocolv1.ErrorCode_ERROR_CODE_TRANSIENT || !strings.Contains(err.Error(), `"v"`) {
+		t.Errorf("v changed to a blob: %v", err)
+	}
+	cs := source.ConfiguredStream{Name: "items", SyncMode: source.FullRefresh, Schema: was}
+	if err := (&Source{}).readSplit(t.Context(), nil, []table{blob}, cs, source.Split{}, nil); connectortest.CodeOf(err) != protocolv1.ErrorCode_ERROR_CODE_TRANSIENT {
+		t.Errorf("a full read with v changed: %v", err)
+	}
+	wider := table{name: "items", key: []int{0}, cols: []sourceColumn{id, ref, {name: "v", dataType: "varchar", columnType: "varchar(40)", kind: kString}}}
+	if err := retyped(wider, was); err != nil {
+		t.Errorf("v widened to varchar(40): %v", err)
+	}
+	if err := retyped(blob, nil); err != nil {
+		t.Errorf("a request that doesn't say: %v", err)
+	}
+}

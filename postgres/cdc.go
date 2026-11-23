@@ -238,7 +238,11 @@ type cdcReader struct {
 // slot and, if missing, the publication.
 func (s *Source) readCDC(ctx context.Context, conns *connPool, req source.ReadRequest, cfgs []source.ConfiguredStream, tables []table, out source.Emitter) error {
 	for _, cs := range cfgs {
-		if err := undeclared(tables[slices.IndexFunc(tables, func(t table) bool { return t.name == cs.Name })], cs.Columns); err != nil {
+		t := tables[slices.IndexFunc(tables, func(t table) bool { return t.name == cs.Name })]
+		if err := undeclared(t, cs.Columns); err != nil {
+			return err
+		}
+		if err := retyped(t, cs.Schema); err != nil {
 			return err
 		}
 	}

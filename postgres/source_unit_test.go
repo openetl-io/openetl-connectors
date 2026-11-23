@@ -6,6 +6,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/apache/arrow-go/v18/arrow"
+	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	protocolv1 "github.com/openetl-io/openetl/sdk/go/protocol/v1"
@@ -83,5 +85,48 @@ func TestReadCDCFailsOnAnUndeclaredColumn(t *testing.T) {
 	err = s.readCDC(t.Context(), newConnPool(s.conn, 1), source.ReadRequest{Pipeline: "p", Streams: []source.ConfiguredStream{cs}}, []source.ConfiguredStream{cs}, []table{users}, nil)
 	if !isTransient(err) || !strings.Contains(err.Error(), `"w"`) {
 		t.Errorf("a cdc read with w undeclared: %v", err)
+	}
+}
+
+// A read of a table with a column declared as another type than the run
+// declared it fails, retryably, before it reads, in any mode: a bytea changed
+// to text would land as other bytes. A change to a type declared the same,
+// as varchar to text, reads on.
+func TestReadFailsOnAChangedType(t *testing.T) {
+	s, err := NewSource([]byte(`{"dsn": "postgres://u:p@127.0.0.1:1/db?connect_timeout=1"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	declared := func(cols ...sourceColumn) *arrow.Schema {
+		b, err := newBatcher(memory.DefaultAllocator, cols)
+		if err != nil {
+			t.Fatal(err)
+		}
+		b.release()
+		return b.declared
+	}
+	id := sourceColumn{name: "id", oid: pgtype.Int4OID}
+	was := declared(id, sourceColumn{name: "doc", oid: pgtype.ByteaOID}, sourceColumn{name: "note", oid: pgtype.VarcharOID})
+	users := table{name: "users", cols: []sourceColumn{id, {name: "doc", oid: pgtype.TextOID}, {name: "note", oid: pgtype.TextOID}}, key: []int{0}, order: []int{0}, replident: 'd'}
+	columns := []string{"id", "doc", "note"}
+	for _, cs := range []source.ConfiguredStream{
+		{Name: "users", SyncMode: source.FullRefresh, Columns: columns, Schema: was},
+		{Name: "users", SyncMode: source.Incremental, Cursor: "id", Columns: columns, Schema: was},
+	} {
+		err := s.readSplit(t.Context(), newConnPool(s.conn, 1), []table{users}, cs, source.Split{}, nil)
+		if !isTransient(err) || !strings.Contains(err.Error(), `"doc"`) {
+			t.Errorf("%v read with doc changed: %v", cs.SyncMode, err)
+		}
+	}
+	cs := source.ConfiguredStream{Name: "users", SyncMode: source.CDC, Columns: columns, Schema: was}
+	err = s.readCDC(t.Context(), newConnPool(s.conn, 1), source.ReadRequest{Pipeline: "p", Streams: []source.ConfiguredStream{cs}}, []source.ConfiguredStream{cs}, []table{users}, nil)
+	if !isTransient(err) || !strings.Contains(err.Error(), `"doc"`) {
+		t.Errorf("a cdc read with doc changed: %v", err)
+	}
+	if err := retyped(users, declared(id, sourceColumn{name: "doc", oid: pgtype.TextOID}, sourceColumn{name: "note", oid: pgtype.VarcharOID})); err != nil {
+		t.Errorf("note's varchar changed to text: %v", err)
+	}
+	if err := retyped(users, nil); err != nil {
+		t.Errorf("a request that doesn't say: %v", err)
 	}
 }

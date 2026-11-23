@@ -30,7 +30,7 @@ require (
 	github.com/jackc/pgx/v5 v5.12.0
 	github.com/klauspost/compress v1.20.3
 	github.com/microsoft/go-mssqldb v1.11.2
-	github.com/openetl-io/openetl/sdk/go v0.1.0-alpha.0.20261117075432-adfb984b69c3
+	github.com/openetl-io/openetl/sdk/go v0.1.0-alpha.0.20261123093955-d9b15254a62c
 	github.com/santhosh-tekuri/jsonschema/v6 v6.0.3
 	github.com/shopspring/decimal v1.6.0
 	github.com/sijms/go-ora/v2 v2.9.0

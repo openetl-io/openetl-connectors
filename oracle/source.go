@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	go_ora "github.com/sijms/go-ora/v2"
 
@@ -520,17 +521,20 @@ func (s *Source) Read(ctx context.Context, req source.ReadRequest, out source.Em
 	var cdc, rest []source.ConfiguredStream
 	for _, cs := range req.Streams {
 		t, ok := findTable(tables, cs.Name)
-		switch {
-		case !ok:
+		if !ok {
 			return configInvalid("oracle: there's no table %s.%s the user can read", schema, cs.Name)
-		case cs.SyncMode == source.CDC:
-			cdc = append(cdc, cs)
-		default:
-			if err := undeclared(t, cs.Columns); err != nil {
-				return err
-			}
-			rest = append(rest, cs)
 		}
+		if err := retyped(t, cs.Schema); err != nil {
+			return err
+		}
+		if cs.SyncMode == source.CDC {
+			cdc = append(cdc, cs)
+			continue
+		}
+		if err := undeclared(t, cs.Columns); err != nil {
+			return err
+		}
+		rest = append(rest, cs)
 	}
 	readRest := func(ctx context.Context, lanes int) error {
 		return source.ReadSplits(ctx, source.ReadRequest{Streams: rest, Lanes: lanes}, out, func(ctx context.Context, cs source.ConfiguredStream, sp source.Split, e source.SplitEmitter) error {
@@ -559,6 +563,24 @@ func undeclared(t table, columns []string) error {
 		if _, declared := arrowTypes(c); declared != nil && !slices.Contains(columns, c.name) {
 			return transient("oracle: %s has a new column %s; the read starts again to declare it", t.name, c.name)
 		}
+	}
+	return nil
+}
+
+// retyped fails, retryably, on a column of t declared as another type than
+// the run declared it, as an ALTER TABLE ... MODIFY since its Discover
+// leaves it: its values would be read as the type the run declared. The
+// next attempt declares the new type. Nil declared: the request doesn't say.
+func retyped(t table, declared *arrow.Schema) error {
+	if declared == nil {
+		return nil
+	}
+	changed, err := source.ChangedTypes(declared, declaredSchema(t))
+	if err != nil {
+		return fmt.Errorf("oracle: %s's declared types: %w", t.name, err)
+	}
+	if len(changed) > 0 {
+		return transient("oracle: %s's column %s changed type since the run declared it; the read starts again to declare it", t.name, changed[0])
 	}
 	return nil
 }

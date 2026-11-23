@@ -188,6 +188,8 @@ A zero date, `0000-00-00`, or one with a zero month or day, which MySQL keeps wh
 
 A column added to a table read with CDC fails the read once, retryably, and the next attempt declares it. A column that was added and dropped again before the read reached it is left out. A column whose type changed so that the binlog's values no longer fit the type the read declared fails the read the same way. The binlog names columns as they were: a change from before a column was renamed, or added, that the read reaches after it, doesn't have it, and sends it as unchanged, so a merge keeps the value the destination has rather than setting it null. No change carries what the rename or the add did to existing rows, such as an added column's default: the destination has it once the row changes again, or a new snapshot of the table brings it. `TRUNCATE` isn't in the binlog as rows: the source logs a warning, and the destination keeps the rows; a new snapshot of the table brings it back in step.
 
+A column whose type changed since the run discovered the table, so that it's declared as another type, fails the read retryably before it reads, in any mode, and the next attempt declares the new type; one declared as the same, as `varchar(20)` to `varchar(40)`, reads on. That needs an OpenETL that gives a read the types the run declared.
+
 ### Delivery
 
 Full refresh and CDC streams replay exactly: a read resumed from a checkpoint yields the same rows in the same order. OpenETL counts incremental streams as ones that may repeat rows, because of the rows at the cursor's last value, and the destination's capabilities decide what guarantee that leaves.
