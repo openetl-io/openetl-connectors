@@ -302,6 +302,80 @@ func TestSplitReadStopsAtUntil(t *testing.T) {
 	})
 }
 
+// TestReadCompletesAtCompleteAt reads a table by CDC, and incrementally with
+// a key and without, from a completion to the next, then reads that part
+// again, asked to complete where it completed, once the binlog and the
+// cursor have moved on: it returns the same rows, and completes with the
+// same state, not where the table is now.
+func TestReadCompletesAtCompleteAt(t *testing.T) {
+	eachServer(t, func(t *testing.T, srv testServer) {
+		e := newSourceEnv(t, srv)
+		e.exec("CREATE TABLE $db.items (id int PRIMARY KEY, v varchar(20))")
+		e.exec("CREATE TABLE $db.ev (id int PRIMARY KEY, v varchar(20), at int)")
+		e.exec("CREATE TABLE $db.loose (v varchar(20), at int)")
+		e.exec("INSERT INTO $db.items SELECT i, CONCAT('v', i) FROM " + numbers(10))
+		e.exec("INSERT INTO $db.ev SELECT i, CONCAT('v', i), i FROM " + numbers(10))
+		e.exec("INSERT INTO $db.loose SELECT CONCAT('v', i), i FROM " + numbers(10))
+		n := 0
+		change := func() {
+			n++
+			e.exec("INSERT INTO $db.items VALUES (?, ?)", 100+n, fmt.Sprint("r", n))
+			e.exec("UPDATE $db.items SET v = ? WHERE id = ?", fmt.Sprint("r", n), n)
+			e.exec("INSERT INTO $db.ev VALUES (?, ?, ?)", 100+n, fmt.Sprint("r", n), 10+n)
+			e.exec("INSERT INTO $db.loose VALUES (?, ?)", fmt.Sprint("r", n), 10+n)
+		}
+		s := e.source(`, "chunkRows": 3`)
+		for _, cs := range []source.ConfiguredStream{
+			{Name: "items", SyncMode: source.CDC},
+			{Name: "ev", SyncMode: source.Incremental, Cursor: "at"},
+			{Name: "loose", SyncMode: source.Incremental, Cursor: "at"},
+		} {
+			first := readLog(t, s, cs)
+			change()
+			cs.State = []byte(first[len(first)-1].state)
+			second := readLog(t, s, cs)
+			end := second[len(second)-1]
+			change()
+			cs.CompleteAt = []byte(end.state)
+			again := readLog(t, s, cs)
+			if last := again[len(again)-1]; !end.complete || !last.complete || last.state != end.state {
+				t.Fatalf("%s: asked to complete at %s, the read ended with %+v", cs.Name, end.state, last)
+			}
+			if got, want := rowTexts(rowsOf(again, -1, len(again))), rowTexts(rowsOf(second, -1, len(second))); !slices.Equal(got, want) {
+				t.Fatalf("%s: read again to its completion %q, not %q", cs.Name, got, want)
+			}
+		}
+		// From no state, as a new stream's first epoch: the snapshot's rows
+		// come as the table is now, and none of the binlog's changes after
+		// the completion.
+		cs := source.ConfiguredStream{Name: "items", SyncMode: source.CDC}
+		first := readLog(t, s, cs)
+		change()
+		cs.CompleteAt = []byte(first[len(first)-1].state)
+		again := readLog(t, s, cs)
+		if last := again[len(again)-1]; !last.complete || last.state != string(cs.CompleteAt) {
+			t.Fatalf("from no state, asked to complete at %s, the read ended with %+v", cs.CompleteAt, last)
+		}
+		if c := changes(rowsOf(again, -1, len(again)), false); len(c) > 0 {
+			t.Fatalf("from no state, the read sent changes past its completion: %q", c)
+		}
+	})
+}
+
+// rowTexts are rows as sorted text, each with its columns in name order.
+func rowTexts(rows []map[string]string) []string {
+	var out []string
+	for _, r := range rows {
+		var b strings.Builder
+		for _, k := range slices.Sorted(maps.Keys(r)) {
+			fmt.Fprintf(&b, "%s=%s ", k, r[k])
+		}
+		out = append(out, b.String())
+	}
+	slices.Sort(out)
+	return out
+}
+
 // batchRows are a batch's rows, each column as Arrow prints it.
 func batchRows(b arrow.RecordBatch) []map[string]string {
 	var out []map[string]string
