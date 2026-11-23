@@ -592,8 +592,12 @@ func (r *topicRead) readWhole(st source.ConfiguredStream, out source.Emitter, co
 		return err
 	}
 	r.bare = topicIDOf(stop) == ""
-	if len(st.State) == 0 && r.from != nil {
-		r.next = maps.Clone(r.from)
+	if len(st.State) == 0 {
+		// The stop's records are of the topic its read had.
+		r.id = topicIDOf(stop)
+		if r.from != nil {
+			r.next = maps.Clone(r.from)
+		}
 	}
 	return nil
 }

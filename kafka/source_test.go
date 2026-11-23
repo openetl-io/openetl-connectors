@@ -898,3 +898,28 @@ func TestACommitWithoutAPipelineCommitsToNoSharedGroup(t *testing.T) {
 		t.Errorf("after a read of pipeline p, its group has offset %d (%v), want 3", o, ok)
 	}
 }
+
+// A read again with no state, as OpenETL's redo of a first epoch is, up to
+// an end that a read of a topic since deleted and created again sent fails
+// with POSITION_LOST, whether the end holds where that read began or not:
+// the end's records were the old topic's.
+func TestARedoOfATopicCreatedAgainIsLost(t *testing.T) {
+	addrs := fake(t)
+	topic := "events"
+	produceRecords(t, addrs, topic, 2, 5, 5)
+	s, err := NewSource(fakeConfig(t, addrs, map[string]any{"topics": []string{topic}}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, end := range []string{
+		`{"offsets":{"0":3,"1":3},"topicId":"AAAAAAAAAAAAAAAAAAAAAA=="}`,
+		`{"offsets":{"0":3,"1":3},"topicId":"AAAAAAAAAAAAAAAAAAAAAA==","from":{"0":0,"1":0}}`,
+	} {
+		for _, cs := range []source.ConfiguredStream{{Name: topic, Until: []byte(end)}, {Name: topic, CompleteAt: []byte(end)}} {
+			err := s.Read(t.Context(), source.ReadRequest{Streams: []source.ConfiguredStream{cs}, Pipeline: "p", Lanes: 1}, &splitEvents{events: map[string][]string{}})
+			if codeOf(err) != "ERROR_CODE_POSITION_LOST" {
+				t.Errorf("a read up to %s: %s %v", end, codeOf(err), err)
+			}
+		}
+	}
+}
