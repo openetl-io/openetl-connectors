@@ -108,6 +108,8 @@ type sourceColumn struct {
 	// values: nil for UTF-8.
 	charset string
 	decoder *encoding.Decoder
+	// The text's collation, by which it orders: empty for another type.
+	collation string
 	// A BINARY(n)'s n.
 	octets int
 	// A DECIMAL's, or a BIT's bits.
@@ -183,7 +185,7 @@ func (s *Source) tables(ctx context.Context, db *sql.DB, srv server) ([]table, e
 // requiring the configured tables to exist.
 func (s *Source) listTables(ctx context.Context, db *sql.DB, srv server, only string) ([]table, error) {
 	rows, err := db.QueryContext(ctx, `SELECT c.TABLE_NAME, c.COLUMN_NAME, LOWER(c.DATA_TYPE), LOWER(c.COLUMN_TYPE), c.IS_NULLABLE = 'NO',
-			coalesce(c.CHARACTER_SET_NAME, ''), coalesce(c.CHARACTER_OCTET_LENGTH, 0), coalesce(c.NUMERIC_PRECISION, 0), coalesce(c.NUMERIC_SCALE, 0),
+			coalesce(c.CHARACTER_SET_NAME, ''), coalesce(c.COLLATION_NAME, ''), coalesce(c.CHARACTER_OCTET_LENGTH, 0), coalesce(c.NUMERIC_PRECISION, 0), coalesce(c.NUMERIC_SCALE, 0),
 			coalesce(k.ORDINAL_POSITION, 0)
 		FROM information_schema.COLUMNS c
 		JOIN information_schema.TABLES t ON t.TABLE_SCHEMA = c.TABLE_SCHEMA AND t.TABLE_NAME = c.TABLE_NAME AND t.TABLE_TYPE = 'BASE TABLE'
@@ -202,7 +204,7 @@ func (s *Source) listTables(ctx context.Context, db *sql.DB, srv server, only st
 		var c sourceColumn
 		var octets, precision, scale int64
 		var pos int
-		if err := rows.Scan(&name, &c.name, &c.dataType, &c.columnType, &c.notNull, &c.charset, &octets, &precision, &scale, &pos); err != nil {
+		if err := rows.Scan(&name, &c.name, &c.dataType, &c.columnType, &c.notNull, &c.charset, &c.collation, &octets, &precision, &scale, &pos); err != nil {
 			return nil, classify(fmt.Errorf("mysql: list tables: %w", err))
 		}
 		if len(s.cfg.Tables) > 0 && !slices.Contains(s.cfg.Tables, name) {
@@ -304,6 +306,9 @@ type sourceState struct {
 	// The primary key's columns that After and the key range are of: see
 	// orderKey.
 	Key []string `json:"key,omitempty"`
+	// The collations of Key's columns, as orderCollations has them; nil in
+	// a state written before states had them.
+	Collations []string `json:"collations,omitempty"`
 	// Set once a table read in one query has been read.
 	Done bool `json:"done,omitempty"`
 	// An incremental read's cursor floor, inclusive, and the highest value
@@ -328,14 +333,34 @@ func orderKey(t table) []string {
 	return names
 }
 
+// orderCollations are the collations of orderKey's columns, empty for one
+// that isn't text.
+func orderCollations(t table) []string {
+	if !chunked(t) {
+		return nil
+	}
+	out := make([]string, len(t.key))
+	for i, k := range t.key {
+		out[i] = t.cols[k].collation
+	}
+	return out
+}
+
 // sameOrder fails a read resumed in another order than the one its state
-// was read in, as once the table's primary key has changed, which only a
-// read from the start carries on from. A split's range is of its order's
-// first column, so it holds before its first row.
+// was read in, as once the table's primary key has changed, or a column of
+// it has another collation, which only a read from the start carries on
+// from. A split's range is of its order's first column, so it holds before
+// its first row.
 func sameOrder(t table, st sourceState) error {
+	if st.After == nil && st.Lo == nil && st.Hi == nil {
+		return nil
+	}
 	key := orderKey(t)
-	if (st.After != nil || st.Lo != nil || st.Hi != nil) && (key == nil || !slices.Equal(st.Key, key)) {
+	if key == nil || !slices.Equal(st.Key, key) {
 		return positionLost("mysql: %s was read in the order of columns %v, and is now read in the order of %v; read it again from the start", t.name, st.Key, key)
+	}
+	if now := orderCollations(t); st.Collations != nil && !slices.Equal(st.Collations, now) {
+		return positionLost("mysql: %s was read in the order of columns %v in collations %q, which are now %q; read it again from the start", t.name, key, st.Collations, now)
 	}
 	return nil
 }
@@ -623,7 +648,7 @@ func (r *tableReader) readTable(ctx context.Context, id string, st sourceState) 
 	if st.After != nil && len(st.After) != len(key) {
 		return fmt.Errorf("mysql: %s state has %d key columns, the table has %d", r.t.name, len(st.After), len(key))
 	}
-	st = sourceState{After: st.After, Key: orderKey(r.t), keyRange: st.keyRange}
+	st = sourceState{After: st.After, Key: orderKey(r.t), Collations: orderCollations(r.t), keyRange: st.keyRange}
 	reading := r.s.Start(r.t.name, id, true)
 	defer r.s.End(r.t.name, id)
 	for {
@@ -738,7 +763,7 @@ func (r *tableReader) readIncremental(ctx context.Context, id, cursor string, st
 		return fmt.Errorf("mysql: %s state has %d cursor and key columns, the read has %d", r.t.name, len(st.After), len(order))
 	}
 	orderCols := r.cols(order)
-	st.Key = orderKey(r.t)
+	st.Key, st.Collations = orderKey(r.t), orderCollations(r.t)
 	reading := r.s.Start(r.t.name, id, true)
 	defer r.s.End(r.t.name, id)
 	for {

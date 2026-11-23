@@ -241,11 +241,13 @@ func TestCursorColumn(t *testing.T) {
 }
 
 // TestSameOrder: a state with a position or a key range holds only in the
-// order it was made in, a range not started yet included.
+// order it was made in, a range not started yet included, and in its key's
+// collations, unless it was written before states had them.
 func TestSameOrder(t *testing.T) {
 	lo := "50"
 	cols := []sourceColumn{{name: "a", kind: kInt32}, {name: "b", kind: kInt32}}
 	byA, byB, loose := table{name: "t", cols: cols, key: []int{0}}, table{name: "t", cols: cols, key: []int{1}}, table{name: "t", cols: cols}
+	byText := table{name: "t", cols: []sourceColumn{{name: "a", kind: kString, collation: "utf8mb4_bin"}}, key: []int{0}}
 	for _, c := range []struct {
 		t    table
 		st   sourceState
@@ -260,6 +262,11 @@ func TestSameOrder(t *testing.T) {
 		{byB, sourceState{After: []string{"1"}, Key: []string{"a"}}, true},
 		{loose, sourceState{After: []string{"1"}, Key: []string{"a"}}, true},
 		{loose, sourceState{After: []string{"1"}}, true},
+		{byA, sourceState{After: []string{"1"}, Key: []string{"a"}, Collations: []string{""}}, false},
+		{byText, sourceState{After: []string{"x"}, Key: []string{"a"}, Collations: []string{"utf8mb4_bin"}}, false},
+		{byText, sourceState{After: []string{"x"}, Key: []string{"a"}}, false},
+		{byText, sourceState{After: []string{"x"}, Key: []string{"a"}, Collations: []string{"utf8mb4_general_ci"}}, true},
+		{byText, sourceState{Done: true, Collations: []string{"utf8mb4_general_ci"}}, false},
 	} {
 		if err := sameOrder(c.t, c.st); (connectortest.CodeOf(err) == protocolv1.ErrorCode_ERROR_CODE_POSITION_LOST) != c.lost {
 			t.Errorf("key %v, state %+v: %v", orderKey(c.t), c.st, err)
