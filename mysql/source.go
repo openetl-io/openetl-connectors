@@ -340,6 +340,17 @@ func sameOrder(t table, st sourceState) error {
 	return nil
 }
 
+// sameWidth fails a read whose positions afters, where they're given, have
+// another number of columns than its order's n.
+func sameWidth(t table, n int, afters ...[]string) error {
+	for _, after := range afters {
+		if after != nil && len(after) != n {
+			return positionLost("mysql: %s was read to a position in %d columns, and is now read in the order of %d, as once its cursor or sync mode changed; read it again from the start", t.name, len(after), n)
+		}
+	}
+	return nil
+}
+
 // keyText spells a key's or cursor's value for a state: binary as hex.
 func keyText(c sourceColumn, v any) string {
 	if b, ok := v.([]byte); ok && c.kind == kBinary {
@@ -479,6 +490,9 @@ func (r *tableReader) readUntil(ctx context.Context, cs source.ConfiguredStream,
 				order = append(order, k)
 			}
 		}
+	}
+	if err := sameWidth(r.t, len(order), st.After, u.After); err != nil {
+		return err
 	}
 	switch {
 	case u.Done:

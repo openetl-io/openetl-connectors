@@ -3,6 +3,7 @@ package mysql
 import (
 	"context"
 	"database/sql/driver"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"maps"
@@ -20,6 +21,7 @@ import (
 	"github.com/openetl-io/openetl-connectors/connectortest"
 	sdk "github.com/openetl-io/openetl/sdk/go"
 	protocolv1 "github.com/openetl-io/openetl/sdk/go/protocol/v1"
+	"github.com/openetl-io/openetl/sdk/go/source"
 )
 
 func TestNormTypeAndWidens(t *testing.T) {
@@ -261,6 +263,44 @@ func TestSameOrder(t *testing.T) {
 	} {
 		if err := sameOrder(c.t, c.st); (connectortest.CodeOf(err) == protocolv1.ErrorCode_ERROR_CODE_POSITION_LOST) != c.lost {
 			t.Errorf("key %v, state %+v: %v", orderKey(c.t), c.st, err)
+		}
+	}
+}
+
+// TestReadUntilOfAnotherWidthIsLost: a read again up to a resume point
+// whose position, or its state's, has another number of columns than the
+// read's order, as once its cursor or sync mode changed, fails as lost
+// before it compares a row with it.
+func TestReadUntilOfAnotherWidthIsLost(t *testing.T) {
+	cols := []sourceColumn{{name: "id", kind: kInt32}, {name: "at", kind: kInt32}}
+	tb, key := table{name: "t", cols: cols, key: []int{0}}, []string{"id"}
+	byAt := source.ConfiguredStream{Name: "t", SyncMode: source.Incremental, Cursor: "at"}
+	whole := source.ConfiguredStream{Name: "t", SyncMode: source.FullRefresh}
+	for _, c := range []struct {
+		cs        source.ConfiguredStream
+		st, until sourceState
+	}{
+		// Positions in the key alone, read by a cursor outside it.
+		{byAt, sourceState{After: []string{"3"}, Key: key}, sourceState{After: []string{"7"}, Key: key}},
+		{byAt, sourceState{}, sourceState{After: []string{"7"}, Key: key}},
+		// Positions in a cursor and the key, read in full.
+		{whole, sourceState{After: []string{"1", "3"}, Key: key}, sourceState{After: []string{"2", "7"}, Key: key}},
+	} {
+		until, err := json.Marshal(c.until)
+		if err != nil {
+			t.Fatal(err)
+		}
+		r := &tableReader{s: &Source{cfg: SourceConfig{Database: "d", ChunkRows: 10}}, t: tb}
+		err = func() (err error) {
+			defer func() {
+				if p := recover(); p != nil {
+					err = fmt.Errorf("panicked: %v", p)
+				}
+			}()
+			return r.readUntil(t.Context(), c.cs, c.st, until)
+		}()
+		if connectortest.CodeOf(err) != protocolv1.ErrorCode_ERROR_CODE_POSITION_LOST {
+			t.Errorf("%v from %+v until %s: %v", c.cs.SyncMode, c.st, until, err)
 		}
 	}
 }
