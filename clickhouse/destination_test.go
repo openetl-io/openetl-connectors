@@ -11,6 +11,7 @@ import (
 	"math"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1110,7 +1111,8 @@ func (c *raceConn) Exec(ctx context.Context, query string, args ...any) error {
 
 // A Recover that finds an epoch's markers missing and its staging gone
 // reports it lost, unless a newer generation has raised the fence since,
-// and may have applied the epoch and dropped its staging: then it's fenced.
+// and may have applied the epoch, dropped its staging and trimmed its
+// markers: then it's fenced.
 func TestDestinationRecoverLostOnlyBehindItsOwnFence(t *testing.T) {
 	for _, newer := range []bool{false, true} {
 		t.Run(fmt.Sprint("newer=", newer), func(t *testing.T) {
@@ -1127,13 +1129,16 @@ func TestDestinationRecoverLostOnlyBehindItsOwnFence(t *testing.T) {
 			}
 			if newer {
 				race = func() {
-					if _, r := k.open(3, streams, e, []destination.Staged{st}); r != destination.Redone {
+					w3, r := k.open(3, streams, e, []destination.Staged{st})
+					if r != destination.Redone {
 						t.Errorf("generation 3 recovered %v, not redone", r)
 					}
+					// As its recovery of a later epoch would.
+					w3.trimMarkers(t.Context(), e.N+1)
 				}
 			}
-			// Recover's first query of system.tables follows its read of
-			// the epoch's markers.
+			// Recover's first query of system.tables, a look for the
+			// epoch's staging, comes before its read of the markers.
 			w2.conn = &raceConn{Conn: w2.conn, prefix: "SELECT count() FROM system.tables", race: race}
 			r, err := w2.Recover(t.Context(), 2, e, []destination.Staged{st})
 			switch {
@@ -1144,6 +1149,79 @@ func TestDestinationRecoverLostOnlyBehindItsOwnFence(t *testing.T) {
 			}
 		})
 	}
+}
+
+// scannedConn runs after once, after the row of the first query that starts
+// with prefix is scanned.
+type scannedConn struct {
+	driver.Conn
+	prefix string
+	after  func()
+}
+
+func (c *scannedConn) QueryRow(ctx context.Context, query string, args ...any) driver.Row {
+	row := c.Conn.QueryRow(ctx, query, args...)
+	if after := c.after; after != nil && strings.HasPrefix(query, c.prefix) {
+		c.after = nil
+		return scannedRow{Row: row, after: after}
+	}
+	return row
+}
+
+type scannedRow struct {
+	driver.Row
+	after func()
+}
+
+func (r scannedRow) Scan(dest ...any) error {
+	err := r.Row.Scan(dest...)
+	r.after()
+	return err
+}
+
+// A Recover that reads an epoch's marker as missing while a replaced
+// attempt, past its checks, goes on to move the epoch's rows, write the
+// marker and drop the staging, reports the epoch applied or redone, not
+// lost, and its rows land once.
+func TestDestinationRecoverWhileReplacedApplies(t *testing.T) {
+	k := newKit(t)
+	s := schemaOf("a", idCol, vCol)
+	streams := []destination.Stream{{Name: "a", Mode: destination.Append}}
+	w1, _ := k.open(1, streams, destination.Epoch{}, nil)
+	k.apply(w1, s)
+	e := epoch(1, 1)
+	st := k.stage(w1, e, batchOf(s, ins(1, int64(1), "a"), ins(1, int64(2), "b")))
+	// Generation 1's commit waits at its move, past its last checks.
+	moving, resume := make(chan struct{}), make(chan struct{})
+	release := sync.OnceFunc(func() { close(resume) })
+	t.Cleanup(release)
+	w1.conn = &raceConn{Conn: w1.conn, prefix: "ALTER TABLE " + w1.q(readyName("p", "a", e.Generation, e.N)) + " MOVE PARTITION", race: func() {
+		close(moving)
+		<-resume
+	}}
+	committed := make(chan error, 1)
+	go func() {
+		_, err := w1.Commit(t.Context(), e, []destination.Staged{st})
+		committed <- err
+	}()
+	select {
+	case <-moving:
+	case err := <-committed:
+		t.Fatalf("generation 1's commit ended before its move: %v", err)
+	}
+	// It finishes once generation 2's Recover has read the marker.
+	w2 := k.writer(2, streams)
+	w2.conn = &scannedConn{Conn: w2.conn, prefix: "SELECT count() FROM " + w2.q(loadsTable), after: func() {
+		release()
+		if err := <-committed; err != nil {
+			t.Errorf("generation 1's commit: %v", err)
+		}
+	}}
+	r, err := w2.Recover(t.Context(), 2, e, []destination.Staged{st})
+	if err != nil || r == destination.Lost {
+		t.Errorf("recovered %v, %v; the epoch is applied", r, err)
+	}
+	wantRows(t, "a", k.rows("a", "id", "v"), "1|a", "2|b")
 }
 
 // A commit that ends an overwrite read with rows, on a writer that never
