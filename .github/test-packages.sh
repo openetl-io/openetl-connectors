@@ -244,7 +244,7 @@ SQL
       --unreachable "$work/$container-source-closed.json" \
       --stream users:full_refresh --stream events:incremental:at --stream orders:cdc \
       --add-records-command "$work/my-add $container $client" \
-      --stops-at-until
+      --stops-at-until $(stops mysql --stops-at-completion)
     config "$container-dest" "{\"dsn\": \"$dsn\"}"
     config "$container-dest-bad" "{\"dsn\": \"$bad\"}"
     config "$container-dest-closed" "{\"dsn\": \"$closed\"}"
