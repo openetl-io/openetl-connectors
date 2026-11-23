@@ -624,8 +624,10 @@ func TestUntilWithinFile(t *testing.T) {
 }
 
 // A read up to a resume point stops where the first read sent it, by file
-// and position, though a file read before it was deleted or written again
-// since, and completes there.
+// and position, though files were written since, and completes there. A file
+// it read records of up to the until, that its start hadn't, which is gone or
+// written again since fails it with POSITION_LOST: it can't send those
+// records again.
 func TestUntilPastChangedFiles(t *testing.T) {
 	var big []byte
 	for i := range batchRecords + 1 {
@@ -635,22 +637,28 @@ func TestUntilPastChangedFiles(t *testing.T) {
 	for _, c := range []struct {
 		name string
 		mode source.SyncMode
-		// The first read's resume point the read again stops at: after
-		// a.jsonl, within b.jsonl, or after it.
-		until int
+		// The first read's resume points the read again starts at, 1-based,
+		// 0 for its beginning, and stops at: after a.jsonl, within
+		// b.jsonl, or after it.
+		from, until int
 		// a.jsonl or b.jsonl, deleted, or written again, of 3 records, at
 		// rewritten, a second after b.jsonl; or a file of 3 records written
 		// at added, between a.jsonl and b.jsonl.
 		deleted, rewritten, added string
+		lost                      bool
 		// The records read again, of each file.
 		want map[string]int
 	}{
-		{name: "after a file read before it was deleted", mode: source.Incremental, until: 2, deleted: "a.jsonl", want: map[string]int{"b.jsonl": batchRecords + 1}},
-		{name: "within a file, one read before it deleted", mode: source.Incremental, until: 1, deleted: "a.jsonl", want: map[string]int{"b.jsonl": batchRecords}},
-		{name: "after the deleted file itself", mode: source.Incremental, until: 0, deleted: "a.jsonl", want: map[string]int{}},
-		{name: "after a file read before it was written again", mode: source.Incremental, until: 2, rewritten: "a.jsonl", want: map[string]int{"b.jsonl": batchRecords + 1}},
-		{name: "within its own file written again", mode: source.FullRefresh, until: 1, rewritten: "b.jsonl", want: map[string]int{"a.jsonl": 1, "b.jsonl": 3}},
+		{name: "after a file read before it was deleted", mode: source.Incremental, until: 2, deleted: "a.jsonl", lost: true},
+		{name: "within a file, one read before it deleted", mode: source.Incremental, until: 1, deleted: "a.jsonl", lost: true},
+		{name: "after the deleted file itself", mode: source.Incremental, until: 0, deleted: "a.jsonl", lost: true},
+		{name: "within its own file deleted", mode: source.Incremental, until: 1, deleted: "b.jsonl", lost: true},
+		{name: "after a file read before it was written again", mode: source.Incremental, until: 2, rewritten: "a.jsonl", lost: true},
+		{name: "within its own file written again", mode: source.FullRefresh, until: 1, rewritten: "b.jsonl", lost: true},
+		{name: "after its own last file, deleted", mode: source.FullRefresh, until: 2, deleted: "b.jsonl", lost: true},
 		{name: "after a file new since, before it", mode: source.Incremental, until: 2, added: "n.jsonl", want: map[string]int{"a.jsonl": 1, "n.jsonl": 3, "b.jsonl": batchRecords + 1}},
+		{name: "from after a file deleted since", mode: source.Incremental, from: 1, until: 2, deleted: "a.jsonl", want: map[string]int{"b.jsonl": batchRecords + 1}},
+		{name: "before a file deleted since", mode: source.Incremental, until: 0, deleted: "b.jsonl", want: map[string]int{"a.jsonl": 1}},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			dir := t.TempDir()
@@ -673,16 +681,28 @@ func TestUntilPastChangedFiles(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
+			three := []byte("{\"id\":1}\n{\"id\":2}\n{\"id\":3}\n")
 			if c.rewritten != "" {
-				put(t, cfg, map[string][]byte{"x/" + c.rewritten: []byte("{\"id\":1}\n{\"id\":2}\n{\"id\":3}\n")})
+				put(t, cfg, map[string][]byte{"x/" + c.rewritten: three})
 				touch("x/"+c.rewritten, at.Add(2*time.Second))
 			}
 			if c.added != "" {
-				put(t, cfg, map[string][]byte{"x/" + c.added: []byte("{\"id\":1}\n{\"id\":2}\n{\"id\":3}\n")})
+				put(t, cfg, map[string][]byte{"x/" + c.added: three})
 				touch("x/"+c.added, at.Add(time.Second/2))
 			}
+			var from []byte
+			if c.from > 0 {
+				from = points[c.from-1]
+			}
 			until := points[c.until]
-			again, err := readStreams(t, s, source.ConfiguredStream{Name: "x", SyncMode: c.mode, Until: until})
+			again, err := readStreams(t, s, source.ConfiguredStream{Name: "x", SyncMode: c.mode, State: from, Until: until})
+			if c.lost {
+				var coded interface{ ErrorCode() protocolv1.ErrorCode }
+				if !errors.As(err, &coded) || coded.ErrorCode() != protocolv1.ErrorCode_ERROR_CODE_POSITION_LOST || len(again.rows["x/"]) > 0 || again.ended["x/"] {
+					t.Fatalf("%v isn't POSITION_LOST before any record, the read sent %d and completed %v", err, len(again.rows["x/"]), again.ended["x/"])
+				}
+				return
+			}
 			if err != nil {
 				t.Fatal(err)
 			}
