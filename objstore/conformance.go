@@ -520,7 +520,7 @@ func S3Store(t *testing.T) TestStore {
 		Name: "s3",
 		Config: map[string]any{
 			"url": "s3://" + s3Bucket(t) + "/" + prefix(), "endpoint": s3Endpoint, "region": "us-east-1",
-			"accessKeyId": "openetl", "secretAccessKey": "openetl",
+			"accessKeyId": "openetlTestAccessKey", "secretAccessKey": "openetl-test-secret-access-key",
 		},
 		Unreachable: map[string]any{"endpoint": "http://127.0.0.1:1"},
 	}

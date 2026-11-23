@@ -38,7 +38,7 @@ func TestSourceConformance(t *testing.T) {
 func TestSourceConformanceSASL(t *testing.T) {
 	sourceSuite(t, saslAdmin(t), func(extra map[string]any) []byte {
 		return saslConfig(t, "scram-sha-512", "scram", scramPassword, extra)
-	}, saslConfig(t, "scram-sha-512", "scram", "wrong", nil))
+	}, saslConfig(t, "scram-sha-512", "scram", "not-the-sasl-password", nil))
 }
 
 // sourceSuite runs the source's suite on two topics that cl makes, with
@@ -194,7 +194,7 @@ func TestDestinationConformance(t *testing.T) {
 
 // Over SASL_SSL, with PLAIN, and with a wrong password for bad credentials.
 func TestDestinationConformanceSASL(t *testing.T) {
-	destinationSuite(t, saslAdmin(t), saslConfig(t, "plain", "admin", adminPassword, nil), saslConfig(t, "plain", "admin", "wrong", nil))
+	destinationSuite(t, saslAdmin(t), saslConfig(t, "plain", "admin", adminPassword, nil), saslConfig(t, "plain", "admin", "not-the-sasl-password", nil))
 }
 
 // destinationSuite runs the destination's suite with cfg, and bad, if not

@@ -68,7 +68,7 @@ runs:
       shell: bash
       run: |
         docker run -d --name clickhouse -p 9000:9000 -p 8123:8123 \
-          -e CLICKHOUSE_USER=openetl -e CLICKHOUSE_PASSWORD=openetl -e CLICKHOUSE_DB=openetl \
+          -e CLICKHOUSE_USER=openetl -e CLICKHOUSE_PASSWORD=clickhouse-test-password -e CLICKHOUSE_DB=openetl \
           -e CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1 --ulimit nofile=262144:262144 \
           clickhouse/clickhouse-server:26.8
     - name: MongoDB
@@ -243,7 +243,7 @@ runs:
         GO
         SQL
         fi
-        if has clickhouse; then answers clickhouse curl -sf -m 5 -o /dev/null -u openetl:openetl 'http://127.0.0.1:8123/?database=openetl' --data-binary 'SELECT 1'; fi
+        if has clickhouse; then answers clickhouse curl -sf -m 5 -o /dev/null -u openetl:clickhouse-test-password 'http://127.0.0.1:8123/?database=openetl' --data-binary 'SELECT 1'; fi
         # A replica set, for change streams: initiated once it takes the user, ready once it's primary.
         if has mongodb; then answers mongodb docker exec mongodb mongosh --quiet -u openetl -p openetl --authenticationDatabase admin --eval 'try { rs.status() } catch (e) { rs.initiate({_id: "rs0", members: [{_id: 0, host: "127.0.0.1:27017"}]}) } if (!db.hello().isWritablePrimary) quit(1)'; fi
         # DynamoDB Local answers an unsigned request with a 400.

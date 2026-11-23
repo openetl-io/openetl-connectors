@@ -29,12 +29,17 @@ func endpoint() string {
 
 const closedPort = "http://127.0.0.1:1"
 
+const (
+	testAccessKeyID     = "openetlTestAccessKey"
+	testSecretAccessKey = "openetl-test-secret-access-key"
+)
+
 func testClient(t testing.TB) *dynamodb.Client {
 	t.Helper()
 	cl := dynamodb.New(dynamodb.Options{
 		Region:       "us-east-1",
 		BaseEndpoint: aws.String(endpoint()),
-		Credentials:  credentials.NewStaticCredentialsProvider("openetl", "openetl", ""),
+		Credentials:  credentials.NewStaticCredentialsProvider(testAccessKeyID, testSecretAccessKey, ""),
 	})
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
@@ -47,7 +52,7 @@ func testClient(t testing.TB) *dynamodb.Client {
 // connConfig is the config's connection to the test endpoint, as JSON
 // fields, with the access key given.
 func connConfig(endpoint, key string) string {
-	return fmt.Sprintf(`"region": "us-east-1", "endpoint": %q, "accessKeyId": %q, "secretAccessKey": "openetl"`, endpoint, key)
+	return fmt.Sprintf(`"region": "us-east-1", "endpoint": %q, "accessKeyId": %q, "secretAccessKey": %q`, endpoint, key, testSecretAccessKey)
 }
 
 // prefix is a name prefix of the test's own.

@@ -25,7 +25,7 @@ func openWriter(t *testing.T, ns string, streams ...destination.Stream) *writer 
 
 func openGeneration(t *testing.T, ns string, gen uint64, streams ...destination.Stream) *writer {
 	t.Helper()
-	d, err := NewDestination([]byte("{" + connConfig(endpoint(), "openetl") + "}"))
+	d, err := NewDestination([]byte("{" + connConfig(endpoint(), testAccessKeyID) + "}"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -307,7 +307,7 @@ func TestDestinationTeardown(t *testing.T) {
 	if _, err := w.PreCommit(t.Context(), destination.Epoch{Generation: 1, N: 2}); err != nil {
 		t.Fatal(err)
 	}
-	d, err := NewDestination([]byte("{" + connConfig(endpoint(), "openetl") + "}"))
+	d, err := NewDestination([]byte("{" + connConfig(endpoint(), testAccessKeyID) + "}"))
 	if err != nil {
 		t.Fatal(err)
 	}

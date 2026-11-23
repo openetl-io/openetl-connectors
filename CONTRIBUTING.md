@@ -41,7 +41,7 @@ The other databases' tests each need their server, set up as `.github/actions/se
 - MySQL at `OPENETL_TEST_MYSQL_DSN` (default `openetl:openetl@tcp(127.0.0.1:3306)/openetl`), in the container `OPENETL_TEST_MYSQL_CONTAINER` (default `mysql`; `.github/test-packages.sh` always uses the containers `mysql` and `mariadb`), and MariaDB at `OPENETL_TEST_MARIADB_DSN` (default `openetl:openetl@tcp(127.0.0.1:3307)/openetl`), each with a row-based binlog and full row metadata;
 - SQL Server at `OPENETL_TEST_SQLSERVER_DSN` (default `sqlserver://openetl:OpenETL-test-1@localhost:1433?database=openetl`), with SQL Server Agent, change tracking and change data capture on, and `sa` at `OPENETL_TEST_SQLSERVER_ADMIN_DSN`;
 - Oracle Database at `OPENETL_TEST_ORACLE_DSN` (default `oracle://openetl:openetl@127.0.0.1:1521/FREEPDB1`), archiving its redo log with supplemental logging, and `SYS` at `OPENETL_TEST_ORACLE_ADMIN_DSN`;
-- ClickHouse at `OPENETL_TEST_CLICKHOUSE_ADDR` (default `127.0.0.1:9000`), and for `.github/test-packages.sh` its HTTP interface at `OPENETL_TEST_CLICKHOUSE_HTTP` (default `http://127.0.0.1:8123`);
+- ClickHouse at `OPENETL_TEST_CLICKHOUSE_ADDR` (default `127.0.0.1:9000`), with the user `openetl` and the password `clickhouse-test-password`, and for `.github/test-packages.sh` its HTTP interface at `OPENETL_TEST_CLICKHOUSE_HTTP` (default `http://127.0.0.1:8123`);
 - MongoDB at `OPENETL_TEST_MONGODB_URI` (default `mongodb://openetl:openetl@127.0.0.1:27017/?directConnection=true`), a replica set;
 - DynamoDB Local at `OPENETL_TEST_DYNAMODB_ENDPOINT` (default `http://127.0.0.1:8000`).
 

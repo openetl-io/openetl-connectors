@@ -49,12 +49,16 @@ func TestDestinationConformance(t *testing.T) {
 	}
 	// The REST fixture takes any token, and SeaweedFS any key: the suite's
 	// catalog is a proxy that takes one token.
-	auth := tokenProxy(t, uri(), "openetl")
-	cfg := map[string]string{"uri": auth, "token": "openetl", "s3Endpoint": s3(), "region": "us-east-1", "accessKeyId": "openetl", "secretAccessKey": "openetl"}
+	const token = "openetl-test-catalog-token"
+	auth := tokenProxy(t, uri(), token)
+	cfg := map[string]string{
+		"uri": auth, "token": token, "s3Endpoint": s3(), "region": "us-east-1",
+		"accessKeyId": "openetlTestAccessKey", "secretAccessKey": "openetl-test-secret-access-key",
+	}
 	unreachable := maps.Clone(cfg)
 	unreachable["uri"] = "http://127.0.0.1:1"
 	wrong := maps.Clone(cfg)
-	wrong["token"] = "wrong"
+	wrong["token"] = "not-the-catalog-token"
 	config, _ := json.Marshal(cfg)
 	closed, _ := json.Marshal(unreachable)
 	bad, _ := json.Marshal(wrong)

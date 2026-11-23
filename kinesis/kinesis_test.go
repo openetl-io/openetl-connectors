@@ -50,7 +50,7 @@ func uniq(prefix string) string { return prefix + "_" + strings.ToLower(rand.Tex
 
 func config(t *testing.T, extra map[string]any) []byte {
 	t.Helper()
-	m := map[string]any{"region": "us-east-1", "endpoint": endpoint(), "accessKeyId": "openetl", "secretAccessKey": "openetl"}
+	m := map[string]any{"region": "us-east-1", "endpoint": endpoint(), "accessKeyId": "openetlTestAccessKey", "secretAccessKey": "openetl-test-secret-access-key"}
 	for k, v := range extra {
 		m[k] = v
 	}

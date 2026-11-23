@@ -47,7 +47,7 @@ type kit struct {
 
 func newKit(t *testing.T) kit {
 	db := newDatabase(t)
-	d, err := NewDestination(testConfig(testAddr(), "openetl", db))
+	d, err := NewDestination(testConfig(testAddr(), testPassword, db))
 	if err != nil {
 		t.Fatal(err)
 	}

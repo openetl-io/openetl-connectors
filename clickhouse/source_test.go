@@ -117,7 +117,7 @@ func (s splitCollector) ResumePoint(state []byte, added ...source.Split) error {
 
 func newTestSource(t *testing.T, db, extra string) *Source {
 	t.Helper()
-	cfg := fmt.Sprintf(`{"addr": %q, "user": "openetl", "password": "openetl", "database": %q%s}`, testAddr(), db, extra)
+	cfg := fmt.Sprintf(`{"addr": %q, "user": "openetl", "password": %q, "database": %q%s}`, testAddr(), testPassword, db, extra)
 	s, err := NewSource([]byte(cfg))
 	if err != nil {
 		t.Fatal(err)
