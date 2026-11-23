@@ -440,6 +440,9 @@ func (s *Source) readSplit(ctx context.Context, b *blob.Bucket, typed *typedColu
 			cuts = u.Gave[len(st.Gave):]
 		}
 		halt = untilOf(st, u, incremental)
+		if err := halt.gone(files, cs.Name); err != nil {
+			return err
+		}
 	}
 	cutTo := func(o object, inclusive bool) {
 		for len(cuts) > 0 {
