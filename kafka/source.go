@@ -1035,6 +1035,10 @@ func (r *topicRead) take(consumer *kgo.Client, out source.Emitter, ps []int32, s
 			continue
 		}
 		r.next[p] = start.Offset
+		if r.from != nil {
+			// Where a read again with no state starts it.
+			r.from[p] = start.Offset
+		}
 		add[p] = kgo.NewOffset().At(start.Offset)
 		if r.splits != nil {
 			r.splits[p] = out.Split(r.name, splitID(p))

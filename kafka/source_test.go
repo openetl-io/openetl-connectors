@@ -923,3 +923,66 @@ func TestARedoOfATopicCreatedAgainIsLost(t *testing.T) {
 		}
 	}
 }
+
+// A partition added while a topic is read whole from the latest offsets is
+// read from its start, which that read's states keep with where the read
+// began: a read again of its first epoch, after retention deleted records
+// of that partition the epoch had, fails with POSITION_LOST rather than
+// return fewer.
+func TestARedoOfAPartitionAddedToAReadFromLatestStartsWhereItDid(t *testing.T) {
+	shortChecks(t, 100*time.Millisecond)
+	addrs := fake(t)
+	topic := "events"
+	produceRecords(t, addrs, topic, 1, 5, 5)
+	s, err := NewSource(fakeConfig(t, addrs, map[string]any{"topics": []string{topic}, "startOffset": "latest"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	first := &splitEvents{events: map[string][]string{}}
+	done := make(chan error, 1)
+	go func() {
+		done <- s.Read(ctx, source.ReadRequest{Streams: []source.ConfiguredStream{{Name: topic}}, Pipeline: "p", Lanes: 1, Continuous: true}, first)
+	}()
+	read := func(prefix string) int {
+		first.mu.Lock()
+		defer first.mu.Unlock()
+		n := 0
+		for _, r := range rowsIn(first.events[source.WholeStream]) {
+			if strings.HasPrefix(r, prefix) {
+				n++
+			}
+		}
+		return n
+	}
+	waitFor(t, "the first read's rows of partition 0", func() bool {
+		produceMore(t, addrs, topic, 0, 1)
+		time.Sleep(100 * time.Millisecond)
+		return read("p0@") > 0
+	})
+	growTopic(t, addrs, topic, 1)
+	waitFor(t, "the added partition's rows", func() bool { return read("p1@") == 4 })
+	time.Sleep(time.Second)
+	cancel()
+	<-done
+	end := first.states[source.WholeStream]
+	var st state
+	if err := json.Unmarshal(end, &st); err != nil || st.Offsets["1"] != 4 {
+		t.Fatalf("the first read ended at %s", end)
+	}
+	cl, err := kgo.NewClient(kgo.SeedBrokers(addrs...))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cl.Close()
+	del := kadm.Offsets{}
+	del.Add(kadm.Offset{Topic: topic, Partition: 1, At: 2})
+	if _, err := kadm.NewClient(cl).DeleteRecords(t.Context(), del); err != nil {
+		t.Fatal(err)
+	}
+	err = s.Read(t.Context(), source.ReadRequest{Streams: []source.ConfiguredStream{{Name: topic, Until: end}}, Pipeline: "p", Lanes: 1}, &splitEvents{events: map[string][]string{}})
+	if codeOf(err) != "ERROR_CODE_POSITION_LOST" {
+		t.Errorf("a read again up to %s: %s %v", end, codeOf(err), err)
+	}
+}
