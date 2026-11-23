@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
@@ -618,6 +620,87 @@ func TestUntilWithinFile(t *testing.T) {
 	err := s.Read(t.Context(), source.ReadRequest{Streams: []source.ConfiguredStream{{Name: "u", SyncMode: source.FullRefresh, Until: within}}, Lanes: 1}, e)
 	if !errors.Is(err, refused) || !bytes.Equal(e.done["u/"], within) {
 		t.Fatalf("completed at %s: %v", e.done["u/"], err)
+	}
+}
+
+// A read up to a resume point stops where the first read sent it, by file
+// and position, though a file read before it was deleted or written again
+// since, and completes there.
+func TestUntilPastChangedFiles(t *testing.T) {
+	var big []byte
+	for i := range batchRecords + 1 {
+		big = fmt.Appendf(big, "{\"id\":%d}\n", i)
+	}
+	at := time.Now().Add(-time.Hour).Truncate(time.Second)
+	for _, c := range []struct {
+		name string
+		mode source.SyncMode
+		// The first read's resume point the read again stops at: after
+		// a.jsonl, within b.jsonl, or after it.
+		until int
+		// a.jsonl or b.jsonl, deleted, or written again, of 3 records, at
+		// rewritten, a second after b.jsonl; or a file of 3 records written
+		// at added, between a.jsonl and b.jsonl.
+		deleted, rewritten, added string
+		// The records read again, of each file.
+		want map[string]int
+	}{
+		{name: "after a file read before it was deleted", mode: source.Incremental, until: 2, deleted: "a.jsonl", want: map[string]int{"b.jsonl": batchRecords + 1}},
+		{name: "within a file, one read before it deleted", mode: source.Incremental, until: 1, deleted: "a.jsonl", want: map[string]int{"b.jsonl": batchRecords}},
+		{name: "after the deleted file itself", mode: source.Incremental, until: 0, deleted: "a.jsonl", want: map[string]int{}},
+		{name: "after a file read before it was written again", mode: source.Incremental, until: 2, rewritten: "a.jsonl", want: map[string]int{"b.jsonl": batchRecords + 1}},
+		{name: "within its own file written again", mode: source.FullRefresh, until: 1, rewritten: "b.jsonl", want: map[string]int{"a.jsonl": 1, "b.jsonl": 3}},
+		{name: "after a file new since, before it", mode: source.Incremental, until: 2, added: "n.jsonl", want: map[string]int{"a.jsonl": 1, "n.jsonl": 3, "b.jsonl": batchRecords + 1}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			dir := t.TempDir()
+			cfg := map[string]any{"url": "file://" + dir}
+			put(t, cfg, map[string][]byte{"x/a.jsonl": []byte("{\"id\":1}\n"), "x/b.jsonl": big})
+			touch := func(key string, to time.Time) {
+				if err := os.Chtimes(filepath.Join(dir, key), to, to); err != nil {
+					t.Fatal(err)
+				}
+			}
+			touch("x/a.jsonl", at)
+			touch("x/b.jsonl", at.Add(time.Second))
+			s := newSource(t, cfg, map[string]any{"name": "x", "glob": "x/*", "format": "jsonl"})
+			points := mustRead(t, s, "x", c.mode, nil).resumes["x/"]
+			if len(points) != 3 {
+				t.Fatalf("%d resume points", len(points))
+			}
+			if c.deleted != "" {
+				if err := mustOpenBucket(t, s).Delete(t.Context(), "x/"+c.deleted); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if c.rewritten != "" {
+				put(t, cfg, map[string][]byte{"x/" + c.rewritten: []byte("{\"id\":1}\n{\"id\":2}\n{\"id\":3}\n")})
+				touch("x/"+c.rewritten, at.Add(2*time.Second))
+			}
+			if c.added != "" {
+				put(t, cfg, map[string][]byte{"x/" + c.added: []byte("{\"id\":1}\n{\"id\":2}\n{\"id\":3}\n")})
+				touch("x/"+c.added, at.Add(time.Second/2))
+			}
+			until := points[c.until]
+			again, err := readStreams(t, s, source.ConfiguredStream{Name: "x", SyncMode: c.mode, Until: until})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !again.ended["x/"] || !bytes.Equal(again.done["x/"], until) {
+				t.Fatalf("a read up to %s completed at %s", until, again.done["x/"])
+			}
+			if resumes := again.resumes["x/"]; len(resumes) == 0 || !bytes.Equal(resumes[len(resumes)-1], until) {
+				t.Errorf("its last resume point isn't its until")
+			}
+			got := map[string]int{}
+			for _, l := range lines(again) {
+				f, _, _ := strings.Cut(l, ":")
+				got[f]++
+			}
+			if !maps.Equal(got, c.want) {
+				t.Errorf("read again %v, not %v", got, c.want)
+			}
+		})
 	}
 }
 
