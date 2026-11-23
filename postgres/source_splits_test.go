@@ -965,6 +965,12 @@ func TestResplitAnIncrementalRead(t *testing.T) {
 // Splits ask to split each other at random throughout a concurrent read, of
 // every key type that divides, and every row is read once. A restart from a
 // checkpoint taken part-way reads exactly the rest.
+//
+// An ask answered at a split's last chunk lapses, so the random asks alone
+// can add nothing, as with int text: its first split holds a third of the
+// rows, and the others two chunks each. Each split also asks to split itself
+// at its first batch, which its first resume point answers whatever the
+// timing.
 func TestResplitAtRandom(t *testing.T) {
 	for name, c := range map[string]struct{ cols, key, row string }{
 		"int":      {"id int", "id", "i"},
@@ -986,18 +992,25 @@ func TestResplitAtRandom(t *testing.T) {
 			for _, sp := range splits {
 				known[sp.ID] = true
 			}
+			started := map[string]bool{}
 			var accepted atomic.Int64
-			rc.OnBatch = func(stream, split string) {
-				mu.Lock()
-				defer mu.Unlock()
-				known[split] = true
-				ids := slices.Sorted(maps.Keys(known))
-				pick := ids[rng.IntN(len(ids))]
-				if ok, err := s.Resplit(t.Context(), stream, pick); err != nil {
+			ask := func(stream, split string) {
+				if ok, err := s.Resplit(t.Context(), stream, split); err != nil {
 					t.Error(err)
 				} else if ok {
 					accepted.Add(1)
 				}
+			}
+			rc.OnBatch = func(stream, split string) {
+				mu.Lock()
+				defer mu.Unlock()
+				if !started[split] {
+					started[split] = true
+					ask(stream, split)
+				}
+				known[split] = true
+				ids := slices.Sorted(maps.Keys(known))
+				ask(stream, ids[rng.IntN(len(ids))])
 			}
 			e.mustRead(s, 4, rc, inSplits(cs, splits))
 			sameValues(t, rc.Values(), oneToN(3000))
