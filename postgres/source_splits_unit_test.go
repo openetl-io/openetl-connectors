@@ -1,13 +1,17 @@
 package postgres
 
 import (
+	"cmp"
 	"encoding/json"
 	"fmt"
 	"math"
 	"slices"
+	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/jackc/pglogrepl"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/openetl-io/openetl-connectors/keysplit"
 )
 
@@ -93,6 +97,91 @@ func TestIntRemainder(t *testing.T) {
 	}
 	if _, _, err := intRemainder(keyRange{Hi: text("x")}, nil, true); err == nil {
 		t.Error("read x as an integer")
+	}
+}
+
+// A resplit of an (int, text) key, asked at any position of a range, leaves
+// the rows after it to the two parts, each to one: the rest of the
+// position's first value stays below, and a range with no other value left
+// isn't divided.
+func TestResplitACompositeKeysRemainder(t *testing.T) {
+	type row struct {
+		a int
+		b string
+	}
+	var rows []row
+	for a := range 10 {
+		for _, b := range []string{"x", "y", "z"} {
+			rows = append(rows, row{a, b})
+		}
+	}
+	atoi := func(s *string) int {
+		n, err := strconv.Atoi(*s)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	// What a read of st reads, by its where and afterKey.
+	reads := func(st sourceState, x row) bool {
+		if st.Lo != nil && x.a <= atoi(st.Lo) || st.Hi != nil && x.a > atoi(st.Hi) {
+			return false
+		}
+		if st.After == nil {
+			return true
+		}
+		at := atoi(&st.After[0])
+		return x.a > at || x.a == at && x.b > st.After[1]
+	}
+	tbl := table{name: "t", cols: []sourceColumn{{name: "a", oid: pgtype.Int4OID}, {name: "b", oid: pgtype.TextOID}}, order: []int{0, 1}}
+	seven := "7"
+	for _, lo := range []string{"", "2"} {
+		r := keyRange{Hi: &seven}
+		if lo != "" {
+			r.Lo = &lo
+		}
+		for _, p := range rows {
+			if !reads(sourceState{keyRange: r}, p) {
+				continue
+			}
+			st := sourceState{After: []string{strconv.Itoa(p.a), p.b}, keyRange: r}
+			var want []row
+			for _, x := range rows {
+				if reads(st, x) {
+					want = append(want, x)
+				}
+			}
+			var reading keysplit.Reading
+			reading.Asked.Store(true)
+			added, err := (&Source{}).resplit(t.Context(), nil, tbl, &reading, &st, false, st.position(), false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			parts := []sourceState{st}
+			for _, sp := range added {
+				var upper sourceState
+				if err := json.Unmarshal(sp.State, &upper); err != nil {
+					t.Fatal(err)
+				}
+				parts = append(parts, upper)
+			}
+			var got []row
+			for _, part := range parts {
+				for _, x := range rows {
+					if reads(part, x) {
+						got = append(got, x)
+					}
+				}
+			}
+			slices.SortFunc(got, func(x, y row) int { return cmp.Or(cmp.Compare(x.a, y.a), strings.Compare(x.b, y.b)) })
+			if !slices.Equal(got, want) {
+				t.Errorf("(%s, 7] after %v: the parts read %v, want %v", lo, p, got, want)
+			}
+			divides := p.a < 7
+			if (len(added) == 1) != divides || reading.Over.Load() == divides {
+				t.Errorf("(%s, 7] after %v: added %d, over %v", lo, p, len(added), reading.Over.Load())
+			}
+		}
 	}
 }
 
