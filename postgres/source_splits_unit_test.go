@@ -177,8 +177,11 @@ func TestResplitACompositeKeysRemainder(t *testing.T) {
 			if !slices.Equal(got, want) {
 				t.Errorf("(%s, 7] after %v: the parts read %v, want %v", lo, p, got, want)
 			}
-			divides := p.a < 7
-			if (len(added) == 1) != divides || reading.Over.Load() == divides {
+			divides, splits := p.a < 7, 0
+			if divides {
+				splits = 1
+			}
+			if len(added) != splits || reading.Over.Load() == divides {
 				t.Errorf("(%s, 7] after %v: added %d, over %v", lo, p, len(added), reading.Over.Load())
 			}
 		}
