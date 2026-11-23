@@ -310,7 +310,7 @@ SH
     --bad-credentials "$work/ms-source-bad.json" \
     --unreachable "$work/ms-source-closed.json" \
     --stream users:full_refresh --stream orders:cdc --add-records-command "$work/ms-add" \
-    --stops-at-until
+    --stops-at-until $(stops sqlserver --stops-at-completion)
   config ms-dest "{\"dsn\": \"$ms\"}"
   config ms-dest-bad "{\"dsn\": \"$bad_ms\"}"
   config ms-dest-closed "{\"dsn\": \"$closed_ms\"}"
