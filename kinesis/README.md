@@ -61,7 +61,7 @@ Then `put` is skipped, as putting a record would write to a stream, and names th
 
 Each Kinesis stream is a stream, read with the `stream` sync mode: every stream the credentials can list, or those `streams` lists, matching `streamPattern` if it's set.
 
-The source reads each shard from its sequence number, as the last checkpoint recorded it. A parent shard is read to its end before its children, so a key's records stay in order across a resharding. A stream it hasn't read before starts at `startPosition`:
+The source reads each shard from its sequence number, as the last checkpoint recorded it. A parent shard is read to its end before its children, so a key's records stay in order across a resharding. Once a shard is read to its end, the source lists the stream's shards every second until the listing has the shard's children, which Kinesis can list late. A scheduled read tries five times, and the next sync reads the children it didn't find. From 0.2.0, a continuous read keeps listing until it finds them, and reads them without the pipeline starting again; before, it gave up after five tries too, and read them only once its job started again. While the read waits, its other shards' ends wait too, and a stream read whole sends nothing. A stream it hasn't read before starts at `startPosition`:
 
 - `earliest` (the default): each shard's oldest record.
 - `latest`: the records that arrive after the first read starts.

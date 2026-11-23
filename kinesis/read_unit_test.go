@@ -524,3 +524,56 @@ func TestListsEveryStream(t *testing.T) {
 		t.Errorf("listed %v, %v; want %v", got, err, want)
 	}
 }
+
+// A continuous read lists the stream's shards again until a shard it read
+// to its end has children, however long the listing stays without them,
+// and reads them: read whole, and as splits.
+func TestContinuousReadListsChildrenAgain(t *testing.T) {
+	for _, c := range []struct {
+		name   string
+		splits []source.Split
+		child  string
+	}{
+		{name: "whole", child: ""},
+		{name: "splits", splits: []source.Split{{ID: "p"}}, child: "c"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			old := time.Now().Add(-time.Hour)
+			f := &fakeStream{perCall: 3, shards: []*fakeShard{{id: "p", closed: true}, {id: "c", parent: "p"}}}
+			f.put(f.shards[0], 3, old)
+			f.put(f.shards[1], 2, old)
+			f.shards[1].seqs = []string{"200", "201"}
+			// The read's first listing and its first tries after p ends
+			// don't have c.
+			var lists atomic.Int32
+			f.override = func(op string, _ map[string]any) (int, any, bool) {
+				if op != "ListShards" || lists.Add(1) > listTries+2 {
+					return 0, nil, false
+				}
+				p := map[string]any{"ShardId": "p", "HashKeyRange": map[string]any{"StartingHashKey": "0", "EndingHashKey": "1"},
+					"SequenceNumberRange": map[string]any{"StartingSequenceNumber": "1", "EndingSequenceNumber": "99999"}}
+				return http.StatusOK, map[string]any{"Shards": []any{p}}, true
+			}
+			s := newReadSource(t, f)
+			ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+			defer cancel()
+			log := &eventLog{}
+			done := make(chan error, 1)
+			go func() {
+				done <- s.Read(ctx, source.ReadRequest{Pipeline: "p", Lanes: 1, Continuous: true, Streams: []source.ConfiguredStream{{Name: "s", SyncMode: source.Stream, Splits: c.splits}}}, log)
+			}()
+			want := []string{"100", "101", "102", "200", "201"}
+			for ctx.Err() == nil && !slices.Equal(log.rowSeqs(), want) {
+				time.Sleep(50 * time.Millisecond)
+			}
+			cancel()
+			<-done
+			if got := log.rowSeqs(); !slices.Equal(got, want) {
+				t.Fatalf("read %v, want %v, after %d listings", got, want, lists.Load())
+			}
+			if c.child != "" && !slices.ContainsFunc(log.last(len(log.events)), func(e string) bool { return strings.HasPrefix(e, "p complete ") && strings.HasSuffix(e, " +c") }) {
+				t.Errorf("p didn't add c: %v", log.events)
+			}
+		})
+	}
+}
