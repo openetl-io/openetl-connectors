@@ -95,7 +95,8 @@ const (
 	// How many empty GetRecords the retention check follows from a shard's
 	// trim horizon before it counts the shard as empty.
 	trimHorizonCalls = 20
-	// How many listings a shard that ended waits for its children through.
+	// How many listings a bounded read's shard that ended waits for its
+	// children through.
 	listTries = 5
 	// The most rows one Rows call carries.
 	rowsPerEmit = 5000
@@ -746,17 +747,20 @@ func completeAt(em source.SplitEmitter, stop []byte) error {
 	return em.Complete(stop)
 }
 
-// listChildren lists the stream's shards. A closed shard's children exist
-// before it ends, so a listing without them is stale.
+// listChildren lists the stream's shards until shard, read to its end, has
+// children. A closed shard's children exist before it ends, so a listing
+// without them is stale. A bounded read stops trying after listTries, and
+// the next read finds them; a continuous read lists nothing else again, so
+// it keeps trying.
 func (rd *reading) listChildren(ctx context.Context, r *streamRead, shard string) error {
-	for range listTries {
+	for try := 1; ; try++ {
 		if err := rd.s.list(ctx, rd.cl, r); err != nil {
 			return err
 		}
 		r.mu.Lock()
 		childless := r.childless(shard)
 		r.mu.Unlock()
-		if !childless {
+		if !childless || rd.bounded && try >= listTries {
 			return nil
 		}
 		select {
@@ -765,7 +769,6 @@ func (rd *reading) listChildren(ctx context.Context, r *streamRead, shard string
 		case <-time.After(listEvery):
 		}
 	}
-	return nil
 }
 
 func (r *streamRead) childless(shard string) bool {

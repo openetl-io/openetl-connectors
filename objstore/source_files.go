@@ -169,6 +169,81 @@ func cmpPos(c cut, o object, incremental bool) int {
 	return cmp.Compare(c.Key, o.Key)
 }
 
+// untilAt is where a read up to an until stops: by position, as a read
+// again lists the files again, and a file read before the until that was
+// deleted or written again since leaves a state that never equals it.
+type untilAt struct {
+	// The until's file: the one it's in, at at, or with at nil the last it
+	// read whole, in the read's order. Incremental: files last modified
+	// before floor are before it too, and with none every other is after.
+	key      string
+	modified int64
+	at       *filePos
+	floor    int64
+	none     bool
+}
+
+// untilOf is where a read from from up to until stops. Incremental, the
+// last file until read whole is the latest of those it has and from hasn't.
+func untilOf(from, until readState, incremental bool) *untilAt {
+	switch {
+	case until.At != nil:
+		return &untilAt{key: until.At.Key, modified: until.At.Modified, at: until.At, floor: until.Floor}
+	case !incremental:
+		return &untilAt{key: until.Last}
+	}
+	u := &untilAt{floor: until.Floor, none: true}
+	for k, m := range until.Read {
+		if from.done(object{Key: k, Modified: time.Unix(0, m), Version: until.Versions[k]}, true) {
+			continue
+		}
+		if u.none || cmp.Or(cmp.Compare(m, u.modified), cmp.Compare(k, u.key)) > 0 {
+			u.key, u.modified, u.none = k, m, false
+		}
+	}
+	return u
+}
+
+// cmpFile compares o with the until's file in the read's order.
+func (u *untilAt) cmpFile(o object, incremental bool) int {
+	if !incremental {
+		return cmp.Compare(o.Key, u.key)
+	}
+	m := o.Modified.UnixNano()
+	switch {
+	case m < u.floor:
+		return -1
+	case u.none:
+		return 1
+	}
+	return cmp.Or(cmp.Compare(m, u.modified), cmp.Compare(o.Key, u.key))
+}
+
+// past says o is after the until, so the read stops before it. Nil: the
+// read has no until.
+func (u *untilAt) past(o object, incremental bool) bool {
+	return u != nil && u.cmpFile(o, incremental) > 0
+}
+
+// after says a read that has read o whole has reached the until.
+func (u *untilAt) after(o object, incremental bool) bool {
+	return u != nil && u.cmpFile(o, incremental) >= 0
+}
+
+// in says a read at p in o has reached the until: o is the file the until
+// is in, as it was then. Of the file written again since, the read reads
+// all.
+func (u *untilAt) in(o object, p filePos, incremental bool) bool {
+	if u == nil || u.at == nil || u.cmpFile(o, incremental) != 0 {
+		return false
+	}
+	a := u.at
+	if o.Modified.UnixNano() != a.Modified || o.Size != a.Size || !sameTag(a.Version, o.Version) {
+		return false
+	}
+	return cmp.Or(cmp.Compare(p.Records, a.Records), cmp.Compare(p.RowGroup, a.RowGroup), cmp.Compare(p.Offset, a.Offset)) >= 0
+}
+
 // filePos is a position in a file, after a batch of its records.
 type filePos struct {
 	Key      string `json:"key"`

@@ -633,7 +633,8 @@ func (w *writer) deleteAll(ctx context.Context, prefix string) {
 
 // dropStaged is best effort, within ctx and cleanupTimeout: a staged file
 // left behind is never applied again, because its stream's marker exists,
-// and DropStale or Recover drops it later.
+// and the Recover of a later generation drops it, with all that earlier
+// generations staged.
 func (w *writer) dropStaged(ctx context.Context, d staged) {
 	ctx, cancel := context.WithTimeout(ctx, cleanupTimeout)
 	defer cancel()
@@ -733,7 +734,8 @@ const cleanupTimeout = 30 * time.Second
 
 // Close aborts open parts and drops the files of epochs that were never
 // pre-committed, within ctx and cleanupTimeout: what a store that stops
-// answering keeps stays for a later Recover or DropStale, as after a crash.
+// answering keeps stays until the Recover of a later generation drops it,
+// as after a crash.
 func (w *writer) Close(ctx context.Context) error {
 	ctx, cancel := context.WithTimeout(ctx, cleanupTimeout)
 	defer cancel()

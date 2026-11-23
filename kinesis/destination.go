@@ -215,6 +215,8 @@ type writer struct {
 type entry struct {
 	data []byte
 	key  string
+	// The epoch it was written in.
+	epoch uint64
 }
 
 func (e entry) size() int { return len(e.data) + len(e.key) }
@@ -533,7 +535,7 @@ func (e *streamEncoder) partitionKey(vals []any) (string, error) {
 	return k, nil
 }
 
-func (w *writer) Write(ctx context.Context, _ destination.Epoch, stream string, batch arrow.RecordBatch) error {
+func (w *writer) Write(ctx context.Context, e destination.Epoch, stream string, batch arrow.RecordBatch) error {
 	if _, ok := w.streams[stream]; !ok {
 		return fmt.Errorf("kinesis: unknown stream %q", stream)
 	}
@@ -564,7 +566,7 @@ func (w *writer) Write(ctx context.Context, _ destination.Epoch, stream string, 
 		if err != nil {
 			return fmt.Errorf("kinesis: stream %q: partition key: %w", stream, err)
 		}
-		if err := w.add(ctx, enc.target, q, entry{data: data, key: key}); err != nil {
+		if err := w.add(ctx, enc.target, q, entry{data: data, key: key, epoch: e.N}); err != nil {
 			return fmt.Errorf("kinesis: stream %q: %w", stream, err)
 		}
 	}
@@ -688,16 +690,30 @@ func (w *writer) limit(ctx context.Context, entries []entry) error {
 	return nil
 }
 
-// PreCommit sends what's left, and returns once Kinesis has accepted every
-// record of the epoch.
-func (w *writer) PreCommit(ctx context.Context, _ destination.Epoch) (destination.Staged, error) {
+// PreCommit sends what's left of epoch e, and returns once Kinesis has
+// accepted every record of it. The next epoch's records, which Writes can
+// give before it, wait for that epoch's PreCommit, or a full request.
+func (w *writer) PreCommit(ctx context.Context, e destination.Epoch) (destination.Staged, error) {
 	for target, q := range w.pending {
-		for len(q.entries) > 0 {
-			if err := w.putAll(ctx, target, w.take(q)); err != nil {
+		// Writes come in epoch order, and take keeps it, so e's records are
+		// the queue's first.
+		n := 0
+		for n < len(q.entries) && q.entries[n].epoch <= e.N {
+			n++
+		}
+		now := &queue{entries: q.entries[:n:n]}
+		for _, en := range now.entries {
+			now.bytes += en.size()
+		}
+		q.entries, q.bytes = q.entries[n:], q.bytes-now.bytes
+		for len(now.entries) > 0 {
+			if err := w.putAll(ctx, target, w.take(now)); err != nil {
 				return nil, err
 			}
 		}
-		delete(w.pending, target)
+		if len(q.entries) == 0 {
+			delete(w.pending, target)
+		}
 	}
 	return nil, nil
 }
