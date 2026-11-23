@@ -302,3 +302,28 @@ func TestSourceIncrementalStopsWhereItIsAsked(t *testing.T) {
 		t.Error("an until with one column of two")
 	}
 }
+
+// A read given the resume point of a read without a read order, sent once
+// it had read every row up to its highest cursor value, reads those rows
+// again though the table has a primary key since, then sends that resume
+// point and completes with it: the resume point holds after its rows, not
+// before them.
+func TestSourceIncrementalReadsAgainAReadWithoutAnOrder(t *testing.T) {
+	e := newSourceEnv(t)
+	e.exec("CREATE TABLE $schema.k (seq int, v text)")
+	e.exec("INSERT INTO $schema.k VALUES (1, 'a'), (2, 'b')")
+	until := `{"done":true,"until":"2"}`
+	if first := mustReadIncremental(t, e.source(""), "k", "seq", ""); !slices.Contains(first.log, "k@"+until) {
+		t.Fatalf("the first read emitted %q", first.log)
+	}
+	e.exec("ALTER TABLE $schema.k ADD PRIMARY KEY (seq)")
+	e.exec("INSERT INTO $schema.k VALUES (3, 'c')")
+	got, err := readIncrementalUntil(t, e.source(`, "chunkRows": 1`), "k", "seq", "", until)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n := len(got.log)
+	if seqs := got.column("k", "seq"); !slices.Equal(seqs, []string{"1", "2"}) || n < 2 || got.log[n-2] != "k@"+until || got.log[n-1] != "k complete"+until {
+		t.Errorf("read %v, emitted %q", seqs, got.log)
+	}
+}

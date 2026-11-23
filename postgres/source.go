@@ -544,9 +544,13 @@ type incrementalEnd struct {
 	// The state given; nil if none was.
 	state []byte
 	// It's an until: the read emits no row past after, the until's
-	// position, nil before the first row, then a resume point with state.
+	// position, nil before the first row unless done, then a resume point
+	// with state.
 	until bool
 	after []string
+	// The until is of a read without a read order that had read its rows:
+	// it holds after every row up to ceiling.
+	done bool
 	// The highest cursor value the read that sent state went up to, which
 	// a completion's floor is; nil if it found none.
 	ceiling *string
@@ -570,7 +574,7 @@ func endOf(t table, sp source.Split) (incrementalEnd, error) {
 		e.ceiling = at.Since
 		return e, nil
 	}
-	e.after, e.ceiling = at.After, at.Until
+	e.after, e.ceiling, e.done = at.After, at.Until, at.Done
 	return e, sameOrder(t, at)
 }
 
@@ -689,7 +693,7 @@ func (s *Source) readIncremental(ctx context.Context, conn *pgx.Conn, t table, s
 	if st.Done {
 		return complete(out, sourceState{Since: st.Until})
 	}
-	if stop.until && stop.after == nil {
+	if stop.until && stop.after == nil && !stop.done {
 		return end()
 	}
 	st.Key = t.orderKey()
