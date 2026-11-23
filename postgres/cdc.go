@@ -188,9 +188,7 @@ type chunk struct {
 	rng    *snapshotRange
 	snap   pgSnapshot
 	// Transactions that committed at or after it weren't seen. It's held
-	// until the log reaches it, and its rows' sequence is its. In a read that
-	// ends at an until, it's the until's position if that's sooner: the next
-	// read reads the transactions from there again, after it.
+	// until the log reaches it, and its rows' sequence is its.
 	lsn  pglogrepl.LSN
 	rows map[string][][]byte
 	// Keys in key order.
@@ -287,7 +285,7 @@ func (s *Source) readCDC(ctx context.Context, conns *connPool, req source.ReadRe
 			}
 		}
 		if !req.Continuous {
-			if err := st.stopAt(cs.Until, cs.CompleteAt); err != nil {
+			if err := st.stopAt(r.slot, cs.Until, cs.CompleteAt); err != nil {
 				return err
 			}
 		}
@@ -386,9 +384,10 @@ func (r *cdcReader) slotConfirmed(ctx context.Context) (pglogrepl.LSN, error) {
 // stopAt sets where a bounded read of the stream stops: its until, or its
 // complete_at, which is never set with it. Either is a state this source
 // sent, whose position says which transactions the read that sent it had
-// read: those that committed before it. A stream with a snapshot left to
-// read ignores it, as a chunk read again isn't the chunk read before.
-func (st *cdcStream) stopAt(until, completeAt []byte) error {
+// read: those that committed before it, in slot's log; one in another's fails
+// with POSITION_LOST. A stream with a snapshot left to read ignores it, as a
+// chunk read again isn't the chunk read before.
+func (st *cdcStream) stopAt(slot string, until, completeAt []byte) error {
 	state := until
 	if state == nil {
 		state = completeAt
@@ -402,6 +401,9 @@ func (st *cdcStream) stopAt(until, completeAt []byte) error {
 	}
 	if at.Snapshot != nil || at.LSN == 0 {
 		return nil
+	}
+	if at.Slot != slot {
+		return positionLost("postgres: %s is to stop at %s in replication slot %q, and the source reads %q", st.t.name, pglogrepl.LSN(at.LSN), at.Slot, slot)
 	}
 	st.stop, st.stopState, st.until = pglogrepl.LSN(at.LSN), state, until != nil
 	return nil

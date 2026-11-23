@@ -78,8 +78,10 @@ type cdcState struct {
 	// Stream records created before this are in the snapshot.
 	Skip time.Time `json:"skip"`
 	// The snapshot's segments, while it runs.
-	Snapshot []segState            `json:"snapshot,omitempty"`
-	Shards   map[string]shardState `json:"shards,omitempty"`
+	Snapshot []segState `json:"snapshot,omitempty"`
+	// Each shard's position, from begin on; nil before, when list adopts
+	// none of the shards it lists.
+	Shards map[string]shardState `json:"shards,omitempty"`
 }
 
 type shardState struct {
@@ -146,7 +148,7 @@ func (s *Source) readCDC(ctx context.Context, cl *clients, cs source.ConfiguredS
 	}
 	switch {
 	case len(cs.State) > 0:
-		if err := json.Unmarshal(cs.State, &r.st); err != nil {
+		if r.st, err = decodeState(cs.State); err != nil {
 			return fmt.Errorf("dynamodb: state of %s: %w", cs.Name, err)
 		}
 		if r.st.Stream != t.streamARN {
@@ -179,6 +181,19 @@ func (s *Source) readCDC(ctx context.Context, cl *clients, cs source.ConfiguredS
 		}
 	}
 	return r.follow(ctx)
+}
+
+// decodeState decodes a read's state. Every state is past begin, so it
+// tracks shards: none where the stream listed none, which JSON leaves out.
+func decodeState(b []byte) (cdcState, error) {
+	var st cdcState
+	if err := json.Unmarshal(b, &st); err != nil {
+		return st, err
+	}
+	if st.Shards == nil {
+		st.Shards = map[string]shardState{}
+	}
+	return st, nil
 }
 
 // begin lists the stream's shards, each to be read from the snapshot's

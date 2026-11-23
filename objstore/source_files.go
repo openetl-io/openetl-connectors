@@ -13,6 +13,9 @@ import (
 	"time"
 
 	"gocloud.dev/blob"
+
+	sdk "github.com/openetl-io/openetl/sdk/go"
+	protocolv1 "github.com/openetl-io/openetl/sdk/go/protocol/v1"
 )
 
 // globRegexp is the regular expression of a glob over keys: * and ? match
@@ -167,6 +170,153 @@ func cmpPos(c cut, o object, incremental bool) int {
 		}
 	}
 	return cmp.Compare(c.Key, o.Key)
+}
+
+// untilAt is where a read up to an until stops: by position, as a read
+// again lists the files again, and a file written since leaves a state that
+// never equals it.
+type untilAt struct {
+	// The until's file: the one it's in, at at, or with at nil the last it
+	// read whole, in the read's order. Incremental: files last modified
+	// before floor are before it too, and with none every other is after.
+	key      string
+	modified int64
+	at       *filePos
+	floor    int64
+	none     bool
+	// The files the read sends records of up to the until, as the until's
+	// state saw them, which have to be as they were.
+	need []needed
+}
+
+// needed is a file a read up to an until sends records of, as at has it,
+// of any size where at's is below 0. Nil at: any file of the key, all a
+// full refresh's state keeps of a file it read whole.
+type needed struct {
+	key string
+	at  *filePos
+}
+
+func (n needed) matches(o object) bool {
+	a := n.at
+	return a == nil || o.Modified.UnixNano() == a.Modified && (a.Size < 0 || o.Size == a.Size) && sameTag(a.Version, o.Version)
+}
+
+// untilOf is where a read from from up to until stops. Incremental, the
+// last file until read whole is the latest of those it has and from hasn't.
+func untilOf(from, until readState, incremental bool) *untilAt {
+	u := &untilAt{floor: until.Floor, none: true, need: neededOf(from, until, incremental)}
+	switch {
+	case until.At != nil:
+		u.key, u.modified, u.at, u.none = until.At.Key, until.At.Modified, until.At, false
+	case !incremental:
+		u.key, u.none = until.Last, false
+	default:
+		for _, n := range readSince(from, until) {
+			if u.none || cmp.Or(cmp.Compare(n.at.Modified, u.modified), cmp.Compare(n.key, u.key)) > 0 {
+				u.key, u.modified, u.none = n.key, n.at.Modified, false
+			}
+		}
+	}
+	return u
+}
+
+// readSince are the files an incremental until read whole that from
+// hadn't.
+func readSince(from, until readState) []needed {
+	var out []needed
+	for k, m := range until.Read {
+		v := until.Versions[k]
+		if !from.done(object{Key: k, Modified: time.Unix(0, m), Version: v}, true) {
+			out = append(out, needed{key: k, at: &filePos{Key: k, Modified: m, Size: -1, Version: v}})
+		}
+	}
+	return out
+}
+
+// neededOf are the files a read from from up to until sends records of:
+// those it reads whole on the way, and the until's own up to its place.
+func neededOf(from, until readState, incremental bool) []needed {
+	var out []needed
+	switch {
+	case incremental:
+		out = readSince(from, until)
+	case until.Last != "" && until.Last != from.Last:
+		out = append(out, needed{key: until.Last})
+	}
+	a := until.At
+	if f := from.At; !incremental && f != nil && (a == nil || a.Key != f.Key) {
+		out = append(out, needed{key: f.Key, at: f})
+	}
+	if a != nil && (from.At == nil || *from.At != *a) {
+		out = append(out, needed{key: a.Key, at: a})
+	}
+	return out
+}
+
+// gone fails a read with POSITION_LOST if a file it sends records of up to
+// its until isn't among files, or isn't as it was: the read can't send
+// those records again.
+func (u *untilAt) gone(files []object, stream string) error {
+	if u == nil {
+		return nil
+	}
+	listed := make(map[string]object, len(files))
+	for _, o := range files {
+		listed[o.Key] = o
+	}
+	for _, n := range u.need {
+		o, ok := listed[n.key]
+		what := "was deleted"
+		switch {
+		case ok && n.matches(o):
+			continue
+		case ok:
+			what = "was written again"
+		}
+		return sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_POSITION_LOST, fmt.Errorf("objstore: stream %q: %s, which the read up to where it stops sends records of, %s since, so the read can't send them again", stream, n.key, what))
+	}
+	return nil
+}
+
+// cmpFile compares o with the until's file in the read's order.
+func (u *untilAt) cmpFile(o object, incremental bool) int {
+	if !incremental {
+		return cmp.Compare(o.Key, u.key)
+	}
+	m := o.Modified.UnixNano()
+	switch {
+	case m < u.floor:
+		return -1
+	case u.none:
+		return 1
+	}
+	return cmp.Or(cmp.Compare(m, u.modified), cmp.Compare(o.Key, u.key))
+}
+
+// past says o is after the until, so the read stops before it. Nil: the
+// read has no until.
+func (u *untilAt) past(o object, incremental bool) bool {
+	return u != nil && u.cmpFile(o, incremental) > 0
+}
+
+// after says a read that has read o whole has reached the until.
+func (u *untilAt) after(o object, incremental bool) bool {
+	return u != nil && u.cmpFile(o, incremental) >= 0
+}
+
+// in says a read at p in o has reached the until: o is the file the until
+// is in, as it was then. Of the file written again since, the read reads
+// all.
+func (u *untilAt) in(o object, p filePos, incremental bool) bool {
+	if u == nil || u.at == nil || u.cmpFile(o, incremental) != 0 {
+		return false
+	}
+	a := u.at
+	if o.Modified.UnixNano() != a.Modified || o.Size != a.Size || !sameTag(a.Version, o.Version) {
+		return false
+	}
+	return cmp.Or(cmp.Compare(p.Records, a.Records), cmp.Compare(p.RowGroup, a.RowGroup), cmp.Compare(p.Offset, a.Offset)) >= 0
 }
 
 // filePos is a position in a file, after a batch of its records.

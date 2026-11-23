@@ -3,6 +3,7 @@ package postgres
 import (
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"slices"
 	"strings"
@@ -13,6 +14,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/jackc/pglogrepl"
 
+	protocolv1 "github.com/openetl-io/openetl/sdk/go/protocol/v1"
 	"github.com/openetl-io/openetl/sdk/go/source"
 )
 
@@ -132,9 +134,9 @@ func TestCDCStopsAtAPosition(t *testing.T) {
 		state, _ := json.Marshal(cdcState{Slot: "s", LSN: lsn(stopAt)})
 		var err error
 		if until {
-			err = st.stopAt(state, nil)
+			err = st.stopAt("s", state, nil)
 		} else {
-			err = st.stopAt(nil, state)
+			err = st.stopAt("s", nil, state)
 		}
 		if err != nil || st.stop != stopAt {
 			t.Fatalf("stops at %v (%v), not at %v", st.stop, err, stopAt)
@@ -202,16 +204,35 @@ func TestCDCStopsAtAPosition(t *testing.T) {
 	// with a snapshot of its own.
 	st := &cdcStream{t: table{name: "users"}, ranges: []*snapshotRange{{}}}
 	state, _ := json.Marshal(cdcState{Slot: "s", LSN: 300})
-	if err := st.stopAt(state, nil); err != nil || st.stop != 0 {
+	if err := st.stopAt("s", state, nil); err != nil || st.stop != 0 {
 		t.Errorf("a stream mid-snapshot stops at %v (%v)", st.stop, err)
 	}
 	st = &cdcStream{t: table{name: "users"}}
 	state, _ = json.Marshal(cdcState{Slot: "s", LSN: 300, Snapshot: &snapshotCursor{After: []string{"7"}}})
-	if err := st.stopAt(state, nil); err != nil || st.stop != 0 {
+	if err := st.stopAt("s", state, nil); err != nil || st.stop != 0 {
 		t.Errorf("a stop mid-snapshot stops at %v (%v)", st.stop, err)
 	}
-	if err := st.stopAt([]byte("{"), nil); err == nil {
+	if err := st.stopAt("s", []byte("{"), nil); err == nil {
 		t.Error("a broken until")
+	}
+}
+
+// A position in another slot's log says nothing of this one's: a read asked
+// to stop at one fails with POSITION_LOST, as one resumed from it does.
+func TestCDCStopsOnlyAtAPositionOfItsSlot(t *testing.T) {
+	state, _ := json.Marshal(cdcState{Slot: "other", LSN: 300})
+	for _, until := range []bool{true, false} {
+		st := &cdcStream{t: table{name: "users"}}
+		var err error
+		if until {
+			err = st.stopAt("s", state, nil)
+		} else {
+			err = st.stopAt("s", nil, state)
+		}
+		var coded interface{ ErrorCode() protocolv1.ErrorCode }
+		if !errors.As(err, &coded) || coded.ErrorCode() != protocolv1.ErrorCode_ERROR_CODE_POSITION_LOST || st.stop != 0 {
+			t.Errorf("until %v: stops at %v (%v), want POSITION_LOST", until, st.stop, err)
+		}
 	}
 }
 

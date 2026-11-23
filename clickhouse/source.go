@@ -275,6 +275,17 @@ type sourceState struct {
 	keyRange
 }
 
+// stateOf decodes a split's state; an empty one is a read from the start.
+func stateOf(stream string, state []byte) (sourceState, error) {
+	var st sourceState
+	if len(state) > 0 {
+		if err := json.Unmarshal(state, &st); err != nil {
+			return st, fmt.Errorf("clickhouse: %s state: %w", stream, err)
+		}
+	}
+	return st, nil
+}
+
 func (s *Source) Read(ctx context.Context, req source.ReadRequest, out source.Emitter) error {
 	ctx = noDeadline{ctx}
 	limit := min(max(req.Lanes, 1), s.cfg.MaxConnections)
@@ -300,11 +311,9 @@ func (s *Source) Read(ctx context.Context, req source.ReadRequest, out source.Em
 		}
 	}
 	return source.ReadSplits(ctx, source.ReadRequest{Streams: req.Streams, Lanes: limit}, out, func(ctx context.Context, cs source.ConfiguredStream, sp source.Split, e source.SplitEmitter) error {
-		var st sourceState
-		if sp.State != nil {
-			if err := json.Unmarshal(sp.State, &st); err != nil {
-				return fmt.Errorf("clickhouse: %s state: %w", cs.Name, err)
-			}
+		st, err := stateOf(cs.Name, sp.State)
+		if err != nil {
+			return err
 		}
 		until := sp.Until
 		if sp.ID == source.WholeStream && until == nil {

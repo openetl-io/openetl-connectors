@@ -253,3 +253,55 @@ func TestSameVersionAgain(t *testing.T) {
 		t.Errorf("after the version again with v b, the item is %v", it)
 	}
 }
+
+// An overwrite read's swap that a crash cut short, finished by an attempt
+// without its stream, as one paused or removed since, applies the read with
+// the key and deletes the stream had: a delete marks its key's item
+// deleted, or removes it.
+func TestPendingSwapWithoutTheStream(t *testing.T) {
+	for _, deletes := range []destination.DeleteMode{destination.SoftDelete, destination.HardDelete} {
+		db := newMemDB(map[string][]string{controlTable: {"p", "n"}})
+		w := memWriter(t, db, destination.Stream{Name: "t", Mode: destination.Overwrite, PrimaryKey: []string{"id"}, Deletes: deletes})
+		if err := w.StartReads(t.Context(), map[string]time.Time{"t": time.Now()}); err != nil {
+			t.Fatal(err)
+		}
+		e := destination.Epoch{Generation: 1, N: 1}
+		b := memBatch([]string{"id", "v", idColumn, opColumn},
+			[]*string{sp("a"), sp("1"), sp("id-1"), sp("insert")},
+			[]*string{sp("b"), sp("2"), sp("id-2"), sp("insert")},
+			[]*string{sp("b"), nil, sp("id-3"), sp("delete")})
+		err := w.Write(t.Context(), e, "t", b)
+		b.Release()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := w.EndRead(t.Context(), e, "t"); err != nil {
+			t.Fatal(err)
+		}
+		staged, err := w.PreCommit(t.Context(), e)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// The swap fails on the missing target, after the marker.
+		if _, err := w.Commit(t.Context(), e, []destination.Staged{staged}); err == nil {
+			t.Fatal("committed into a table that isn't there")
+		}
+		if _, err := db.CreateTable(t.Context(), &dynamodb.CreateTableInput{TableName: aws.String("t"), KeySchema: []types.KeySchemaElement{{AttributeName: aws.String("id"), KeyType: types.KeyTypeHash}}}); err != nil {
+			t.Fatal(err)
+		}
+		memWriter(t, db)
+		items := map[string]map[string]types.AttributeValue{}
+		for _, it := range db.items("t") {
+			items[stringOf(it["id"])] = it
+		}
+		deleted, _ := items["b"][deletedColumn].(*types.AttributeValueMemberBOOL)
+		switch {
+		case stringOf(items["a"]["v"]) != "1":
+			t.Errorf("deletes %d: items %v, want a's", deletes, items)
+		case deletes == destination.HardDelete && items["b"] != nil:
+			t.Errorf("hard deletes: b is %v, want it gone", items["b"])
+		case deletes == destination.SoftDelete && (deleted == nil || !deleted.Value || stringOf(items["b"]["v"]) != "2"):
+			t.Errorf("soft deletes: b is %v, want its item marked deleted", items["b"])
+		}
+	}
+}

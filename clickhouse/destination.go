@@ -632,27 +632,32 @@ const (
 	loadsTable = "_openetl_loads"
 )
 
-// fence is the pipeline's highest generation, 0 if none has recovered.
-func (w *writer) fence(ctx context.Context) (uint64, error) {
-	var g uint64
-	if err := w.conn.QueryRow(ctx, "SELECT max(generation) FROM "+w.q(fenceTable)+" WHERE pipeline = ?", w.cfg.Pipeline).Scan(&g); err != nil {
-		return 0, classify(fmt.Errorf("clickhouse: read the fence: %w", err))
+// fence is the pipeline's highest generation; ok is false if none has
+// recovered, and the fence has no row.
+func (w *writer) fence(ctx context.Context) (g uint64, ok bool, err error) {
+	var rows uint64
+	if err := w.conn.QueryRow(ctx, "SELECT max(generation), count() FROM "+w.q(fenceTable)+" WHERE pipeline = ?", w.cfg.Pipeline).Scan(&g, &rows); err != nil {
+		return 0, false, classify(fmt.Errorf("clickhouse: read the fence: %w", err))
 	}
-	return g, nil
+	return g, rows > 0, nil
 }
 
-func (w *writer) checkFence(ctx context.Context) error {
-	g, err := w.fence(ctx)
+// fenceAt fails with ErrFenced if a generation newer than gen has raised
+// the fence, and fails if none has raised it.
+func (w *writer) fenceAt(ctx context.Context, gen uint64) error {
+	g, ok, err := w.fence(ctx)
 	switch {
 	case err != nil:
 		return err
-	case g == 0:
+	case !ok:
 		return errors.New("clickhouse: the fence is missing; Recover must run first")
-	case g > w.cfg.Generation:
-		return fmt.Errorf("%w: fence is %d, applier is %d", destination.ErrFenced, g, w.cfg.Generation)
+	case g > gen:
+		return fmt.Errorf("%w: fence is %d, applier is %d", destination.ErrFenced, g, gen)
 	}
 	return nil
 }
+
+func (w *writer) checkFence(ctx context.Context) error { return w.fenceAt(ctx, w.cfg.Generation) }
 
 // apply makes one stream's part of the epoch visible, unless its marker is
 // there, and returns the staged rows it didn't insert, as Dedupe skipped
@@ -717,6 +722,8 @@ func (w *writer) apply(ctx context.Context, desc staged, s stagedStream) (uint64
 			}
 		}
 	}
+	// The marker is written before the staging is dropped, which Recover's
+	// unapplied relies on.
 	if err := w.exec(ctx, "INSERT INTO "+w.q(loadsTable)+" (pipeline, stream, generation, epoch) VALUES ("+
 		literal(w.cfg.Pipeline)+", "+literal(s.Name)+", "+strconv.FormatUint(desc.Generation, 10)+", "+strconv.FormatUint(desc.Epoch, 10)+")"); err != nil {
 		return 0, fmt.Errorf("clickhouse: write the marker of %s: %w", s.Name, err)

@@ -184,6 +184,10 @@ func (w *writer) Stage(ctx context.Context, tables map[uint64]map[string]*stagin
 	if err != nil {
 		return nil, err
 	}
+	if len(cols) == 0 {
+		// No apply could read its staging: a target needs a column.
+		return nil, fmt.Errorf("sqlserver: a batch of %s has no columns, and a table needs one", stream)
+	}
 	keyed(cols, key)
 	byStream := tables[e.N]
 	if byStream == nil {

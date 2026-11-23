@@ -403,6 +403,28 @@ func TestStageMixedSources(t *testing.T) {
 	}
 }
 
+// A batch without columns is refused before anything is staged: a Redshift
+// table has a column, so no target can take its rows, and a staging that no
+// apply can read would fail every Commit and Recover of its epoch.
+func TestStageRefusesABatchWithoutColumns(t *testing.T) {
+	rec := array.NewRecordBatch(arrow.NewSchema(nil, nil), nil, 3)
+	defer rec.Release()
+	dir := t.TempDir()
+	w := &writer{dir: dir, Epochs: sqlstage.NewEpochs[*stagingTable]()}
+	st, err := w.stage(w.Staging, "stg", destination.Epoch{N: 1}, "s", "t", nil, rec)
+	if st != nil {
+		for _, p := range st.parts {
+			p.discard()
+		}
+	}
+	if err == nil || !strings.Contains(err.Error(), "no columns") {
+		t.Errorf("a batch without columns: %v", err)
+	}
+	if files, _ := os.ReadDir(dir); len(w.Staging[1]) > 0 || len(files) > 0 {
+		t.Errorf("staged %v, in %d files", w.Staging[1], len(files))
+	}
+}
+
 // A merge's unchanged column comes only from a version that isn't older
 // than the target's row, which mergePicks joins; without a seq, from any.
 func TestMergePicks(t *testing.T) {

@@ -6,6 +6,7 @@ import (
 	"crypto/md5"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"reflect"
 	"regexp"
 	"slices"
@@ -15,6 +16,8 @@ import (
 	"time"
 
 	"github.com/apache/arrow-go/v18/arrow"
+	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awskinesis "github.com/aws/aws-sdk-go-v2/service/kinesis"
 	"github.com/aws/aws-sdk-go-v2/service/kinesis/types"
@@ -434,6 +437,50 @@ func TestPartialFailureKeepsKeyOrder(t *testing.T) {
 		}
 		if inOrder != c.inOrder {
 			t.Errorf("ordering %s: in order %v, accepted %v", c.ordering, inOrder, f.accepted)
+		}
+	}
+}
+
+// PreCommit sends its epoch's records alone: the next epoch's, which Writes
+// can give before it, wait for that epoch's PreCommit.
+func TestPreCommitSendsItsEpoch(t *testing.T) {
+	f := &fakePutter{}
+	w := testWriter(orderingKey, f)
+	w.d.cfg.Format, w.d.cfg.PartitionKey.Mode = records.JSON, partitionByKey
+	w.streams = map[string]destination.Stream{"t": {Name: "t", PrimaryKey: []string{"id"}}}
+	w.encs, w.ready = map[string]*streamEncoder{}, map[string]bool{"t": true}
+	sc := arrow.NewSchema([]arrow.Field{{Name: "id", Type: arrow.PrimitiveTypes.Int64}}, nil)
+	write := func(n uint64, ids ...int64) {
+		b := array.NewInt64Builder(memory.DefaultAllocator)
+		defer b.Release()
+		b.AppendValues(ids, nil)
+		col := b.NewArray()
+		defer col.Release()
+		batch := array.NewRecordBatch(sc, []arrow.Array{col}, int64(len(ids)))
+		defer batch.Release()
+		if err := w.Write(t.Context(), destination.Epoch{Generation: 1, N: n}, "t", batch); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write(1, 1, 2, 1)
+	write(2, 3, 1)
+	for _, c := range []struct {
+		n    uint64
+		want string
+	}{{1, "1,2,1"}, {2, "1,2,1,3,1"}} {
+		if _, err := w.PreCommit(t.Context(), destination.Epoch{Generation: 1, N: c.n}); err != nil {
+			t.Fatal(err)
+		}
+		var got []string
+		for _, e := range f.accepted {
+			var row map[string]any
+			if err := json.Unmarshal(e.data, &row); err != nil {
+				t.Fatal(err)
+			}
+			got = append(got, fmt.Sprint(row["id"]))
+		}
+		if strings.Join(got, ",") != c.want {
+			t.Errorf("after PreCommit(%d), Kinesis has %v, want %s", c.n, got, c.want)
 		}
 	}
 }

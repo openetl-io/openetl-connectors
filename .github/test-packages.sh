@@ -244,7 +244,7 @@ SQL
       --unreachable "$work/$container-source-closed.json" \
       --stream users:full_refresh --stream events:incremental:at --stream orders:cdc \
       --add-records-command "$work/my-add $container $client" \
-      --stops-at-until
+      --stops-at-until $(stops mysql --stops-at-completion)
     config "$container-dest" "{\"dsn\": \"$dsn\"}"
     config "$container-dest-bad" "{\"dsn\": \"$bad\"}"
     config "$container-dest-closed" "{\"dsn\": \"$closed\"}"
@@ -310,7 +310,7 @@ SH
     --bad-credentials "$work/ms-source-bad.json" \
     --unreachable "$work/ms-source-closed.json" \
     --stream users:full_refresh --stream orders:cdc --add-records-command "$work/ms-add" \
-    --stops-at-until
+    --stops-at-until $(stops sqlserver --stops-at-completion)
   config ms-dest "{\"dsn\": \"$ms\"}"
   config ms-dest-bad "{\"dsn\": \"$bad_ms\"}"
   config ms-dest-closed "{\"dsn\": \"$closed_ms\"}"
@@ -386,7 +386,7 @@ SH
     --bad-credentials "$work/ora-source-bad.json" \
     --unreachable "$work/ora-source-closed.json" \
     --stream "${up}_USERS:full_refresh" --stream "${up}_EVENTS:incremental:AT" --stream "${up}_ORDERS:cdc" \
-    --add-records-command "$work/ora-add" --stops-at-until
+    --add-records-command "$work/ora-add" --stops-at-until $(stops oracle --stops-at-completion)
   # A table's rows as JSON lines: a time of day as HH:MM:SS.fffffffff, a
   # BINARY_FLOAT or BINARY_DOUBLE as text that keeps every digit, and an
   # interval's JSON text as an object.

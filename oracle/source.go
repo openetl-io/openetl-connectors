@@ -238,6 +238,8 @@ type sourceState struct {
 	// The key of the last row read, spelled as keyText spells it; in an
 	// incremental read, its cursor value first.
 	After []string `json:"after,omitempty"`
+	// The key's columns that After and the key range are of: see orderKey.
+	Key []string `json:"key,omitempty"`
 	// Set once a table read in one query has been read.
 	Done bool `json:"done,omitempty"`
 	// An incremental read's cursor floor, inclusive, and the highest value
@@ -247,6 +249,31 @@ type sourceState struct {
 	Until *string `json:"until,omitempty"`
 	// A split's key range.
 	keyRange
+}
+
+// orderKey is what a state names a table's read order by: its key's
+// columns, or none for a table read in one query.
+func orderKey(t table) []string {
+	if !chunked(t) {
+		return nil
+	}
+	var names []string
+	for _, k := range t.key {
+		names = append(names, t.cols[k].name)
+	}
+	return names
+}
+
+// sameOrder fails a read resumed in another order than the one its state
+// was read in, as once the table's key has been added, dropped or changed,
+// which only a read from the start carries on from. A split's range is of
+// its order's first column, so it holds before its first row.
+func sameOrder(t table, st sourceState) error {
+	positioned := st.After != nil || st.Lo != nil || st.Hi != nil
+	if now := orderKey(t); positioned && (now == nil || !slices.Equal(st.Key, now)) {
+		return positionLost("oracle: %s was read in the order of columns %v, and is now read in the order of %v: read it again from the start", t.name, st.Key, now)
+	}
+	return nil
 }
 
 // keyText spells a key's or a cursor's value, as go-ora reads it, for a
@@ -507,14 +534,10 @@ func (s *Source) Read(ctx context.Context, req source.ReadRequest, out source.Em
 	}
 	readRest := func(ctx context.Context, lanes int) error {
 		return source.ReadSplits(ctx, source.ReadRequest{Streams: rest, Lanes: lanes}, out, func(ctx context.Context, cs source.ConfiguredStream, sp source.Split, e source.SplitEmitter) error {
-			until := sp.Until
-			if sp.ID == source.WholeStream && len(cs.Splits) == 0 {
-				until = cs.Until
-			}
 			if req.Continuous {
-				until = nil
+				sp.Until, sp.CompleteAt = nil, nil
 			}
-			return s.readSplit(ctx, conns, schema, tables, cs, sp, until, e)
+			return s.readSplit(ctx, conns, schema, tables, cs, sp, e)
 		})
 	}
 	var readCDC func(context.Context) error
@@ -541,29 +564,32 @@ func undeclared(t table, columns []string) error {
 }
 
 // readSplit reads one split of a table read in full or incrementally, on a
-// connection of its own; up to the resume point whose state is until, if
-// it isn't nil.
-func (s *Source) readSplit(ctx context.Context, conns *connPool, schema string, tables []table, cs source.ConfiguredStream, sp source.Split, until []byte, out source.SplitEmitter) error {
+// connection of its own; up to the split's Until, or its CompleteAt, if it
+// has one.
+func (s *Source) readSplit(ctx context.Context, conns *connPool, schema string, tables []table, cs source.ConfiguredStream, sp source.Split, out source.SplitEmitter) error {
 	var st sourceState
 	if sp.State != nil {
 		if err := json.Unmarshal(sp.State, &st); err != nil {
 			return fmt.Errorf("oracle: %s state: %w", cs.Name, err)
 		}
 	}
+	t, _ := findTable(tables, cs.Name)
+	if err := sameOrder(t, st); err != nil {
+		return err
+	}
 	conn, err := conns.Get(ctx)
 	if err != nil {
 		return err
 	}
 	defer conns.Put(conn)
-	t, _ := findTable(tables, cs.Name)
 	b := newBatcher(memory.DefaultAllocator, t.cols, false)
 	defer b.release()
 	r := &tableReader{s: s, conn: conn, schema: schema, t: t, b: b, out: out}
-	if until != nil {
-		return r.readUntil(ctx, cs, st, until)
+	if sp.Until != nil {
+		return r.readUntil(ctx, cs, st, sp.Until)
 	}
 	if cs.SyncMode == source.Incremental {
-		return r.readIncremental(ctx, sp.ID, cs.Cursor, st)
+		return r.readIncremental(ctx, sp.ID, cs.Cursor, st, sp.CompleteAt)
 	}
 	return r.readTable(ctx, sp.ID, st)
 }
@@ -606,6 +632,9 @@ func (r *tableReader) readUntil(ctx context.Context, cs source.ConfiguredStream,
 	if err := json.Unmarshal(until, &u); err != nil {
 		return fmt.Errorf("oracle: %s until: %w", cs.Name, err)
 	}
+	if err := sameOrder(r.t, u); err != nil {
+		return err
+	}
 	order := r.t.key
 	bounds := func(w *where) error { return nil }
 	if cs.SyncMode == source.Incremental {
@@ -617,8 +646,9 @@ func (r *tableReader) readUntil(ctx context.Context, cs source.ConfiguredStream,
 		order = incrementalOrder(r.t, ci)
 	}
 	switch {
-	case !chunked(r.t):
-		if !st.Done && u.Done {
+	case u.Done:
+		// A read in one query, as of a table that may have had no key then.
+		if !st.Done {
 			if _, _, err := r.query(ctx, nil, bounds, nil); err != nil {
 				return err
 			}
@@ -674,7 +704,9 @@ func cursorBounds(c column, st sourceState) func(*where) error {
 }
 
 func (r *tableReader) readTable(ctx context.Context, id string, st sourceState) error {
-	if !chunked(r.t) {
+	// A read in one query, as of a table before it had a key, is done once
+	// that query is.
+	if !chunked(r.t) || st.Done {
 		if !st.Done {
 			if _, _, err := r.query(ctx, nil, nil, nil); err != nil {
 				return err
@@ -688,7 +720,7 @@ func (r *tableReader) readTable(ctx context.Context, id string, st sourceState) 
 	if st.After != nil && len(st.After) != len(r.t.key) {
 		return fmt.Errorf("oracle: %s state has %d key columns, the table has %d", r.t.name, len(st.After), len(r.t.key))
 	}
-	st = sourceState{After: st.After, keyRange: st.keyRange}
+	st = sourceState{After: st.After, Key: orderKey(r.t), keyRange: st.keyRange}
 	reading := r.s.Start(r.t.name, id, true)
 	defer r.s.End(r.t.name, id)
 	for {
@@ -717,23 +749,32 @@ func (r *tableReader) readTable(ctx context.Context, id string, st sourceState) 
 // to the cursor's highest value when the read started, in (cursor, key)
 // order. It completes with that value as the next read's floor, so the rows
 // that hold it are read again then. Rows with a NULL cursor aren't read.
-func (r *tableReader) readIncremental(ctx context.Context, id, cursor string, st sourceState) error {
+// completeAt, if set, is a completion this source sent before: the read goes
+// up to its floor, which was that read's highest value, and completes with
+// it.
+func (r *tableReader) readIncremental(ctx context.Context, id, cursor string, st sourceState, completeAt []byte) error {
 	ci, err := cursorColumn(r.t, cursor)
 	if err != nil {
 		return err
 	}
+	end := func() error { return complete(r.out, sourceState{Since: st.Until}) }
+	if completeAt != nil {
+		end = func() error { return r.out.Complete(completeAt) }
+	}
 	if st.Until == nil {
-		until, err := maxCursor(ctx, r.conn, r.schema, r.t, ci)
+		until, err := r.upTo(ctx, ci, completeAt)
 		if err != nil {
 			return err
 		}
 		if until == nil {
-			return complete(r.out, sourceState{Since: st.Since})
+			// Nothing to read: the next read keeps the floor.
+			st.Until = st.Since
+			return end()
 		}
 		st = sourceState{Since: st.Since, Until: until}
 	}
 	bounds := cursorBounds(r.t.cols[ci], st)
-	if !chunked(r.t) {
+	if !chunked(r.t) || st.Done {
 		if !st.Done {
 			if _, _, err := r.query(ctx, nil, bounds, nil); err != nil {
 				return err
@@ -743,12 +784,13 @@ func (r *tableReader) readIncremental(ctx context.Context, id, cursor string, st
 				return err
 			}
 		}
-		return complete(r.out, sourceState{Since: st.Until})
+		return end()
 	}
 	order := incrementalOrder(r.t, ci)
 	if st.After != nil && len(st.After) != len(order) {
 		return fmt.Errorf("oracle: %s state has %d cursor and key columns, the read has %d", r.t.name, len(st.After), len(order))
 	}
+	st.Key = orderKey(r.t)
 	reading := r.s.Start(r.t.name, id, true)
 	defer r.s.End(r.t.name, id)
 	for {
@@ -780,7 +822,7 @@ func (r *tableReader) readIncremental(ctx context.Context, id, cursor string, st
 			return err
 		}
 		if ended {
-			return complete(r.out, sourceState{Since: st.Until})
+			return end()
 		}
 	}
 }
@@ -796,6 +838,20 @@ func maxCursor(ctx context.Context, conn *sql.Conn, schema string, t table, ci i
 	}
 	m := keyText(c, v)
 	return &m, nil
+}
+
+// upTo is the highest cursor value an incremental read reads: the floor of
+// completeAt, a completion it sent before, if set, or else the column's
+// highest value now.
+func (r *tableReader) upTo(ctx context.Context, ci int, completeAt []byte) (*string, error) {
+	if completeAt == nil {
+		return maxCursor(ctx, r.conn, r.schema, r.t, ci)
+	}
+	var at sourceState
+	if err := json.Unmarshal(completeAt, &at); err != nil {
+		return nil, fmt.Errorf("oracle: where %s completes: %w", r.t.name, err)
+	}
+	return at.Since, nil
 }
 
 // cursorColumn is the index of a table's column that an incremental read can

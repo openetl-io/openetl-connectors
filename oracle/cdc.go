@@ -52,6 +52,11 @@ type cdcState struct {
 	// When SCN's transaction committed, or its redo log began: how far
 	// behind the read is, in time.
 	At *time.Time `json:"at,omitempty"`
+	// Where the stream's first read started: the SCN its snapshot is as of,
+	// and the From it then mined from. A read again from no state starts
+	// there. 0: not known.
+	Start     uint64 `json:"start,omitempty"`
+	StartFrom uint64 `json:"startFrom,omitempty"`
 }
 
 type snapshotCursor struct {
@@ -72,7 +77,8 @@ type cdcStream struct {
 	// too.
 	segs map[int]bool
 	lobs bool
-	// A read that stops at a resume point.
+	// A read that stops at a resume point or a completion it sent before:
+	// either is a position the read reached.
 	until    *cdcState
 	untilRaw []byte
 	finished bool
@@ -220,23 +226,19 @@ func (s *Source) readCDC(ctx context.Context, conns *connPool, req source.ReadRe
 		if st.segs, err = r.segments(st.t.name); err != nil {
 			return err
 		}
-		switch {
-		case cs.State == nil:
-			fresh = append(fresh, st)
-		default:
-			if err := json.Unmarshal(cs.State, &st.state); err != nil {
-				return fmt.Errorf("oracle: %s state: %w", t.name, err)
-			}
-			if st.state.DB != r.db {
-				return positionLost("oracle: %s's state is of database %s, and this is %s: read the stream again from a snapshot", t.name, st.state.DB, r.db)
-			}
+		stop := cs.Until
+		if stop == nil {
+			stop = cs.CompleteAt
 		}
-		if cs.Until != nil && !req.Continuous {
-			var u cdcState
-			if err := json.Unmarshal(cs.Until, &u); err != nil {
-				return fmt.Errorf("oracle: %s until: %w", t.name, err)
-			}
-			st.until, st.untilRaw = &u, cs.Until
+		if req.Continuous {
+			stop = nil
+		}
+		isNew, err := r.setUp(st, cs.State, stop)
+		if err != nil {
+			return err
+		}
+		if isNew {
+			fresh = append(fresh, st)
 		}
 		st.b = newBatcher(memory.DefaultAllocator, st.t.cols, true)
 		defer st.b.release()
@@ -252,6 +254,46 @@ func (s *Source) readCDC(ctx context.Context, conns *connPool, req source.ReadRe
 		}
 	}
 	return r.mine()
+}
+
+// setUp sets a stream up to read from its state, and to stop at the state
+// stop if it isn't nil. isNew: it has no state, and starts from a new
+// snapshot.
+func (r *cdcReader) setUp(st *cdcStream, state, stop []byte) (isNew bool, err error) {
+	if stop != nil {
+		var u cdcState
+		if err := json.Unmarshal(stop, &u); err != nil {
+			return false, fmt.Errorf("oracle: %s until: %w", st.t.name, err)
+		}
+		st.until, st.untilRaw = &u, stop
+	}
+	switch {
+	case state != nil:
+		if err := json.Unmarshal(state, &st.state); err != nil {
+			return false, fmt.Errorf("oracle: %s state: %w", st.t.name, err)
+		}
+		if st.state.DB != r.db {
+			return false, positionLost("oracle: %s's state is of database %s, and this is %s: read the stream again from a snapshot", st.t.name, st.state.DB, r.db)
+		}
+	case st.until != nil:
+		st.state, err = startedAt(st.t.name, r.db, *st.until)
+	default:
+		isNew = true
+	}
+	return isNew, err
+}
+
+// startedAt is where a read again from no state up to stop, a state the
+// stream's first read sent, starts: where that read started, so that its
+// snapshot is as of the same SCN and its redo is read from the same place.
+func startedAt(table, db string, stop cdcState) (cdcState, error) {
+	switch {
+	case stop.DB != db:
+		return cdcState{}, positionLost("oracle: %s's position is of database %s, and this is %s: read the stream again from a snapshot", table, stop.DB, db)
+	case stop.Start == 0:
+		return cdcState{}, positionLost("oracle: %s's position doesn't say what SCN its snapshot was read as of, so its first read can't be read again as it was: read the stream again from a snapshot", table)
+	}
+	return cdcState{SCN: stop.Start, From: stop.StartFrom, Snapshot: &snapshotCursor{}, DB: db, Start: stop.Start, StartFrom: stop.StartFrom}, nil
 }
 
 // supplemental checks the redo log holds a change's every column, so an
@@ -328,7 +370,7 @@ func (r *cdcReader) settle(fresh []*cdcStream) error {
 		}
 		if changed == "" {
 			for _, st := range fresh {
-				st.state = cdcState{SCN: at, From: from, Snapshot: &snapshotCursor{}, DB: r.db}
+				st.state = cdcState{SCN: at, From: from, Snapshot: &snapshotCursor{}, DB: r.db, Start: at, StartFrom: from}
 			}
 			return nil
 		}

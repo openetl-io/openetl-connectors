@@ -460,3 +460,27 @@ func TestMergeIntoATableMadeFromStaging(t *testing.T) {
 		}
 	})
 }
+
+// A batch without columns fails its write before anything is staged: a
+// MySQL table has a column, so no target can take its rows, and a staging
+// that no apply can read would fail every Commit and Recover of its epoch.
+// The epoch then commits without it.
+func TestBatchWithoutColumnsIsRefused(t *testing.T) {
+	eachServer(t, func(t *testing.T, srv testServer) {
+		e := newDestEnv(t, srv)
+		w := e.open(destination.Stream{Name: "added", Mode: destination.Append})
+		rec := array.NewRecordBatch(arrow.NewSchema(nil, nil), nil, 3)
+		defer rec.Release()
+		ep := destination.Epoch{Generation: 1, N: 1}
+		if err := w.Write(t.Context(), ep, "added", rec); err == nil || !strings.Contains(err.Error(), "no columns") {
+			t.Fatalf("a batch without columns: %v", err)
+		}
+		st, err := w.PreCommit(t.Context(), ep)
+		if err == nil {
+			_, err = w.Commit(t.Context(), ep, []destination.Staged{st})
+		}
+		if err != nil {
+			t.Errorf("the epoch without it: %v", err)
+		}
+	})
+}

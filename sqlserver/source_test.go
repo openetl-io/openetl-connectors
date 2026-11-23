@@ -451,6 +451,83 @@ func TestSourceFullRefreshResumes(t *testing.T) {
 	}
 }
 
+// A read resumed after its table gained or lost its primary key goes on in
+// the order its state was read in, or fails: a table read to its end
+// without one, then given one, isn't read again; one read part way in its
+// key's order, whose key is then dropped or made of another column, fails
+// with POSITION_LOST rather than reading it again from the start or from a
+// key of other columns, and so does a read again to such a key from no state.
+func TestReadOrderChanges(t *testing.T) {
+	for name, mode := range map[string]source.SyncMode{"full": source.FullRefresh, "incremental": source.Incremental} {
+		t.Run(name, func(t *testing.T) {
+			e := newSourceEnv(t)
+			s := e.source(`, "chunkRows": 2`)
+			read := func(table, state, until string) (*splitCapture, error) {
+				cs := source.ConfiguredStream{Name: table, SyncMode: mode}
+				if mode == source.Incremental {
+					cs.Cursor = "at"
+				}
+				if state != "" {
+					cs.State = []byte(state)
+				}
+				if until != "" {
+					cs.Until = []byte(until)
+				}
+				c := &splitCapture{Col: "id"}
+				return c, s.Read(t.Context(), source.ReadRequest{Streams: []source.ConfiguredStream{cs}}, c)
+			}
+			resumes := func(c *splitCapture) []string {
+				var out []string
+				for _, ev := range c.Of(source.WholeStream) {
+					if ev.Resume {
+						out = append(out, ev.State)
+					}
+				}
+				return out
+			}
+			e.exec("CREATE TABLE $schema.loose (id int NOT NULL, k int NOT NULL, at datetime2)")
+			e.exec("CREATE TABLE $schema.keyed (id int NOT NULL CONSTRAINT pk_keyed PRIMARY KEY, k int NOT NULL, at datetime2)")
+			for _, table := range []string{"loose", "keyed"} {
+				e.exec("INSERT INTO $schema." + table + " SELECT n, 10 - n, DATEADD(day, n, '2026-01-01') FROM (SELECT TOP (5) ROW_NUMBER() OVER (ORDER BY (SELECT 1)) AS n FROM sys.all_objects) x")
+			}
+
+			first, err := read("loose", "", "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			done := resumes(first)
+			if len(done) != 1 || !strings.Contains(done[0], `"done":true`) {
+				t.Fatalf("read without a key: resume points %v", done)
+			}
+			e.exec("ALTER TABLE $schema.loose ADD CONSTRAINT pk_loose PRIMARY KEY (id)")
+			again, err := read("loose", done[0], "")
+			if ev := again.Of(source.WholeStream); err != nil || len(again.Values()) != 0 || len(ev) == 0 || !ev[len(ev)-1].Complete {
+				t.Errorf("from %s, once the table has a key: %v, read %v, events %+v", done[0], err, again.Values(), ev)
+			}
+
+			first, err = read("keyed", "", "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			mid := resumes(first)[0]
+			e.exec("ALTER TABLE $schema.keyed DROP CONSTRAINT pk_keyed")
+			c, err := read("keyed", mid, "")
+			if codeOf(err) != protocolv1.ErrorCode_ERROR_CODE_POSITION_LOST {
+				t.Errorf("from %s, once the table has no key: %v, read %v", mid, err, c.Values())
+			}
+			e.exec("ALTER TABLE $schema.keyed ADD CONSTRAINT pk_keyed_k PRIMARY KEY (k)")
+			c, err = read("keyed", mid, "")
+			if codeOf(err) != protocolv1.ErrorCode_ERROR_CODE_POSITION_LOST {
+				t.Errorf("from %s, once the table's key is another column: %v, read %v", mid, err, c.Values())
+			}
+			c, err = read("keyed", "", mid)
+			if codeOf(err) != protocolv1.ErrorCode_ERROR_CODE_POSITION_LOST {
+				t.Errorf("from no state to %s, once the table's key is another column: %v, read %v", mid, err, c.Values())
+			}
+		})
+	}
+}
+
 // Every type a column can have, read with its nulls and extremes.
 func TestSourceTypes(t *testing.T) {
 	e := newSourceEnv(t)

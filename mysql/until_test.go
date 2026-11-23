@@ -17,6 +17,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
 
+	protocolv1 "github.com/openetl-io/openetl/sdk/go/protocol/v1"
 	"github.com/openetl-io/openetl/sdk/go/source"
 )
 
@@ -249,6 +250,56 @@ func TestCDCReadStopsAtUntil(t *testing.T) {
 	})
 }
 
+// TestCDCReadAgainOnAServerWithoutUntilIsLost reads a part again on another
+// server, by GTIDs, up to a resume point whose GTIDs have transactions the
+// server hasn't, as where a failover lost them or a replica hasn't applied
+// them yet: the read fails as lost, whether the binlog's end or a later
+// transaction comes first, rather than stop there without them. Up to one
+// whose transactions the server has, it stops there.
+func TestCDCReadAgainOnAServerWithoutUntilIsLost(t *testing.T) {
+	eachServer(t, func(t *testing.T, srv testServer) {
+		e := newSourceEnv(t, srv)
+		e.exec("CREATE TABLE $db.items (id int PRIMARY KEY)")
+		e.exec("INSERT INTO $db.items VALUES (1)")
+		s := e.source("")
+		cs := source.ConfiguredStream{Name: "items", SyncMode: source.CDC}
+		first := readLog(t, s, cs)
+		e.exec("INSERT INTO $db.items VALUES (2)")
+		cs.State = []byte(first[len(first)-1].state)
+		second := readLog(t, s, cs)
+		other := func(state, gtids string) []byte {
+			var m map[string]any
+			if err := json.Unmarshal([]byte(state), &m); err != nil {
+				t.Fatal(err)
+			}
+			m["server"] = "another"
+			if gtids != "" {
+				m["gtid"] = fmt.Sprint(m["gtid"], ",", gtids)
+			}
+			b, _ := json.Marshal(m)
+			return b
+		}
+		cs.State = other(first[len(first)-1].state, "")
+		cs.Until = other(second[len(second)-1].state, "")
+		endsAt(t, readLog(t, s, cs), string(cs.Until))
+		missing := "3e11fa47-71ca-11e1-9e33-c80aa9429562:1-5"
+		if srv.name == "mariadb" {
+			missing = "99-99-5"
+		}
+		cs.Until = other(second[len(second)-1].state, missing)
+		for _, when := range []string{"at the binlog's end", "at a later transaction"} {
+			if when == "at a later transaction" {
+				e.exec("INSERT INTO $db.items VALUES (3)")
+			}
+			l := &eventLog{}
+			err := s.Read(t.Context(), source.ReadRequest{Streams: []source.ConfiguredStream{cs}, Pipeline: "until", Lanes: 1}, l)
+			if codeOf(err) != protocolv1.ErrorCode_ERROR_CODE_POSITION_LOST || !strings.Contains(err.Error(), "items") {
+				t.Fatalf("%s, until GTIDs the server hasn't: %v, events %+v", when, err, l.events)
+			}
+		}
+	})
+}
+
 // TestSplitReadStopsAtUntil reads a split, and an incremental read, again
 // between two of their resume points.
 func TestSplitReadStopsAtUntil(t *testing.T) {
@@ -300,6 +351,80 @@ func TestSplitReadStopsAtUntil(t *testing.T) {
 			}
 		}
 	})
+}
+
+// TestReadCompletesAtCompleteAt reads a table by CDC, and incrementally with
+// a key and without, from a completion to the next, then reads that part
+// again, asked to complete where it completed, once the binlog and the
+// cursor have moved on: it returns the same rows, and completes with the
+// same state, not where the table is now.
+func TestReadCompletesAtCompleteAt(t *testing.T) {
+	eachServer(t, func(t *testing.T, srv testServer) {
+		e := newSourceEnv(t, srv)
+		e.exec("CREATE TABLE $db.items (id int PRIMARY KEY, v varchar(20))")
+		e.exec("CREATE TABLE $db.ev (id int PRIMARY KEY, v varchar(20), at int)")
+		e.exec("CREATE TABLE $db.loose (v varchar(20), at int)")
+		e.exec("INSERT INTO $db.items SELECT i, CONCAT('v', i) FROM " + numbers(10))
+		e.exec("INSERT INTO $db.ev SELECT i, CONCAT('v', i), i FROM " + numbers(10))
+		e.exec("INSERT INTO $db.loose SELECT CONCAT('v', i), i FROM " + numbers(10))
+		n := 0
+		change := func() {
+			n++
+			e.exec("INSERT INTO $db.items VALUES (?, ?)", 100+n, fmt.Sprint("r", n))
+			e.exec("UPDATE $db.items SET v = ? WHERE id = ?", fmt.Sprint("r", n), n)
+			e.exec("INSERT INTO $db.ev VALUES (?, ?, ?)", 100+n, fmt.Sprint("r", n), 10+n)
+			e.exec("INSERT INTO $db.loose VALUES (?, ?)", fmt.Sprint("r", n), 10+n)
+		}
+		s := e.source(`, "chunkRows": 3`)
+		for _, cs := range []source.ConfiguredStream{
+			{Name: "items", SyncMode: source.CDC},
+			{Name: "ev", SyncMode: source.Incremental, Cursor: "at"},
+			{Name: "loose", SyncMode: source.Incremental, Cursor: "at"},
+		} {
+			first := readLog(t, s, cs)
+			change()
+			cs.State = []byte(first[len(first)-1].state)
+			second := readLog(t, s, cs)
+			end := second[len(second)-1]
+			change()
+			cs.CompleteAt = []byte(end.state)
+			again := readLog(t, s, cs)
+			if last := again[len(again)-1]; !end.complete || !last.complete || last.state != end.state {
+				t.Fatalf("%s: asked to complete at %s, the read ended with %+v", cs.Name, end.state, last)
+			}
+			if got, want := rowTexts(rowsOf(again, -1, len(again))), rowTexts(rowsOf(second, -1, len(second))); !slices.Equal(got, want) {
+				t.Fatalf("%s: read again to its completion %q, not %q", cs.Name, got, want)
+			}
+		}
+		// From no state, as a new stream's first epoch: the snapshot's rows
+		// come as the table is now, and none of the binlog's changes after
+		// the completion.
+		cs := source.ConfiguredStream{Name: "items", SyncMode: source.CDC}
+		first := readLog(t, s, cs)
+		change()
+		cs.CompleteAt = []byte(first[len(first)-1].state)
+		again := readLog(t, s, cs)
+		if last := again[len(again)-1]; !last.complete || last.state != string(cs.CompleteAt) {
+			t.Fatalf("from no state, asked to complete at %s, the read ended with %+v", cs.CompleteAt, last)
+		}
+		if c := changes(rowsOf(again, -1, len(again)), false); len(c) > 0 {
+			t.Fatalf("from no state, the read sent changes past its completion: %q", c)
+		}
+	})
+}
+
+// rowTexts are rows as sorted text, each with its columns in name order.
+func rowTexts(rows []map[string]string) []string {
+	var out []string
+	for _, r := range rows {
+		var b strings.Builder
+		for _, k := range slices.Sorted(maps.Keys(r)) {
+			fmt.Fprintf(&b, "%s=%s ", k, r[k])
+		}
+		out = append(out, b.String())
+	}
+	slices.Sort(out)
+	return out
 }
 
 // batchRows are a batch's rows, each column as Arrow prints it.

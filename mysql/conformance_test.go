@@ -50,16 +50,22 @@ func TestSourceConformance(t *testing.T) {
 			return fmt.Appendf(nil, `{"dsn": %q, "database": %q, "chunkRows": 25, "snapshotChunkRows": 20}`, dsn, database)
 		}
 		conformance.SourceSuite{
-			Launch:         launch,
-			Config:         cfg(srv.dsn),
-			BadCredentials: cfg(srv.badPassword(t)),
-			Unreachable:    cfg(closedPort),
-			StopsAtUntil:   true,
+			Launch:            launch,
+			Config:            cfg(srv.dsn),
+			BadCredentials:    cfg(srv.badPassword(t)),
+			Unreachable:       cfg(closedPort),
+			StopsAtUntil:      true,
+			StopsAtCompletion: true,
 			AddRecords: func(ctx context.Context, stream string) (int, error) {
 				switch stream {
 				case "events":
-					_, err := db.ExecContext(ctx, q(`INSERT INTO $db.events WITH RECURSIVE n(i) AS (SELECT 1001 UNION ALL SELECT i + 1 FROM n WHERE i < 1010)
-						SELECT i, DATE_ADD('2026-02-01', INTERVAL i MINUTE), '{}' FROM n`))
+					// Each call adds new events, later than any before.
+					var from int64
+					if err := db.QueryRowContext(ctx, q("SELECT greatest(max(id) + 1, 1001) FROM $db.events")).Scan(&from); err != nil {
+						return 0, err
+					}
+					_, err := db.ExecContext(ctx, q(`INSERT INTO $db.events WITH RECURSIVE n(i) AS (SELECT ? UNION ALL SELECT i + 1 FROM n WHERE i < ? + 9)
+						SELECT i, DATE_ADD('2026-02-01', INTERVAL i MINUTE), '{}' FROM n`), from, from)
 					return 10, err
 				case "orders":
 					// Each call adds new orders, as a continuous read is restarted.

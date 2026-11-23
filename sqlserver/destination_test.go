@@ -688,6 +688,29 @@ func TestFence(t *testing.T) {
 	}
 }
 
+// A batch without columns fails its write before anything is staged: a SQL
+// Server table has a column, so no target can take its rows, and a staging
+// that no apply can read would fail every Commit and Recover of its epoch.
+// The epoch then commits without it.
+func TestBatchWithoutColumnsIsRefused(t *testing.T) {
+	env := newEnv(t)
+	w := env.openStreams(1, destination.ScopePipeline, destination.Stream{Name: "added", Mode: destination.Append})
+	recov(t, w, 1, destination.Epoch{})
+	rec := array.NewRecordBatch(arrow.NewSchema(nil, nil), nil, 3)
+	defer rec.Release()
+	e := destination.Epoch{Generation: 1, N: 1}
+	if err := w.Write(t.Context(), e, "added", rec); err == nil || !strings.Contains(err.Error(), "no columns") {
+		t.Fatalf("a batch without columns: %v", err)
+	}
+	st, err := w.PreCommit(t.Context(), e)
+	if err == nil {
+		_, err = w.Commit(t.Context(), e, []destination.Staged{st})
+	}
+	if err != nil {
+		t.Errorf("the epoch without it: %v", err)
+	}
+}
+
 func TestDestinationTypes(t *testing.T) {
 	env := newEnv(t)
 	fields := []arrow.Field{

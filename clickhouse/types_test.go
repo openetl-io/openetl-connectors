@@ -175,6 +175,19 @@ func TestUndeclaredText(t *testing.T) {
 	}
 }
 
+// A split with no state, or an empty one, starts from the beginning; one
+// with a state goes on from it.
+func TestStateOf(t *testing.T) {
+	for _, state := range [][]byte{nil, {}} {
+		if st, err := stateOf("e", state); err != nil || st.Done || st.After != nil {
+			t.Errorf("state %q: %+v, %v", state, st, err)
+		}
+	}
+	if st, err := stateOf("e", []byte(`{"done":true}`)); err != nil || !st.Done {
+		t.Errorf("a done state: %+v, %v", st, err)
+	}
+}
+
 // An order column's text scans into a *string, or into a **string where
 // it's Nullable, as a Nullable cursor's is.
 func TestScannedString(t *testing.T) {

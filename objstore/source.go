@@ -1,7 +1,6 @@
 package objstore
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -431,10 +430,18 @@ func (s *Source) readSplit(ctx context.Context, b *blob.Bucket, typed *typedColu
 	// A read up to a resume point after a Resplit's halving that its
 	// state is before halves where the first read did.
 	var cuts []cut
+	var halt *untilAt
 	if len(until) > 0 {
 		var u readState
-		if err := json.Unmarshal(until, &u); err == nil && len(u.Gave) > len(st.Gave) {
+		if err := json.Unmarshal(until, &u); err != nil {
+			return fmt.Errorf("objstore: where stream %q's read stops: %w", cs.Name, err)
+		}
+		if len(u.Gave) > len(st.Gave) {
 			cuts = u.Gave[len(st.Gave):]
+		}
+		halt = untilOf(st, u, incremental)
+		if err := halt.gone(files, cs.Name); err != nil {
+			return err
 		}
 	}
 	cutTo := func(o object, inclusive bool) {
@@ -447,10 +454,9 @@ func (s *Source) readSplit(ctx context.Context, b *blob.Bucket, typed *typedColu
 			cuts = cuts[1:]
 		}
 	}
-	// resume sends a resume point at st, in or after file o, and reports
-	// whether it's the read's until, where the split completes. A Resplit
+	// resume sends a resume point at st, in or after file o. A Resplit
 	// asked for gives half the files yet to be read to a new split.
-	resume := func(o object, in bool) (bool, error) {
+	resume := func(o object, in bool) error {
 		cutTo(o, true)
 		var added []source.Split
 		run.mu.Lock()
@@ -469,7 +475,7 @@ func (s *Source) readSplit(ctx context.Context, b *blob.Bucket, typed *typedColu
 				state, err := json.Marshal(child)
 				if err != nil {
 					run.mu.Unlock()
-					return false, err
+					return err
 				}
 				added = append(added, source.Split{ID: give.id(), State: state})
 				run.left = slices.DeleteFunc(run.left, func(k string) bool { return !keep.has(k) })
@@ -478,15 +484,16 @@ func (s *Source) readSplit(ctx context.Context, b *blob.Bucket, typed *typedColu
 		run.mu.Unlock()
 		state, err := json.Marshal(st)
 		if err != nil {
-			return false, err
+			return err
 		}
-		if len(until) > 0 && bytes.Equal(state, until) {
-			if err := out.ResumePoint(until); err != nil {
-				return false, err
-			}
-			return true, out.Complete(until)
+		return out.ResumePoint(state, added...)
+	}
+	// reached ends the read at its until, which it emits as it was given.
+	reached := func() error {
+		if err := out.ResumePoint(until); err != nil {
+			return err
 		}
-		return false, out.ResumePoint(state, added...)
+		return out.Complete(until)
 	}
 	// The split's files yet to start, in the read's order, which Resplit
 	// sees once the first starts. Starting a file takes it from them, with
@@ -502,6 +509,9 @@ func (s *Source) readSplit(ctx context.Context, b *blob.Bucket, typed *typedColu
 		cutTo(o, false)
 		if !r.has(o.Key) || st.done(o, incremental) {
 			continue
+		}
+		if halt.past(o, incremental) {
+			break
 		}
 		run.mu.Lock()
 		if left != nil {
@@ -519,6 +529,9 @@ func (s *Source) readSplit(ctx context.Context, b *blob.Bucket, typed *typedColu
 		if st.At != nil && st.At.Key == o.Key && st.At.Modified == at.Modified && st.At.Size == o.Size && sameTag(st.At.Version, o.Version) {
 			at = *st.At
 		}
+		if halt.in(o, at, incremental) {
+			return reached()
+		}
 		stop := false
 		sk := sink{
 			records: out.Records,
@@ -526,12 +539,11 @@ func (s *Source) readSplit(ctx context.Context, b *blob.Bucket, typed *typedColu
 			resume: func(p filePos) error {
 				p.Key, p.Modified, p.Size, p.Version = at.Key, at.Modified, at.Size, o.Version
 				st.At = &p
-				var err error
-				stop, err = resume(o, true)
-				if err == nil && stop {
-					err = errStop
+				if halt.in(o, p, incremental) {
+					stop = true
+					return errStop
 				}
-				return err
+				return resume(o, true)
 			},
 		}
 		switch spec.cfg.Format {
@@ -547,8 +559,8 @@ func (s *Source) readSplit(ctx context.Context, b *blob.Bucket, typed *typedColu
 		if err != nil && !errors.Is(err, errStop) {
 			return err
 		}
-		if stop {
-			return nil
+		if stop || halt.after(o, incremental) {
+			return reached()
 		}
 		st.finish(o, incremental)
 		// A large state's resume points come every so many files, but for
@@ -560,9 +572,12 @@ func (s *Source) readSplit(ctx context.Context, b *blob.Bucket, typed *typedColu
 			continue
 		}
 		unmarked = 0
-		if stop, err := resume(o, false); err != nil || stop {
+		if err := resume(o, false); err != nil {
 			return err
 		}
+	}
+	if halt != nil {
+		return reached()
 	}
 	if !incremental {
 		return out.Complete(nil)

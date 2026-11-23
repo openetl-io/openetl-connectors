@@ -457,6 +457,72 @@ func TestCDCRefusesRolledBackXA(t *testing.T) {
 	})
 }
 
+// TestCDCReadsRolledBackTransactions reads transactions that changed a
+// MyISAM table and rolled back, which MariaDB writes to the binlog with
+// their changes: one logged as statements, with a ROLLBACK, and one logged
+// as rows, with a ROLLBACK TO a savepoint, that rolled back no change to
+// items are passed, and the read goes on to the next; ones that rolled back
+// a change to items fail the read as lost, rather than send it. MySQL with
+// GTIDs refuses such transactions.
+func TestCDCReadsRolledBackTransactions(t *testing.T) {
+	eachServer(t, func(t *testing.T, srv testServer) {
+		e := newSourceEnv(t, srv)
+		enforced, _, err := globalVariable(t.Context(), e.db, "enforce_gtid_consistency")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.EqualFold(enforced, "ON") {
+			t.Skip("enforce_gtid_consistency refuses a transaction that changes a MyISAM table and an InnoDB one, so the binlog has none")
+		}
+		e.exec("CREATE TABLE $db.items (id int PRIMARY KEY, v varchar(20))")
+		e.exec("CREATE TABLE $db.other (id int PRIMARY KEY)")
+		e.exec("CREATE TABLE $db.log (id int PRIMARY KEY) ENGINE=MyISAM")
+		s := e.source("")
+		session := func(qs ...string) {
+			conn, err := e.db.Conn(t.Context())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = conn.Close() }()
+			for _, q := range append(qs, "SET SESSION binlog_format = DEFAULT") {
+				if _, err := conn.ExecContext(t.Context(), strings.ReplaceAll(q, "$db", quoteIdent(e.database))); err != nil {
+					t.Fatalf("%s: %v", q, err)
+				}
+			}
+		}
+		first := read(t, s, cdc("rollback", nil, "items"))
+		session("SET SESSION binlog_format = 'STATEMENT'", "BEGIN", "INSERT INTO $db.other VALUES (1)", "INSERT INTO $db.log VALUES (1)", "ROLLBACK")
+		session("BEGIN", "INSERT INTO $db.items VALUES (1, 'a')", "SAVEPOINT s1", "INSERT INTO $db.other VALUES (2)", "INSERT INTO $db.log VALUES (2)", "ROLLBACK TO s1", "COMMIT")
+		e.exec("INSERT INTO $db.items VALUES (2, 'b')")
+		next := read(t, s, cdc("rollback", map[string]string{"items": first.state("items")}, "items"))
+		var log []string
+		for _, r := range next.rows("items") {
+			log = append(log, r["openetl.op"]+" "+r["id"])
+		}
+		if want := []string{"insert 1", "insert 2"}; !slices.Equal(log, want) {
+			t.Fatalf("changes %q, want %q", log, want)
+		}
+		for i, qs := range [][]string{
+			{"BEGIN", "INSERT INTO $db.items VALUES (3, 'c')", "SAVEPOINT s1", "INSERT INTO $db.items VALUES (4, 'd')", "INSERT INTO $db.log VALUES (3)", "ROLLBACK TO s1", "COMMIT"},
+			{"SET SESSION binlog_format = 'MIXED'", "BEGIN", "INSERT INTO $db.items VALUES (UUID_SHORT() % 1000 + 1000, 'e')", "CREATE TEMPORARY TABLE $db.tmp (x int)",
+				"INSERT INTO $db.tmp VALUES (1)", "ROLLBACK"},
+		} {
+			// As after a reset of items, from past the transactions before.
+			from := read(t, s, cdc("rollback", nil, "items")).state("items")
+			session(qs...)
+			// A transaction after it, which a read that misses the rollback
+			// fails at.
+			e.exec("INSERT INTO $db.items VALUES (?, 'later')", 100+i)
+			c := &capture{}
+			t.Cleanup(c.release)
+			err := s.Read(t.Context(), cdc("rollback", map[string]string{"items": from}, "items"), c)
+			if codeOf(err) != protocolv1.ErrorCode_ERROR_CODE_POSITION_LOST || !strings.Contains(err.Error(), "items") {
+				t.Fatalf("%s: %v (%v), rows %v", qs[len(qs)-1], err, codeOf(err), c.rows("items"))
+			}
+		}
+	})
+}
+
 // TestCDCRefusesPartialRowImages reads a session's changes logged with
 // binlog_row_image = MINIMAL: its delete has the key it needs, its update
 // hasn't the columns it left alone and fails the read.
@@ -800,6 +866,115 @@ func TestSourceChunksAndResumesExactly(t *testing.T) {
 	})
 }
 
+// TestReadOrderChangedBetweenAttempts resumes reads from states made before
+// a table's primary key was added, changed or dropped. One read in a single
+// query, and done, completes without reading the table again, and read
+// again up to that state reads it as it did. One read in key order fails
+// as a lost position: its position is in an order the table no longer has.
+func TestReadOrderChangedBetweenAttempts(t *testing.T) {
+	eachServer(t, func(t *testing.T, srv testServer) {
+		e := newSourceEnv(t, srv)
+		e.exec("CREATE TABLE $db.loose (id int NOT NULL, at int)")
+		e.exec("CREATE TABLE $db.keyed (a int NOT NULL, b int NOT NULL, PRIMARY KEY (a))")
+		e.exec("INSERT INTO $db.loose SELECT i, i FROM " + numbers(5))
+		e.exec("INSERT INTO $db.keyed SELECT i, 7 - i FROM " + numbers(6))
+		s := e.source(`, "chunkRows": 2`)
+		// Each read's first resume point, and how many rows came before it.
+		type part struct {
+			cs    source.ConfiguredStream
+			state string
+			rows  int
+		}
+		var parts []part
+		for _, cs := range []source.ConfiguredStream{
+			{Name: "loose", SyncMode: source.FullRefresh},
+			{Name: "loose", SyncMode: source.Incremental, Cursor: "at"},
+			{Name: "keyed", SyncMode: source.FullRefresh},
+			{Name: "keyed", SyncMode: source.Incremental, Cursor: "b"},
+		} {
+			first := readLog(t, s, cs)
+			j := resumePoints(first)[0]
+			parts = append(parts, part{cs, first[j].state, len(rowsOf(first, -1, j))})
+		}
+		e.exec("ALTER TABLE $db.loose ADD PRIMARY KEY (id)")
+		e.exec("ALTER TABLE $db.keyed DROP PRIMARY KEY, ADD PRIMARY KEY (b)")
+		for _, p := range parts[:2] {
+			cs := p.cs
+			cs.State = []byte(p.state)
+			if again := readLog(t, s, cs); len(rowsOf(again, -1, len(again))) > 0 || !again[len(again)-1].complete {
+				t.Fatalf("%v from %s, once the table has a key: %+v", cs.SyncMode, p.state, again)
+			}
+			cs.State, cs.Until = nil, []byte(p.state)
+			again := readLog(t, s, cs)
+			endsAt(t, again, p.state)
+			if n := len(rowsOf(again, -1, len(again))); n != p.rows {
+				t.Fatalf("%v until %s, once the table has a key: %d rows, not %d", cs.SyncMode, p.state, n, p.rows)
+			}
+		}
+		lost := func(when string) {
+			for _, p := range parts[2:] {
+				cs := p.cs
+				cs.State = []byte(p.state)
+				err := s.Read(t.Context(), source.ReadRequest{Streams: []source.ConfiguredStream{cs}, Lanes: 1}, &eventLog{})
+				if codeOf(err) != protocolv1.ErrorCode_ERROR_CODE_POSITION_LOST {
+					t.Fatalf("%v from %s, %s: %v", cs.SyncMode, p.state, when, err)
+				}
+			}
+		}
+		lost("with another key")
+		e.exec("ALTER TABLE $db.keyed DROP PRIMARY KEY")
+		lost("without a key")
+	})
+}
+
+// TestReadKeyCollationChangedBetweenAttempts reads a table with a text key
+// part of the way, in full and incrementally, then gives the key another
+// collation, which orders its text another way: a read resumed from there,
+// or read again up to there, fails as lost, rather than leave out the rows
+// the new order puts before its position. A state without the key's
+// collations, as one written before states had them, resumes as before.
+func TestReadKeyCollationChangedBetweenAttempts(t *testing.T) {
+	eachServer(t, func(t *testing.T, srv testServer) {
+		e := newSourceEnv(t, srv)
+		e.exec("CREATE TABLE $db.names (id varchar(10) COLLATE utf8mb4_general_ci PRIMARY KEY, at int NOT NULL)")
+		e.exec("INSERT INTO $db.names VALUES ('a', 1), ('b', 1), ('Y', 1), ('Z', 1)")
+		s := e.source(`, "chunkRows": 2`)
+		var parts []source.ConfiguredStream
+		for _, cs := range []source.ConfiguredStream{
+			{Name: "names", SyncMode: source.FullRefresh},
+			{Name: "names", SyncMode: source.Incremental, Cursor: "at"},
+		} {
+			first := readLog(t, s, cs)
+			j := resumePoints(first)[0]
+			var st map[string]any
+			if err := json.Unmarshal([]byte(first[j].state), &st); err != nil {
+				t.Fatal(err)
+			}
+			delete(st, "collations")
+			cs.State, _ = json.Marshal(st)
+			rest := readLog(t, s, cs)
+			if got, want := len(rowsOf(rest, -1, len(rest))), 4-len(rowsOf(first, -1, j)); got != want {
+				t.Fatalf("%v from %s: %d rows, not %d", cs.SyncMode, cs.State, got, want)
+			}
+			cs.State = []byte(first[j].state)
+			parts = append(parts, cs)
+		}
+		e.exec("ALTER TABLE $db.names MODIFY id varchar(10) COLLATE utf8mb4_bin")
+		for _, cs := range parts {
+			for _, until := range []bool{false, true} {
+				if until {
+					cs.State, cs.Until = nil, cs.State
+				}
+				l := &eventLog{}
+				err := s.Read(t.Context(), source.ReadRequest{Streams: []source.ConfiguredStream{cs}, Lanes: 1}, l)
+				if codeOf(err) != protocolv1.ErrorCode_ERROR_CODE_POSITION_LOST {
+					t.Errorf("%v from %s until %s, in another collation: %v, rows %v", cs.SyncMode, cs.State, cs.Until, err, rowsOf(l.events, -1, len(l.events)))
+				}
+			}
+		}
+	})
+}
+
 func TestSourceReadsIncrementally(t *testing.T) {
 	eachServer(t, func(t *testing.T, srv testServer) {
 		e := newSourceEnv(t, srv)
@@ -861,7 +1036,7 @@ func TestResplitDividesTheRemainder(t *testing.T) {
 		s := e.source(`, "chunkRows": 10`)
 		var added []source.Split
 		out := &resplitter{s: s, added: &added}
-		err := s.readSplit(t.Context(), &connPool{DB: e.db, Held: make(chan struct{}, 1)}, mustTables(t, s, e), source.ConfiguredStream{Name: "big", SyncMode: source.FullRefresh}, source.Split{ID: "x"}, nil, out)
+		err := s.readSplit(t.Context(), &connPool{DB: e.db, Held: make(chan struct{}, 1)}, mustTables(t, s, e), source.ConfiguredStream{Name: "big", SyncMode: source.FullRefresh}, source.Split{ID: "x"}, out)
 		if err != nil {
 			t.Fatal(err)
 		}

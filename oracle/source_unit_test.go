@@ -12,7 +12,9 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	go_ora "github.com/sijms/go-ora/v2"
 
+	"github.com/openetl-io/openetl-connectors/connectortest"
 	"github.com/openetl-io/openetl/sdk/go/check"
+	protocolv1 "github.com/openetl-io/openetl/sdk/go/protocol/v1"
 	"github.com/openetl-io/openetl/sdk/go/source"
 )
 
@@ -303,6 +305,34 @@ func TestKeyText(t *testing.T) {
 	} {
 		if got := keyText(cols("X " + c.typ)[0], c.v); got != c.want {
 			t.Errorf("%s %v: %q, want %q", c.typ, c.v, got, c.want)
+		}
+	}
+}
+
+// A state with a position or a key range holds only in the order it was
+// made in, a range not started yet included; one without either holds in
+// any.
+func TestSameOrder(t *testing.T) {
+	lo := "50"
+	cs := cols("A NUMBER", "B NUMBER")
+	byA, byB, loose := table{name: "T", cols: cs, key: []int{0}}, table{name: "T", cols: cs, key: []int{1}}, table{name: "T", cols: cs}
+	for _, c := range []struct {
+		t    table
+		st   sourceState
+		lost bool
+	}{
+		{byA, sourceState{}, false},
+		{byA, sourceState{Done: true}, false},
+		{loose, sourceState{Done: true}, false},
+		{byA, sourceState{keyRange: keyRange{Lo: &lo}, Key: []string{"A"}}, false},
+		{byA, sourceState{After: []string{"1"}, Key: []string{"A"}}, false},
+		{byB, sourceState{keyRange: keyRange{Hi: &lo}, Key: []string{"A"}}, true},
+		{byB, sourceState{After: []string{"1"}, Key: []string{"A"}}, true},
+		{loose, sourceState{After: []string{"1"}, Key: []string{"A"}}, true},
+		{byA, sourceState{After: []string{"1"}}, true},
+	} {
+		if err := sameOrder(c.t, c.st); (connectortest.CodeOf(err) == protocolv1.ErrorCode_ERROR_CODE_POSITION_LOST) != c.lost {
+			t.Errorf("key %v, state %+v: %v", orderKey(c.t), c.st, err)
 		}
 	}
 }

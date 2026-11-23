@@ -318,7 +318,7 @@ func TestApplySchemaRefusesTypeChanges(t *testing.T) {
 	}
 
 	// The user promotes it and makes extra required, after a write left n
-	// out: the epoch is read again.
+	// out: the epoch is read again, however often ApplySchema is retried.
 	writeRows(t, w, ep(3), "users", []arrow.Field{idField, wide}, `[{"id": 3, "n": 5000000000}]`)
 	tbl := env.table("users")
 	tx := tbl.NewTransaction()
@@ -331,14 +331,59 @@ func TestApplySchemaRefusesTypeChanges(t *testing.T) {
 	if _, err := tx.Commit(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := sa.ApplySchema(t.Context(), []destination.StreamSchema{{Name: "users", Schema: arrow.NewSchema([]arrow.Field{idField, wide}, nil)}}); err == nil || !strings.Contains(err.Error(), "read the epoch again") {
-		t.Fatalf("ApplySchema after n was left out: %v", err)
+	for try := range 2 {
+		if _, err := sa.ApplySchema(t.Context(), []destination.StreamSchema{{Name: "users", Schema: arrow.NewSchema([]arrow.Field{idField, wide}, nil)}}); err == nil || !strings.Contains(err.Error(), "read the epoch again") {
+			t.Fatalf("ApplySchema %d after n was left out: %v", try+1, err)
+		}
 	}
+	// The next attempt's writer takes it.
+	sa = env.writer(2, users).(destination.SchemaApplier)
 	a = apply(idField, wide, extra)
 	if len(a.Refused) != 0 {
 		t.Errorf("refused %+v after the user's change", a.Refused)
 	}
 	if l := a.Limits["users"]; !slices.Equal(l.NotNull, []string{"extra"}) || len(l.Fixed) != 0 || l.MaxColumns != 0 {
 		t.Errorf("limits %+v", l)
+	}
+}
+
+// The values an epoch's writes left out fail that epoch: ApplySchema for an
+// earlier one, whose schema the table takes, passes, and leaves them for
+// their own.
+func TestLeftOutValuesFailTheirOwnEpoch(t *testing.T) {
+	env := newEnv(t)
+	w := env.writer(1, appends("items")...)
+	sa := w.(destination.SchemaApplier)
+	narrow := arrow.Field{Name: "x", Type: arrow.PrimitiveTypes.Int32, Nullable: true}
+	wide := arrow.Field{Name: "x", Type: arrow.PrimitiveTypes.Int64, Nullable: true}
+	apply := func(f arrow.Field) error {
+		_, err := sa.ApplySchema(t.Context(), []destination.StreamSchema{{Name: "items", Schema: arrow.NewSchema([]arrow.Field{idField, f}, nil)}})
+		return err
+	}
+	if err := apply(narrow); err != nil {
+		t.Fatal(err)
+	}
+	writeRows(t, w, ep(1), "items", []arrow.Field{idField, narrow}, `[{"id": 1, "x": 1}]`)
+	st := precommit(t, w, ep(1))
+	// Epoch 2's rows come wider before epoch 1 commits.
+	writeRows(t, w, ep(2), "items", []arrow.Field{idField, wide}, `[{"id": 2, "x": 5000000000}]`)
+	if err := apply(narrow); err != nil {
+		t.Fatalf("ApplySchema for epoch 1: %v", err)
+	}
+	commit(t, w, ep(1), st)
+
+	tbl := env.table("items")
+	tx := tbl.NewTransaction()
+	if err := tx.UpdateSchema(true, false).UpdateColumn([]string{"x"}, table.ColumnUpdate{FieldType: ice.Optional[ice.Type]{Valid: true, Val: ice.PrimitiveTypes.Int64}}).Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Commit(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	precommit(t, w, ep(2))
+	for try := range 2 {
+		if err := apply(wide); err == nil || !strings.Contains(err.Error(), "read the epoch again") {
+			t.Fatalf("ApplySchema %d for epoch 2: %v", try+1, err)
+		}
 	}
 }
