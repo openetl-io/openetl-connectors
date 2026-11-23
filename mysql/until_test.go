@@ -17,6 +17,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
 
+	protocolv1 "github.com/openetl-io/openetl/sdk/go/protocol/v1"
 	"github.com/openetl-io/openetl/sdk/go/source"
 )
 
@@ -245,6 +246,56 @@ func TestCDCReadStopsAtUntil(t *testing.T) {
 		}
 		if last != "" && last <= lastChange {
 			t.Fatalf("by GTIDs, the snapshot's rows have seq %s, below the changes' %s", last, lastChange)
+		}
+	})
+}
+
+// TestCDCReadAgainOnAServerWithoutUntilIsLost reads a part again on another
+// server, by GTIDs, up to a resume point whose GTIDs have transactions the
+// server hasn't, as where a failover lost them or a replica hasn't applied
+// them yet: the read fails as lost, whether the binlog's end or a later
+// transaction comes first, rather than stop there without them. Up to one
+// whose transactions the server has, it stops there.
+func TestCDCReadAgainOnAServerWithoutUntilIsLost(t *testing.T) {
+	eachServer(t, func(t *testing.T, srv testServer) {
+		e := newSourceEnv(t, srv)
+		e.exec("CREATE TABLE $db.items (id int PRIMARY KEY)")
+		e.exec("INSERT INTO $db.items VALUES (1)")
+		s := e.source("")
+		cs := source.ConfiguredStream{Name: "items", SyncMode: source.CDC}
+		first := readLog(t, s, cs)
+		e.exec("INSERT INTO $db.items VALUES (2)")
+		cs.State = []byte(first[len(first)-1].state)
+		second := readLog(t, s, cs)
+		other := func(state, gtids string) []byte {
+			var m map[string]any
+			if err := json.Unmarshal([]byte(state), &m); err != nil {
+				t.Fatal(err)
+			}
+			m["server"] = "another"
+			if gtids != "" {
+				m["gtid"] = fmt.Sprint(m["gtid"], ",", gtids)
+			}
+			b, _ := json.Marshal(m)
+			return b
+		}
+		cs.State = other(first[len(first)-1].state, "")
+		cs.Until = other(second[len(second)-1].state, "")
+		endsAt(t, readLog(t, s, cs), string(cs.Until))
+		missing := "3e11fa47-71ca-11e1-9e33-c80aa9429562:1-5"
+		if srv.name == "mariadb" {
+			missing = "99-99-5"
+		}
+		cs.Until = other(second[len(second)-1].state, missing)
+		for _, when := range []string{"at the binlog's end", "at a later transaction"} {
+			if when == "at a later transaction" {
+				e.exec("INSERT INTO $db.items VALUES (3)")
+			}
+			l := &eventLog{}
+			err := s.Read(t.Context(), source.ReadRequest{Streams: []source.ConfiguredStream{cs}, Pipeline: "until", Lanes: 1}, l)
+			if codeOf(err) != protocolv1.ErrorCode_ERROR_CODE_POSITION_LOST || !strings.Contains(err.Error(), "items") {
+				t.Fatalf("%s, until GTIDs the server hasn't: %v, events %+v", when, err, l.events)
+			}
 		}
 	})
 }

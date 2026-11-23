@@ -342,8 +342,12 @@ func (r *cdcReader) reachUntil() error {
 // first read sent between its state and until, as the table has them now,
 // with the seq of until's position, or on another server of where the read
 // stopped, so that they come after the changes before it and before those
-// after; then a resume point with until, and completes with it.
+// after; then a resume point with until, and completes with it. On another
+// server, the read has to have every transaction until's GTIDs have.
 func (r *cdcReader) finish(st *cdcStream) error {
+	if st.until.Server != r.server && (r.gset == nil || st.untilGTID == nil || !r.gset.Contain(st.untilGTID)) {
+		return positionLost("mysql: %s is read again up to where it got to on server %s, and server %s, which the read is on, hasn't every transaction before there; read it again", st.t.name, st.until.Server, r.server)
+	}
 	from, fromArgs, err := remaining(st.t, st.fromState)
 	if err != nil {
 		return err

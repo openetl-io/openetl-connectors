@@ -927,6 +927,54 @@ func TestReadOrderChangedBetweenAttempts(t *testing.T) {
 	})
 }
 
+// TestReadKeyCollationChangedBetweenAttempts reads a table with a text key
+// part of the way, in full and incrementally, then gives the key another
+// collation, which orders its text another way: a read resumed from there,
+// or read again up to there, fails as lost, rather than leave out the rows
+// the new order puts before its position. A state without the key's
+// collations, as one written before states had them, resumes as before.
+func TestReadKeyCollationChangedBetweenAttempts(t *testing.T) {
+	eachServer(t, func(t *testing.T, srv testServer) {
+		e := newSourceEnv(t, srv)
+		e.exec("CREATE TABLE $db.names (id varchar(10) COLLATE utf8mb4_general_ci PRIMARY KEY, at int NOT NULL)")
+		e.exec("INSERT INTO $db.names VALUES ('a', 1), ('b', 1), ('Y', 1), ('Z', 1)")
+		s := e.source(`, "chunkRows": 2`)
+		var parts []source.ConfiguredStream
+		for _, cs := range []source.ConfiguredStream{
+			{Name: "names", SyncMode: source.FullRefresh},
+			{Name: "names", SyncMode: source.Incremental, Cursor: "at"},
+		} {
+			first := readLog(t, s, cs)
+			j := resumePoints(first)[0]
+			var st map[string]any
+			if err := json.Unmarshal([]byte(first[j].state), &st); err != nil {
+				t.Fatal(err)
+			}
+			delete(st, "collations")
+			cs.State, _ = json.Marshal(st)
+			rest := readLog(t, s, cs)
+			if got, want := len(rowsOf(rest, -1, len(rest))), 4-len(rowsOf(first, -1, j)); got != want {
+				t.Fatalf("%v from %s: %d rows, not %d", cs.SyncMode, cs.State, got, want)
+			}
+			cs.State = []byte(first[j].state)
+			parts = append(parts, cs)
+		}
+		e.exec("ALTER TABLE $db.names MODIFY id varchar(10) COLLATE utf8mb4_bin")
+		for _, cs := range parts {
+			for _, until := range []bool{false, true} {
+				if until {
+					cs.State, cs.Until = nil, cs.State
+				}
+				l := &eventLog{}
+				err := s.Read(t.Context(), source.ReadRequest{Streams: []source.ConfiguredStream{cs}, Lanes: 1}, l)
+				if codeOf(err) != protocolv1.ErrorCode_ERROR_CODE_POSITION_LOST {
+					t.Errorf("%v from %s until %s, in another collation: %v, rows %v", cs.SyncMode, cs.State, cs.Until, err, rowsOf(l.events, -1, len(l.events)))
+				}
+			}
+		}
+	})
+}
+
 func TestSourceReadsIncrementally(t *testing.T) {
 	eachServer(t, func(t *testing.T, srv testServer) {
 		e := newSourceEnv(t, srv)
