@@ -309,13 +309,18 @@ func (t table) orderKey() []string {
 }
 
 // sameOrder fails a read resumed in another order than the one its state
-// was read in, which only a read from the start carries on from. A split's
-// range is of its order's first column, so it holds before its first row.
+// was read in, which only a read from the start carries on from, or without
+// one. A split's range is of its order's first column, so it holds before
+// its first row. Only a read in an order has a position or a range.
 func sameOrder(t table, st sourceState) error {
-	if (st.After != nil || st.Lo != nil || st.Hi != nil) && !slices.Equal(st.Key, t.orderKey()) {
-		return positionLost("postgres: %s was read in the order of columns %v, and is now read in another; it's read again from the start", t.name, st.Key)
+	if st.After == nil && st.Lo == nil && st.Hi == nil || len(t.order) > 0 && slices.Equal(st.Key, t.orderKey()) {
+		return nil
 	}
-	return nil
+	was := "its primary key"
+	if st.Key != nil {
+		was = "columns " + strings.Join(st.Key, ", ")
+	}
+	return positionLost("postgres: %s was read in the order of %s, and is now read in another, or in none; it's read again from the start", t.name, was)
 }
 
 func indexOf(xs []int, x int) int {
@@ -434,7 +439,7 @@ func (s *Source) readSplit(ctx context.Context, conns *connPool, tables []table,
 	}
 	defer conns.put(ctx, conn)
 	if cs.SyncMode == source.Incremental {
-		return s.readIncremental(ctx, conn, t, sp.ID, cs.Cursor, st, sp.CompleteAt, out)
+		return s.readIncremental(ctx, conn, t, sp, cs.Cursor, st, out)
 	}
 	return s.readTable(ctx, conn, t, sp.ID, st, out)
 }
@@ -532,15 +537,67 @@ func compareKey(key []string, op string, at []string, arg func(string) string) s
 	return "(" + strings.Join(key, ", ") + ") " + op + " (" + strings.Join(params, ", ") + ")"
 }
 
+// incrementalEnd is where an incremental read given an until or a
+// complete_at ends: a resume point's or a completion's state this source
+// sent before. Zero: where the read would end.
+type incrementalEnd struct {
+	// The state given; nil if none was.
+	state []byte
+	// It's an until: the read emits no row past after, the until's
+	// position, nil before the first row, then a resume point with state.
+	until bool
+	after []string
+	// The highest cursor value the read that sent state went up to, which
+	// a completion's floor is; nil if it found none.
+	ceiling *string
+}
+
+// endOf is where a read of t's split sp ends. An until's position holds
+// only in the order it was read in, as a state's does.
+func endOf(t table, sp source.Split) (incrementalEnd, error) {
+	e := incrementalEnd{state: sp.CompleteAt}
+	if sp.Until != nil {
+		e = incrementalEnd{state: sp.Until, until: true}
+	}
+	if e.state == nil {
+		return e, nil
+	}
+	var at sourceState
+	if err := json.Unmarshal(e.state, &at); err != nil {
+		return e, fmt.Errorf("postgres: where %s ends: %w", t.name, err)
+	}
+	if !e.until {
+		e.ceiling = at.Since
+		return e, nil
+	}
+	e.after, e.ceiling = at.After, at.Until
+	return e, sameOrder(t, at)
+}
+
+// reached emits what a read that has reached e emits: the until's resume
+// point, then a completion with its state.
+func (e incrementalEnd) reached(out source.SplitEmitter) error {
+	if e.until {
+		if err := out.ResumePoint(e.state); err != nil {
+			return err
+		}
+	}
+	return out.Complete(e.state)
+}
+
 // readIncremental reads the rows whose cursor is from the state's floor up
 // to the cursor's highest value when the read started, in (cursor, key)
 // order. It completes with that value as the next read's floor, so the rows
 // that hold it are read again then. Rows with a NULL cursor aren't read.
-// completeAt, if set, is a completion this source sent before: the read
-// goes up to its floor, which was that read's highest value, and completes
-// with it.
-func (s *Source) readIncremental(ctx context.Context, conn *pgx.Conn, t table, id, cursor string, st sourceState, completeAt []byte, out source.SplitEmitter) error {
+// Given an until or a complete_at (incrementalEnd), the read goes up to the
+// highest value of the read that sent it instead, stops at an until's
+// position, and completes with the state given.
+func (s *Source) readIncremental(ctx context.Context, conn *pgx.Conn, t table, sp source.Split, cursor string, st sourceState, out source.SplitEmitter) error {
 	ci, err := cursorColumn(t, cursor)
+	if err != nil {
+		return err
+	}
+	stop, err := endOf(t, sp)
 	if err != nil {
 		return err
 	}
@@ -554,9 +611,11 @@ func (s *Source) readIncremental(ctx context.Context, conn *pgx.Conn, t table, i
 	for i, c := range t.cols {
 		cols[i] = pgx.Identifier{c.name}.Sanitize()
 	}
-	end := func() error { return complete(out, sourceState{Since: st.Until}) }
-	if completeAt != nil {
-		end = func() error { return out.Complete(completeAt) }
+	end := func() error {
+		if stop.state != nil {
+			return stop.reached(out)
+		}
+		return complete(out, sourceState{Since: st.Until})
 	}
 	only, where := "", ""
 	if f := finite(t.cols[ci], cols[ci]); f != "" {
@@ -568,18 +627,14 @@ func (s *Source) readIncremental(ctx context.Context, conn *pgx.Conn, t table, i
 		}
 	}
 	if st.Until == nil {
-		var until *string
-		if completeAt != nil {
-			var at sourceState
-			if err := json.Unmarshal(completeAt, &at); err != nil {
-				return fmt.Errorf("postgres: where %s completes: %w", t.name, err)
+		until := stop.ceiling
+		if stop.state == nil {
+			if err := conn.QueryRow(ctx, "SELECT max("+cols[ci]+")::text FROM "+ident+where).Scan(&until); err != nil {
+				return classify(fmt.Errorf("postgres: read %s: %w", t.name, err))
 			}
-			until = at.Since
-		} else if err := conn.QueryRow(ctx, "SELECT max("+cols[ci]+")::text FROM "+ident+where).Scan(&until); err != nil {
-			return classify(fmt.Errorf("postgres: read %s: %w", t.name, err))
 		}
 		if until == nil {
-			if completeAt != nil {
+			if stop.state != nil {
 				return end()
 			}
 			return complete(out, sourceState{Since: st.Since})
@@ -626,7 +681,7 @@ func (s *Source) readIncremental(ctx context.Context, conn *pgx.Conn, t table, i
 	}
 	head := "SELECT " + list + ", " + strings.Join(text, ", ") + " FROM " + ident + " WHERE "
 	tail := " ORDER BY " + strings.Join(order, ", ") + " LIMIT " + strconv.Itoa(s.cfg.ChunkRows)
-	for _, after := range [][]string{st.After} {
+	for _, after := range [][]string{st.After, stop.after} {
 		if after != nil && len(after) != len(order) {
 			return fmt.Errorf("postgres: %s state has %d cursor and key columns, the read has %d", t.name, len(after), len(order))
 		}
@@ -634,15 +689,21 @@ func (s *Source) readIncremental(ctx context.Context, conn *pgx.Conn, t table, i
 	if st.Done {
 		return complete(out, sourceState{Since: st.Until})
 	}
+	if stop.until && stop.after == nil {
+		return end()
+	}
 	st.Key = t.orderKey()
 	first := pgx.Identifier{t.cols[t.order[0]].name}.Sanitize()
-	reading := s.Start(t.name, id, true)
-	defer s.End(t.name, id)
+	reading := s.Start(t.name, sp.ID, true)
+	defer s.End(t.name, sp.ID)
 	for {
 		where := []string{bounds()}
 		where = append(where, st.where(first, arg)...)
 		if st.After != nil {
 			where = append(where, afterKey(order, st.After, arg))
+		}
+		if stop.after != nil {
+			where = append(where, compareKey(order, "<=", stop.after, arg))
 		}
 		n, last, err := s.query(ctx, conn, b, t.name, head+strings.Join(where, " AND ")+tail, args, len(order), out)
 		if err != nil {
@@ -651,7 +712,7 @@ func (s *Source) readIncremental(ctx context.Context, conn *pgx.Conn, t table, i
 		if n > 0 {
 			st.After = last
 		}
-		ended := n < s.cfg.ChunkRows
+		ended := n < s.cfg.ChunkRows || stop.after != nil && slices.Equal(st.After, stop.after)
 		// The position follows the key only where the cursor is its first
 		// column.
 		var pos *string

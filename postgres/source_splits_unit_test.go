@@ -205,6 +205,7 @@ func TestSameOrder(t *testing.T) {
 	cols := []sourceColumn{{name: "a"}, {name: "b"}}
 	byB := table{name: "t", cols: cols, order: []int{1}}
 	byKey := table{name: "t", cols: cols, key: []int{0}, order: []int{0}}
+	unordered := table{name: "t", cols: cols}
 	for _, c := range []struct {
 		t    table
 		st   sourceState
@@ -219,7 +220,19 @@ func TestSameOrder(t *testing.T) {
 		{byB, sourceState{After: []string{"1"}, Key: []string{"a"}}, true},
 		{byKey, sourceState{keyRange: keyRange{Lo: &lo}}, false},
 		{byKey, sourceState{keyRange: keyRange{Lo: &lo}, Key: []string{"b"}}, true},
-		{table{name: "t", cols: cols}, sourceState{keyRange: keyRange{Lo: &lo}, Key: []string{"b"}}, true},
+		{unordered, sourceState{keyRange: keyRange{Lo: &lo}, Key: []string{"b"}}, true},
+		// A table that lost its primary key, read in its order, as states
+		// from 0.1.0 were, which name no key.
+		{unordered, sourceState{After: []string{"1"}}, true},
+		{unordered, sourceState{keyRange: keyRange{Lo: &lo}}, true},
+		{unordered, sourceState{keyRange: keyRange{Hi: &lo}, After: []string{"1"}}, true},
+		{unordered, sourceState{}, false},
+		{unordered, sourceState{Done: true}, false},
+		{byKey, sourceState{After: []string{"1"}}, false},
+		// A state of a read without an order, which a table read in one now
+		// takes as ended.
+		{byKey, sourceState{Done: true}, false},
+		{byB, sourceState{Done: true}, false},
 	} {
 		if err := sameOrder(c.t, c.st); (err != nil) != c.lost {
 			b, _ := json.Marshal(c.st)

@@ -363,13 +363,14 @@ func columnDefs(cols []column) string {
 
 // prepared is what a stream's apply reads before its transaction.
 type prepared struct {
-	// The staging's columns; none if the epoch staged nothing for it.
+	// The staging's columns, if the epoch staged rows for it.
 	cols []string
 	// The relation that reads every lane's staging, as acrossLanes makes it.
 	rows lanesRows
-	// Overwrite: the read table's columns once it can take the staging's;
-	// none if the read has no table.
-	read []string
+	// Overwrite: the read table's columns once it can take the staging's,
+	// if hasRead: the read has a table.
+	read    []string
+	hasRead bool
 	// Merge: the columns an update in the staging didn't send.
 	unchanged []string
 	// The patches' staging's columns; none if there's nothing to patch.
@@ -525,7 +526,7 @@ func (w *writer) applyRows(ctx context.Context, tx pgx.Tx, s stagedStream, p pre
 		n = uint64(affected)
 	}
 	if s.Ended {
-		return n, w.replace(ctx, tx, s, p.read)
+		return n, w.replace(ctx, tx, s, p)
 	}
 	return n, nil
 }
@@ -534,8 +535,8 @@ func (w *writer) applyRows(ctx context.Context, tx pgx.Tx, s stagedStream, p pre
 // deduped stream inserts one row per _openetl_id, and with Dedupe only IDs
 // the target doesn't have.
 func (w *writer) insert(s stagedStream, p prepared) string {
-	list, sel := quoteAll(p.cols), selectList(p.cols, "s")
-	into := "INSERT INTO " + w.ident(s.Into()) + " (" + list + ") "
+	sel := selectList(p.cols, "s")
+	into := "INSERT INTO " + w.ident(s.Into()) + columnList(p.cols)
 	id := pgx.Identifier{idColumn}.Sanitize()
 	switch {
 	case s.Dedupe:
@@ -758,9 +759,9 @@ func (w *writer) latestResolved(s stagedStream, prep prepared, hasSeq bool) stri
 
 // replace makes the read's rows the target's, and drops the read's table.
 // Readers see the old rows until the transaction commits.
-func (w *writer) replace(ctx context.Context, tx pgx.Tx, s stagedStream, read []string) error {
+func (w *writer) replace(ctx context.Context, tx pgx.Tx, s stagedStream, p prepared) error {
 	switch {
-	case s.Table == "" && len(read) > 0:
+	case s.Table == "" && p.hasRead:
 		return fmt.Errorf("its read has rows in %s, and no target table", s.Read)
 	case s.Table == "":
 		// The stream never had a schema, so it has no table to empty.
@@ -773,15 +774,23 @@ func (w *writer) replace(ctx context.Context, tx pgx.Tx, s stagedStream, read []
 	if _, err := tx.Exec(ctx, "DELETE FROM "+w.ident(s.Table)); err != nil {
 		return err
 	}
-	if len(read) == 0 {
+	if !p.hasRead {
 		return nil
 	}
-	list := quoteAll(read)
-	if _, err := tx.Exec(ctx, "INSERT INTO "+w.ident(s.Table)+" ("+list+") SELECT "+list+" FROM "+w.ident(s.Read)); err != nil {
+	if _, err := tx.Exec(ctx, "INSERT INTO "+w.ident(s.Table)+columnList(p.read)+"SELECT "+quoteAll(p.read)+" FROM "+w.ident(s.Read)); err != nil {
 		return err
 	}
 	_, err := tx.Exec(ctx, "DROP TABLE "+w.ident(s.Read))
 	return err
+}
+
+// columnList is an INSERT's list of cols, spaced; none for no columns, whose
+// rows take each column's default.
+func columnList(cols []string) string {
+	if len(cols) == 0 {
+		return " "
+	}
+	return " (" + quoteAll(cols) + ") "
 }
 
 func quoteAll(names []string) string {
@@ -805,12 +814,14 @@ func names(cols []column) []string {
 func (w *writer) prepare(ctx context.Context, desc staged, s stagedStream) (prepared, error) {
 	var p prepared
 	var cols []column
-	if len(s.Stagings) > 0 {
+	hasStaging := len(s.Stagings) > 0
+	if hasStaging {
+		var ok bool
 		var err error
-		if cols, p.rows, err = w.acrossLanes(ctx, s.Stagings); err != nil {
+		if cols, p.rows, ok, err = w.acrossLanes(ctx, s.Stagings); err != nil {
 			return p, err
 		}
-		if len(cols) == 0 {
+		if !ok {
 			// A newer generation's Recover drops what older ones staged.
 			var fence uint64
 			err := w.pool.QueryRow(ctx, "SELECT generation FROM "+w.ident("_openetl_fence")+" WHERE pipeline = $1", w.cfg.Pipeline).Scan(&fence)
@@ -822,22 +833,22 @@ func (w *writer) prepare(ctx context.Context, desc staged, s stagedStream) (prep
 		p.cols = names(cols)
 	}
 	if s.Mode == modeOverwrite {
-		if cols != nil {
+		if hasStaging {
 			if err := w.ensureRead(ctx, s, cols); err != nil {
 				return p, err
 			}
 		}
-		have, err := w.columnTypes(ctx, s.Read)
+		have, ok, err := w.tableColumns(ctx, s.Read)
 		if err != nil {
 			return p, err
 		}
-		p.read = names(have)
-		if s.Ended && len(have) > 0 && s.Table != "" {
+		p.read, p.hasRead = names(have), ok
+		if s.Ended && ok && s.Table != "" {
 			if err := w.ensureTable(ctx, s.Name, s.Table, have); err != nil {
 				return p, err
 			}
 		}
-	} else if cols != nil {
+	} else if hasStaging {
 		if err := w.ensureTable(ctx, s.Name, s.Table, cols); err != nil {
 			return p, err
 		}
@@ -848,12 +859,12 @@ func (w *writer) prepare(ctx context.Context, desc staged, s stagedStream) (prep
 			return p, err
 		}
 	}
-	if s.Dedupe && cols != nil {
+	if s.Dedupe && hasStaging {
 		if err := w.ensureIndex(ctx, s.Into(), sqlstage.IndexName(s.Into()), false, []string{idColumn}); err != nil {
 			return p, fmt.Errorf("postgres: index %s on %s: %w", idColumn, s.Into(), err)
 		}
 	}
-	if s.Mode == modeMerge && (cols != nil || p.patch != nil) {
+	if s.Mode == modeMerge && (hasStaging || p.patch != nil) {
 		if err := w.ensureKey(ctx, s.Table, s.Key); err != nil {
 			return p, err
 		}
@@ -884,17 +895,15 @@ func (w *writer) prepare(ctx context.Context, desc staged, s stagedStream) (prep
 // acrossLanes returns the columns of tables, each staging of one stream on
 // a lane, at each column's widest type, and the relation that reads them as
 // one with those columns, whatever each lane's schema was. A table's own
-// relation if there's one. No columns if one of them doesn't exist.
-func (w *writer) acrossLanes(ctx context.Context, tables []string) ([]column, lanesRows, error) {
+// relation if there's one. ok is false if one of them doesn't exist; a
+// staging of batches without columns has none.
+func (w *writer) acrossLanes(ctx context.Context, tables []string) (_ []column, _ lanesRows, ok bool, _ error) {
 	each := make([][]column, len(tables))
 	var cols []column
 	for i, t := range tables {
 		var err error
-		if each[i], err = w.columnTypes(ctx, t); err != nil {
-			return nil, lanesRows{}, err
-		}
-		if len(each[i]) == 0 {
-			return nil, lanesRows{}, nil
+		if each[i], ok, err = w.tableColumns(ctx, t); err != nil || !ok {
+			return nil, lanesRows{}, false, err
 		}
 		for _, c := range each[i] {
 			j := slices.IndexFunc(cols, func(x column) bool { return x.name == c.name })
@@ -905,12 +914,12 @@ func (w *writer) acrossLanes(ctx context.Context, tables []string) ([]column, la
 			case widens(cols[j].typ, c.typ):
 				cols[j] = c
 			default:
-				return nil, lanesRows{}, fmt.Errorf("postgres: column %q is %s on one lane, and %s on another", c.name, cols[j].typ, c.typ)
+				return nil, lanesRows{}, false, fmt.Errorf("postgres: column %q is %s on one lane, and %s on another", c.name, cols[j].typ, c.typ)
 			}
 		}
 	}
 	if len(tables) == 1 {
-		return cols, lanesRows{rel: w.ident(tables[0])}, nil
+		return cols, lanesRows{rel: w.ident(tables[0])}, true, nil
 	}
 	selects := make([]string, len(tables))
 	for i, t := range tables {
@@ -920,7 +929,7 @@ func (w *writer) acrossLanes(ctx context.Context, tables []string) ([]column, la
 		}
 		selects[i] = "SELECT " + strings.Join(sel, ", ") + " FROM " + w.ident(t)
 	}
-	return cols, lanesRows{rel: "(" + strings.Join(selects, " UNION ALL ") + ")", lanes: true}, nil
+	return cols, lanesRows{rel: "(" + strings.Join(selects, " UNION ALL ") + ")", lanes: true}, true, nil
 }
 
 // laneColumn selects the stream's column c from a lane's staging of the
@@ -940,15 +949,15 @@ func laneColumn(c column, have []column) string {
 }
 
 // preparePatch returns the columns of the stream's patches, none if its
-// target doesn't exist, _openetl_synced_at only if the target has it, and
-// gives an append target the _openetl_id index
-// patches match on.
+// target doesn't exist or has no columns, which no patch matches a row of;
+// _openetl_synced_at only if the target has it. It gives an append target
+// the _openetl_id index patches match on.
 func (w *writer) preparePatch(ctx context.Context, desc staged, s stagedStream) ([]string, lanesRows, error) {
-	cols, rows, err := w.acrossLanes(ctx, s.Patches)
+	cols, rows, ok, err := w.acrossLanes(ctx, s.Patches)
 	if err != nil {
 		return nil, rows, err
 	}
-	if len(cols) == 0 {
+	if !ok {
 		return nil, rows, fmt.Errorf("postgres: patches for %s in epoch %d-g%d are missing", s.Name, desc.Epoch, desc.Generation)
 	}
 	target, err := w.columnTypes(ctx, s.Table)
@@ -978,7 +987,7 @@ func (w *writer) preparePatch(ctx context.Context, desc staged, s stagedStream) 
 // target, after ApplySchema refused to and said how, and the read's table
 // replaces the target's rows.
 func (w *writer) ensureRead(ctx context.Context, s stagedStream, cols []column) error {
-	have, err := w.columnTypes(ctx, s.Read)
+	have, ok, err := w.tableColumns(ctx, s.Read)
 	if err != nil {
 		return err
 	}
@@ -994,7 +1003,7 @@ func (w *writer) ensureRead(ctx context.Context, s stagedStream, cols []column) 
 		}
 		return c
 	}
-	if len(have) == 0 {
+	if !ok {
 		want := make([]column, len(cols))
 		for i, c := range cols {
 			want[i] = targetType(c)
@@ -1362,7 +1371,7 @@ func (w *writer) ddl(ctx context.Context, stmt string) error {
 }
 
 // columnTypes returns a table's columns in order, or none if it doesn't
-// exist.
+// exist or has none: tableColumns tells those apart.
 func (w *writer) columnTypes(ctx context.Context, table string) ([]column, error) {
 	rows, err := w.pool.Query(ctx, `SELECT attname, format_type(atttypid, atttypmod) FROM pg_attribute
 		WHERE attrelid = to_regclass($1) AND attnum > 0 AND NOT attisdropped ORDER BY attnum`, w.ident(table))
@@ -1377,6 +1386,16 @@ func (w *writer) columnTypes(ctx context.Context, table string) ([]column, error
 		return nil, fmt.Errorf("postgres: read the columns of %s: %w", table, err)
 	}
 	return cols, nil
+}
+
+// tableColumns returns a table's columns in order, and whether it exists.
+func (w *writer) tableColumns(ctx context.Context, table string) ([]column, bool, error) {
+	cols, err := w.columnTypes(ctx, table)
+	if err != nil || len(cols) > 0 {
+		return cols, err == nil, err
+	}
+	ok, err := w.Exists(ctx, table)
+	return cols, ok, err
 }
 
 func (w *writer) Unapplied(ctx context.Context, desc staged, streams []stagedStream) ([]stagedStream, error) {

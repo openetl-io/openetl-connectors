@@ -282,3 +282,5 @@ A schema change waits up to 5 seconds for its table's metadata lock, and tries u
 ### Limits
 
 A row too long for the server's `max_allowed_packet` can't be written: it fails the write with `DATA_INVALID`, naming the stream and the limit. Raise `max_allowed_packet` to write it.
+
+A batch without columns fails the write, since a MySQL table has at least one.
