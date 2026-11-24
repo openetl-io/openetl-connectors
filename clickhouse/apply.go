@@ -204,7 +204,7 @@ func (w *writer) insertQuery(s stagedStream, cols []string, rel, tmp string) str
 // the delete's; a hard delete sets _openetl_is_deleted, which FINAL leaves
 // out. A column the latest version didn't send, as _openetl_unchanged says,
 // takes its value from the key's latest staged version that did, or else
-// keeps the target's.
+// keeps the target's, and with it that version's or the target's hold of it.
 func (w *writer) mergeQuery(ctx context.Context, s stagedStream, cols []string, rel string, target []column, tmp string) (string, error) {
 	hasSeq, hasOp := slices.Contains(cols, seqColumn), slices.Contains(cols, opColumn)
 	hasUnchanged := slices.Contains(cols, unchangedColumn)
@@ -258,9 +258,20 @@ func (w *writer) mergeQuery(ctx context.Context, s stagedStream, cols []string, 
 		insertCols = append(insertCols, isDeletedColumn)
 	}
 	join := soft || len(unchanged) > 0 || len(last) > 0
+	hi, ok := indexOf(target, heldColumn)
+	hasHeld := ok && target[hi].typ == heldType && slices.Contains(cols, heldColumn)
 	sel := make([]string, len(insertCols))
 	isDelete := "l." + ident(opColumn) + " = 'delete'"
 	tcol := func(c string) string { return "t._t" + strconv.Itoa(slices.Index(cols, c)) }
+	// The columns neither the latest version nor any earlier one sent.
+	var resolved []string
+	for j, u := range unchanged {
+		resolved = append(resolved, "(x = "+literal(u)+" AND r._f"+strconv.Itoa(j)+")")
+	}
+	remaining := "l." + ident(unchangedColumn)
+	if len(resolved) > 0 {
+		remaining = "arrayFilter(x -> NOT (" + strings.Join(resolved, " OR ") + "), " + remaining + ")"
+	}
 	for i, c := range insertCols {
 		v := "l." + ident(c)
 		switch {
@@ -270,17 +281,18 @@ func (w *writer) mergeQuery(ctx context.Context, s stagedStream, cols []string, 
 			v = "toUInt8(0)"
 		case slices.Contains(s.Key, c):
 		case c == unchangedColumn && join:
-			// The columns neither the latest version nor any earlier one
-			// sent, and, where the target has the key, it never received.
-			var resolved []string
-			for j, u := range unchanged {
-				resolved = append(resolved, "(x = "+literal(u)+" AND r._f"+strconv.Itoa(j)+")")
-			}
-			remaining := v
-			if len(resolved) > 0 {
-				remaining = "arrayFilter(x -> NOT (" + strings.Join(resolved, " OR ") + "), " + v + ")"
-			}
+			// Of those, the ones that, where the target has the key, it
+			// never received.
 			v = "if(t._found = 1, arrayIntersect(" + remaining + ", " + tcol(c) + "), " + remaining + ")"
+		case c == heldColumn && hasHeld && hasUnchanged && join:
+			// The latest version's holds, an earlier version's for a column
+			// taken from it, and the target's for a column none sent, so a
+			// patch from the version that holds it still fills it.
+			v = "mapUpdate(mapFilter((x, h) -> has(" + remaining + ", x), " + tcol(c) + "), " + v + ")"
+			for j := range unchanged {
+				js := strconv.Itoa(j)
+				v = "mapUpdate(" + v + ", mapFilter((x, h) -> has(l." + ident(unchangedColumn) + ", x) AND r._f" + js + ", r._h" + js + "))"
+			}
 		case slices.Contains(unchanged, c):
 			j := strconv.Itoa(slices.Index(unchanged, c))
 			v = "if(has(l." + ident(unchangedColumn) + ", " + literal(c) + "), if(r._f" + j + ", r._r" + j + ", if(t._found = 1, " + tcol(c) + ", " + v + ")), " + v + ")"
@@ -326,7 +338,15 @@ func (w *writer) mergeQuery(ctx context.Context, s stagedStream, cols []string, 
 		rsel := keyAs("_k")
 		for j, u := range unchanged {
 			sent := "NOT has(" + ident(unchangedColumn) + ", " + literal(u) + ")"
-			rsel = append(rsel, "argMaxIf(tuple("+ident(u)+"), "+ord+", "+sent+").1 AS _r"+strconv.Itoa(j), "countIf("+sent+") > 0 AS _f"+strconv.Itoa(j))
+			js := strconv.Itoa(j)
+			if hasHeld {
+				// The value and, if that version holds it, the hold.
+				rsel = append(rsel, "argMaxIf(tuple("+ident(u)+", mapFilter((x, h) -> x = "+literal(u)+", "+ident(heldColumn)+")), "+ord+", "+sent+") AS _v"+js,
+					"tupleElement(_v"+js+", 1) AS _r"+js, "tupleElement(_v"+js+", 2) AS _h"+js)
+			} else {
+				rsel = append(rsel, "argMaxIf(tuple("+ident(u)+"), "+ord+", "+sent+").1 AS _r"+js)
+			}
+			rsel = append(rsel, "countIf("+sent+") > 0 AS _f"+js)
 		}
 		q += " LEFT JOIN (SELECT " + strings.Join(rsel, ", ") + " FROM " + rel + " GROUP BY " + key + ") AS r ON " + on("r", "_k")
 	}

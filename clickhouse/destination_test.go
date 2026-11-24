@@ -803,6 +803,28 @@ func testDestinationPatchMerge(t *testing.T, k kit) {
 	wantRows(t, "m after the newer version's patch", k.rows("m", "id", "v", "w", heldColumn), "1|p1b|w1b|{}", "2|b2|w2b|{}")
 }
 
+// Holds by key: an update that didn't send a held column keeps its hold,
+// the target's or that of the earlier version in the epoch it takes the
+// column from, so the held version's patch still fills it.
+func TestDestinationPatchMergeUnchanged(t *testing.T) {
+	k := newKit(t)
+	unchanged := arrow.Field{Name: unchangedColumn, Type: arrow.ListOf(arrow.BinaryTypes.String), Nullable: true}
+	s := schemaOf("m", idCol, vCol, wCol, unchanged, heldCol)
+	streams := []destination.Stream{{Name: "m", Mode: destination.Merge, PrimaryKey: []string{"id"}}}
+	w, _ := k.open(1, streams, destination.Epoch{}, nil)
+	k.apply(w, s)
+	cols := []string{"id", "v", "w", heldColumn}
+	r1 := ins(1, int64(1), nil, "w1", nil, []string{"v"})
+	k.commit(w, epoch(1, 1), batchOf(s, r1))
+	r2 := ins(1, int64(2), nil, "w2", nil, []string{"v"})
+	k.commit(w, epoch(1, 2), batchOf(s, upd(2, int64(1), nil, "w1b", []string{"v"}, nil), r2, upd(2, int64(2), nil, "w2b", []string{"v"}, nil)))
+	wantRows(t, "m after updates that didn't send v", k.rows("m", cols...), "1|NULL|w1b|{'v':'"+heldHex(r1)+"'}", "2|NULL|w2b|{'v':'"+heldHex(r2)+"'}")
+	if err := k.commitPatches(w, epoch(1, 3), "m", patchBatch(t, "m", []arrow.Field{vCol}, patchRow{r1, []string{"v"}, []any{"p1"}}, patchRow{r2, []string{"v"}, []any{"p2"}})); err != nil {
+		t.Fatal(err)
+	}
+	wantRows(t, "m after the held versions' patches", k.rows("m", cols...), "1|p1|w1b|{}", "2|p2|w2b|{}")
+}
+
 // A column held while the destination refuses its type change arrives at
 // the table's type; once the user has run the refusal's fix, patches at
 // the new type fill it, or fill col__v2 for col's hold. A patch whose type
