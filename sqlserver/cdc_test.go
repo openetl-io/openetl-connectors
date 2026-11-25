@@ -355,7 +355,12 @@ func TestCaptureCleanupMidRead(t *testing.T) {
 	// Cleanup lowers its low water mark to the first change committed at the
 	// mark's tran_end_time, a datetime, which the inserts may share: a change
 	// committed at a later one is a mark past them all.
-	e.exec("DECLARE @t datetime = sys.fn_cdc_map_lsn_to_time(sys.fn_cdc_get_max_lsn()); WHILE CONVERT(datetime, SYSDATETIME()) <= @t WAITFOR DELAY '00:00:00.001'")
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	_, err := e.db.ExecContext(ctx, "DECLARE @t datetime = sys.fn_cdc_map_lsn_to_time(sys.fn_cdc_get_max_lsn()); WHILE CONVERT(datetime, SYSDATETIME()) <= @t WAITFOR DELAY '00:00:00.001'")
+	cancel()
+	if err != nil {
+		t.Fatalf("waiting for the server's clock to pass the last change's commit time: %v", err)
+	}
 	e.harvested()
 	var once sync.Once
 	left := -1
@@ -368,7 +373,7 @@ func TestCaptureCleanupMidRead(t *testing.T) {
 		})
 	}}
 	t.Cleanup(c.release)
-	err := s.Read(t.Context(), source.ReadRequest{Streams: []source.ConfiguredStream{{Name: "t", SyncMode: source.CDC, State: []byte(state)}}}, c)
+	err = s.Read(t.Context(), source.ReadRequest{Streams: []source.ConfiguredStream{{Name: "t", SyncMode: source.CDC, State: []byte(state)}}}, c)
 	if left != 0 {
 		t.Fatalf("the cleanup left %d of the 4 changes, so it didn't remove those the read hadn't reached", left)
 	}
