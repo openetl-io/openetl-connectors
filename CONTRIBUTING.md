@@ -80,7 +80,7 @@ openetl connector package --tag postgres/v0.2.0
 
 `package` picks the directory whose package is `postgres`, builds each role for every platform into `dist/` (`postgres-source-linux-amd64` and the like), and writes `dist/postgres.connector.yaml`, whose binaries point at the `postgres/v0.2.0` release's assets. The executables and the descriptor are that release's assets, and `openetl connector apply -f postgres.connector.yaml` pins the version. Tags are per package: `postgres/v0.2.0`, `kafka/v0.1.3`.
 
-**A release** is one package's tag, pushed: `PACKAGE/vX.Y.Z`, or `PACKAGE/vX.Y.Z-alpha.N`, `-beta.N` or `-rc.N` for a prerelease, on a commit in `main` that `ci` passed. Each package has versions of its own and is released when it has changed; nothing is edited before a release.
+**A release** is one package's tag, pushed: `PACKAGE/vX.Y.Z`, or `PACKAGE/vX.Y.Z-alpha`, `-beta` or `-rc` for a prerelease, with or without a number (`-alpha.1`), on a commit in `main` that `ci` passed. Each package has versions of its own and is released when it has changed; nothing is edited before a release.
 
 ```sh
 git tag postgres/v0.2.0-alpha.1 origin/main && git push origin postgres/v0.2.0-alpha.1

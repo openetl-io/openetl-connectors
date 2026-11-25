@@ -1,7 +1,8 @@
 name: release
 
 # Releases one package when its tag is pushed: PACKAGE/vX.Y.Z, or a
-# prerelease, PACKAGE/vX.Y.Z-alpha.N, -beta.N or -rc.N. The tag's commit must
+# prerelease, PACKAGE/vX.Y.Z-alpha, -beta or -rc, with or without a number
+# (PACKAGE/vX.Y.Z-alpha.N). The tag's commit must
 # be in main or in a release branch, release-PACKAGE-X.Y (or release-X.Y), and
 # ci must have passed on it, with the package's job, "package PACKAGE", among
 # the jobs that ran; a run of ci still going on it is waited for. It packages
@@ -73,8 +74,8 @@ jobs:
     steps:
       - name: The tag names a package's version
         run: |
-          re='^([a-z0-9][a-z0-9-]*)/v([0-9]+\.[0-9]+\.[0-9]+(-(alpha|beta|rc)\.[0-9]+)?)$'
-          [[ "$TAG" =~ $re ]] || { echo "::error::$TAG isn't a tag such as postgres/v0.2.0 or postgres/v0.2.0-alpha.1"; exit 1; }
+          re='^([a-z0-9][a-z0-9-]*)/v([0-9]+\.[0-9]+\.[0-9]+(-(alpha|beta|rc)(\.[0-9]+)?)?)$'
+          [[ "$TAG" =~ $re ]] || { echo "::error::$TAG isn't a tag such as postgres/v0.2.0, postgres/v0.2.0-alpha or postgres/v0.2.0-alpha.1"; exit 1; }
           { echo "PACKAGE=${BASH_REMATCH[1]}"; echo "VERSION=${BASH_REMATCH[2]}"
             echo "DIST=$RUNNER_TEMP/dist"; } >> "$GITHUB_ENV"
       # The tag, or on a dry run the branch.
