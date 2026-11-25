@@ -318,6 +318,29 @@ func TestDestinationRefusesTransactionsTheBrokersCant(t *testing.T) {
 	}
 }
 
+// A replication factor above the brokers' number fails the check and Open
+// with a config error that names replicationFactor, with what the brokers
+// said of it.
+func TestDestinationRefusesAReplicationFactorTheBrokersCant(t *testing.T) {
+	d, err := NewDestination(config(t, map[string]any{"replicationFactor": 2, "markerTopic": uniq("markers")}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := check.Run(t.Context(), d.Checks())
+	if got := statuses(r); got["markers.topic"] != "failed:replication_factor_refused" || got["cluster.transaction-timeout"] != "passed" {
+		t.Errorf("check: %v", got)
+	}
+	logItems(t, "check", r)
+	cfg := destination.OpenConfig{Pipeline: uniq("p"), Generation: 1, Scope: destination.ScopePipeline, CommitInterval: time.Second,
+		Streams: []destination.Stream{{Name: "s", Mode: destination.Append}}}
+	_, err = d.Open(t.Context(), cfg)
+	var coded interface{ ErrorCode() protocolv1.ErrorCode }
+	if !errors.As(err, &coded) || coded.ErrorCode() != protocolv1.ErrorCode_ERROR_CODE_CONFIG_INVALID || !strings.Contains(err.Error(), "which replicationFactor sets") {
+		t.Errorf("Open = %v", err)
+	}
+	t.Logf("Open: %v", err)
+}
+
 // capture is an Emitter that keeps what a read emits.
 type capture struct {
 	mu       sync.Mutex

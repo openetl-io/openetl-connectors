@@ -94,6 +94,26 @@ var (
 		Message: "{topic}'s cleanup.policy is {policy}, so the destination's markers expire with its retention, and recovery can't find an epoch's marker once it has.",
 		Fix:     "Set cleanup.policy=compact on {topic}.",
 	}
+	partitionsRequired = check.Reason{
+		Name: "partitions_required", Code: configInvalid,
+		Message: "The brokers create no topic without a number of partitions, as MSK Serverless's don't, so creating {topic} needs partitions set.",
+		Fix:     "Set partitions to the number of partitions to create topics with.",
+	}
+	partitionsRefused = check.Reason{
+		Name: "partitions_refused", Code: configInvalid,
+		Message: "The brokers refuse to create {topic} with {partitions} partitions, which partitions sets.",
+		Fix:     "Set partitions to a number of partitions the brokers allow.",
+	}
+	replicationRequired = check.Reason{
+		Name: "replication_factor_required", Code: configInvalid,
+		Message: "The brokers create no topic without a replication factor, so creating {topic} needs replicationFactor set.",
+		Fix:     "Set replicationFactor to the replication factor to create topics with.",
+	}
+	replicationRefused = check.Reason{
+		Name: "replication_factor_refused", Code: configInvalid,
+		Message: "The brokers refuse to create {topic} with a replication factor of {replication_factor}, which replicationFactor sets.",
+		Fix:     "Set replicationFactor to one the brokers allow, at most the number of brokers.",
+	}
 )
 
 // clusterProbe is one list's client of the cluster, made by the first check
@@ -597,18 +617,7 @@ func (d *Destination) writable(ctx context.Context, p *check.Probe, cl *kgo.Clie
 		if cr := d.cfg.CreateTopics; cr != nil && !*cr {
 			return noTopic.Fail("topic", topic)
 		}
-		partitions, rf := d.cfg.Partitions, d.cfg.ReplicationFactor
-		if partitions == 0 {
-			partitions = -1
-		}
-		if rf == 0 {
-			rf = -1
-		}
-		res, err := kadm.NewClient(cl).ValidateCreateTopics(ctx, partitions, rf, configs, topic)
-		if err == nil {
-			err = res.Error()
-		}
-		if err != nil && !errors.Is(err, kerr.TopicAlreadyExists) {
+		if err := d.cfg.createTopic(ctx, kadm.NewClient(cl), true, topic, configs); err != nil {
 			return c.failure(err, "CREATE", "the topic "+topic)
 		}
 		p.Found("{topic} doesn't exist yet: the destination will create it.")
@@ -661,14 +670,22 @@ func (d *Destination) Checks() []check.Check {
 					return err
 				}
 				limit, err := transactionLimit(ctx, kadm.NewClient(cl))
-				if err != nil {
+				need := timeout(DestinationCapabilities.DefaultCommitInterval)
+				switch {
+				case errors.Is(err, errNoBrokerConfigs):
+					p.Param("required", need.String())
+					p.Param("default", DestinationCapabilities.DefaultCommitInterval.String())
+					p.Param("most", timeout(DestinationCapabilities.MaxCommitInterval).String())
+					p.Param("longest", DestinationCapabilities.MaxCommitInterval.String())
+					return check.Skip("the brokers don't describe their configs, as MSK Serverless's don't, so their transaction.max.timeout.ms can't be read here: " +
+						"check that it's at least twice the commit interval and a minute, {required} for the default interval of {default}, and {most} for the longest, {longest}")
+				case err != nil:
 					return d.cfg.failure(err, "", "")
-				}
-				if limit == 0 {
+				case limit == 0:
 					return check.Skip("the credentials can't describe the brokers' configs, which takes DESCRIBE_CONFIGS on the cluster")
 				}
 				p.Param("found", limit.String())
-				if need := timeout(DestinationCapabilities.DefaultCommitInterval); limit < need {
+				if limit < need {
 					return check.SettingMismatch.Fail("setting", "The brokers' transaction.max.timeout.ms", "required", "at least "+need.String())
 				}
 				longest := min(DestinationCapabilities.MaxCommitInterval, (limit-time.Minute)/2).Truncate(time.Second)
@@ -680,9 +697,13 @@ func (d *Destination) Checks() []check.Check {
 	)
 }
 
+// errNoBrokerConfigs: the brokers describe no broker's configs, as MSK
+// Serverless's don't, answering INVALID_REQUEST.
+var errNoBrokerConfigs = errors.New("kafka: the brokers don't describe their configs")
+
 // transactionLimit is the brokers' transaction.max.timeout.ms; 0 if the
 // credentials may not describe the brokers' configs, or the brokers don't
-// say.
+// say; errNoBrokerConfigs if the brokers describe none.
 func transactionLimit(ctx context.Context, adm *kadm.Client) (time.Duration, error) {
 	brokers, err := adm.ListBrokers(ctx)
 	if err != nil || len(brokers) == 0 {
@@ -692,10 +713,12 @@ func transactionLimit(ctx context.Context, adm *kadm.Client) (time.Duration, err
 	if err == nil && len(rcs) > 0 {
 		err = rcs[0].Err
 	}
-	if errors.Is(err, kerr.ClusterAuthorizationFailed) || err == nil && len(rcs) == 0 {
+	switch {
+	case errors.Is(err, kerr.ClusterAuthorizationFailed), err == nil && len(rcs) == 0:
 		return 0, nil
-	}
-	if err != nil {
+	case errors.Is(err, kerr.InvalidRequest):
+		return 0, fmt.Errorf("%w: %w", errNoBrokerConfigs, err)
+	case err != nil:
 		return 0, err
 	}
 	for _, c := range rcs[0].Configs {

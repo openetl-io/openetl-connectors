@@ -16,20 +16,6 @@ import (
 	"github.com/openetl-io/openetl/sdk/go/source"
 )
 
-// statuses are a report's items' statuses by name, failures with their
-// reason.
-func statuses(r check.Report) map[string]string {
-	out := map[string]string{}
-	for _, it := range r.Items {
-		s := it.Status.String()
-		if it.Failure != nil {
-			s += ":" + it.Failure.Reason
-		}
-		out[it.Name] = s
-	}
-	return out
-}
-
 // logItems logs each item as people see it.
 func logItems(t *testing.T, what string, r check.Report) {
 	t.Helper()

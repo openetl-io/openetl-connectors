@@ -196,6 +196,78 @@ func TestATopicLimitBelowTheClientsBatchesIsConfig(t *testing.T) {
 	}
 }
 
+// On a cluster that answers as MSK Serverless did, a writer without
+// partitions fails as a config error that says to set them, rather than an
+// internal error that OpenETL retries: at Open, which creates the marker
+// topic, and at a stream's first write, which creates its topic. With
+// partitions set, it creates both and its epochs land, though the brokers
+// don't describe their configs.
+func TestTopicsOnMSKServerless(t *testing.T) {
+	l := newLanes(t)
+	mskServerless(l.c)
+	cfg := destination.OpenConfig{Pipeline: l.pipeline, Generation: 1, Scope: destination.ScopePipeline, CommitInterval: time.Second,
+		Streams: []destination.Stream{{Name: l.table, Mode: destination.Append}}}
+	_, err := l.d.Open(t.Context(), cfg)
+	if codeOf(err) != "ERROR_CODE_CONFIG_INVALID" || !strings.Contains(err.Error(), "_openetl_markers needs partitions set") {
+		t.Errorf("Open without partitions: %s %v", codeOf(err), err)
+	}
+
+	without := l.d
+	with, err := NewDestination(fakeConfig(t, l.addrs, map[string]any{"partitions": 1}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	l.d = with
+	w := l.open(1, 0)
+	l.commit(w, epochOf(1, 1), l.stage(w, epochOf(1, 1), 0, 3))
+	l.want("with partitions", 0, 3)
+
+	// The marker topic exists now; a stream's new topic is refused at its
+	// first write.
+	l.d, l.table = without, "other"
+	w = l.open(2, 0)
+	b := idRows(l.table, 0, 3)
+	defer b.Release()
+	err = w.Write(t.Context(), epochOf(2, 1), l.table, b)
+	if codeOf(err) != "ERROR_CODE_CONFIG_INVALID" || !strings.Contains(err.Error(), "other needs partitions set") {
+		t.Errorf("a new topic's write without partitions: %s %v", codeOf(err), err)
+	}
+}
+
+// A topic the brokers won't create with the config's partitions or
+// replication factor, or with their default replication factor where it
+// sets none, fails as a config error that names the setting. A refusal of
+// the credentials is still theirs.
+func TestATopicTheBrokersWontCreateIsConfig(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		extra map[string]any
+		// What the brokers answer every creation with; 0: kfake's own
+		// answer.
+		code int16
+		// The error's code, and what its text says.
+		want, says string
+	}{
+		{"partitions refused", map[string]any{"partitions": 3}, kerr.InvalidPartitions.Code, "ERROR_CODE_CONFIG_INVALID", "with 3 partitions, which partitions sets"},
+		{"no default replication factor", nil, kerr.InvalidReplicationFactor.Code, "ERROR_CODE_CONFIG_INVALID", "needs replicationFactor set"},
+		{"more replicas than brokers", map[string]any{"replicationFactor": 2}, 0, "ERROR_CODE_CONFIG_INVALID", "a replication factor of 2, which replicationFactor sets"},
+		{"no CREATE", nil, kerr.TopicAuthorizationFailed.Code, "ERROR_CODE_PERMISSION_DENIED", "TOPIC_AUTHORIZATION_FAILED"},
+	} {
+		c := fakeCluster(t)
+		if tc.code != 0 {
+			refuseCreates(c, tc.code)
+		}
+		d, err := NewDestination(fakeConfig(t, c.ListenAddrs(), tc.extra))
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = d.Open(t.Context(), destination.OpenConfig{Pipeline: "p", Generation: 1, Scope: destination.ScopePipeline, CommitInterval: time.Second})
+		if codeOf(err) != tc.want || !strings.Contains(err.Error(), tc.says) {
+			t.Errorf("%s: Open = %s %v", tc.name, codeOf(err), err)
+		}
+	}
+}
+
 // A transaction open past its timeout, which the brokers abort, fails its
 // epoch as transient, at the commit, at a commit again, as OpenETL retries
 // one, or at the pre-commit: no newer writer owns the lane, as a fence
