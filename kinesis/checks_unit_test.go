@@ -17,6 +17,8 @@ import (
 	"time"
 
 	"github.com/apache/arrow-go/v18/arrow"
+	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/kinesis/types"
 	"github.com/twmb/franz-go/pkg/sr"
@@ -543,7 +545,7 @@ func TestEnsureStreamFinishesSetup(t *testing.T) {
 		t.Fatal(err)
 	}
 	writer := func(retention int32) *writer {
-		return &writer{d: &Destination{cfg: DestinationConfig{Connection: c, StreamMode: streamOnDemand, RetentionHours: retention}}, cl: cl, ready: map[string]bool{}}
+		return &writer{d: &Destination{cfg: DestinationConfig{Connection: c, StreamMode: streamOnDemand, RetentionHours: retention}}, cl: cl, ready: map[string]bool{}, fresh: map[string]time.Time{}}
 	}
 	retentionOf := func(name string) int {
 		mu.Lock()
@@ -614,6 +616,203 @@ func TestEnsureStreamFinishesSetup(t *testing.T) {
 	}
 	if len(tagsOf("plain")) != 0 || f.called("ListTagsForStream") != before {
 		t.Errorf("plain: tags %v, %d listings", tagsOf("plain"), f.called("ListTagsForStream")-before)
+	}
+}
+
+// newStream is a Kinesis of one stream that, once it's created, answers
+// that it doesn't exist to some calls of each operation, as Kinesis does
+// for a while after it creates a stream.
+type newStream struct {
+	mu      sync.Mutex
+	exists  bool
+	created time.Time
+	// CreateStream answers ResourceInUseException, as when another lane
+	// creates the stream.
+	inUse bool
+	// How many of each operation's next calls, once the stream exists,
+	// answer ResourceNotFoundException; -1: every one.
+	unknown   map[string]int
+	retention int
+	tags      map[string]string
+	put       int
+}
+
+func (s *newStream) handle(op string, in map[string]any) (int, any) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	name, _ := in["StreamName"].(string)
+	if op == "CreateStream" {
+		inUse := s.exists || s.inUse
+		s.exists, s.created, s.retention, s.tags = true, time.Now(), 24, map[string]string{}
+		if m, ok := in["Tags"].(map[string]any); ok {
+			for k, v := range m {
+				s.tags[k], _ = v.(string)
+			}
+		}
+		if inUse {
+			return apiError("ResourceInUseException", "Stream "+name+" under account 123456789012 already exists.")
+		}
+		return http.StatusOK, nil
+	}
+	if s.exists && s.unknown[op] != 0 {
+		if s.unknown[op] > 0 {
+			s.unknown[op]--
+		}
+	} else if s.exists {
+		switch op {
+		case "DescribeStreamSummary":
+			sum := summary(name, s.retention, 0)
+			sum["StreamDescriptionSummary"].(map[string]any)["StreamCreationTimestamp"] = float64(s.created.Unix())
+			return http.StatusOK, sum
+		case "DescribeStream":
+			return http.StatusOK, described(name)
+		case "ListTagsForStream":
+			var out []any
+			for k, v := range s.tags {
+				out = append(out, map[string]any{"Key": k, "Value": v})
+			}
+			return http.StatusOK, map[string]any{"Tags": out, "HasMoreTags": false}
+		case "IncreaseStreamRetentionPeriod":
+			h, _ := in["RetentionPeriodHours"].(float64)
+			s.retention = int(h)
+			return http.StatusOK, nil
+		case "RemoveTagsFromStream":
+			delete(s.tags, setupTag)
+			return http.StatusOK, nil
+		case "PutRecords":
+			recs, _ := in["Records"].([]any)
+			out := make([]any, len(recs))
+			for i := range recs {
+				out[i] = map[string]any{"SequenceNumber": "1", "ShardId": "shardId-000000000000"}
+			}
+			s.put += len(recs)
+			return http.StatusOK, map[string]any{"FailedRecordCount": 0, "Records": out}
+		}
+		return apiError("UnknownOperationException", op)
+	}
+	return apiError("ResourceNotFoundException", "Stream "+name+" under account 123456789012 not found.")
+}
+
+// newStreamWriter opens a writer of the stream t, to the Kinesis stream
+// ns.t, against s.
+func newStreamWriter(t *testing.T, s *newStream, retention int32, create bool) (*writer, *fakeKinesis) {
+	t.Helper()
+	f, c := newFake(t, s.handle)
+	cfg := DestinationConfig{Connection: c, RetentionHours: retention, CreateStreams: &create}
+	if err := cfg.validate(); err != nil {
+		t.Fatal(err)
+	}
+	w, err := (&Destination{cfg: cfg}).Open(t.Context(), destination.OpenConfig{Namespace: "ns", Streams: []destination.Stream{{Name: "t", Mode: destination.Append, PrimaryKey: []string{"id"}}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return w.(*writer), f
+}
+
+var firstEpoch = destination.Epoch{Generation: 1, N: 1}
+
+// writeIDs writes rows with ids to stream t in firstEpoch.
+func writeIDs(t *testing.T, w *writer, ids ...int64) error {
+	t.Helper()
+	b := array.NewInt64Builder(memory.DefaultAllocator)
+	defer b.Release()
+	b.AppendValues(ids, nil)
+	col := b.NewArray()
+	defer col.Release()
+	sc := arrow.NewSchema([]arrow.Field{{Name: "id", Type: arrow.PrimitiveTypes.Int64}}, nil)
+	batch := array.NewRecordBatch(sc, []arrow.Array{col}, int64(len(ids)))
+	defer batch.Release()
+	return w.Write(t.Context(), firstEpoch, "t", batch)
+}
+
+// sendIDs writes rows with ids to stream t, and pre-commits them.
+func sendIDs(t *testing.T, w *writer, ids ...int64) error {
+	t.Helper()
+	if err := writeIDs(t, w, ids...); err != nil {
+		return err
+	}
+	_, err := w.PreCommit(t.Context(), firstEpoch)
+	return err
+}
+
+// Kinesis answering that a stream doesn't exist, for its first calls after
+// CreateStream, fails no write: the writer calls it again until it knows
+// the stream. So does a stream another lane is creating or created moments
+// ago.
+func TestNewStreamNotKnownYet(t *testing.T) {
+	for _, c := range []struct {
+		name      string
+		retention int32
+		s         *newStream
+	}{
+		{"puts", 0, &newStream{unknown: map[string]int{"PutRecords": 3}}},
+		{"describe", 0, &newStream{unknown: map[string]int{"DescribeStream": 1, "PutRecords": 1}}},
+		{"setup", 48, &newStream{unknown: map[string]int{"DescribeStreamSummary": 1, "IncreaseStreamRetentionPeriod": 1, "RemoveTagsFromStream": 1, "PutRecords": 2}}},
+		{"another lane creating", 48, &newStream{inUse: true, unknown: map[string]int{"ListTagsForStream": 1, "DescribeStreamSummary": 1, "PutRecords": 2}}},
+		{"another lane's, just created", 0, &newStream{exists: true, created: time.Now().Add(-time.Minute), retention: 24, unknown: map[string]int{"PutRecords": 2}}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			existed := c.s.exists
+			w, f := newStreamWriter(t, c.s, c.retention, true)
+			if err := sendIDs(t, w, 1, 2, 3); err != nil {
+				t.Fatalf("%s: %v", codeOf(err), err)
+			}
+			s := c.s
+			s.mu.Lock()
+			defer s.mu.Unlock()
+			for op, n := range s.unknown {
+				if n != 0 {
+					t.Errorf("%d of %s's not-found answers left", n, op)
+				}
+			}
+			if s.put != 3 {
+				t.Errorf("Kinesis took %d records, not 3", s.put)
+			}
+			if c.retention > 0 && (s.retention != int(c.retention) || s.tags[setupTag] != "") {
+				t.Errorf("%dh of retention, tags %v", s.retention, s.tags)
+			}
+			if want, n := map[bool]int{false: 1, true: 0}[existed], f.called("CreateStream"); n != want {
+				t.Errorf("%d CreateStream calls, not %d", n, want)
+			}
+		})
+	}
+}
+
+// A stream that doesn't exist, with createStreams off, is a config error
+// at once; so is one that isn't new and that Kinesis says is gone. A new
+// stream that Kinesis doesn't know newStreamWait after the writer found it
+// ready fails with TRANSIENT, and says so.
+func TestStreamNotFound(t *testing.T) {
+	w, f := newStreamWriter(t, &newStream{}, 0, false)
+	err := sendIDs(t, w, 1)
+	if codeOf(err) != protocolv1.ErrorCode_ERROR_CODE_CONFIG_INVALID || !strings.Contains(err.Error(), "ns.t doesn't exist, and createStreams is off") {
+		t.Errorf("createStreams off: %s: %v", codeOf(err), err)
+	}
+	if n := f.called("DescribeStreamSummary"); n != 1 || f.called("CreateStream") != 0 || f.called("PutRecords") != 0 {
+		t.Errorf("createStreams off: %d describes, %d creates, %d puts", n, f.called("CreateStream"), f.called("PutRecords"))
+	}
+
+	gone := &newStream{exists: true, created: time.Now().Add(-48 * time.Hour), retention: 24, unknown: map[string]int{"PutRecords": -1}}
+	w, f = newStreamWriter(t, gone, 0, true)
+	if err := sendIDs(t, w, 1); codeOf(err) != protocolv1.ErrorCode_ERROR_CODE_CONFIG_INVALID {
+		t.Errorf("an old stream gone: %s: %v", codeOf(err), err)
+	}
+	if n := f.called("PutRecords"); n != 1 {
+		t.Errorf("an old stream gone: %d puts", n)
+	}
+
+	w, f = newStreamWriter(t, &newStream{unknown: map[string]int{"PutRecords": -1}}, 0, true)
+	if err := writeIDs(t, w, 1); err != nil {
+		t.Fatal(err)
+	}
+	w.fresh["ns.t"] = time.Now().Add(100*time.Millisecond - newStreamWait)
+	_, err = w.PreCommit(t.Context(), firstEpoch)
+	if codeOf(err) != protocolv1.ErrorCode_ERROR_CODE_TRANSIENT || !strings.Contains(err.Error(), "put records to ns.t: the stream is new, and Kinesis still answers that it doesn't exist after waiting 2m") ||
+		!strings.Contains(err.Error(), "ResourceNotFoundException") {
+		t.Errorf("never known: %s: %v", codeOf(err), err)
+	}
+	if n := f.called("PutRecords"); n < 2 {
+		t.Errorf("never known: %d puts", n)
 	}
 }
 

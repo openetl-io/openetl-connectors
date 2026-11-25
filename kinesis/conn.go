@@ -271,10 +271,11 @@ var (
 	}
 )
 
-// classify gives Kinesis's errors their taxonomy codes.
+// classify gives Kinesis's errors their taxonomy codes. An error that has a
+// code keeps it.
 func classify(err error) error {
-	if err == nil {
-		return nil
+	if err == nil || codeOf(err) != protocolv1.ErrorCode_ERROR_CODE_UNSPECIFIED {
+		return err
 	}
 	if _, ok := errors.AsType[net.Error](err); ok && !errors.Is(err, context.Canceled) {
 		return sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_TRANSIENT, err)
