@@ -432,7 +432,7 @@ func TestMergePicks(t *testing.T) {
 	cols := []column{{name: "id", typ: "bigint"}, {name: "name", typ: varcharMax}, {name: seqColumn, typ: "decimal(38,0)"}, {name: unchangedColumn, typ: varcharMax}}
 	s := stagedStream{Name: "users", Table: "users", Key: []string{"id"}, Mode: modeMerge}
 	picks := func(cols []column) string {
-		for _, q := range w.merge(s, prepared{cols: cols, rows: `"s"."stg"`, unchanged: []string{"name"}, everUnchanged: []string{"name"}}) {
+		for _, q := range w.merge(s, prepared{cols: cols, rows: gathered{rel: `"s"."stg"`}, unchanged: []string{"name"}, everUnchanged: []string{"name"}}) {
 			if strings.Contains(q, `TEMP TABLE "`+mergePicks+`"`) {
 				return q
 			}
@@ -448,13 +448,67 @@ func TestMergePicks(t *testing.T) {
 	}
 }
 
+// A stream's staging of one table has no _openetl_part, and the windows over
+// it order by _openetl_ord alone: Redshift refused the constant part in the
+// merge's CREATE TABLE AS and the dedupe's INSERT once the staging had a
+// column narrower than the target's, which the relation casts. Of several
+// tables, each row's table orders first.
+func TestGatheredOrder(t *testing.T) {
+	w := &writer{schema: "s"}
+	cols := []column{{name: "id", typ: "bigint"}, {name: "n", typ: "bigint"}, {name: idColumn, typ: "varchar(36)"}, {name: seqColumn, typ: "decimal(38,0)"}, {name: heldColumn, typ: varcharMax}}
+	narrow := slices.Clone(cols)
+	narrow[1].typ = "integer"
+	merge := stagedStream{Name: "alpha", Table: "alpha", Key: []string{"id"}, Mode: modeMerge}
+	dedupe := stagedStream{Name: "alpha", Table: "alpha", Dedupe: true}
+	window := func(stmt string) string {
+		_, after, _ := strings.Cut(stmt, "ROW_NUMBER() OVER (")
+		before, _, _ := strings.Cut(after, ") AS "+rnColumn)
+		return before
+	}
+
+	one := w.relation([]string{"stg"}, [][]column{narrow}, cols)
+	if want := `(SELECT "id" AS "id", CAST("n" AS bigint) AS "n", "_openetl_id" AS "_openetl_id", "_openetl_seq" AS "_openetl_seq", "_openetl_held" AS "_openetl_held", "_openetl_ord" FROM "s"."stg")`; one.rel != want || one.parts {
+		t.Errorf("one table: %+v, want %s", one, want)
+	}
+	p := prepared{cols: cols, rows: one, patch: cols, patches: one}
+	stmts := w.merge(merge, p)
+	for _, c := range []struct{ what, got, want string }{
+		{"merge's versions", window(stmts[0]), `PARTITION BY x."id" ORDER BY CASE WHEN x."_openetl_seq" IS NULL THEN 1 ELSE 0 END, x."_openetl_seq" DESC, x."_openetl_ord" DESC`},
+		{"dedupe's insert", window(w.insert(dedupe, p)), `PARTITION BY x."_openetl_id" ORDER BY x."_openetl_ord"`},
+		{"patch", window(w.patch(merge, p)[0]), `PARTITION BY y."id", y."_openetl_id" ORDER BY y."_openetl_ord" DESC`},
+	} {
+		if c.got != c.want {
+			t.Errorf("one table, %s: %s, want %s", c.what, c.got, c.want)
+		}
+	}
+	if all := strings.Join(append(stmts, w.insert(dedupe, p)), ";\n"); strings.Contains(all, partColumn) {
+		t.Errorf("one table orders by %s:\n%s", partColumn, all)
+	}
+
+	several := w.relation([]string{"stg", "stg_2"}, [][]column{narrow, cols}, cols)
+	if !several.parts || !strings.Contains(several.rel, `CAST("n" AS bigint) AS "n", "_openetl_id" AS "_openetl_id", "_openetl_seq" AS "_openetl_seq", "_openetl_held" AS "_openetl_held", 0 AS _openetl_part, "_openetl_ord" FROM "s"."stg" UNION ALL SELECT "id" AS "id", "n" AS "n",`) ||
+		!strings.HasSuffix(several.rel, `1 AS _openetl_part, "_openetl_ord" FROM "s"."stg_2")`) {
+		t.Errorf("several tables: %+v", several)
+	}
+	p = prepared{cols: cols, rows: several, patch: cols, patches: several}
+	for _, c := range []struct{ what, got, want string }{
+		{"merge's versions", window(w.merge(merge, p)[0]), `PARTITION BY x."id" ORDER BY CASE WHEN x."_openetl_seq" IS NULL THEN 1 ELSE 0 END, x."_openetl_seq" DESC, x._openetl_part DESC, x."_openetl_ord" DESC`},
+		{"dedupe's insert", window(w.insert(dedupe, p)), `PARTITION BY x."_openetl_id" ORDER BY x._openetl_part, x."_openetl_ord"`},
+		{"patch", window(w.patch(merge, p)[0]), `PARTITION BY y."id", y."_openetl_id" ORDER BY y._openetl_part DESC, y."_openetl_ord" DESC`},
+	} {
+		if c.got != c.want {
+			t.Errorf("several tables, %s: %s, want %s", c.what, c.got, c.want)
+		}
+	}
+}
+
 // Of two patch columns that fill one held column, the first's UPDATE leaves
 // it held for the second's to match, and the second's takes it out.
 func TestPatchSharedHeldColumn(t *testing.T) {
 	w := &writer{schema: "s"}
 	s := stagedStream{Table: "t", Mode: modeMerge, Key: []string{"id"}, Fills: map[string]string{"price__v2": "price"}}
 	patch := []column{{name: "id", typ: "bigint"}, {name: "price__v2", typ: "bigint"}, {name: "price", typ: "integer"}, {name: idColumn, typ: "varchar(36)"}, {name: heldColumn, typ: varcharMax}}
-	stmts := w.patch(s, prepared{patch: patch, patches: `"s"."p"`})
+	stmts := w.patch(s, prepared{patch: patch, patches: gathered{rel: `"s"."p"`}})
 	if len(stmts) != 2 {
 		t.Fatalf("%d statements: %q", len(stmts), stmts)
 	}
