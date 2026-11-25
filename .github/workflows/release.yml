@@ -88,7 +88,10 @@ jobs:
           repository: openetl-io/openetl
           ref: main
           path: openetl
-          sparse-checkout: internal/notices
+          # go.work names sdk/go's modules, so they must be there too.
+          sparse-checkout: |
+            internal/notices
+            sdk/go
       - name: This tag can be released
         id: check
         working-directory: openetl-connectors
