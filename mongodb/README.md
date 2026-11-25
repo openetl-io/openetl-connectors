@@ -5,8 +5,6 @@ description: Read MongoDB collections in full, by a cursor field, or change by c
 
 The `mongodb` package has a source and a destination. The source reads the collections of one database: whole, from where a cursor field last got to, or as a stream of every insert, update, replace and delete through change streams (CDC). The destination writes each stream into a collection of its own.
 
-Both are tested against MongoDB 8.0, as a single-node replica set. Sharded clusters aren't tested, and neither are TLS, SRV records or several hosts, so the checks' `net.tls` item and their items for each of several hosts are tested only as lists, not against a server.
-
 ## Source
 
 ### What it reads
@@ -275,5 +273,4 @@ A validator whose `validationAction` is `warn`, or whose `validationLevel` is `o
 ### Limits
 
 - Filling held cells uses `$getField` and `$setField`, which need MongoDB 5.0 or later.
-- Overwrite's `renameCollection` isn't tested on a sharded cluster.
 - A document is at most 16 MB, as MongoDB allows.

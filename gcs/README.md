@@ -7,8 +7,6 @@ The `gcs` package has a source and a destination for files in Google Cloud Stora
 
 It reads and writes files as the [`s3`](../s3/README.md) package does: only the store, its credentials and its permissions differ.
 
-Both roles are tested against fake-gcs-server, an emulator. CI doesn't test Google Cloud Storage itself. See [Limits](#limits) for what the emulator can't show.
-
 ## Connecting
 
 The source and the destination share their connection settings. Keep the key in a secret, as `{ secret: NAME }`.
@@ -265,4 +263,3 @@ The destination adds new columns: later files have them, and earlier files don't
 - The source doesn't capture deleted files or deleted rows. A file written again is read again whole, as new records, if its modification time changed or its generation did, so a file rewritten within the same second is read again too.
 - Discovery reads every file's footer or header, so it takes longer with more files.
 - The destination doesn't merge or deduplicate.
-- Only fake-gcs-server is tested. It checks no credentials, so refused credentials are untested, and it answers over plain HTTP, so the check's `net.tls` item is untested. Google Cloud Storage's own consistency and permissions aren't shown by it.

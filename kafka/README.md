@@ -5,8 +5,6 @@ description: Read Kafka topics as streams, and write streams into topics in one 
 
 The `kafka` package has a source and a destination. The source reads each topic as a stream, from where the last read stopped. The destination writes each stream into a topic, a record per row, and commits each epoch in one Kafka transaction, so every row lands exactly once.
 
-Both are tested against Apache Kafka 4.3 and the Karapace schema registry: without TLS or SASL, and through a SASL_SSL listener with PLAIN, SCRAM-SHA-256, SCRAM-SHA-512 and OAUTHBEARER. The tests also show that the broker refuses a client certificate its CA didn't sign, but no test signs in with a client certificate the broker accepts. A registry's basic authentication and AWS MSK IAM are supported, but no test runs them against a server: MSK IAM's signed request is tested on its own.
-
 ## Connecting
 
 The source and the destination share their connection settings:

@@ -5,7 +5,7 @@ description: Read Oracle tables in full, by a cursor column, or change by change
 
 The `oracle` package has a source and a destination. The source reads the tables of one schema: whole, from where a cursor column last got to, or as a stream of every insert, update and delete from the redo log, which it reads through LogMiner (CDC). The destination writes each stream into a table of its own, and commits each epoch exactly once.
 
-Both use [go-ora](https://github.com/sijms/go-ora), a pure Go driver, so nothing of Oracle's client has to be installed. Both are tested against Oracle Database 23ai Free (23.26), connected to its pluggable database `FREEPDB1`.
+Both use [go-ora](https://github.com/sijms/go-ora), a pure Go driver, so nothing of Oracle's client has to be installed.
 
 ## Source
 
@@ -188,7 +188,7 @@ A read OpenETL asks to end at an earlier resume point (`until`), to read a part 
 - Dates before the Gregorian calendar's start, 15 October 1582, are read through go-ora, which counts them in the Gregorian calendar, while Oracle counts them in the Julian: they're days off, and a key or cursor that has such a date can resume a read at the wrong row. Years before 1 AD arrive as the proleptic Gregorian calendar counts them (Oracle's year -1 is year 0).
 - A change made before a change of its table's columns, which LogMiner gives in Oracle's internal format, is read assuming the database's character set is `AL32UTF8` and its national one `AL16UTF16`, the defaults.
 - An empty LOB, `EMPTY_CLOB()` or `EMPTY_BLOB()`, which Oracle doesn't count as `NULL`, arrives as null: go-ora reads it so.
-- The source is tested against single-instance databases; with RAC, LogMiner reads every thread's redo, and the source checks every thread's logs are on disk, but it isn't tested. A change an instance writes late can be missed while the read has seen no row of that instance's redo.
+- With RAC, LogMiner reads every thread's redo, and the source checks that every thread's logs are on disk, but a change an instance writes late can be missed while the read has seen no row of that instance's redo.
 
 ## Destination
 
@@ -315,4 +315,3 @@ Exactly once, or effectively once when a stream is merged from a source that may
 - Dates and timestamps are written from year 1 to 9999; a value outside fails the epoch. Oracle counts days before 15 October 1582 in the Julian calendar, so such a date is stored with the year, month and day it arrives with, and 5 to 14 October 1582 become 15 October.
 - A time of day is an `INTERVAL DAY(0) TO SECOND`, as Oracle has no time-of-day type; read it with `EXTRACT`, or add it to a date.
 - go-ora reads an `INTERVAL` to the microsecond; `EXTRACT(SECOND FROM …)` gives the nanoseconds a `SECOND(9)` column keeps.
-- The destination is tested against Oracle Database 23ai Free, single instance. It isn't tested against 19c or RAC.

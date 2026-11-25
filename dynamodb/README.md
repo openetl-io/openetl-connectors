@@ -5,13 +5,6 @@ description: Read DynamoDB tables in full, by a cursor attribute, or change by c
 
 The `dynamodb` package has a source and a destination. The source reads a region's tables in one of three ways: whole by Scan, the items whose cursor attribute has reached a floor, or a snapshot followed by every insert, modify and remove from the table's DynamoDB stream (CDC). The destination writes each stream into a table of its own.
 
-Both are tested against DynamoDB Local 3.3.2. Local doesn't show:
-
-- **Credentials.** Local takes any access key made of letters and digits, so the tests can only show that a malformed key fails with `AUTH_INVALID`.
-- **Throttling.** Local doesn't throttle, so the backoff and the retries of unprocessed items run only against fakes in unit tests.
-- **Shard changes.** Local's streams keep a single shard and trim nothing. Shard lineage after splits and merges, trimmed positions and shards that age out are shown against a fake of the DynamoDB Streams API.
-- **Item size.** The 400 KB check is the connector's own, so Local's limit is never reached.
-
 ## Connecting
 
 The source and the destination share their connection settings:

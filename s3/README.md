@@ -12,8 +12,6 @@ The `s3` package has a source and a destination for files on Amazon S3, on anoth
 
 The source reads the files that a glob matches as a stream, in Parquet, Avro, CSV or JSON Lines. The destination writes each stream as a directory of Parquet, CSV or JSON Lines files, and appends each epoch's files exactly once, or replaces a table's files at once when a read ends.
 
-Both roles are tested on a local filesystem and against SeaweedFS's S3 API. The destination's Parquet appends have also run against Amazon S3. CI doesn't test Amazon S3 itself. See [Limits](#limits) for what SeaweedFS can't show.
-
 ## Connecting
 
 The source and the destination share their connection settings. Keep keys in secrets, as `{ secret: NAME }`.
@@ -26,7 +24,7 @@ Set `region`. With `accessKeyId` and `secretAccessKey`, the connector uses those
 
 A store with S3's API, such as MinIO, Cloudflare R2 or Ceph, takes the same settings, with `endpoint` set to its S3 API's URL, `region` to one the store takes, and its keys in `accessKeyId` and `secretAccessKey`. With `endpoint`, the connector addresses buckets by path, `ENDPOINT/BUCKET/KEY`, rather than by host name. The destination's uploads to an `endpoint` carry a checksum only where the store asks for one, as some S3-compatible stores refuse the CRC32 that Amazon S3 takes with every upload.
 
-Only SeaweedFS's S3 API is tested; the stores named here aren't. Appends need only S3's reads, writes, copies, deletes and listings. Overwrite also needs the store to honor S3's conditional writes, `If-None-Match` and `If-Match`: a pipeline that overwrites runs the destination's `store.conditional-write` preflight, which warns as `conditional_writes_ignored` on a store that ignores them, as [Checks and preflights](#checks-and-preflights) says.
+Appends need only S3's reads, writes, copies, deletes and listings. Overwrite also needs the store to honor S3's conditional writes, `If-None-Match` and `If-Match`: a pipeline that overwrites runs the destination's `store.conditional-write` preflight, which warns as `conditional_writes_ignored` on a store that ignores them, as [Checks and preflights](#checks-and-preflights) says.
 
 ### Local filesystem
 
@@ -288,5 +286,3 @@ The destination adds new columns: later files have them, and earlier files don't
 - Discovery reads every file's footer or header, so it takes longer with more files.
 - The destination doesn't merge or deduplicate.
 - Overwrite relies on the store's conditional writes. On an S3-compatible store that ignores `If-Match` and `If-None-Match`, a stale attempt could write an older read's manifest over a newer one's.
-- SeaweedFS answers over plain HTTP, so the check's `net.tls` item is untested.
-- SeaweedFS is the only S3-compatible store tested, and the test's checks no credentials, so refused credentials are tested only against stand-ins of S3's answers. Amazon S3's own consistency and permissions aren't shown by it.

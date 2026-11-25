@@ -98,7 +98,7 @@ A fix to a release that `main` has moved past goes on a branch `release-PACKAGE-
 
 The [docs site](https://github.com/openetl-io/docs-web) shows each package from `main`: its page (`README.md` and any `docs/`), its schemas and its logo, with the package's releases and their notes. A fix to a page is on the site within minutes of reaching `main`; there's nothing to backport.
 
-So a page, and its schemas' descriptions, describe what `main` does, which can be more than any release has. While the connectors are in alpha, they carry no version marks: they don't say which release a setting or behaviour arrives in, or how an earlier one behaved.
+So a page, and its schemas' descriptions, describe what `main` does, which can be more than any release has. While the connectors are in alpha, they carry no version marks: they don't say which release a setting or behaviour arrives in, or how an earlier one behaved. Nor do they say what was or wasn't tested, or against what: a limit is stated as what the connector does or doesn't do.
 
 The `docs` workflow calls the site's deploy hook, the secret `CLOUDFLARE_DEPLOY_HOOK`, on a push to `main` that changes a package's page, `docs/`, `openetl-connector.yaml`, schemas or logo, and `release` calls it once a release is published, for the site's list of releases. Without the secret, it skips. `gh workflow run docs.yml` deploys now.
 

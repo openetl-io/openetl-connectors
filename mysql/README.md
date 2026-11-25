@@ -5,8 +5,6 @@ description: Read MySQL and MariaDB tables in full, by a cursor column, or chang
 
 The `mysql` package has a source and a destination, and both work against MariaDB too. The source reads the tables of one database: whole, from where a cursor column last got to, or as a stream of every insert, update and delete from the binary log (CDC). The destination writes each stream into a table of its own, and commits each epoch exactly once.
 
-Both are tested against MySQL 8.4 and MariaDB 11.8.
-
 ## Source
 
 ### What it reads
@@ -154,7 +152,7 @@ config:
 | `verify-ca` | with TLS, if the certificate is signed by `ca` |
 | `verify-identity` | as `verify-ca`, and if the certificate names the DSN's host; the default |
 
-`ca` holds the PEM certificates of the authorities that sign the server's certificate; without it, the system's are used. A user created `REQUIRE X509` presents a client certificate, `cert`, and its key, `key`, which is a secret. MySQL generates a CA and certificates that name no host, so its own take `verify-ca`; MariaDB makes a certificate signed by itself, which `verify-ca` takes with that certificate as `ca`. Each mode but `verify-identity` is tested connecting to both, and a client certificate to MySQL; `verify-identity` is tested refusing their certificates, which name no host, and isn't tested with one that names it.
+`ca` holds the PEM certificates of the authorities that sign the server's certificate; without it, the system's are used. A user created `REQUIRE X509` presents a client certificate, `cert`, and its key, `key`, which is a secret. MySQL generates a CA and certificates that name no host, so its own take `verify-ca`; MariaDB makes a certificate signed by itself, which `verify-ca` takes with that certificate as `ca`.
 
 ### Types
 

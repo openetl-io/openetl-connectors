@@ -7,8 +7,6 @@ The `azureblob` package has a source and a destination for files in Azure Blob S
 
 It reads and writes files as the [`s3`](../s3/README.md) package does: only the store, its credentials and its permissions differ.
 
-Both roles are tested against Azurite, an emulator. CI doesn't test Azure Blob Storage itself. See [Limits](#limits) for what the emulator can't show.
-
 ## Connecting
 
 The source and the destination share their connection settings. Keep keys in secrets, as `{ secret: NAME }`. Set one of these:
@@ -273,5 +271,4 @@ The destination adds new columns: later files have them, and earlier files don't
 - The source doesn't capture deleted files or deleted rows. A file written again is read again whole, as new records, if its modification time changed or its ETag did, so a file rewritten within the same second is read again too.
 - Discovery reads every file's footer or header, so it takes longer with more files.
 - The destination doesn't merge or deduplicate.
-- Only Azurite is tested. It answers over plain HTTP, so the check's `net.tls` item is untested, and it has no hierarchical namespace, so Azure Data Lake Storage Gen2 accounts are untested. Azure's own consistency and permissions aren't shown by it.
 - An endpoint that doesn't answer takes about half a minute to fail, after the client's retries.

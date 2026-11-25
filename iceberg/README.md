@@ -5,8 +5,6 @@ description: Write streams into Iceberg tables through a REST catalog or AWS Glu
 
 The `iceberg` package has a destination. It writes each stream into an Iceberg table, as Parquet data files, and commits each epoch through the table's catalog: an Iceberg REST catalog, or AWS Glue. The catalog's own compare-and-swap keeps an epoch from being committed twice.
 
-It's tested against Apache Iceberg's REST catalog fixture 1.10, with its tables in an S3-compatible store, and against moto's emulation of Glue. It has also run against AWS Glue with Amazon S3, which CI does not test.
-
 ## What it writes
 
 Each stream becomes a table in the pipeline's `destination.namespace`, or else the config's `namespace` (`default` unless set). If the pipeline's `destination.tables` gives the stream a name, the table has that name, exactly as written. Otherwise, the table has the stream's name as the pipeline's `destination.naming` gives it: by default, lowercase, with `_` in place of anything outside `a-z`, `0-9` and `_`. The namespace is created if it's missing. New tables are Iceberg format version 2, unpartitioned, with every column optional, and write Parquet compressed with zstd at level 1.
@@ -161,7 +159,7 @@ An epoch's data files are in its tables' locations from when they're written unt
 ## Limits
 
 - New tables are unpartitioned and unsorted: the destination has no setting for a new table's partitioning or sort order. Partition a table with an engine that can, such as Spark's `ALTER TABLE … ADD PARTITION FIELD`, and the destination writes into its partitions from then on.
-- New tables are format 2, and timestamps are kept in microseconds: the destination neither creates format 3 tables nor writes `timestamp_ns`. It appends to and overwrites a format 3 table that exists, giving its rows their row IDs; merges and held cells' patches into a format 3 table are untested.
+- New tables are format 2, and timestamps are kept in microseconds: the destination neither creates format 3 tables nor writes `timestamp_ns`. It appends to and overwrites a format 3 table that exists, giving its rows their row IDs.
 - Deduping holds every `_openetl_id` of the epoch in memory, and of the whole read for an overwrite, and a staged file that loses rows is read whole to be written again.
 - A merge, and a patch of held cells, holds in memory at commit the epoch's staged rows or patches of one stream at a time, with the table's rows they match. It finds those by up to 1,000 distinct values of each column it matches on, by the range between the lowest and highest beyond that, and by no value of a column with a null among them, so a match on one column with a null reads the whole table.
 - The destination writes; it doesn't read tables back as a source.

@@ -3,9 +3,6 @@ title: Amazon Redshift
 description: Write into Amazon Redshift by appending, overwriting or merging, loaded from Parquet files in S3 by COPY.
 ---
 
-> [!WARNING]
-> Unverified. The destination builds and its unit tests pass, but it hasn't run against a Redshift cluster or Serverless workgroup, and its conformance suite hasn't passed. Try it on data you can reload before you rely on it.
-
 The `redshift` package has a destination. It writes each stream into a table of its own, staging each epoch as Parquet files in an S3 bucket that Redshift's `COPY` loads, and commits each epoch exactly once. It has no source: to read from a Postgres database into Redshift, use the [postgres](../postgres/README.md) source.
 
 ## Destination
@@ -121,4 +118,4 @@ Run them, then release the hold. Or let the destination make such changes itself
 - Each epoch is one `COPY` per stream and lane. Many small streams commit slowly.
 - A batch without columns fails the write, since a Redshift table has at least one.
 - `VARCHAR` compares without trailing blanks, so the destination matches text keys by their bytes too: `'a'` and `'a '` are different keys.
-- When a `COPY` fails on a file's data, the error names the column, the line and the reason that Redshift logged in `SYS_LOAD_ERROR_DETAIL`, or else in `STL_LOAD_ERRORS`, and is `DATA_INVALID`. A Parquet `COPY` logs only some of its errors; for the rest, the error has the reason Redshift's own error gives. Like the rest of the destination, this hasn't run against a cluster.
+- When a `COPY` fails on a file's data, the error names the column, the line and the reason that Redshift logged in `SYS_LOAD_ERROR_DETAIL`, or else in `STL_LOAD_ERRORS`, and is `DATA_INVALID`. A Parquet `COPY` logs only some of its errors; for the rest, the error has the reason Redshift's own error gives.
