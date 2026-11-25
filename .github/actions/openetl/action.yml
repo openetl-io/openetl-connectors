@@ -6,7 +6,7 @@ description: >-
   pulled. With from release, it's the CLI of an openetl release, checked
   against the release's checksums: by default the newest, the first release
   of openetl that isn't a draft and whose tag is vX.Y.Z or a prerelease's,
-  vX.Y.Z-alpha.N, -beta.N or -rc.N.
+  vX.Y.Z-alpha, -beta or -rc, with or without .N.
 inputs:
   from:
     description: edge or release
