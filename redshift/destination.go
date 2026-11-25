@@ -217,7 +217,8 @@ const (
 	// Each staging row's place in its table, as it was staged.
 	ordColumn = "_openetl_ord"
 	// Of the staging gathered for an apply: which staging table a row is
-	// from, in order, and its place among its key's or its ID's versions.
+	// from, in order, where there are several, and its place among its key's
+	// or its ID's versions.
 	partColumn = "_openetl_part"
 	rnColumn   = "_openetl_rn"
 
@@ -386,8 +387,8 @@ type prepared struct {
 	// The staging's columns, at each one's widest type; none if the epoch
 	// staged nothing for it.
 	cols []column
-	// Every lane's staging, as gather makes it.
-	rows string
+	// Every lane's staging.
+	rows gathered
 	// Overwrite: the read table's columns once it can take the staging's;
 	// none if the read has no table.
 	read []string
@@ -399,7 +400,33 @@ type prepared struct {
 	// The patches' staging's columns; none if there's nothing to patch.
 	patch []column
 	// Every lane's patches.
-	patches string
+	patches gathered
+}
+
+// gathered is a relation of the rows of a stream's staging tables, as gather
+// makes it.
+type gathered struct {
+	rel string
+	// Whether it's of several tables, and so has _openetl_part. Of one, it
+	// hasn't: the column would be a constant, and Redshift refuses a window
+	// ordered by it in a CREATE TABLE AS or an INSERT when the relation
+	// casts a column, as "constant expressions are not supported in order by
+	// clauses".
+	parts bool
+}
+
+// staged orders the rows of rel, an alias of g, as they were staged, or the
+// last staged first.
+func (g gathered) staged(rel string, lastFirst bool) string {
+	dir := ""
+	if lastFirst {
+		dir = " DESC"
+	}
+	order := rel + "." + quoteIdent(ordColumn) + dir
+	if g.parts {
+		order = rel + "." + partColumn + dir + ", " + order
+	}
+	return order
 }
 
 // apply applies each stream that has no marker yet, then drops its staging.
@@ -623,10 +650,10 @@ func isText(typ string) bool {
 	return strings.HasPrefix(typ, "varchar") || strings.HasPrefix(typ, "char")
 }
 
-// latestFirst orders rel's rows from the last staged, by _openetl_seq if the
-// staging has it, nulls last.
-func latestFirst(rel string, hasSeq bool) string {
-	order := rel + "." + partColumn + " DESC, " + rel + "." + quoteIdent(ordColumn) + " DESC"
+// latestFirst orders the rows of rel, an alias of g, from the last staged, by
+// _openetl_seq if the staging has it, nulls last.
+func (g gathered) latestFirst(rel string, hasSeq bool) string {
+	order := g.staged(rel, true)
 	if hasSeq {
 		seq := rel + "." + quoteIdent(seqColumn)
 		order = "CASE WHEN " + seq + " IS NULL THEN 1 ELSE 0 END, " + seq + " DESC, " + order
@@ -684,11 +711,11 @@ func (w *writer) insert(s stagedStream, p prepared) string {
 	cols := names(p.cols)
 	into := "INSERT INTO " + w.ident(s.Into()) + " (" + quoteAll(cols) + ") "
 	if !s.Deduped() {
-		return into + "SELECT " + selectList("s", cols) + " FROM " + p.rows + " s"
+		return into + "SELECT " + selectList("s", cols) + " FROM " + p.rows.rel + " s"
 	}
 	id := quoteIdent(idColumn)
-	q := into + "SELECT " + selectList("s", cols) + " FROM (SELECT x.*, ROW_NUMBER() OVER (PARTITION BY x." + id + " ORDER BY x." + partColumn + ", x." + quoteIdent(ordColumn) +
-		") AS " + rnColumn + " FROM " + p.rows + " x) s WHERE s." + rnColumn + " = 1"
+	q := into + "SELECT " + selectList("s", cols) + " FROM (SELECT x.*, ROW_NUMBER() OVER (PARTITION BY x." + id + " ORDER BY " + p.rows.staged("x", false) +
+		") AS " + rnColumn + " FROM " + p.rows.rel + " x) s WHERE s." + rnColumn + " = 1"
 	if s.Dedupe {
 		q += " AND NOT EXISTS (SELECT 1 FROM " + w.ident(s.Into()) + " t WHERE t." + id + " = s." + id + ")"
 	}
@@ -744,8 +771,8 @@ func (w *writer) patch(s stagedStream, p prepared) []string {
 		if slices.Contains(cols, syncedColumn) {
 			set += ", " + q(syncedColumn) + " = p." + q(syncedColumn)
 		}
-		from := "(SELECT y.*, ROW_NUMBER() OVER (PARTITION BY " + parts + " ORDER BY y." + partColumn + " DESC, y." + q(ordColumn) + " DESC) AS " + rnColumn +
-			" FROM " + p.patches + " y WHERE " + w.heldHas("y."+q(heldColumn), held) + ")"
+		from := "(SELECT y.*, ROW_NUMBER() OVER (PARTITION BY " + parts + " ORDER BY " + p.patches.staged("y", true) + ") AS " + rnColumn +
+			" FROM " + p.patches.rel + " y WHERE " + w.heldHas("y."+q(heldColumn), held) + ")"
 		out = append(out, "UPDATE "+t+" SET "+set+" FROM "+from+" p WHERE p."+rnColumn+" = 1 AND "+keyEq(t, "p", match, p.patch)+
 			" AND "+w.heldHas(h, held)+" AND "+w.heldID(h, held)+" = p."+q(idColumn))
 	}
@@ -779,7 +806,7 @@ func (w *writer) merge(s stagedStream, p prepared) []string {
 	hasHeld := slices.Contains(cols, heldColumn) && slices.Contains(cols, idColumn)
 	stmts := []string{
 		"CREATE TEMP TABLE " + q(mergeVersions) + " AS SELECT x.*, ROW_NUMBER() OVER (PARTITION BY " + keyParts("x", s.Key, p.cols) +
-			" ORDER BY " + latestFirst("x", hasSeq) + ") AS " + rnColumn + " FROM " + p.rows + " x",
+			" ORDER BY " + p.rows.latestFirst("x", hasSeq) + ") AS " + rnColumn + " FROM " + p.rows.rel + " x",
 	}
 	latest := w.latest(s, p, &stmts)
 
@@ -1049,7 +1076,7 @@ func (w *writer) heldNames(ctx context.Context, s stagedStream, p prepared) (hel
 	for i := range found {
 		dest[i] = &found[i]
 	}
-	if err := w.pool.QueryRow(ctx, "SELECT "+strings.Join(aggs, ", ")+" FROM "+p.rows+" x").Scan(dest...); err != nil {
+	if err := w.pool.QueryRow(ctx, "SELECT "+strings.Join(aggs, ", ")+" FROM "+p.rows.rel+" x").Scan(dest...); err != nil {
 		return nil, nil, classify(fmt.Errorf("redshift: read the held and unchanged columns of %s's staging: %w", s.Name, err))
 	}
 	i := 0
@@ -1073,17 +1100,18 @@ func (w *writer) heldNames(ctx context.Context, s stagedStream, p prepared) (hel
 // gather returns the columns of tables, each a staging of one stream, at
 // each column's widest type, or into's where that's wider, and a relation of
 // every one's rows, in order, each with its table's place in tables as
-// _openetl_part. No columns if one of them doesn't exist.
-func (w *writer) gather(ctx context.Context, tables []string, into []column) ([]column, string, error) {
+// _openetl_part where there are several. No columns if one of them doesn't
+// exist.
+func (w *writer) gather(ctx context.Context, tables []string, into []column) ([]column, gathered, error) {
 	have, err := w.catalog(ctx, tables)
 	if err != nil {
-		return nil, "", err
+		return nil, gathered{}, err
 	}
 	each := make([][]column, len(tables))
 	var cols []column
 	for i, t := range tables {
 		if have[t] == nil {
-			return nil, "", nil
+			return nil, gathered{}, nil
 		}
 		for _, tc := range have[t].cols {
 			if tc.name == ordColumn {
@@ -1098,7 +1126,7 @@ func (w *writer) gather(ctx context.Context, tables []string, into []column) ([]
 			case widens(cols[j].typ, c.typ):
 				cols[j] = c
 			default:
-				return nil, "", fmt.Errorf("redshift: column %q is %s in one staging table, and %s in another", c.name, cols[j].typ, c.typ)
+				return nil, gathered{}, fmt.Errorf("redshift: column %q is %s in one staging table, and %s in another", c.name, cols[j].typ, c.typ)
 			}
 		}
 	}
@@ -1107,6 +1135,13 @@ func (w *writer) gather(ctx context.Context, tables []string, into []column) ([]
 			cols[j].typ = to
 		}
 	}
+	return cols, w.relation(tables, each, cols), nil
+}
+
+// relation is gather's relation of tables' rows, each table with the columns
+// of its place in each, at the types of cols.
+func (w *writer) relation(tables []string, each [][]column, cols []column) gathered {
+	g := gathered{parts: len(tables) > 1}
 	selects := make([]string, len(tables))
 	for i, t := range tables {
 		sel := make([]string, 0, len(cols)+2)
@@ -1124,18 +1159,22 @@ func (w *writer) gather(ctx context.Context, tables []string, into []column) ([]
 				sel = append(sel, castTo(quoteIdent(c.name), from, c.typ)+as)
 			}
 		}
-		sel = append(sel, strconv.Itoa(i)+" AS "+partColumn, quoteIdent(ordColumn))
+		if g.parts {
+			sel = append(sel, strconv.Itoa(i)+" AS "+partColumn)
+		}
+		sel = append(sel, quoteIdent(ordColumn))
 		selects[i] = "SELECT " + strings.Join(sel, ", ") + " FROM " + w.ident(t)
 	}
-	return cols, "(" + strings.Join(selects, " UNION ALL ") + ")", nil
+	g.rel = "(" + strings.Join(selects, " UNION ALL ") + ")"
+	return g
 }
 
 // preparePatch returns the columns of the stream's patches, none if its
 // target doesn't exist, and _openetl_synced_at only if the target has it.
-func (w *writer) preparePatch(ctx context.Context, s stagedStream) ([]column, string, error) {
+func (w *writer) preparePatch(ctx context.Context, s stagedStream) ([]column, gathered, error) {
 	target, err := w.columnTypes(ctx, s.Table)
 	if err != nil {
-		return nil, "", err
+		return nil, gathered{}, err
 	}
 	cols, rows, err := w.gather(ctx, s.Patches, target)
 	if err != nil {
