@@ -190,7 +190,7 @@ func (d *Destination) Open(ctx context.Context, cfg destination.OpenConfig) (des
 	if err != nil {
 		return nil, err
 	}
-	w := &writer{d: d, cfg: cfg, reg: reg, cl: cl, put: cl, streams: map[string]destination.Stream{}, encs: map[string]*streamEncoder{}, ready: map[string]bool{}, pending: map[string]*queue{}}
+	w := &writer{d: d, cfg: cfg, reg: reg, cl: cl, put: cl, streams: map[string]destination.Stream{}, encs: map[string]*streamEncoder{}, ready: map[string]bool{}, fresh: map[string]time.Time{}, pending: map[string]*queue{}}
 	for _, s := range cfg.Streams {
 		w.streams[s.Name] = s
 	}
@@ -208,6 +208,10 @@ type writer struct {
 	encs    map[string]*streamEncoder
 	// Kinesis streams that exist and are active.
 	ready map[string]bool
+	// When the writer found each new stream (isNew) new, and then ready:
+	// until newStreamWait after, Kinesis answering that it doesn't exist is
+	// waited out.
+	fresh map[string]time.Time
 	// Each Kinesis stream's records not sent yet, in order.
 	pending map[string]*queue
 }
@@ -340,6 +344,55 @@ const (
 	setupPending = "pending"
 )
 
+// Kinesis can answer that a new stream doesn't exist for a while after
+// creating it, even once DescribeStream reports it active. A writer calls
+// Kinesis again for up to newStreamWait after it found the stream new, and
+// again after it found it ready. A stream created less than recentStream
+// ago, by the connector's clock, is new: another lane or attempt may have
+// just created it.
+const (
+	newStreamWait = 2 * time.Minute
+	recentStream  = 10 * time.Minute
+)
+
+// isNew says Kinesis is creating the stream, or created it moments ago.
+func isNew(sum *types.StreamDescriptionSummary) bool {
+	return sum.StreamStatus == types.StreamStatusCreating || time.Since(aws.ToTime(sum.StreamCreationTimestamp)) < recentStream
+}
+
+// unknown says how long to wait before calling Kinesis again about stream
+// name, after its n-th call answered err: a moment, while err is Kinesis
+// not knowing the new stream yet. It's 0 and err for another err or a
+// stream that isn't new, and 0 and an error that says so once newStreamWait
+// is up.
+func (w *writer) unknown(name string, n int, err error) (time.Duration, error) {
+	since, ok := w.fresh[name]
+	if !ok || apiCode(err) != "ResourceNotFoundException" {
+		return 0, err
+	}
+	left := newStreamWait - time.Since(since)
+	if left <= 0 {
+		return 0, sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_TRANSIENT, fmt.Errorf("the stream is new, and Kinesis still answers that it doesn't exist after waiting %s: %w", human(newStreamWait), err))
+	}
+	return min(w.d.cfg.Retry.backoff(n), left), nil
+}
+
+// known calls f, and again after a wait while it answers that the new
+// stream name doesn't exist yet (unknown).
+func (w *writer) known(ctx context.Context, name string, f func() error) error {
+	for n := 1; ; n++ {
+		wait, err := w.unknown(name, n, f())
+		if wait == 0 {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(wait):
+		}
+	}
+}
+
 // ensureStream waits for a Kinesis stream to be active, creating it unless
 // it exists or createStreams is off. Only a stream it creates gets the
 // config's mode, retention and encryption; an existing one is left as it
@@ -369,8 +422,14 @@ func (w *writer) ensureStream(ctx context.Context, name string) error {
 		case "":
 			created = err == nil
 		case "ResourceInUseException":
+			// Created, or being created, by another lane or attempt.
 			err = nil
 		}
+		if err == nil {
+			w.fresh[name] = time.Now()
+		}
+	} else if err == nil && isNew(sum.StreamDescriptionSummary) {
+		w.fresh[name] = time.Now()
 	}
 	if err != nil {
 		return classify(fmt.Errorf("kinesis: stream %s: %w", name, err))
@@ -381,8 +440,10 @@ func (w *writer) ensureStream(ctx context.Context, name string) error {
 	if cfg.setup() {
 		pending := created
 		if !created {
-			var err error
-			pending, err = pendingSetup(ctx, w.cl, name)
+			err := w.known(ctx, name, func() (err error) {
+				pending, err = pendingSetup(ctx, w.cl, name)
+				return err
+			})
 			switch {
 			case accessDenied(apiCode(err)) && sum != nil && encrypted(cfg, sum.StreamDescriptionSummary):
 				// Without its tags, the stream counts as one the
@@ -407,6 +468,9 @@ func (w *writer) ensureStream(ctx context.Context, name string) error {
 		}
 	}
 	w.ready[name] = true
+	if _, ok := w.fresh[name]; ok {
+		w.fresh[name] = time.Now()
+	}
 	return nil
 }
 
@@ -441,8 +505,20 @@ func pendingSetup(ctx context.Context, cl tagLister, name string) (bool, error) 
 	}
 }
 
+// active waits for a stream to be active; a new one that Kinesis doesn't
+// know yet isn't active yet.
 func (w *writer) active(ctx context.Context, name string) error {
-	waiter := awskinesis.NewStreamExistsWaiter(w.cl, func(o *awskinesis.StreamExistsWaiterOptions) { o.MinDelay = time.Second })
+	waiter := awskinesis.NewStreamExistsWaiter(w.cl, func(o *awskinesis.StreamExistsWaiterOptions) {
+		o.MinDelay = time.Second
+		state := o.Retryable
+		o.Retryable = func(ctx context.Context, in *awskinesis.DescribeStreamInput, out *awskinesis.DescribeStreamOutput, err error) (bool, error) {
+			if err == nil {
+				return state(ctx, in, out, err)
+			}
+			wait, err := w.unknown(name, 1, err)
+			return wait > 0, err
+		}
+	})
 	if err := waiter.Wait(ctx, &awskinesis.DescribeStreamInput{StreamName: aws.String(name)}, 5*time.Minute); err != nil {
 		return classify(fmt.Errorf("kinesis: stream %s didn't become active: %w", name, err))
 	}
@@ -454,13 +530,21 @@ func (w *writer) active(ctx context.Context, name string) error {
 // setup tag.
 func (w *writer) configure(ctx context.Context, name string) error {
 	cfg := &w.d.cfg
-	res, err := w.cl.DescribeStreamSummary(ctx, &awskinesis.DescribeStreamSummaryInput{StreamName: aws.String(name)})
+	var res *awskinesis.DescribeStreamSummaryOutput
+	err := w.known(ctx, name, func() (err error) {
+		res, err = w.cl.DescribeStreamSummary(ctx, &awskinesis.DescribeStreamSummaryInput{StreamName: aws.String(name)})
+		return err
+	})
 	if err != nil {
 		return classify(fmt.Errorf("kinesis: stream %s: %w", name, err))
 	}
 	sum := res.StreamDescriptionSummary
 	if h := cfg.RetentionHours; h > aws.ToInt32(sum.RetentionPeriodHours) {
-		if _, err := w.cl.IncreaseStreamRetentionPeriod(ctx, &awskinesis.IncreaseStreamRetentionPeriodInput{StreamName: aws.String(name), RetentionPeriodHours: aws.Int32(h)}); err != nil {
+		err := w.known(ctx, name, func() error {
+			_, err := w.cl.IncreaseStreamRetentionPeriod(ctx, &awskinesis.IncreaseStreamRetentionPeriodInput{StreamName: aws.String(name), RetentionPeriodHours: aws.Int32(h)})
+			return err
+		})
+		if err != nil {
 			return classify(fmt.Errorf("kinesis: stream %s: set retention: %w", name, err))
 		}
 		if err := w.active(ctx, name); err != nil {
@@ -468,14 +552,22 @@ func (w *writer) configure(ctx context.Context, name string) error {
 		}
 	}
 	if k := cfg.KMSKeyID; k != "" && (sum.EncryptionType != types.EncryptionTypeKms || aws.ToString(sum.KeyId) != k) {
-		if _, err := w.cl.StartStreamEncryption(ctx, &awskinesis.StartStreamEncryptionInput{StreamName: aws.String(name), EncryptionType: types.EncryptionTypeKms, KeyId: aws.String(k)}); err != nil {
+		err := w.known(ctx, name, func() error {
+			_, err := w.cl.StartStreamEncryption(ctx, &awskinesis.StartStreamEncryptionInput{StreamName: aws.String(name), EncryptionType: types.EncryptionTypeKms, KeyId: aws.String(k)})
+			return err
+		})
+		if err != nil {
 			return classify(fmt.Errorf("kinesis: stream %s: start encryption: %w", name, err))
 		}
 		if err := w.active(ctx, name); err != nil {
 			return err
 		}
 	}
-	if _, err := w.cl.RemoveTagsFromStream(ctx, &awskinesis.RemoveTagsFromStreamInput{StreamName: aws.String(name), TagKeys: []string{setupTag}}); err != nil {
+	err = w.known(ctx, name, func() error {
+		_, err := w.cl.RemoveTagsFromStream(ctx, &awskinesis.RemoveTagsFromStreamInput{StreamName: aws.String(name), TagKeys: []string{setupTag}})
+		return err
+	})
+	if err != nil {
 		return classify(fmt.Errorf("kinesis: stream %s: remove its setup tag: %w", name, err))
 	}
 	return nil
@@ -632,7 +724,11 @@ func (w *writer) putAll(ctx context.Context, target string, entries []entry) err
 		for i, e := range entries {
 			in.Records[i] = types.PutRecordsRequestEntry{Data: e.data, PartitionKey: aws.String(e.key)}
 		}
-		res, err := w.put.PutRecords(ctx, in)
+		var res *awskinesis.PutRecordsOutput
+		err := w.known(ctx, target, func() (err error) {
+			res, err = w.put.PutRecords(ctx, in)
+			return err
+		})
 		if throttled(err) {
 			if err := th.wait(ctx, err); err != nil {
 				return failed(err)

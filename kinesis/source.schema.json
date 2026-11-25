@@ -162,7 +162,7 @@
           "examples": [
             "openetl-orders"
           ],
-          "description": "The enhanced fan-out consumer's name. The first read registers it on each stream it reads. Unset: openetl- and the pipeline's name, or where that name has characters a consumer's can't or is longer than 120 characters, those replaced with - or cut, then - and a hash of the whole name. Give each pipeline its own: a shard takes one subscription per consumer."
+          "description": "The enhanced fan-out consumer's name. The first read registers it on each stream it reads. Unset: openetl- and the pipeline's ID, or where the ID has characters a consumer's name can't or is longer than 120 characters, those replaced with - or cut, then - and a hash of the whole ID. Give each pipeline its own: a shard takes one subscription per consumer."
         },
         "deregisterOnTeardown": {
           "type": "boolean",
