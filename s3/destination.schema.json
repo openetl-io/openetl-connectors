@@ -40,7 +40,7 @@
     "endpoint": {
       "type": "string",
       "title": "Endpoint",
-      "description": "An S3-compatible store's endpoint, such as MinIO's, Cloudflare R2's or SeaweedFS's, with path-style addressing. Empty for Amazon S3. Not for file:// URLs. From 0.2.0, uploads to it carry only the checksums the store asks for.",
+      "description": "An S3-compatible store's endpoint, such as MinIO's, Cloudflare R2's or SeaweedFS's, with path-style addressing. Empty for Amazon S3. Not for file:// URLs. Uploads to it carry only the checksums the store asks for.",
       "x-group": "location",
       "x-format": "uri",
       "x-advanced": true
@@ -48,7 +48,7 @@
     "region": {
       "type": "string",
       "title": "Region",
-      "description": "The bucket's AWS region. From 0.2.0, a bucket in another region fails with CONFIG_INVALID, and the error names the bucket's region.",
+      "description": "The bucket's AWS region. A bucket in another region fails with CONFIG_INVALID, and the error names the bucket's region.",
       "x-group": "s3"
     },
     "accessKeyId": {
@@ -74,7 +74,7 @@
       ],
       "default": "parquet",
       "title": "Format",
-      "description": "The files' format: Parquet, CSV with a header line, or JSON Lines. From 0.2.0.",
+      "description": "The files' format: Parquet, CSV with a header line, or JSON Lines.",
       "x-group": "files"
     },
     "compression": {
@@ -86,7 +86,7 @@
         "none"
       ],
       "title": "Compression",
-      "description": "Parquet: zstd (the default), snappy, gzip or none, inside the file. CSV and JSON Lines, from 0.2.0: gzip, zstd or none (the default), the whole file, which gets the extension .gz or .zst.",
+      "description": "Parquet: zstd (the default), snappy, gzip or none, inside the file. CSV and JSON Lines: gzip, zstd or none (the default), the whole file, which gets the extension .gz or .zst.",
       "x-group": "files"
     },
     "fileSize": {
@@ -95,7 +95,7 @@
       "maximum": 4294967296,
       "default": 268435456,
       "title": "File size",
-      "description": "Bytes a file reaches, compressed, before the next one starts: at least 1 MiB and, from 0.2.0, at most 4 GiB, as Commit copies each file into place and S3 copies at most 5 GiB at once.",
+      "description": "Bytes a file reaches, compressed, before the next one starts: at least 1 MiB and at most 4 GiB, as Commit copies each file into place and S3 copies at most 5 GiB at once.",
       "x-group": "files",
       "x-advanced": true
     }

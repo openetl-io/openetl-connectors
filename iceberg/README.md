@@ -16,10 +16,10 @@ A table that already exists keeps its own settings: the destination writes with 
 All three write modes work:
 
 - **Append** adds each epoch's data files to the table.
-- **Overwrite** keeps a read's files out of the table until the read ends, then replaces the table's files with them. From 0.2.0, a stream paused in the middle of a read goes on with it once it's resumed: the read's end replaces the table's files with those written before the pause too.
+- **Overwrite** keeps a read's files out of the table until the read ends, then replaces the table's files with them. A stream paused in the middle of a read goes on with it once it's resumed: the read's end replaces the table's files with those written before the pause too.
 - **Merge** writes equality deletes for the keys an epoch changes, with the keys' new rows, so the table holds each key's latest version. Query engines that read Iceberg v2 apply the deletes.
 
-Each epoch is one snapshot per table, with the epoch's marker in the snapshot's summary and in a table property. The commit checks the marker on the snapshot it builds on, and the catalog refuses it if another commit landed first, so no epoch lands twice. From 0.2.0, a marker property, `openetl.loaded.PIPELINE`, that isn't one the destination wrote fails the commit, and the run without a retry, rather than having the epoch applied again: set it to `EPOCH:GENERATION`, the `openetl.epoch` and `openetl.generation` of the last snapshot the pipeline committed.
+Each epoch is one snapshot per table, with the epoch's marker in the snapshot's summary and in a table property. The commit checks the marker on the snapshot it builds on, and the catalog refuses it if another commit landed first, so no epoch lands twice. A marker property, `openetl.loaded.PIPELINE`, that isn't one the destination wrote fails the commit, and the run without a retry, rather than having the epoch applied again: set it to `EPOCH:GENERATION`, the `openetl.epoch` and `openetl.generation` of the last snapshot the pipeline committed.
 
 The commit checks the fence too, a table property that each attempt's recovery raises. An Iceberg commit can't be made to depend on a property, though, and raising it changes no snapshot, so a replaced attempt that checked the fence before it was raised can still commit, and an older recovery can lower it again. What keeps a replaced attempt from committing an epoch the newer one doesn't know of is the [checkpoint log](https://github.com/openetl-io/openetl/blob/main/docs/internals/commits.md#checkpoints), in which it can't record one; an epoch they both apply lands once, by its marker.
 
@@ -35,7 +35,7 @@ A continuous pipeline commits every minute unless it sets its own `delivery.comm
 
 ## Delivery
 
-Streams whose source replays exactly land exactly once. A stream whose source may send rows again, such as a Postgres table read incrementally, lands effectively once when it's merged: the repeat lands on its key's row. From 0.2.0, appended or overwritten, such a stream is deduped at commit and lands exactly once, unless the pipeline requires only `at_least_once`, or the stream has no primary key and doesn't collapse: the commit leaves out each row whose `_openetl_id` an earlier row of the epoch has, and each one the table already has. An overwrite's target is its own read, so it keeps one row per `_openetl_id` across the read. With `at_least_once`, a stream without a primary key that collapses is deduped within each epoch only.
+Streams whose source replays exactly land exactly once. A stream whose source may send rows again, such as a Postgres table read incrementally, lands effectively once when it's merged: the repeat lands on its key's row. Appended or overwritten, such a stream is deduped at commit and lands exactly once, unless the pipeline requires only `at_least_once`, or the stream has no primary key and doesn't collapse: the commit leaves out each row whose `_openetl_id` an earlier row of the epoch has, and each one the table already has. An overwrite's target is its own read, so it keeps one row per `_openetl_id` across the read. With `at_least_once`, a stream without a primary key that collapses is deduped within each epoch only.
 
 Deduping costs reads, since Iceberg has no index to look IDs up in: the commit reads the `_openetl_id` column of the epoch's staged files, and against the table, scans the table's `_openetl_id` column, filtered by the epoch's IDs when there are at most 1,000 of them and in full when there are more. A staged file that loses rows is written again without them. The pipeline's status counts the rows it left out as collapsed.
 
@@ -45,7 +45,7 @@ Deduping costs reads, since Iceberg has no index to look IDs up in: the commit r
 
 Set `uri`, and `warehouse` if the catalog serves more than one. For authentication, give a bearer `token`, or OAuth2 client credentials as `credential`, in the form `CLIENT_ID:CLIENT_SECRET`.
 
-From 0.2.0, these `properties` apply from the first request, for the catalog's config, so a catalog that needs them can be signed in to:
+These `properties` apply from the first request, for the catalog's config, so a catalog that needs them can be signed in to:
 
 - `scope`: the scope a token is asked for, `catalog` unless set. Polaris takes `PRINCIPAL_ROLE:ALL`.
 - `oauth2-server-uri`: the token endpoint of an identity provider of the catalog's own, such as Keycloak's, which `credential` goes to instead of the catalog's `v1/oauth/tokens`. `audience` and `resource` go with the token request.
@@ -93,17 +93,17 @@ Without `accessKeyId` and `secretAccessKey`, the destination uses the AWS SDK's 
 The credentials need these actions:
 
 - **S3**, whenever the destination writes to S3 with them: `s3:GetObject`, `s3:PutObject` and `s3:DeleteObject` on the tables' locations, and `s3:ListBucket` on their bucket, which an overwrite needs to clean up after a read.
-- **Glue**: `glue:GetDatabase`, `glue:CreateDatabase` for a namespace that doesn't exist yet, `glue:GetTable`, `glue:CreateTable` and `glue:UpdateTable`. From 0.2.0, the checks also use `glue:DeleteTable`, `glue:GetTables` and `glue:DeleteDatabase` when they created the namespace, and `glue:GetDatabases`, though they pass without it.
+- **Glue**: `glue:GetDatabase`, `glue:CreateDatabase` for a namespace that doesn't exist yet, `glue:GetTable`, `glue:CreateTable` and `glue:UpdateTable`. The checks also use `glue:DeleteTable`, `glue:GetTables` and `glue:DeleteDatabase` when they created the namespace, and `glue:GetDatabases`, though they pass without it.
 
 The [config schema](./destination.schema.json) has every setting.
 
 ### Checks
 
-From 0.2.0, `openetl check` runs the destination's checks, in order: it resolves and connects to the catalog's host, and, over HTTPS, completes a TLS handshake (`net.dns`, `net.connect`, `net.tls`; for Glue at AWS's own endpoint, and for a host that the `HTTPS_PROXY`, `HTTP_PROXY` and `NO_PROXY` environment variables send through a proxy, these only advise, since the client may reach it through a proxy a dial doesn't take); signs in and lists namespaces (`catalog.auth`); finds the namespace, which the first write creates if it's missing (`catalog.namespace`); creates a table `_openetl_check_…` there, creating the namespace if needed (`catalog.create`); commits a property change to it (`catalog.commit`); with `s3Endpoint`, reaches the store (`store.dns`, `store.connect`, `store.tls`, which only advise for a host behind a proxy too); and writes and deletes a file in the table's location (`store.write`, `store.delete`). It then purges the table, and drops a namespace it created.
+`openetl check` runs the destination's checks, in order: it resolves and connects to the catalog's host, and, over HTTPS, completes a TLS handshake (`net.dns`, `net.connect`, `net.tls`; for Glue at AWS's own endpoint, and for a host that the `HTTPS_PROXY`, `HTTP_PROXY` and `NO_PROXY` environment variables send through a proxy, these only advise, since the client may reach it through a proxy a dial doesn't take); signs in and lists namespaces (`catalog.auth`); finds the namespace, which the first write creates if it's missing (`catalog.namespace`); creates a table `_openetl_check_…` there, creating the namespace if needed (`catalog.create`); commits a property change to it (`catalog.commit`); with `s3Endpoint`, reaches the store (`store.dns`, `store.connect`, `store.tls`, which only advise for a host behind a proxy too); and writes and deletes a file in the table's location (`store.write`, `store.delete`). It then purges the table, and drops a namespace it created.
 
-From 0.2.0, a refusal of the credentials or of access, by the catalog or the store, fails a run with the refusal's code, as it fails the checks, rather than as an internal error the platform retries.
+A refusal of the credentials or of access, by the catalog or the store, fails a run with the refusal's code, as it fails the checks, rather than as an internal error the platform retries.
 
-From 0.2.0, a pipeline's preflight reaches the catalog, signs in and finds the namespace, without the checks that create a table or write files, and checks each stream: that its write mode is append, overwrite or merge and that a merge has a primary key of columns that aren't floating-point (`stream.NAME.mode`), and that its table, if it exists, takes the stream's columns without a type change the stream doesn't allow, and, for a merge, is format 2 or later, partitioned by nothing outside the key, and holds no files of an earlier partitioning (`stream.NAME.table`). For a stream whose schema OpenETL doesn't know yet, it checks only the write mode, that a merge has a primary key, and whether the table named after the stream exists.
+A pipeline's preflight reaches the catalog, signs in and finds the namespace, without the checks that create a table or write files, and checks each stream: that its write mode is append, overwrite or merge and that a merge has a primary key of columns that aren't floating-point (`stream.NAME.mode`), and that its table, if it exists, takes the stream's columns without a type change the stream doesn't allow, and, for a merge, is format 2 or later, partitioned by nothing outside the key, and holds no files of an earlier partitioning (`stream.NAME.table`). For a stream whose schema OpenETL doesn't know yet, it checks only the write mode, that a merge has a primary key, and whether the table named after the stream exists.
 
 ## Types
 
@@ -146,8 +146,6 @@ Columns of the table's partition spec can't be held, and nor can a required colu
 
 ## Partitioned tables
 
-From 0.2.0.
-
 The destination creates its tables unpartitioned, and doesn't change a table's partitioning. It writes into a table that's already partitioned, by any of Iceberg's transforms, with each data file in one partition. At commit, it reads each file's partition columns to find its partition; if the table's partitioning changed after the file was written, so that its rows span partitions, it writes the rows again, by partition.
 
 A merge writes equality deletes in the partition of the key's new row, so it needs every column the table is partitioned by in the stream's primary key. It refuses a table partitioned by another column, and the preflight says so.
@@ -158,15 +156,15 @@ A delete written in a table's current partitioning doesn't reach files of an ear
 
 Each commit adds a snapshot, and a metadata file, to each table it writes, and the destination neither expires snapshots, nor compacts data files, nor deletes old metadata files. Run them in an engine that can, such as Spark's `expire_snapshots` and `rewrite_data_files` procedures, and set a table's `write.metadata.delete-after-commit.enabled` to `true` to keep only its `write.metadata.previous-versions-max` newest metadata files.
 
-An epoch's data files are in its tables' locations from when they're written until the epoch commits, which can be long after for a pipeline that stops with an epoch staged, and a table's catalog knows nothing of them until then. A `remove_orphan_files` that runs with an `older_than` shorter than that deletes them, and the epoch can't commit: its recovery reports it lost. An overwrite read's files are there too, out of the table, until the read ends, with its manifests under the table's `_openetl/reads`; from 0.2.0, a paused stream's read goes on once the stream is resumed. Keep `older_than` longer than a pipeline may stay stopped or a stream paused, and longer than an overwrite read takes.
+An epoch's data files are in its tables' locations from when they're written until the epoch commits, which can be long after for a pipeline that stops with an epoch staged, and a table's catalog knows nothing of them until then. A `remove_orphan_files` that runs with an `older_than` shorter than that deletes them, and the epoch can't commit: its recovery reports it lost. An overwrite read's files are there too, out of the table, until the read ends, with its manifests under the table's `_openetl/reads`; a paused stream's read goes on once the stream is resumed. Keep `older_than` longer than a pipeline may stay stopped or a stream paused, and longer than an overwrite read takes.
 
 ## Limits
 
-- New tables are unpartitioned and unsorted: the destination has no setting for a new table's partitioning or sort order. Partition a table with an engine that can, such as Spark's `ALTER TABLE … ADD PARTITION FIELD`, and from 0.2.0, the destination writes into its partitions from then on.
-- New tables are format 2, and timestamps are kept in microseconds: the destination neither creates format 3 tables nor writes `timestamp_ns`. From 0.2.0, it appends to and overwrites a format 3 table that exists, giving its rows their row IDs; merges and held cells' patches into a format 3 table are untested.
-- From 0.2.0, deduping holds every `_openetl_id` of the epoch in memory, and of the whole read for an overwrite, and a staged file that loses rows is read whole to be written again.
+- New tables are unpartitioned and unsorted: the destination has no setting for a new table's partitioning or sort order. Partition a table with an engine that can, such as Spark's `ALTER TABLE … ADD PARTITION FIELD`, and the destination writes into its partitions from then on.
+- New tables are format 2, and timestamps are kept in microseconds: the destination neither creates format 3 tables nor writes `timestamp_ns`. It appends to and overwrites a format 3 table that exists, giving its rows their row IDs; merges and held cells' patches into a format 3 table are untested.
+- Deduping holds every `_openetl_id` of the epoch in memory, and of the whole read for an overwrite, and a staged file that loses rows is read whole to be written again.
 - A merge, and a patch of held cells, holds in memory at commit the epoch's staged rows or patches of one stream at a time, with the table's rows they match. It finds those by up to 1,000 distinct values of each column it matches on, by the range between the lowest and highest beyond that, and by no value of a column with a null among them, so a match on one column with a null reads the whole table.
 - The destination writes; it doesn't read tables back as a source.
 - Glue commits one table at a time, so a pipeline into Glue needs stream scope, and an epoch's tables may land a few moments apart.
-- From 0.2.0, an epoch that can't be recovered, as some of its staged files are gone, leaves the rest in its tables' locations as orphan files, which no snapshot holds.
-- From 0.2.0, the destination can't tell a stream removed from the pipeline from a paused one, so an overwrite read that a removed stream left unfinished keeps its files in the table's location, out of the table, until the stream is added back or the table is dropped.
+- An epoch that can't be recovered, as some of its staged files are gone, leaves the rest in its tables' locations as orphan files, which no snapshot holds.
+- The destination can't tell a stream removed from the pipeline from a paused one, so an overwrite read that a removed stream left unfinished keeps its files in the table's location, out of the table, until the stream is added back or the table is dropped.

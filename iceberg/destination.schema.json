@@ -81,7 +81,7 @@
       "type": "object",
       "additionalProperties": {"type": "string"},
       "title": "Properties",
-      "description": "More catalog and file IO properties, as Iceberg names them, such as glue.endpoint, glue.id, s3.endpoint or a REST catalog's header.* and rest.* settings. From 0.2.0, a REST catalog's scope, oauth2-server-uri, audience, resource, rest.sigv4-enabled, rest.signing-name and rest.signing-region apply from its first request.",
+      "description": "More catalog and file IO properties, as Iceberg names them, such as glue.endpoint, glue.id, s3.endpoint or a REST catalog's header.* and rest.* settings. A REST catalog's scope, oauth2-server-uri, audience, resource, rest.sigv4-enabled, rest.signing-name and rest.signing-region apply from its first request.",
       "x-group": "catalog",
       "x-advanced": true
     }

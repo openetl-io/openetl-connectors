@@ -19,21 +19,21 @@
     "tlsServerName": {"type": "string", "title": "Server name", "x-group": "tls", "x-advanced": true, "description": "The name to verify the brokers' certificates against, if not their host."},
     "tlsInsecureSkipVerify": {"type": "boolean", "default": false, "title": "Skip verification", "x-group": "tls", "x-advanced": true, "description": "Don't verify the brokers' certificates."},
     "saslMechanism": {"type": "string", "title": "SASL mechanism", "x-group": "auth", "description": "SASL authentication. Unset: none.", "oneOf": [
-      {"const": "plain", "title": "PLAIN", "description": "A user and password, sent as they are: use it over TLS. From 0.2.0, the check warns without TLS."},
+      {"const": "plain", "title": "PLAIN", "description": "A user and password, sent as they are: use it over TLS. The check warns without TLS."},
       {"const": "scram-sha-256", "title": "SCRAM-SHA-256", "description": "A user and password, never sent."},
       {"const": "scram-sha-512", "title": "SCRAM-SHA-512", "description": "A user and password, never sent."},
-      {"const": "oauthbearer", "title": "OAUTHBEARER", "description": "From 0.2.0. A token from an OAuth client-credentials grant."},
-      {"const": "aws-msk-iam", "title": "AWS MSK IAM", "description": "From 0.2.0. Amazon MSK's IAM access control, signed with AWS credentials."}
+      {"const": "oauthbearer", "title": "OAUTHBEARER", "description": "A token from an OAuth client-credentials grant."},
+      {"const": "aws-msk-iam", "title": "AWS MSK IAM", "description": "Amazon MSK's IAM access control, signed with AWS credentials."}
     ]},
     "saslUsername": {"type": "string", "title": "Username", "x-group": "auth", "x-when": {"saslMechanism": ["plain", "scram-sha-256", "scram-sha-512"]}, "description": "The user saslMechanism authenticates as, for plain and SCRAM."},
     "saslPassword": {"type": "string", "x-secret": true, "title": "Password", "x-group": "auth", "x-when": {"saslMechanism": ["plain", "scram-sha-256", "scram-sha-512"]}, "description": "The SASL user's password."},
-    "oauthTokenUrl": {"type": "string", "x-format": "uri", "title": "Token URL", "x-group": "auth", "x-when": {"saslMechanism": "oauthbearer"}, "description": "From 0.2.0. The identity provider's token endpoint, http or https, for oauthbearer: the connector asks it for a token with the client-credentials grant, and asks again before the token expires."},
-    "oauthClientId": {"type": "string", "title": "Client ID", "x-group": "auth", "x-when": {"saslMechanism": "oauthbearer"}, "description": "From 0.2.0. The OAuth client the token is for."},
-    "oauthClientSecret": {"type": "string", "x-secret": true, "title": "Client secret", "x-group": "auth", "x-when": {"saslMechanism": "oauthbearer"}, "description": "From 0.2.0. The OAuth client's secret, sent to the token endpoint with HTTP basic authentication."},
-    "oauthScopes": {"type": "array", "items": {"type": "string"}, "title": "Scopes", "x-group": "auth", "x-when": {"saslMechanism": "oauthbearer"}, "description": "From 0.2.0. Scopes to ask the token for. Empty: none, so the provider's default."},
-    "oauthExtensions": {"type": "object", "additionalProperties": {"type": "string"}, "title": "SASL extensions", "x-group": "auth", "x-advanced": true, "x-when": {"saslMechanism": "oauthbearer"}, "description": "From 0.2.0. SASL extensions sent with the token, such as Confluent Cloud's logicalCluster and identityPoolId."},
-    "awsAccessKeyId": {"type": "string", "x-secret": true, "title": "AWS access key ID", "x-group": "auth", "x-when": {"saslMechanism": "aws-msk-iam"}, "description": "From 0.2.0. For aws-msk-iam, with awsSecretAccessKey. Unset: the AWS SDK's default chain, such as the environment, a web identity or the instance's role. The region is the brokers', from their host names."},
-    "awsSecretAccessKey": {"type": "string", "x-secret": true, "title": "AWS secret access key", "x-group": "auth", "x-when": {"saslMechanism": "aws-msk-iam"}, "description": "From 0.2.0. The access key's secret."},
+    "oauthTokenUrl": {"type": "string", "x-format": "uri", "title": "Token URL", "x-group": "auth", "x-when": {"saslMechanism": "oauthbearer"}, "description": "The identity provider's token endpoint, http or https, for oauthbearer: the connector asks it for a token with the client-credentials grant, and asks again before the token expires."},
+    "oauthClientId": {"type": "string", "title": "Client ID", "x-group": "auth", "x-when": {"saslMechanism": "oauthbearer"}, "description": "The OAuth client the token is for."},
+    "oauthClientSecret": {"type": "string", "x-secret": true, "title": "Client secret", "x-group": "auth", "x-when": {"saslMechanism": "oauthbearer"}, "description": "The OAuth client's secret, sent to the token endpoint with HTTP basic authentication."},
+    "oauthScopes": {"type": "array", "items": {"type": "string"}, "title": "Scopes", "x-group": "auth", "x-when": {"saslMechanism": "oauthbearer"}, "description": "Scopes to ask the token for. Empty: none, so the provider's default."},
+    "oauthExtensions": {"type": "object", "additionalProperties": {"type": "string"}, "title": "SASL extensions", "x-group": "auth", "x-advanced": true, "x-when": {"saslMechanism": "oauthbearer"}, "description": "SASL extensions sent with the token, such as Confluent Cloud's logicalCluster and identityPoolId."},
+    "awsAccessKeyId": {"type": "string", "x-secret": true, "title": "AWS access key ID", "x-group": "auth", "x-when": {"saslMechanism": "aws-msk-iam"}, "description": "For aws-msk-iam, with awsSecretAccessKey. Unset: the AWS SDK's default chain, such as the environment, a web identity or the instance's role. The region is the brokers', from their host names."},
+    "awsSecretAccessKey": {"type": "string", "x-secret": true, "title": "AWS secret access key", "x-group": "auth", "x-when": {"saslMechanism": "aws-msk-iam"}, "description": "The access key's secret."},
     "schemaRegistryUrl": {"type": "string", "x-format": "uri", "title": "Registry URL", "x-group": "registry", "description": "A Confluent-compatible schema registry. Avro and Protobuf need one."},
     "schemaRegistryUsername": {"type": "string", "title": "Registry username", "x-group": "registry", "description": "A user for the schema registry's basic authentication, which sends the password as it is: use an https schemaRegistryUrl. Unset: none."},
     "schemaRegistryPassword": {"type": "string", "x-secret": true, "title": "Registry password", "x-group": "registry", "description": "The schema registry user's password."},
@@ -47,8 +47,8 @@
     "topicPattern": {"type": "string", "x-format": "regex", "title": "Topic pattern", "description": "A regular expression topics must match to be offered."},
     "startOffset": {"type": "string", "default": "earliest", "title": "Start offset", "x-group": "reading", "description": "Where a partition's first read starts.", "oneOf": [
       {"const": "earliest", "title": "Earliest", "description": "The oldest record the partition keeps."},
-      {"const": "latest", "title": "Latest", "description": "Records written after the first read starts. From 0.2.0, a read again of its first epoch, as OpenETL does to recover on several workers, starts where that read did."}
+      {"const": "latest", "title": "Latest", "description": "Records written after the first read starts. A read again of its first epoch, as OpenETL does to recover on several workers, starts where that read did."}
     ]},
-    "group": {"type": "string", "title": "Consumer group", "x-group": "reading", "x-advanced": true, "description": "The consumer group the read's offsets are committed to once checkpointed, for Kafka's tools. Default: openetl-<pipeline>; from 0.2.0, without it, a checkpoint committed when no read is running commits nothing, as the pipeline isn't known then."}
+    "group": {"type": "string", "title": "Consumer group", "x-group": "reading", "x-advanced": true, "description": "The consumer group the read's offsets are committed to once checkpointed, for Kafka's tools. Default: openetl-<pipeline>; without it, a checkpoint committed when no read is running commits nothing, as the pipeline isn't known then."}
   }
 }

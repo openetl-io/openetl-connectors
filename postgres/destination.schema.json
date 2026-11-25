@@ -5,13 +5,13 @@
   "additionalProperties": false,
   "required": ["dsn"],
   "x-groups": [
-    {"id": "tls", "title": "TLS", "description": "From 0.2.0. Certificates given in place of the files the dsn's sslrootcert, sslcert and sslkey name."}
+    {"id": "tls", "title": "TLS", "description": "Certificates given in place of the files the dsn's sslrootcert, sslcert and sslkey name."}
   ],
   "properties": {
     "dsn": {"type": "string", "x-secret": true, "description": "A connection URL or a keyword/value connection string.", "title": "Connection string", "examples": ["postgres://USER:PASSWORD@HOST:5432/DATABASE?sslmode=verify-full"]},
     "schema": {"type": "string", "default": "public", "description": "Used when the pipeline names no namespace.", "title": "Schema"},
-    "tlsCa": {"type": "string", "description": "From 0.2.0. PEM certificates of the authorities that sign the server's certificate, given in place of the dsn's sslrootcert file. The server's certificate must chain to them under every sslmode that uses TLS, and also name the dsn's host under verify-full. Setting it makes TLS required: sslmode=disable or allow is refused, and prefer doesn't fall back to a plaintext connection.", "title": "CA certificates", "x-group": "tls", "x-format": "multiline"},
-    "tlsCert": {"type": "string", "description": "From 0.2.0. A PEM client certificate, in place of the dsn's sslcert file, for a server that asks for one, such as with the cert authentication method or clientcert=verify-full. Needs tlsKey, and makes TLS required as tlsCa does.", "title": "Client certificate", "x-group": "tls", "x-format": "multiline"},
-    "tlsKey": {"type": "string", "x-secret": true, "description": "From 0.2.0. The client certificate's private key, PEM, unencrypted, in place of the dsn's sslkey file.", "title": "Client key", "x-group": "tls", "x-format": "multiline"}
+    "tlsCa": {"type": "string", "description": "PEM certificates of the authorities that sign the server's certificate, given in place of the dsn's sslrootcert file. The server's certificate must chain to them under every sslmode that uses TLS, and also name the dsn's host under verify-full. Setting it makes TLS required: sslmode=disable or allow is refused, and prefer doesn't fall back to a plaintext connection.", "title": "CA certificates", "x-group": "tls", "x-format": "multiline"},
+    "tlsCert": {"type": "string", "description": "A PEM client certificate, in place of the dsn's sslcert file, for a server that asks for one, such as with the cert authentication method or clientcert=verify-full. Needs tlsKey, and makes TLS required as tlsCa does.", "title": "Client certificate", "x-group": "tls", "x-format": "multiline"},
+    "tlsKey": {"type": "string", "x-secret": true, "description": "The client certificate's private key, PEM, unencrypted, in place of the dsn's sslkey file.", "title": "Client key", "x-group": "tls", "x-format": "multiline"}
   }
 }

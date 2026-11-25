@@ -12,9 +12,6 @@ The `s3` package has a source and a destination for files on Amazon S3, on anoth
 
 The source reads the files that a glob matches as a stream, in Parquet, Avro, CSV or JSON Lines. The destination writes each stream as a directory of Parquet, CSV or JSON Lines files, and appends each epoch's files exactly once, or replaces a table's files at once when a read ends.
 
-> [!NOTE]
-> 0.1.0-alpha has the destination's Parquet appends on S3 and local disks. The source, the destination's CSV and JSON Lines, and overwrite are from 0.2.0.
-
 Both roles are tested on a local filesystem and against SeaweedFS's S3 API. The destination's Parquet appends have also run against Amazon S3. CI doesn't test Amazon S3 itself. See [Limits](#limits) for what SeaweedFS can't show.
 
 ## Connecting
@@ -27,7 +24,7 @@ Set `region`. With `accessKeyId` and `secretAccessKey`, the connector uses those
 
 ### S3-compatible stores
 
-A store with S3's API, such as MinIO, Cloudflare R2 or Ceph, takes the same settings, with `endpoint` set to its S3 API's URL, `region` to one the store takes, and its keys in `accessKeyId` and `secretAccessKey`. With `endpoint`, the connector addresses buckets by path, `ENDPOINT/BUCKET/KEY`, rather than by host name. From 0.2.0, the destination's uploads to an `endpoint` carry a checksum only where the store asks for one, as some S3-compatible stores refuse the CRC32 that Amazon S3 takes with every upload.
+A store with S3's API, such as MinIO, Cloudflare R2 or Ceph, takes the same settings, with `endpoint` set to its S3 API's URL, `region` to one the store takes, and its keys in `accessKeyId` and `secretAccessKey`. With `endpoint`, the connector addresses buckets by path, `ENDPOINT/BUCKET/KEY`, rather than by host name. The destination's uploads to an `endpoint` carry a checksum only where the store asks for one, as some S3-compatible stores refuse the CRC32 that Amazon S3 takes with every upload.
 
 Only SeaweedFS's S3 API is tested; the stores named here aren't. Appends need only S3's reads, writes, copies, deletes and listings. Overwrite also needs the store to honor S3's conditional writes, `If-None-Match` and `If-Match`: a pipeline that overwrites runs the destination's `store.conditional-write` preflight, which warns as `conditional_writes_ignored` on a store that ignores them, as [Checks and preflights](#checks-and-preflights) says.
 
@@ -37,13 +34,13 @@ A `file://` URL names a directory on the runner's disk, which the destination cr
 
 ### Checks and preflights
 
-From 0.2.0, a check reports these items, in order, for either role. Each one after the first runs only if the item before it passed or warned. On `file://` URLs, the check has only `store.list` and the destination's `store.write` and `store.delete`.
+A check reports these items, in order, for either role. Each one after the first runs only if the item before it passed or warned. On `file://` URLs, the check has only `store.list` and the destination's `store.write` and `store.delete`.
 
 | Item | What it checks |
 | --- | --- |
 | `net.dns`, `net.connect`, `net.tls` | The store's API resolves, accepts a connection and, over HTTPS, completes a TLS handshake: `endpoint`, or `s3.REGION.amazonaws.com`. Without `endpoint`, a failure here only warns, since a runner can reach AWS through a proxy that the store's SDK uses and a direct connection doesn't. |
-| `store.auth` | The store accepts the credentials. If the store knows the identity but refuses it access, this item passes, and the items after it show what access is missing. From 0.2.0, it passes too for a bucket in another region than `region`, whose answer doesn't show whether the store takes the credentials, and `store.bucket` fails. |
-| `store.bucket` | The bucket exists. From 0.2.0, a bucket in another region than `region` fails this item, which names the bucket's region. |
+| `store.auth` | The store accepts the credentials. If the store knows the identity but refuses it access, this item passes, and the items after it show what access is missing. It passes too for a bucket in another region than `region`, whose answer doesn't show whether the store takes the credentials, and `store.bucket` fails. |
+| `store.bucket` | The bucket exists. A bucket in another region than `region` fails this item, which names the bucket's region. |
 | `store.list` | The identity lists the files under `url`: `s3:ListBucket`. |
 | `store.write`, `store.delete` | The destination's only: it writes a file under `URL/_openetl/` (`s3:PutObject`), then deletes it (`s3:DeleteObject`). |
 
@@ -62,11 +59,9 @@ A destination's preflight has these items:
 
 ### Errors
 
-Credentials that the store refuses fail the check and the sync with `AUTH_INVALID`, `AUTH_EXPIRED` or `PERMISSION_DENIED`, and OpenETL retries only `AUTH_EXPIRED`. A store that doesn't answer, rate limits the connector or returns a server error fails with `TRANSIENT` or `RATE_LIMITED`, which OpenETL retries. Without AWS credentials, the connector fails with `AUTH_INVALID`; when what gives it credentials, such as STS or the runner's endpoint of a role's, doesn't answer or returns a server error, with `TRANSIENT`. From 0.2.0, a bucket in another region than `region` fails the check and the sync with `CONFIG_INVALID`, and the error names the bucket's region to set; before, the check said the bucket didn't exist.
+Credentials that the store refuses fail the check and the sync with `AUTH_INVALID`, `AUTH_EXPIRED` or `PERMISSION_DENIED`, and OpenETL retries only `AUTH_EXPIRED`. A store that doesn't answer, rate limits the connector or returns a server error fails with `TRANSIENT` or `RATE_LIMITED`, which OpenETL retries. Without AWS credentials, the connector fails with `AUTH_INVALID`; when what gives it credentials, such as STS or the runner's endpoint of a role's, doesn't answer or returns a server error, with `TRANSIENT`. A bucket in another region than `region` fails the check and the sync with `CONFIG_INVALID`, and the error names the bucket's region to set.
 
 ## Source
-
-From 0.2.0.
 
 ### What it reads
 
@@ -163,7 +158,7 @@ s3://my-bucket/raw/orders/9af7d67a-fb93-45a8-9061-af62ce29978d-00000000000000000
 
 CSV and JSON Lines files are compressed whole with `compression`: `gzip` (adding `.gz` to the name), `zstd` (adding `.zst`), or `none` (the default).
 
-A file closes at `fileSize` bytes, 256 MiB by default, and the next one starts. `fileSize` is at most 4 GiB (from 0.2.0), as Commit copies each file into place and S3 copies at most 5 GiB in one request.
+A file closes at `fileSize` bytes, 256 MiB by default, and the next one starts. `fileSize` is at most 4 GiB, as Commit copies each file into place and S3 copies at most 5 GiB in one request.
 
 The destination keeps what it needs besides the tables under `URL/_openetl/`: files being staged, a marker per stream and epoch, and a record of each table's columns. Leave it in place, and point readers at the table directories, or at an overwritten table's manifest, as [Write modes](#write-modes) says.
 
@@ -186,20 +181,18 @@ The [config schema](./destination.schema.json) has every setting.
 ### Write modes
 
 - **Append** adds each epoch's files to the table. Deletes from a CDC source arrive as rows whose `_openetl_op` is `delete`, and a reader that wants the latest version of each row picks it by `_openetl_seq`.
-- **Overwrite**, from 0.2.0, replaces the table's contents with each full read. A read's files go to `TABLE/_reads/START/`, named for when the read started. When the read ends, the destination writes `TABLE/_symlink_format_manifest/manifest`, which lists the read's files, one URL per line, and then deletes the files of older reads under `_reads/`. That deletion is best effort: if listing `_reads/` or deleting a file fails, the write still succeeds, and the older files stay, listed by no manifest, until a later overwrite deletes them. The manifest is written with the store's conditional write, so an attempt that a newer one replaced can't put an older read back. A read that ends with no rows writes an empty manifest.
+- **Overwrite** replaces the table's contents with each full read. A read's files go to `TABLE/_reads/START/`, named for when the read started. When the read ends, the destination writes `TABLE/_symlink_format_manifest/manifest`, which lists the read's files, one URL per line, and then deletes the files of older reads under `_reads/`. That deletion is best effort: if listing `_reads/` or deleting a file fails, the write still succeeds, and the older files stay, listed by no manifest, until a later overwrite deletes them. The manifest is written with the store's conditional write, so an attempt that a newer one replaced can't put an older read back. A read that ends with no rows writes an empty manifest.
 
-OpenETL picks each stream's mode. From 0.2.0, without the pipeline's `destination.write`, a stream read with `full_refresh` is overwritten, and a stream read with `incremental`, `cdc` or `stream` is appended to. `destination.write: append` appends to every stream, so each full read adds all its rows again. `destination.write: overwrite` overwrites every stream, and the plan refuses it if a stream is read with `incremental`, `cdc` or `stream`. [Pipeline settings](https://github.com/openetl-io/openetl/blob/main/docs/pipelines/settings.md#destination) has the field. In a pipeline on more than one worker, each attempt reads an overwritten stream on one of them, and the plan warns so.
+OpenETL picks each stream's mode. Without the pipeline's `destination.write`, a stream read with `full_refresh` is overwritten, and a stream read with `incremental`, `cdc` or `stream` is appended to. `destination.write: append` appends to every stream, so each full read adds all its rows again. `destination.write: overwrite` overwrites every stream, and the plan refuses it if a stream is read with `incremental`, `cdc` or `stream`. [Pipeline settings](https://github.com/openetl-io/openetl/blob/main/docs/pipelines/settings.md#destination) has the field. In a pipeline on more than one worker, each attempt reads an overwritten stream on one of them, and the plan warns so.
 
 > [!IMPORTANT]
 > An overwrite is atomic only for readers that read the files the manifest lists, as a table defined with Hive's `SymlinkTextInputFormat` does. A reader that lists the table's directory instead sees the files of every read not yet deleted, under `_reads/`. Readers that skip names starting with `_`, as Hadoop's do, see none of them. Between the manifest's write and the deletion of the older read's files, the older files are still there but listed by no manifest.
 >
 > The older read's files are deleted just after the manifest is replaced, so a reader that read the manifest before then can find its files gone and fail. Run such readers between overwrites, or have them try again.
 
-### Upgrading from 0.1.0-alpha
+### Changing write modes
 
-The 0.1.0-alpha package appends to every stream, as it has no overwrite. From 0.2.0, a stream read with `full_refresh` is overwritten unless the pipeline sets `destination.write`, so a pipeline that appended its full reads overwrites them once the package is upgraded, with no change to its spec. To keep appending, set `destination.write: append` in the pipeline before its first sync with 0.2.0.
-
-An overwrite deletes only older reads under `_reads/`, so the files appended before the upgrade stay at the top of the table's directory, listed by no manifest. A reader that reads the manifest sees only the latest read. A reader that lists the directory sees the appended files and the latest read's, both. A reader that skips names starting with `_` sees only the appended files, and never a read. Once the first overwrite has committed, point readers at the manifest, then, once no reader is still reading files it found by listing the directory, delete the table's files outside `_reads/` and `_symlink_format_manifest/`: the destination doesn't use them again.
+An overwrite deletes only older reads under `_reads/`, so the files appended before the first overwrite stay at the top of the table's directory, listed by no manifest. A reader that reads the manifest sees only the latest read. A reader that lists the directory sees the appended files and the latest read's, both. A reader that skips names starting with `_` sees only the appended files, and never a read. Once the first overwrite has committed, point readers at the manifest, then, once no reader is still reading files it found by listing the directory, delete the table's files outside `_reads/` and `_symlink_format_manifest/`: the destination doesn't use them again.
 
 The other way, a table overwritten and then appended to keeps its manifest and its last read under `_reads/`, and appended files go to the top of its directory, which the manifest doesn't list. A reader that reads the manifest sees only that last read, and never an appended row. A reader that lists the directory sees the last read and the appended files, both. A reader that skips names starting with `_` sees only the appended files. Once an appended read that holds every row has committed, point readers at the directory, then, once no reader is still reading files through the manifest, delete `_symlink_format_manifest/` and `_reads/` together, never one without the other: a manifest whose read is gone lists files that no longer exist. Only a full read appended with `destination.write: append` is known to hold every row. For a stream now read another way, keep the last read and its manifest until you have checked that the appended files hold every row you need. Kept, they cost storage, and a reader that lists the directory sees their rows with the appended ones.
 
@@ -217,7 +210,7 @@ A continuous pipeline commits every minute unless it sets its own `delivery.comm
 
 The credentials need to read, write, copy, delete and list objects under the URL. On Amazon S3 that's `s3:ListBucket` on the bucket, and `s3:GetObject`, `s3:PutObject` and `s3:DeleteObject` on its objects under the URL. Overwrite also needs the store to honor conditional writes, `If-None-Match` and `If-Match`, which the `store.conditional-write` preflight checks. The destination's check writes and deletes an object under `_openetl/`. The source needs to list and read objects under the URL.
 
-A file over 16 MiB is uploaded in parts. From 0.2.0, a staged file whose write stops partway, as when a sync fails, has its parts dropped with `s3:AbortMultipartUpload`, which the credentials need for that; without it, the parts stay, as they do when the store doesn't answer the abort within 30 seconds of the writer's close. A bucket lifecycle rule that aborts incomplete multipart uploads after a day also clears those, and those of a connector that was killed.
+A file over 16 MiB is uploaded in parts. A staged file whose write stops partway, as when a sync fails, has its parts dropped with `s3:AbortMultipartUpload`, which the credentials need for that; without it, the parts stay, as they do when the store doesn't answer the abort within 30 seconds of the writer's close. A bucket lifecycle rule that aborts incomplete multipart uploads after a day also clears those, and those of a connector that was killed.
 
 ## Types
 
