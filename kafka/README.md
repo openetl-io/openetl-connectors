@@ -30,9 +30,9 @@ From 0.2.0, `openetl connector check`, and the check OpenETL runs before a pipel
 - Reaching every broker the cluster advertises, which is where reads and writes go.
 - Reaching the schema registry and signing in to it, with `avro` or `protobuf`.
 - The source: that each topic in `topics` exists and the credentials may read it, or that at least one topic is offered.
-- The destination: that the credentials may read and write the marker topic, which is meant to be compacted, and the brokers' `transaction.max.timeout.ms`, which bounds the commit interval.
+- The destination: that the credentials may read and write the marker topic, which is meant to be compacted, or that the brokers would create it with `partitions` and `replicationFactor`; and the brokers' `transaction.max.timeout.ms`, which bounds the commit interval. Brokers that don't describe their configs, as MSK Serverless's don't, skip that last step, which then says what the setting must be, for you to check.
 
-A failed step names what is missing: a wrong password, a certificate the client or the broker doesn't trust, or the operation a principal has no ACL for, such as `User:openetl has no READ on the topic orders`. The checks read the topics' authorized operations, so they need no more than the read or write itself does.
+A failed step names what is missing: a wrong password, a certificate the client or the broker doesn't trust, the operation a principal has no ACL for, such as `User:openetl has no READ on the topic orders`, or the setting to change, such as `partitions` on a cluster that has no default number of partitions. The checks read the topics' authorized operations, so they need no more than the read or write itself does.
 
 Before a run, the preflight checks each stream:
 
@@ -131,7 +131,7 @@ From 0.2.0, a read that OpenETL gives an end stops there: it reads each partitio
 
 ### What it writes
 
-Each stream goes to a topic named after its table, prefixed with the pipeline's `destination.namespace` or the config's `namespace` if either is set: `NAMESPACE.TABLE`. Missing topics are created, with `partitions` and `replicationFactor` or the brokers' defaults, unless `createTopics` is `false`.
+Each stream goes to a topic named after its table, prefixed with the pipeline's `destination.namespace` or the config's `namespace` if either is set: `NAMESPACE.TABLE`. Missing topics are created, with `partitions` and `replicationFactor` or the brokers' defaults, unless `createTopics` is `false`. From 0.2.0, a number of partitions or a replication factor that the brokers refuse, or a default they don't have, as MSK Serverless has no default number of partitions, fails the check, the preflight and the write with a `CONFIG_INVALID` error that names the setting to set. Before 0.2.0, the write failed with an internal error, which OpenETL tried again.
 
 Each row is one record:
 
@@ -151,7 +151,7 @@ Epoch N goes on producer N mod 3. With a transform, OpenETL can write an epoch w
 
 Streams whose source replays exactly land exactly once. A stream that may repeat rows, such as a Postgres table read incrementally, gets at least once: the destination has no way to drop the rows sent again.
 
-A transaction must stay open for less than the brokers' `transaction.max.timeout.ms`, 15 minutes by default, so a pipeline's commit interval can be at most 7 minutes. The destination reads the brokers' setting when it opens, and from 0.2.0 in its check too, if the credentials may describe their configs. A continuous pipeline commits every 10 seconds unless it sets its own `delivery.commit.interval`. Each transaction's timeout is twice the commit interval and a minute. The brokers abort a transaction open longer, as when a commit is held up, and answer its producer as they do a fenced one: from 0.2.0, the attempt fails as transient rather than fenced, and the next attempt writes the epoch again.
+A transaction must stay open for less than the brokers' `transaction.max.timeout.ms`, 15 minutes by default, so a pipeline's commit interval can be at most 7 minutes. The destination reads the brokers' setting when it opens, and from 0.2.0 in its check too, if the brokers describe their configs and the credentials may read them. MSK Serverless's brokers don't describe theirs, so there the destination reads it at neither: the check skips it and says what it must be, at least twice the commit interval and a minute. A continuous pipeline commits every 10 seconds unless it sets its own `delivery.commit.interval`. Each transaction's timeout is twice the commit interval and a minute. The brokers abort a transaction open longer, as when a commit is held up, and answer its producer as they do a fenced one: from 0.2.0, the attempt fails as transient rather than fenced, and the next attempt writes the epoch again.
 
 A commit that the brokers fail other than by a fence, as with a server error, is settled by aborting the transaction. Unless the epoch's marker shows that the commit had landed, the epoch fails as transient, and the next attempt writes it again. From 0.2.0, OpenETL's retries of the commit fail as transient too, as does a retry of one whose transaction outlived its timeout. Before 0.2.0, they failed as fenced, which ends a scheduled sync rather than try it again.
 
@@ -171,6 +171,8 @@ A transaction that a lost worker left open stays open until the brokers abort it
 ### Set it up
 
 The credentials need to write to the topics and create them unless `createTopics` is `false`, to read and write the marker topic, and to use transactional IDs that start with `transactionalIdPrefix`: WRITE on those transactional IDs. The marker topic is created with `cleanup.policy=compact` if it doesn't exist.
+
+On MSK Serverless, set `partitions`: it creates no topic without a number of partitions, the marker topic included. It takes `replicationFactor` unset.
 
 ### Example
 

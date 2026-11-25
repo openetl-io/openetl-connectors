@@ -41,6 +41,88 @@ func itemsOf(checks []check.Check) []string {
 	return out
 }
 
+// statuses are a report's items' statuses by name, failures with their
+// reason.
+func statuses(r check.Report) map[string]string {
+	out := map[string]string{}
+	for _, it := range r.Items {
+		s := it.Status.String()
+		if it.Failure != nil {
+			s += ":" + it.Failure.Reason
+		}
+		out[it.Name] = s
+	}
+	return out
+}
+
+// rendered is a report's item of that name, its templates filled in.
+func rendered(t *testing.T, r check.Report, name string) check.Item {
+	t.Helper()
+	for _, it := range r.Items {
+		if it.Name == name {
+			return it.Rendered()
+		}
+	}
+	t.Fatalf("no item %s", name)
+	return check.Item{}
+}
+
+// mskServerless makes c answer as MSK Serverless did: INVALID_PARTITIONS to
+// a topic to be created with the brokers' default number of partitions,
+// whether or not its replication factor is the brokers' too, and
+// INVALID_REQUEST to a describe of a broker's configs.
+func mskServerless(c *kfake.Cluster) {
+	c.ControlKey(int16(kmsg.CreateTopics), func(kr kmsg.Request) (kmsg.Response, error, bool) {
+		req := kr.(*kmsg.CreateTopicsRequest)
+		resp := req.ResponseKind().(*kmsg.CreateTopicsResponse)
+		for _, rt := range req.Topics {
+			if rt.NumPartitions != -1 {
+				return nil, nil, false
+			}
+			st := kmsg.NewCreateTopicsResponseTopic()
+			st.Topic, st.ErrorCode = rt.Topic, kerr.InvalidPartitions.Code
+			resp.Topics = append(resp.Topics, st)
+		}
+		c.KeepControl()
+		return resp, nil, true
+	})
+	refuseBrokerConfigs(c, kerr.InvalidRequest.Code)
+}
+
+// refuseBrokerConfigs makes c answer every describe of a broker's configs
+// with code.
+func refuseBrokerConfigs(c *kfake.Cluster, code int16) {
+	c.ControlKey(int16(kmsg.DescribeConfigs), func(kr kmsg.Request) (kmsg.Response, error, bool) {
+		req := kr.(*kmsg.DescribeConfigsRequest)
+		resp := req.ResponseKind().(*kmsg.DescribeConfigsResponse)
+		for _, r := range req.Resources {
+			if r.ResourceType != kmsg.ConfigResourceTypeBroker {
+				return nil, nil, false
+			}
+			rr := kmsg.NewDescribeConfigsResponseResource()
+			rr.ResourceName, rr.ResourceType, rr.ErrorCode = r.ResourceName, r.ResourceType, code
+			resp.Resources = append(resp.Resources, rr)
+		}
+		c.KeepControl()
+		return resp, nil, true
+	})
+}
+
+// refuseCreates makes c answer every creation of a topic with code.
+func refuseCreates(c *kfake.Cluster, code int16) {
+	c.ControlKey(int16(kmsg.CreateTopics), func(kr kmsg.Request) (kmsg.Response, error, bool) {
+		req := kr.(*kmsg.CreateTopicsRequest)
+		resp := req.ResponseKind().(*kmsg.CreateTopicsResponse)
+		for _, rt := range req.Topics {
+			st := kmsg.NewCreateTopicsResponseTopic()
+			st.Topic, st.ErrorCode = rt.Topic, code
+			resp.Topics = append(resp.Topics, st)
+		}
+		c.KeepControl()
+		return resp, nil, true
+	})
+}
+
 // The lists are valid for any config and request, topics whose names make
 // the same check name included, and hold what the config calls for.
 func TestCheckLists(t *testing.T) {
@@ -239,8 +321,9 @@ func testCA(t *testing.T) string {
 }
 
 // transactionLimit reads the brokers' transaction.max.timeout.ms, is 0 only
-// where the credentials may not describe their configs, and fails on any
-// other error, rather than skipping the check.
+// where the credentials may not describe their configs, is
+// errNoBrokerConfigs only where the brokers answer INVALID_REQUEST, as MSK
+// Serverless's do, and fails on any other error.
 func TestTransactionLimit(t *testing.T) {
 	limit := func(code int16) (time.Duration, error) {
 		c := fakeCluster(t)
@@ -270,8 +353,131 @@ func TestTransactionLimit(t *testing.T) {
 	if got, err := limit(kerr.ClusterAuthorizationFailed.Code); err != nil || got != 0 {
 		t.Errorf("without DESCRIBE_CONFIGS = %v, %v", got, err)
 	}
-	if _, err := limit(kerr.InvalidRequest.Code); !errors.Is(err, kerr.InvalidRequest) {
+	if _, err := limit(kerr.InvalidRequest.Code); !errors.Is(err, errNoBrokerConfigs) || !errors.Is(err, kerr.InvalidRequest) {
+		t.Errorf("MSK Serverless's answer = %v", err)
+	}
+	if _, err := limit(kerr.UnknownServerError.Code); !errors.Is(err, kerr.UnknownServerError) || errors.Is(err, errNoBrokerConfigs) {
 		t.Errorf("a broker's error = %v", err)
+	}
+}
+
+// On a cluster that answers as MSK Serverless did, the destination's check
+// fails the marker topic with a config error that says to set partitions,
+// rather than an internal one, and skips the brokers'
+// transaction.max.timeout.ms, which it can't read, saying what it must be.
+// The preflight fails a stream's new topic as the check does the marker
+// topic. With partitions set, the check passes, the skip aside.
+func TestDestinationCheckOnMSKServerless(t *testing.T) {
+	c := fakeCluster(t)
+	mskServerless(c)
+	dest := func(extra map[string]any) *Destination {
+		d, err := NewDestination(fakeConfig(t, c.ListenAddrs(), extra))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return d
+	}
+	r := check.Run(t.Context(), dest(nil).Checks())
+	if got := statuses(r); got["markers.topic"] != "failed:partitions_required" || got["cluster.transaction-timeout"] != "skipped" {
+		t.Errorf("without partitions: %v", got)
+	}
+	if code := codeOf(r.Err()); code != "ERROR_CODE_CONFIG_INVALID" {
+		t.Errorf("without partitions, the check fails with %s: %v", code, r.Err())
+	}
+	if it := rendered(t, r, "markers.topic"); !strings.Contains(it.Message, "_openetl_markers needs partitions set") || it.Failure.Fix != "Set partitions to the number of partitions to create topics with." {
+		t.Errorf("markers.topic: %s; fix: %s", it.Message, it.Failure.Fix)
+	}
+	it := rendered(t, r, "cluster.transaction-timeout")
+	for _, s := range []string{"MSK Serverless", "transaction.max.timeout.ms", "at least twice the commit interval and a minute", "1m20s for the default interval of 10s", "15m0s for the longest, 7m0s"} {
+		if !strings.Contains(it.Message, s) {
+			t.Errorf("cluster.transaction-timeout's message doesn't say %q: %s", s, it.Message)
+		}
+	}
+	pf := check.Run(t.Context(), dest(nil).Preflight(destination.PreflightRequest{Pipeline: "p", Streams: []destination.Stream{{Name: "orders"}}}))
+	if got := statuses(pf)["stream.orders.write"]; got != "failed:partitions_required" {
+		t.Errorf("a new topic's preflight without partitions: %s", got)
+	}
+
+	r = check.Run(t.Context(), dest(map[string]any{"partitions": 3}).Checks())
+	if got := statuses(r); got["markers.topic"] != "passed" || got["cluster.transaction-timeout"] != "skipped" || !r.OK() {
+		t.Errorf("with partitions: %v, %v", got, r.Err())
+	}
+	pf = check.Run(t.Context(), dest(map[string]any{"partitions": 3}).Preflight(destination.PreflightRequest{Pipeline: "p", Streams: []destination.Stream{{Name: "orders"}}}))
+	if got := statuses(pf)["stream.orders.write"]; got != "passed" {
+		t.Errorf("a new topic's preflight with partitions: %s", got)
+	}
+}
+
+// The check of the brokers' transaction.max.timeout.ms passes a limit that
+// fits, fails one too low and an error other than MSK Serverless's, and
+// skips where the credentials may not describe the brokers' configs, as it
+// did before MSK Serverless's skip.
+func TestTransactionTimeoutCheck(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		opts []kfake.Opt
+		// A broker resource's error code; 0 for none.
+		code int16
+		want string
+	}{
+		{"the brokers' default", nil, 0, "passed"},
+		{"a limit too low", []kfake.Opt{kfake.BrokerConfigs(map[string]string{"transaction.max.timeout.ms": "60000"})}, 0, "failed:setting_mismatch"},
+		{"a broker's error", nil, kerr.UnknownServerError.Code, "failed:unknown"},
+		{"no DESCRIBE_CONFIGS", nil, kerr.ClusterAuthorizationFailed.Code, "skipped"},
+	} {
+		c, err := kfake.NewCluster(append([]kfake.Opt{kfake.NumBrokers(1)}, tc.opts...)...)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer c.Close()
+		if tc.code != 0 {
+			refuseBrokerConfigs(c, tc.code)
+		}
+		d, err := NewDestination(fakeConfig(t, c.ListenAddrs(), nil))
+		if err != nil {
+			t.Fatal(err)
+		}
+		r := check.Run(t.Context(), d.Checks())
+		if got := statuses(r)["cluster.transaction-timeout"]; got != tc.want {
+			t.Errorf("%s: %s, want %s", tc.name, got, tc.want)
+		}
+		if it := rendered(t, r, "cluster.transaction-timeout"); tc.want == "skipped" && !strings.Contains(it.Message, "DESCRIBE_CONFIGS") {
+			t.Errorf("%s: skipped with %q", tc.name, it.Message)
+		}
+	}
+}
+
+// A topic the brokers won't create with the config's partitions or
+// replication factor, or with their defaults where it sets none, fails the
+// check with a config error that names the setting. Other refusals fail as
+// they did.
+func TestCheckOfATopicTheBrokersWontCreate(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		extra map[string]any
+		// What the brokers answer every creation with; 0: kfake's own
+		// answer.
+		code int16
+		want string
+	}{
+		{"partitions refused", map[string]any{"partitions": 3}, kerr.InvalidPartitions.Code, "failed:partitions_refused"},
+		{"no default replication factor", nil, kerr.InvalidReplicationFactor.Code, "failed:replication_factor_required"},
+		{"more replicas than brokers", map[string]any{"replicationFactor": 2}, 0, "failed:replication_factor_refused"},
+		{"no CREATE", nil, kerr.TopicAuthorizationFailed.Code, "failed:privilege_missing"},
+		{"a policy", nil, kerr.PolicyViolation.Code, "failed:unknown"},
+	} {
+		c := fakeCluster(t)
+		if tc.code != 0 {
+			refuseCreates(c, tc.code)
+		}
+		d, err := NewDestination(fakeConfig(t, c.ListenAddrs(), tc.extra))
+		if err != nil {
+			t.Fatal(err)
+		}
+		r := check.Run(t.Context(), d.Checks())
+		if got := statuses(r)["markers.topic"]; got != tc.want {
+			t.Errorf("%s: %s, want %s", tc.name, got, tc.want)
+		}
 	}
 }
 

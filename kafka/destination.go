@@ -22,6 +22,7 @@ import (
 
 	"github.com/openetl-io/openetl-connectors/records"
 	sdk "github.com/openetl-io/openetl/sdk/go"
+	"github.com/openetl-io/openetl/sdk/go/check"
 	"github.com/openetl-io/openetl/sdk/go/destination"
 	protocolv1 "github.com/openetl-io/openetl/sdk/go/protocol/v1"
 )
@@ -324,18 +325,68 @@ func (w *writer) ensureTopic(ctx context.Context, topic string, configs map[stri
 		if c := w.d.cfg.CreateTopics; c != nil && !*c {
 			return sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_CONFIG_INVALID, fmt.Errorf("kafka: topic %s doesn't exist, and createTopics is off", topic))
 		}
-		partitions, rf := w.d.cfg.Partitions, w.d.cfg.ReplicationFactor
-		if partitions == 0 {
-			partitions = -1
-		}
-		if rf == 0 {
-			rf = -1
-		}
-		if _, err := w.admin.CreateTopic(ctx, partitions, rf, configs, topic); err != nil && !errors.Is(err, kerr.TopicAlreadyExists) {
+		if err := w.d.cfg.createTopic(ctx, w.admin, false, topic, configs); err != nil {
 			return classify(fmt.Errorf("kafka: create topic %s: %w", topic, err))
 		}
 	}
 	w.topics[topic] = true
+	return nil
+}
+
+// createTopic creates topic, or with validate only asks the brokers whether
+// they would, with the config's partitions and replication factor, or the
+// brokers' defaults where it sets none. A topic that exists is no error. A
+// partition count or replication factor the brokers refuse, their default
+// included, is a config error that names its setting.
+func (cfg *DestinationConfig) createTopic(ctx context.Context, adm *kadm.Client, validate bool, topic string, configs map[string]*string) error {
+	partitions, rf := cfg.Partitions, cfg.ReplicationFactor
+	if partitions == 0 {
+		partitions = -1
+	}
+	if rf == 0 {
+		rf = -1
+	}
+	create := adm.CreateTopics
+	if validate {
+		create = adm.ValidateCreateTopics
+	}
+	res, err := create(ctx, partitions, rf, configs, topic)
+	if err != nil {
+		return err
+	}
+	r, ok := res[topic]
+	if !ok {
+		return errors.New("the brokers' answer doesn't have the topic")
+	}
+	err = r.Err
+	if err == nil || errors.Is(err, kerr.TopicAlreadyExists) {
+		return nil
+	}
+	if r.ErrMessage != "" {
+		err = fmt.Errorf("%w %s", err, r.ErrMessage)
+	}
+	if f := cfg.countRefused(err, topic); f != nil {
+		return f
+	}
+	return err
+}
+
+// countRefused is err, the brokers' refusal to create topic, as a check's
+// failure that names the setting to change, where they refused its
+// partition count or its replication factor; nil otherwise. Asked for
+// their default, a cluster that has none, as MSK Serverless has no default
+// partition count, refuses it so.
+func (cfg *DestinationConfig) countRefused(err error, topic string) *check.Failure {
+	switch {
+	case errors.Is(err, kerr.InvalidPartitions) && cfg.Partitions == 0:
+		return partitionsRequired.Wrap(err, "topic", topic)
+	case errors.Is(err, kerr.InvalidPartitions):
+		return partitionsRefused.Wrap(err, "topic", topic, "partitions", strconv.Itoa(int(cfg.Partitions)))
+	case errors.Is(err, kerr.InvalidReplicationFactor) && cfg.ReplicationFactor == 0:
+		return replicationRequired.Wrap(err, "topic", topic)
+	case errors.Is(err, kerr.InvalidReplicationFactor):
+		return replicationRefused.Wrap(err, "topic", topic, "replication_factor", strconv.Itoa(int(cfg.ReplicationFactor)))
+	}
 	return nil
 }
 
