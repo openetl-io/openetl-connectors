@@ -236,7 +236,7 @@ A patch needs `ALTER UPDATE`, which the grants above include.
 
 ### Clusters
 
-The destination writes to a single server: it creates plain `MergeTree` and `ReplacingMergeTree` tables, with no `ON CLUSTER`, and keeps its fence and markers in such tables, which are each server's own. On a cluster behind a load balancer, attempts reaching different servers would see different fences and markers, so the destination doesn't deliver exactly once there. The source reads through one server, and reads a `Distributed` table in a single query.
+The destination writes to a single server: it creates plain `MergeTree` and `ReplacingMergeTree` tables, with no `ON CLUSTER`, and keeps its fence and markers in such tables, which are each server's own. On a cluster behind a load balancer, attempts reaching different servers would see different fences and markers, so the destination doesn't deliver exactly once there. The source reads through one server, and a full refresh reads a `Distributed` table in a single query.
 
 ### Limits
 
