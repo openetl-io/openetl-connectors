@@ -208,7 +208,8 @@ func TestTopicsOnMSKServerless(t *testing.T) {
 	cfg := destination.OpenConfig{Pipeline: l.pipeline, Generation: 1, Scope: destination.ScopePipeline, CommitInterval: time.Second,
 		Streams: []destination.Stream{{Name: l.table, Mode: destination.Append}}}
 	_, err := l.d.Open(t.Context(), cfg)
-	if codeOf(err) != "ERROR_CODE_CONFIG_INVALID" || !strings.Contains(err.Error(), "_openetl_markers needs partitions set") {
+	if codeOf(err) != "ERROR_CODE_CONFIG_INVALID" || !strings.Contains(err.Error(), "_openetl_markers needs partitions set") ||
+		strings.Count(err.Error(), kerr.InvalidPartitions.Description) != 1 {
 		t.Errorf("Open without partitions: %s %v", codeOf(err), err)
 	}
 
@@ -255,7 +256,7 @@ func TestATopicTheBrokersWontCreateIsConfig(t *testing.T) {
 	} {
 		c := fakeCluster(t)
 		if tc.code != 0 {
-			refuseCreates(c, tc.code)
+			refuseCreates(c, tc.code, "")
 		}
 		d, err := NewDestination(fakeConfig(t, c.ListenAddrs(), tc.extra))
 		if err != nil {

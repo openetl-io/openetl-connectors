@@ -37,7 +37,7 @@ A failed step names what is missing: a wrong password, a certificate the client 
 Before a run, the preflight checks each stream:
 
 - The source: that its topic exists and may be read, that the topic keeps records longer than the time between a scheduled pipeline's syncs (a warning otherwise), that the schema registry has the topic's value subject with `avro` or `protobuf` (a warning otherwise), and that the credentials may commit offsets to the consumer group.
-- The destination: that the stream is appended to, that the topic exists and may be written, or may be created; and that the pipeline's transactional IDs may be used. The preflight describes the IDs' transactions and never starts a producer with them, which would fence the pipeline's writers.
+- The destination: that the stream is appended to, that the topic exists and may be written, or may be created; and that the pipeline's transactional IDs may be used. The preflight describes the IDs' transactions and never starts a producer with them, which would fence the pipeline's writers. Brokers that don't offer DescribeTransactions, as MSK Serverless's and those before Kafka 3.0 don't, skip that last step, so a missing WRITE on the IDs shows at the first write.
 
 ## Source
 
@@ -172,7 +172,7 @@ A transaction that a lost worker left open stays open until the brokers abort it
 
 The credentials need to write to the topics and create them unless `createTopics` is `false`, to read and write the marker topic, and to use transactional IDs that start with `transactionalIdPrefix`: WRITE on those transactional IDs. The marker topic is created with `cleanup.policy=compact` if it doesn't exist.
 
-On MSK Serverless, set `partitions`: it creates no topic without a number of partitions, the marker topic included. It takes `replicationFactor` unset.
+On MSK Serverless, set `partitions`: it creates no topic without a number of partitions, the marker topic included. It takes `replicationFactor` unset. Its brokers describe neither their configs nor transactions, so the check skips `transaction.max.timeout.ms` and the preflight skips the transactional IDs, each saying why.
 
 ### Example
 

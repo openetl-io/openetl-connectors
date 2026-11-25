@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"errors"
+	"io"
 	"math/big"
 	"net/http"
 	"net/http/httptest"
@@ -25,6 +26,7 @@ import (
 	"github.com/twmb/franz-go/pkg/kfake"
 	"github.com/twmb/franz-go/pkg/kgo"
 	"github.com/twmb/franz-go/pkg/kmsg"
+	"github.com/twmb/franz-go/pkg/kversion"
 
 	sdk "github.com/openetl-io/openetl/sdk/go"
 	"github.com/openetl-io/openetl/sdk/go/check"
@@ -67,10 +69,11 @@ func rendered(t *testing.T, r check.Report, name string) check.Item {
 	return check.Item{}
 }
 
-// mskServerless makes c answer as MSK Serverless did: INVALID_PARTITIONS to
-// a topic to be created with the brokers' default number of partitions,
-// whether or not its replication factor is the brokers' too, and
-// INVALID_REQUEST to a describe of a broker's configs.
+// mskServerless makes c answer as MSK Serverless did: INVALID_PARTITIONS,
+// with the code's description as its message, to a topic to be created with
+// the brokers' default number of partitions, whether or not its replication
+// factor is the brokers' too, and INVALID_REQUEST to a describe of a
+// broker's configs.
 func mskServerless(c *kfake.Cluster) {
 	c.ControlKey(int16(kmsg.CreateTopics), func(kr kmsg.Request) (kmsg.Response, error, bool) {
 		req := kr.(*kmsg.CreateTopicsRequest)
@@ -80,7 +83,7 @@ func mskServerless(c *kfake.Cluster) {
 				return nil, nil, false
 			}
 			st := kmsg.NewCreateTopicsResponseTopic()
-			st.Topic, st.ErrorCode = rt.Topic, kerr.InvalidPartitions.Code
+			st.Topic, st.ErrorCode, st.ErrorMessage = rt.Topic, kerr.InvalidPartitions.Code, kmsg.StringPtr(kerr.InvalidPartitions.Description)
 			resp.Topics = append(resp.Topics, st)
 		}
 		c.KeepControl()
@@ -108,14 +111,18 @@ func refuseBrokerConfigs(c *kfake.Cluster, code int16) {
 	})
 }
 
-// refuseCreates makes c answer every creation of a topic with code.
-func refuseCreates(c *kfake.Cluster, code int16) {
+// refuseCreates makes c answer every creation of a topic with code, and
+// message unless it's empty.
+func refuseCreates(c *kfake.Cluster, code int16, message string) {
 	c.ControlKey(int16(kmsg.CreateTopics), func(kr kmsg.Request) (kmsg.Response, error, bool) {
 		req := kr.(*kmsg.CreateTopicsRequest)
 		resp := req.ResponseKind().(*kmsg.CreateTopicsResponse)
 		for _, rt := range req.Topics {
 			st := kmsg.NewCreateTopicsResponseTopic()
 			st.Topic, st.ErrorCode = rt.Topic, code
+			if message != "" {
+				st.ErrorMessage = kmsg.StringPtr(message)
+			}
 			resp.Topics = append(resp.Topics, st)
 		}
 		c.KeepControl()
@@ -387,6 +394,9 @@ func TestDestinationCheckOnMSKServerless(t *testing.T) {
 	if it := rendered(t, r, "markers.topic"); !strings.Contains(it.Message, "_openetl_markers needs partitions set") || it.Failure.Fix != "Set partitions to the number of partitions to create topics with." {
 		t.Errorf("markers.topic: %s; fix: %s", it.Message, it.Failure.Fix)
 	}
+	if it := rendered(t, r, "markers.topic"); it.Failure.Detail != "INVALID_PARTITIONS: Number of partitions is below 1." {
+		t.Errorf("markers.topic's detail: %q", it.Failure.Detail)
+	}
 	it := rendered(t, r, "cluster.transaction-timeout")
 	for _, s := range []string{"MSK Serverless", "transaction.max.timeout.ms", "at least twice the commit interval and a minute", "1m20s for the default interval of 10s", "15m0s for the longest, 7m0s"} {
 		if !strings.Contains(it.Message, s) {
@@ -468,7 +478,7 @@ func TestCheckOfATopicTheBrokersWontCreate(t *testing.T) {
 	} {
 		c := fakeCluster(t)
 		if tc.code != 0 {
-			refuseCreates(c, tc.code)
+			refuseCreates(c, tc.code, "")
 		}
 		d, err := NewDestination(fakeConfig(t, c.ListenAddrs(), tc.extra))
 		if err != nil {
@@ -478,6 +488,202 @@ func TestCheckOfATopicTheBrokersWontCreate(t *testing.T) {
 		if got := statuses(r)["markers.topic"]; got != tc.want {
 			t.Errorf("%s: %s, want %s", tc.name, got, tc.want)
 		}
+	}
+}
+
+// A refusal to create a topic says the brokers' message once: a message
+// that is its code's description, as MSK Serverless's is, only as the
+// code's text, and one of the brokers' own after it.
+func TestTopicRefusalSaysTheBrokersMessageOnce(t *testing.T) {
+	const own = "Number of partitions was set to an invalid non-positive value."
+	for message, want := range map[string]string{
+		"":                                 "INVALID_PARTITIONS: Number of partitions is below 1.",
+		kerr.InvalidPartitions.Description: "INVALID_PARTITIONS: Number of partitions is below 1.",
+		own:                                "INVALID_PARTITIONS: Number of partitions is below 1. " + own,
+	} {
+		c := fakeCluster(t)
+		refuseCreates(c, kerr.InvalidPartitions.Code, message)
+		d, err := NewDestination(fakeConfig(t, c.ListenAddrs(), nil))
+		if err != nil {
+			t.Fatal(err)
+		}
+		r := check.Run(t.Context(), d.Checks())
+		it := rendered(t, r, "markers.topic")
+		if it.Failure == nil || it.Failure.Reason != "partitions_required" || it.Failure.Detail != want {
+			t.Errorf("the brokers' message %q: %+v, want the detail %q", message, it.Failure, want)
+		}
+	}
+}
+
+// answerTransactions makes c answer every DescribeTransactions with code for
+// each ID.
+func answerTransactions(c *kfake.Cluster, code int16) {
+	c.ControlKey(int16(kmsg.DescribeTransactions), func(kr kmsg.Request) (kmsg.Response, error, bool) {
+		c.KeepControl()
+		req := kr.(*kmsg.DescribeTransactionsRequest)
+		resp := req.ResponseKind().(*kmsg.DescribeTransactionsResponse)
+		for _, id := range req.TransactionalIDs {
+			st := kmsg.NewDescribeTransactionsResponseTransactionState()
+			st.TransactionalID, st.ErrorCode = id, code
+			resp.TransactionStates = append(resp.TransactionStates, st)
+		}
+		return resp, nil, true
+	})
+}
+
+// withoutDescribeTransactions is Kafka's newest versions but for
+// DescribeTransactions, which brokers capped to it don't offer, as MSK
+// Serverless's don't.
+func withoutDescribeTransactions() *kversion.Versions {
+	vs := kversion.Stable()
+	vs.SetMaxKeyVersion(int16(kmsg.DescribeTransactions), -1)
+	return vs
+}
+
+// The preflight's step of the transactional IDs passes where the brokers
+// describe them, and skips where the brokers don't offer
+// DescribeTransactions: where their ApiVersions leave it out, so the client
+// won't send it, as on MSK Serverless and Kafka 2.8, and where a broker
+// answers UNSUPPORTED_VERSION. A refusal of the credentials, or another
+// error of a broker's, fails it.
+func TestTransactionalIDsCheck(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		versions *kversion.Versions
+		// What the brokers answer each ID with; 0: kfake's own answer.
+		code int16
+		want string
+	}{
+		{"Kafka's", nil, 0, "passed"},
+		{"no DescribeTransactions, as on MSK Serverless", withoutDescribeTransactions(), 0, "skipped"},
+		{"Kafka 2.8", kversion.V2_8_0(), 0, "skipped"},
+		{"UNSUPPORTED_VERSION", nil, kerr.UnsupportedVersion.Code, "skipped"},
+		{"no WRITE", nil, kerr.TransactionalIDAuthorizationFailed.Code, "failed:privilege_missing"},
+		{"a broker's error", nil, kerr.UnknownServerError.Code, "failed:unknown"},
+	} {
+		opts := []kfake.Opt{kfake.NumBrokers(1)}
+		if tc.versions != nil {
+			opts = append(opts, kfake.MaxVersions(tc.versions))
+		}
+		c, err := kfake.NewCluster(opts...)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer c.Close()
+		if tc.code != 0 {
+			answerTransactions(c, tc.code)
+		}
+		d, err := NewDestination(fakeConfig(t, c.ListenAddrs(), nil))
+		if err != nil {
+			t.Fatal(err)
+		}
+		r := check.Run(t.Context(), d.Preflight(destination.PreflightRequest{Pipeline: "p"}))
+		it := rendered(t, r, "transactions.id")
+		got := it.Status.String()
+		if it.Failure != nil {
+			got += ":" + it.Failure.Reason
+		}
+		if got != tc.want {
+			t.Errorf("%s: %s, want %s: %s", tc.name, got, tc.want, it.Message)
+		}
+		if tc.want == "skipped" && !strings.Contains(it.Message, "don't offer DescribeTransactions") {
+			t.Errorf("%s: skipped with %q", tc.name, it.Message)
+		}
+	}
+}
+
+// Where the brokers don't offer DescribeTransactions, the client refuses
+// the request with the error the preflight had on MSK Serverless, which is
+// no kerr.UnsupportedVersion, and unoffered takes it for that.
+func TestDescribeTransactionsRefusedByTheClient(t *testing.T) {
+	c, err := kfake.NewCluster(kfake.NumBrokers(1), kfake.MaxVersions(withoutDescribeTransactions()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	cl, err := kgo.NewClient(kgo.SeedBrokers(c.ListenAddrs()...))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cl.Close()
+	_, err = kadm.NewClient(cl).DescribeTransactions(t.Context(), "openetl-p-0")
+	const recorded = "request DescribeTransactions has 1 separate shard errors, first: broker is too old; the broker has already indicated it will not know how to handle the request"
+	if err == nil || err.Error() != recorded || errors.Is(err, kerr.UnsupportedVersion) {
+		t.Fatalf("DescribeTransactions: %v", err)
+	}
+	if !unoffered(t.Context(), cl, err, kmsg.NewPtrDescribeTransactionsRequest()) {
+		t.Error("the refusal isn't taken for brokers that don't offer DescribeTransactions")
+	}
+}
+
+// unoffered is true only of shard errors at brokers that don't offer the
+// request: not where they do, as where a connection failed, nor of a shard
+// that never reached a broker, nor of another error.
+func TestUnoffered(t *testing.T) {
+	at := func(node int32) error {
+		return &kadm.ShardErrors{Name: "DescribeTransactions", AllFailed: true, Errs: []kadm.ShardError{{Err: io.EOF, Broker: kadm.BrokerDetail{NodeID: node}}}}
+	}
+	req := kmsg.NewPtrDescribeTransactionsRequest()
+	for _, tc := range []struct {
+		name     string
+		versions *kversion.Versions
+		err      error
+		want     bool
+	}{
+		{"brokers that offer it", nil, at(0), false},
+		{"brokers that don't", withoutDescribeTransactions(), at(0), true},
+		{"no broker", withoutDescribeTransactions(), at(-1), false},
+		{"another error", withoutDescribeTransactions(), io.EOF, false},
+		{"no error", withoutDescribeTransactions(), nil, false},
+	} {
+		opts := []kfake.Opt{kfake.NumBrokers(1)}
+		if tc.versions != nil {
+			opts = append(opts, kfake.MaxVersions(tc.versions))
+		}
+		c, err := kfake.NewCluster(opts...)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer c.Close()
+		cl, err := kgo.NewClient(kgo.SeedBrokers(c.ListenAddrs()...))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer cl.Close()
+		if got := unoffered(t.Context(), cl, tc.err, req); got != tc.want {
+			t.Errorf("%s: %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+// A transactional ID that a producer is using passes the preflight, which
+// leaves the producer's transaction to commit.
+func TestTransactionalIDsCheckLeavesAProducerBe(t *testing.T) {
+	c := fakeCluster(t)
+	cl, err := kgo.NewClient(kgo.SeedBrokers(c.ListenAddrs()...), kgo.TransactionalID("openetl-p-0"), kgo.DefaultProduceTopic("t"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cl.Close()
+	if _, err := kadm.NewClient(cl).CreateTopic(t.Context(), 1, 1, nil, "t"); err != nil {
+		t.Fatal(err)
+	}
+	if err := cl.BeginTransaction(); err != nil {
+		t.Fatal(err)
+	}
+	if err := cl.ProduceSync(t.Context(), &kgo.Record{Value: []byte("v")}).FirstErr(); err != nil {
+		t.Fatal(err)
+	}
+	d, err := NewDestination(fakeConfig(t, c.ListenAddrs(), nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := check.Run(t.Context(), d.Preflight(destination.PreflightRequest{Pipeline: "p"}))
+	if got := statuses(r)["transactions.id"]; got != "passed" {
+		t.Errorf("an ID in use: %s", got)
+	}
+	if err := cl.EndTransaction(t.Context(), kgo.TryCommit); err != nil {
+		t.Errorf("the producer's commit after the preflight: %v", err)
 	}
 }
 

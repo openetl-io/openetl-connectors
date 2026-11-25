@@ -362,7 +362,9 @@ func (cfg *DestinationConfig) createTopic(ctx context.Context, adm *kadm.Client,
 	if err == nil || errors.Is(err, kerr.TopicAlreadyExists) {
 		return nil
 	}
-	if r.ErrMessage != "" {
+	// A broker with no message of its own sends its code's description,
+	// which err's text already ends with.
+	if ke, ok := errors.AsType[*kerr.Error](err); r.ErrMessage != "" && (!ok || r.ErrMessage != ke.Description) {
 		err = fmt.Errorf("%w %s", err, r.ErrMessage)
 	}
 	if f := cfg.countRefused(err, topic); f != nil {
