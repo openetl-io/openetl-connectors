@@ -732,6 +732,32 @@ func transactionLimit(ctx context.Context, adm *kadm.Client) (time.Duration, err
 	return 0, nil
 }
 
+// unoffered is whether err, from a kadm request of req's kind, failed only
+// at brokers whose ApiVersions don't offer it at a version the client
+// speaks: they leave its key out, or start above the client's newest
+// version. The client refuses to send such a request, with an error it
+// doesn't export ("broker is too old").
+func unoffered(ctx context.Context, cl *kgo.Client, err error, req kmsg.Request) bool {
+	se, ok := errors.AsType[*kadm.ShardErrors](err)
+	if !ok || len(se.Errs) == 0 {
+		return false
+	}
+	vs, verr := kadm.NewClient(cl).ApiVersions(ctx)
+	if verr != nil {
+		return false
+	}
+	for _, e := range se.Errs {
+		v, ok := vs[e.Broker.NodeID]
+		if !ok || v.Err != nil {
+			return false
+		}
+		if least, exists := v.KeyMinVersion(req.Key()); exists && least <= req.MaxVersion() {
+			return false
+		}
+	}
+	return true
+}
+
 // Preflight checks, for each stream, its write mode, and that its topic is
 // writable or can be created; then that the pipeline's transactional IDs
 // are the credentials' to use.
@@ -803,8 +829,9 @@ func (d *Destination) Preflight(req destination.PreflightRequest) []check.Check 
 			}
 			switch {
 			case errors.Is(err, kerr.TransactionalIDNotFound):
-			case errors.Is(err, kerr.UnsupportedVersion):
-				return check.Skip("the brokers can't describe transactions, which takes Kafka 3.0 or later")
+			case errors.Is(err, kerr.UnsupportedVersion), unoffered(ctx, cl, err, kmsg.NewPtrDescribeTransactionsRequest()):
+				return check.Skip("the brokers don't offer DescribeTransactions, as MSK Serverless's and those before Kafka 3.0 don't, " +
+					"so the transactional IDs can't be checked here: a missing WRITE on them shows at the first write")
 			case err != nil:
 				return d.cfg.failure(err, "WRITE", "the transactional IDs starting "+d.cfg.TransactionalIDPrefix+req.Pipeline)
 			}
