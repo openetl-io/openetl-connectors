@@ -101,7 +101,7 @@
           "description": "The stream has shards shards."
         }
       ],
-      "description": "From 0.2.0. Created streams' capacity mode. An existing stream is left as it is."
+      "description": "Created streams' capacity mode. An existing stream is left as it is."
     },
     "shards": {
       "type": "integer",
@@ -112,7 +112,7 @@
         "createStreams": true,
         "streamMode": "provisioned"
       },
-      "description": "From 0.2.0, it needs streamMode provisioned: before, shards alone made created streams provisioned. Created streams' shards."
+      "description": "Created streams' shards. It needs streamMode provisioned."
     },
     "retentionHours": {
       "type": "integer",
@@ -125,7 +125,7 @@
         "createStreams": true
       },
       "x-advanced": true,
-      "description": "From 0.2.0. Created streams' retention period, in hours, from 24 to 8760. Over 24, a created stream keeps the tag openetl.io/setup until it has its retention and encryption, and if setting them fails, the next write sets them."
+      "description": "Created streams' retention period, in hours, from 24 to 8760. Over 24, a created stream keeps the tag openetl.io/setup until it has its retention and encryption, and if setting them fails, the next write sets them."
     },
     "kmsKeyId": {
       "type": "string",
@@ -138,14 +138,14 @@
       "examples": [
         "alias/aws/kinesis"
       ],
-      "description": "From 0.2.0. Created streams are encrypted with this KMS key: its ID, ARN or alias. Unset: not encrypted. A created stream keeps the tag openetl.io/setup until it has its retention and encryption, and if setting them fails, the next write sets them."
+      "description": "Created streams are encrypted with this KMS key: its ID, ARN or alias. Unset: not encrypted. A created stream keeps the tag openetl.io/setup until it has its retention and encryption, and if setting them fails, the next write sets them."
     },
     "partitionKey": {
       "type": "object",
       "title": "Partition key",
       "x-group": "writing",
       "additionalProperties": false,
-      "description": "From 0.2.0. What each record's partition key is made of, which picks its shard.",
+      "description": "What each record's partition key is made of, which picks its shard.",
       "properties": {
         "mode": {
           "type": "string",
@@ -206,7 +206,7 @@
           "description": "Requests are filled freely: faster when a few keys have most rows, but retries can reorder a key's records."
         }
       ],
-      "description": "From 0.2.0. Whether a key's records stay in order when Kinesis takes part of a request and the rest is sent again."
+      "description": "Whether a key's records stay in order when Kinesis takes part of a request and the rest is sent again."
     },
     "rateLimit": {
       "type": "object",
@@ -214,7 +214,7 @@
       "x-group": "writing",
       "x-advanced": true,
       "additionalProperties": false,
-      "description": "From 0.2.0. Caps on what one destination process sends, on average. Unset: none.",
+      "description": "Caps on what one destination process sends, on average. Unset: none.",
       "properties": {
         "recordsPerSecond": {
           "type": "integer",
@@ -301,7 +301,7 @@
       "x-group": "retries",
       "x-advanced": true,
       "additionalProperties": false,
-      "description": "From 0.2.0. How calls that Kinesis throttles, or that fail for a moment, are retried.",
+      "description": "How calls that Kinesis throttles, or that fail for a moment, are retried.",
       "properties": {
         "initialBackoff": {
           "type": "string",

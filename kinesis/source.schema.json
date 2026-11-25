@@ -109,7 +109,7 @@
         {
           "const": "timestamp",
           "title": "At a time",
-          "description": "From 0.2.0. Records that arrived at or after startTimestamp."
+          "description": "Records that arrived at or after startTimestamp."
         }
       ],
       "description": "Where a stream's first read starts. Later reads resume where the last one stopped."
@@ -125,14 +125,14 @@
       "examples": [
         "2026-11-01T00:00:00Z"
       ],
-      "description": "From 0.2.0. With startPosition timestamp: the first read starts at the records that arrived at or after this time, in RFC 3339. Records older than the stream's retention are gone. It must have passed: Kinesis starts a read only at a time that has, so a time in the future fails the preflight, and a first read fails with CONFIG_INVALID."
+      "description": "With startPosition timestamp: the first read starts at the records that arrived at or after this time, in RFC 3339. Records older than the stream's retention are gone. It must have passed: Kinesis starts a read only at a time that has, so a time in the future fails the preflight, and a first read fails with CONFIG_INVALID."
     },
     "consumer": {
       "type": "object",
       "title": "Consumer",
       "x-group": "reading",
       "additionalProperties": false,
-      "description": "From 0.2.0. How shards are read.",
+      "description": "How shards are read.",
       "properties": {
         "type": {
           "type": "string",
@@ -185,7 +185,7 @@
         "consumer.type": "polling"
       },
       "additionalProperties": false,
-      "description": "From 0.2.0. How each shard is polled with GetRecords.",
+      "description": "How each shard is polled with GetRecords.",
       "properties": {
         "maxRecords": {
           "type": "integer",
@@ -218,7 +218,7 @@
       "x-group": "reading",
       "x-advanced": true,
       "default": true,
-      "description": "From 0.2.0. Split records the Kinesis Producer Library aggregated into their user records, a row each. Off: an aggregated record fails the read, whatever the format."
+      "description": "Split records the Kinesis Producer Library aggregated into their user records, a row each. Off: an aggregated record fails the read, whatever the format."
     },
     "format": {
       "type": "string",
@@ -296,7 +296,7 @@
       "x-group": "retries",
       "x-advanced": true,
       "additionalProperties": false,
-      "description": "From 0.2.0. How calls that Kinesis throttles, or that fail for a moment, are retried.",
+      "description": "How calls that Kinesis throttles, or that fail for a moment, are retried.",
       "properties": {
         "initialBackoff": {
           "type": "string",
