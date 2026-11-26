@@ -5,8 +5,6 @@ description: Read ClickHouse tables in full or by a cursor column, in sorting-ke
 
 The `clickhouse` package has a source and a destination, both over ClickHouse's native protocol. The source reads the tables of one database, whole or from where a cursor column last got to. The destination writes each stream into a table of its own and applies each epoch exactly once, in steps that readers can see one at a time: see [How a commit works](#how-a-commit-works).
 
-Both are tested against a single ClickHouse 26.8 server. Nothing was tested on a cluster: see [Clusters](#clusters).
-
 ## Source
 
 ### What it reads
@@ -40,7 +38,7 @@ GRANT SELECT ON analytics.* TO openetl;
 
 The source changes no setting, so a user whose profile has `readonly = 1` can read: the platform's time limit on a check or a read cancels its query, rather than going to the server as `max_execution_time`, which such a user couldn't set. The user's profile's limits apply to each of the source's queries: a table read in one query, or a chunk, that reads past `max_rows_to_read` or `max_bytes_to_read`, or runs past `max_execution_time`, fails, and fails the same way when it's retried. Give the user a profile without them, or with room for the largest table read in one query.
 
-The source's check is a list of items, each with what failed and how to fix it: the server's name resolves and its port answers (`net.dns`, `net.connect`), with TLS when `tls` is set (`net.tls`), the user signs in (`db.connect`), the server's version (`server.version`, which warns before 26.8, the version the connector is tested on), the database is there (`database.found`), each table in `tables` is (`tables.found`), and the user has `SELECT` on every table offered (`tables.read`).
+The source's check is a list of items, each with what failed and how to fix it: the server's name resolves and its port answers (`net.dns`, `net.connect`), with TLS when `tls` is set (`net.tls`), the user signs in (`db.connect`), the server's version (`server.version`, which warns before 26.8), the database is there (`database.found`), each table in `tables` is (`tables.found`), and the user has `SELECT` on every table offered (`tables.read`).
 
 Before a pipeline runs, its preflight looks at each stream as the pipeline reads it: the table or view is there and the user can select from it (`stream.NAME.read`); a full refresh says whether it reads in sorting-key order, resumably, or in one query (`stream.NAME.order`); an incremental read's cursor is a column of a type the source reads by (`stream.NAME.cursor`); and a stream read with `cdc` or `stream` fails (`stream.NAME.mode`), as ClickHouse keeps no change log.
 
@@ -238,7 +236,7 @@ A patch needs `ALTER UPDATE`, which the grants above include.
 
 ### Clusters
 
-Only a single server was tested. The destination creates plain `MergeTree` and `ReplacingMergeTree` tables, with no `ON CLUSTER`, and keeps its fence and markers in such tables, which are each server's own. On a cluster behind a load balancer, attempts reaching different servers would see different fences and markers, so neither its tables nor its exactly-once delivery are claimed there. The source reads through one server; reading `Replicated` or `Shared` tables, or `Distributed` ones, which are read in a single query, wasn't tested.
+The destination writes to a single server: it creates plain `MergeTree` and `ReplacingMergeTree` tables, with no `ON CLUSTER`, and keeps its fence and markers in such tables, which are each server's own. On a cluster behind a load balancer, attempts reaching different servers would see different fences and markers, so the destination doesn't deliver exactly once there. The source reads through one server, and a full refresh reads a `Distributed` table in a single query.
 
 ### Limits
 

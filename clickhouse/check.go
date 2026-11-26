@@ -32,13 +32,14 @@ var (
 
 const configInvalidCode = protocolv1.ErrorCode_ERROR_CODE_CONFIG_INVALID
 
-// The server version the connectors are tested on; an older one warns.
-var testedVersion = [2]int{26, 8}
+// The oldest server version the connectors are made for; an older one
+// warns.
+var madeForVersion = [2]int{26, 8}
 
 var (
-	untested = check.Reason{
-		Name: "version_untested", Code: configInvalidCode,
-		Message: "The server's version is {found}, older than {required}, the one the connector is tested on.",
+	olderServer = check.Reason{
+		Name: "version_older", Code: configInvalidCode,
+		Message: "The server's version is {found}, older than {required}, the oldest the connector is made for.",
 		Fix:     "Upgrade the server to {required} or later, or try the pipeline's reads and writes on this one first.",
 	}
 	badCursor = check.Reason{
@@ -152,9 +153,9 @@ func connectionChecks(c connConfig, k *sqlcheck.Kit) []check.Check {
 			return k.Failure(err)
 		}
 		p.Param("found", v)
-		p.Param("required", strconv.Itoa(testedVersion[0])+"."+strconv.Itoa(testedVersion[1]))
-		if older(v, testedVersion) {
-			return check.Warn(untested.Fail())
+		p.Param("required", strconv.Itoa(madeForVersion[0])+"."+strconv.Itoa(madeForVersion[1]))
+		if older(v, madeForVersion) {
+			return check.Warn(olderServer.Fail())
 		}
 		p.Found("ClickHouse {found}.")
 		return nil

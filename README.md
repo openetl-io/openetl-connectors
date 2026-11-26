@@ -23,7 +23,7 @@ The official connectors for [OpenETL](https://github.com/openetl-io/openetl): th
 | [ClickHouse](./clickhouse/README.md) | Tables, in full or by a cursor column | Tables, by appending, overwriting or merging; exactly once |
 | [MongoDB](./mongodb/README.md) | Collections, in full, by a cursor field, or change by change through change streams | Collections, by appending, overwriting or merging; exactly once |
 | [Amazon DynamoDB](./dynamodb/README.md) | Tables, in full, by a cursor attribute, or change by change through DynamoDB Streams | Tables, by appending, overwriting or merging; exactly once |
-| [Amazon Redshift](./redshift/README.md) | | Tables, by appending, overwriting or merging, loaded from Parquet on S3 by `COPY`; exactly once, unverified |
+| [Amazon Redshift](./redshift/README.md) | | Tables, by appending, overwriting or merging, loaded from Parquet on S3 by `COPY`; exactly once |
 | [Kafka](./kafka/README.md) | Topics, in JSON, Avro or Protobuf | Topics, in one transaction per epoch; exactly once |
 | [Amazon Kinesis](./kinesis/README.md) | Data streams, shard by shard | Data streams, a record per row; at least once |
 | [Apache Iceberg](./iceberg/README.md) | | Tables, through a REST catalog or AWS Glue; exactly once |

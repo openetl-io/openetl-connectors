@@ -5,8 +5,6 @@ description: Read SQL Server tables and views in full, by a cursor column, or ch
 
 The `sqlserver` package has a source and a destination. The source reads the tables and views of one schema: whole, from where a cursor column last got to, or as a stream of every insert, update and delete through change tracking or change data capture (CDC). The destination writes each stream into a table of its own, and commits each epoch exactly once.
 
-Both are tested against SQL Server 2022.
-
 ## Source
 
 ### What it reads

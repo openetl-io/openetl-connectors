@@ -5,8 +5,6 @@ description: Read Postgres tables in full, by a cursor column, or change by chan
 
 The `postgres` package has a source and a destination. The source reads the tables, views and materialized views of one schema: whole, from where a cursor column last got to, or as a stream of every insert, update and delete through logical replication (CDC). The destination writes each stream into a table of its own, and commits each epoch exactly once.
 
-Both are tested against Postgres 18.
-
 ## Source
 
 ### What it reads

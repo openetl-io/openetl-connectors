@@ -5,8 +5,6 @@ description: Read Kinesis data streams shard by shard, by polling or with enhanc
 
 The `kinesis` package has a source and a destination for Amazon Kinesis Data Streams. The source reads each Kinesis stream as a stream, shard by shard, from where the last read stopped, by polling or with enhanced fan-out. The destination writes each stream into a Kinesis stream, a record per row, and delivers at least once: Kinesis has no transactions.
 
-Both are tested against kinesis-mock, an emulator, and against the Karapace schema registry for Avro and Protobuf. Both have also run against Amazon Kinesis with JSON records, which CI does not test. Enhanced fan-out's subscriptions are tested against a fake of Kinesis's event stream only: kinesis-mock doesn't send the first event the AWS SDK for Go waits for.
-
 The [source's config schema](./source.schema.json) and the [destination's](./destination.schema.json) have every setting and its default. This page explains the ones that need judgment.
 
 ## Connecting
