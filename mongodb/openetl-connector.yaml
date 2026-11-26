@@ -4,7 +4,7 @@ description: MongoDB collections, in full, incrementally or by change streams, a
 license: Apache-2.0
 repository: https://github.com/openetl-io/openetl-connectors
 docs: https://github.com/openetl-io/openetl-connectors/blob/main/mongodb/README.md
-logo: https://upload.wikimedia.org/wikipedia/commons/9/93/MongoDB_Logo.svg
+logo: https://raw.githubusercontent.com/mongodb-js/vscode/v1.18.3/images/mongodb.png
 tags: [database, cdc]
 author: OpenETL
 roles:

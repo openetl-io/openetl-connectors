@@ -4,7 +4,7 @@ description: SQL Server tables, in full, incrementally or by CDC from change tra
 license: Apache-2.0
 repository: https://github.com/openetl-io/openetl-connectors
 docs: https://github.com/openetl-io/openetl-connectors/blob/main/sqlserver/README.md
-logo: https://upload.wikimedia.org/wikipedia/commons/4/41/Microsoft_SQL_Server_2025_icon.svg
+logo: https://raw.githubusercontent.com/Azure/bicep/v0.49.2/src/vscode-bicep-ui/packages/components/assets/azure-architecture-icons/databases/10132-icon-service-SQL-Server.svg
 tags: [database, cdc, mssql]
 author: OpenETL
 roles:
