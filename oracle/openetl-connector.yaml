@@ -4,7 +4,7 @@ description: Oracle Database tables, in full, incrementally or by CDC through Lo
 license: Apache-2.0
 repository: https://github.com/openetl-io/openetl-connectors
 docs: https://github.com/openetl-io/openetl-connectors/blob/main/oracle/README.md
-logo: https://upload.wikimedia.org/wikipedia/commons/5/50/Oracle_logo.svg
+logo: https://raw.githubusercontent.com/oracle/oci-designer-toolkit/v0.70.0/okitclassic/okitserver/static/svg/oracle.svg
 tags: [database, cdc, logminer]
 author: OpenETL
 roles:

@@ -4,7 +4,7 @@ description: Parquet, Avro, CSV and JSON Lines files in Google Cloud Storage, re
 license: Apache-2.0
 repository: https://github.com/openetl-io/openetl-connectors
 docs: https://github.com/openetl-io/openetl-connectors/blob/main/gcs/README.md
-logo: https://upload.wikimedia.org/wikipedia/commons/d/df/Google_Cloud_storage.svg
+logo: https://raw.githubusercontent.com/GoogleCloudPlatform/terraform-dynamic-javascript-webapp/v1.5.0/infra/google-cloud-icons/cloud_storage.svg
 tags: [files, gcp]
 author: OpenETL
 roles:
