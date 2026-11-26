@@ -4,7 +4,7 @@ description: MySQL and MariaDB tables, in full, incrementally or by CDC from the
 license: Apache-2.0
 repository: https://github.com/openetl-io/openetl-connectors
 docs: https://github.com/openetl-io/openetl-connectors/blob/main/mysql/README.md
-logo: https://upload.wikimedia.org/wikipedia/en/d/dd/MySQL_logo.svg
+logo: https://raw.githubusercontent.com/devicons/devicon/v2.18.0/icons/mysql/mysql-original.svg
 tags: [database, cdc, mariadb]
 author: OpenETL
 roles:

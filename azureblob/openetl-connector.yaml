@@ -4,7 +4,7 @@ description: Parquet, Avro, CSV and JSON Lines files in Azure Blob Storage, read
 license: Apache-2.0
 repository: https://github.com/openetl-io/openetl-connectors
 docs: https://github.com/openetl-io/openetl-connectors/blob/main/azureblob/README.md
-logo: https://upload.wikimedia.org/wikipedia/commons/f/fa/Microsoft_Azure.svg
+logo: https://raw.githubusercontent.com/Azure/bicep/v0.49.2/src/vscode-bicep-ui/packages/components/assets/azure-architecture-icons/storage/10086-icon-service-Storage-Accounts.svg
 tags: [files, azure]
 author: OpenETL
 roles:
