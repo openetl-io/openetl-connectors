@@ -240,7 +240,7 @@ The destination writes to a single server: it creates plain `MergeTree` and `Rep
 
 ### Throughput
 
-OpenETL 0.2.0-alpha, with the `postgres` and `clickhouse` packages built from this repository's `main` at commit `e916cd72` rather than the 0.2.0-alpha packages, ran three full refreshes of one Postgres table into a ClickHouse table. Each run succeeded at its first attempt.
+OpenETL 0.2.0-alpha, with the `postgres` and `clickhouse` packages built from this repository's `main` at commit `e916cd72` rather than that release's packages, ran three full refreshes of one Postgres table into a ClickHouse table. Each run succeeded at its first attempt.
 
 | Run | Sync time | Rows/s | MB/s | GB/hour | CPU-seconds per GB | Job peak memory |
 |---|---:|---:|---:|---:|---:|---:|
@@ -258,7 +258,7 @@ The sync time is the sync's own record, its end time less its start time. It inc
 | Runner | EC2 `c8g.2xlarge` in `ap-southeast-2a`: 8 vCPUs (Graviton4), 16 GiB, network up to 15 Gbit/s, and a 60 GB gp3 disk at 6,000 IOPS and 400 MB/s. It ran OpenETL's Compose stack from the release's `compose.yml`, with `OPENETL_RESERVE=0,1Gi` so that a job of 8 vCPUs fits. The job had 8 vCPUs, 13 GiB and 8 lanes. |
 | Database machine | EC2 `c8g.4xlarge` in the same zone: 16 vCPUs, 32 GiB, and a 300 GB gp3 disk at 16,000 IOPS and 1,000 MB/s. Postgres and ClickHouse ran there, and nothing else, each in Docker with host networking, on the private network. |
 | ClickHouse | ClickHouse 26.11.4.11 (`clickhouse/clickhouse-server:26.11.4.11`), with the image's settings except three: a password for `default`, access management for it (`CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1`), and an open-files limit of 262,144. The destination connected as `default` over the native protocol, without TLS. Each run wrote into a database of its own, to a table that the destination created: a `MergeTree` ordered by `id`. |
-| Packages | `postgres` and `clickhouse`, built from this repository's `main` at commit `e916cd72`, not the 0.2.0-alpha packages. The 0.2.0-alpha CLI packaged them for linux/arm64 with `openetl connector package`, and `openetl connector apply -f` applied each package's descriptor. |
+| Packages | `postgres` and `clickhouse`, built from this repository's `main` at commit `e916cd72`, not the packages of the release above. That release's CLI packaged them for linux/arm64 with `openetl connector package`, and `openetl connector apply -f` applied each package's descriptor. |
 
 Each run used these specs, with a pipeline and a namespace of its own. The source's DSN had `sslmode=disable`. The yearly schedule starts no sync during a run, so `openetl sync` started each one.
 

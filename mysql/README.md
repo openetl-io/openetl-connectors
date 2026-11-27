@@ -198,7 +198,7 @@ A read OpenETL asks to end at an earlier resume point (`until`), to read a part 
 
 ### Throughput
 
-OpenETL 0.2.0-alpha, with the `mysql` and `s3` packages built from this repository's `main` at commit `e916cd72` rather than the 0.2.0-alpha packages, ran three full refreshes of one MySQL table, without TLS, into Parquet files on Amazon S3. Each run succeeded at its first attempt.
+OpenETL 0.2.0-alpha, with the `mysql` and `s3` packages built from this repository's `main` at commit `e916cd72` rather than that release's packages, ran three full refreshes of one MySQL table, without TLS, into Parquet files on Amazon S3. Each run succeeded at its first attempt.
 
 | Run | Sync time | Rows/s | MB/s | GB/hour | CPU-seconds per GB | Job peak memory |
 |---|---:|---:|---:|---:|---:|---:|
@@ -216,7 +216,7 @@ The sync time is the sync's own record, its end time less its start time. It inc
 | Runner | EC2 `c8g.2xlarge` in `ap-southeast-2a`: 8 vCPUs (Graviton4), 16 GiB, network up to 15 Gbit/s, and a 60 GB gp3 disk at 6,000 IOPS and 400 MB/s. It ran OpenETL's Compose stack from the release's `compose.yml`, with `OPENETL_RESERVE=0,1Gi` so that a job of 8 vCPUs fits. The job had 8 vCPUs, 13 GiB and 8 lanes. |
 | Database machine | EC2 `c8g.4xlarge` in the same zone: 16 vCPUs, 32 GiB, and a 300 GB gp3 disk at 16,000 IOPS and 1,000 MB/s. MySQL ran there alone, in Docker with host networking, on the private network. |
 | Bucket | One Amazon S3 bucket in `ap-southeast-2`. The `s3` destination used the runner's instance role (`OPENETL_CONNECTOR_AWS_CREDENTIALS=inherit`). Each run wrote into a namespace of its own, with the destination's defaults: Parquet with zstd, and a `fileSize` of 256 MiB. |
-| Packages | `mysql` and `s3`, built from this repository's `main` at commit `e916cd72`, not the 0.2.0-alpha packages. The 0.2.0-alpha CLI packaged them for linux/arm64 with `openetl connector package`, and `openetl connector apply -f` applied each package's descriptor. |
+| Packages | `mysql` and `s3`, built from this repository's `main` at commit `e916cd72`, not the packages of the release above. That release's CLI packaged them for linux/arm64 with `openetl connector package`, and `openetl connector apply -f` applied each package's descriptor. |
 
 Each run used these specs, with a pipeline and a namespace of its own. The source's DSN was `USER:PASSWORD@tcp(HOST:3306)/data`, with no parameters. The yearly schedule starts no sync during a run, so `openetl sync` started each one.
 
