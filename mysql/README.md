@@ -196,6 +196,79 @@ Full refresh and CDC streams replay exactly: a read resumed from a checkpoint yi
 
 A read OpenETL asks to end at an earlier resume point (`until`), to read a part again, sends nothing past it, then that resume point, and completes there. Where the stream's read completed in that part, as a scheduled pipeline's does, OpenETL asks the read to complete where it did (`complete_at`) instead: an incremental read goes up to the highest cursor value the first read went up to, rather than the column's highest now, and a CDC read stops at the binlog position the first read completed at, though the binlog has moved on; either then completes with the same state. A full refresh completes with no position, so a read again of a part it completed in goes to the table's end. A full refresh or incremental read sends the rows between the two ends again, as the table has them now. A CDC read from the same server sends the binlog's changes again as they were, with the same sequence numbers; the snapshot's rows of that part come as the table has them now, after those changes and before any later one, so a merged stream lands as it did, and an appended one has the rows as they are now. Those rows aren't held to the end, whether it's a resume point or a completion: they include rows written since the first read, past the end, and leave out rows deleted since, and if that leaves the read with fewer rows than the first read had, OpenETL fails the attempt with `POSITION_LOST`. From another server, by GTIDs, it sends the same changes with the new server's sequence numbers, which are above every one the first read sent, and the snapshot's rows after them. If that server hasn't every transaction the first read had read by that end, as where a failover lost some or a replica hasn't applied them yet, the read fails with `POSITION_LOST` rather than stop there without them.
 
+### Throughput
+
+OpenETL 0.2.0-alpha, with the `mysql` and `s3` packages built from this repository's `main` at commit `e916cd72` rather than that release's packages, ran three full refreshes of one MySQL table, without TLS, into Parquet files on Amazon S3. Each run succeeded at its first attempt.
+
+| Run | Sync time | Rows/s | MB/s | GB/hour | CPU-seconds per GB | Job peak memory |
+|---|---:|---:|---:|---:|---:|---:|
+| 1 | 44.435 s | 855,102 | 241.6 | 869.6 | 25.95 | 4,092 MiB |
+| 2 | 43.637 s | 870,731 | 246.0 | 885.5 | 26.02 | 4,151 MiB |
+| 3 | 45.631 s | 832,688 | 235.2 | 846.8 | 25.87 | 3,990 MiB |
+| Mean | 44.57 s | 852,840 | 240.9 | 867.3 | 25.95 | 4,151 MiB, the highest |
+
+The sync time is the sync's own record, its end time less its start time. It includes placing the job, starting the connectors and the engine, planning, reading, writing and every commit. The spread of the three times, the slowest less the fastest over the mean, is 4.5%. The rates are of the Postgres table that the MySQL table was copied from, its heap without indexes: 10,733,748,224 bytes and 37,996,289 rows. MySQL's copy holds 10,551,820,288 bytes (`data_length`). MB is 1,000,000 bytes and GB is 1,000,000,000 bytes. The CPU time and the peak memory are the job's, for the engine and both connectors, from the sync's record.
+
+| Part | Set-up |
+|---|---|
+| Data | One InnoDB table of 16 columns and 37,996,289 rows, in `utf8mb4`, with no nulls: `id bigint` primary key, `f1` and `f2 bigint`, `f3 int`, `f4` and `f5 double`, `f6 decimal(18,4)`, `f7 tinyint(1)`, `f10` and `f11 date`, `f12 timestamp(6)`, and five `text` columns, `f8`, `f9` and `f13` to `f15`. Each text value is 32 characters of base64 cut from SHA-512 digests of the key, so it compresses poorly. The rows were copied from a Postgres table, where they take 267 bytes a row on average. |
+| Source | MySQL 8.4.13 (`mysql:8.4`) with `innodb_buffer_pool_size=20G`. A full scan of the table read it into the buffer pool before each run. The source read on up to 8 connections, without TLS, as a user that signs in with `caching_sha2_password`, the server's default. |
+| Runner | EC2 `c8g.2xlarge` in `ap-southeast-2a`: 8 vCPUs (Graviton4), 16 GiB, network up to 15 Gbit/s, and a 60 GB gp3 disk at 6,000 IOPS and 400 MB/s. It ran OpenETL's Compose stack from the release's `compose.yml`, with `OPENETL_RESERVE=0,1Gi` so that a job of 8 vCPUs fits. The job had 8 vCPUs, 13 GiB and 8 lanes. |
+| Database machine | EC2 `c8g.4xlarge` in the same zone: 16 vCPUs, 32 GiB, and a 300 GB gp3 disk at 16,000 IOPS and 1,000 MB/s. MySQL ran there alone, in Docker with host networking, on the private network. |
+| Bucket | One Amazon S3 bucket in `ap-southeast-2`. The `s3` destination used the runner's instance role (`OPENETL_CONNECTOR_AWS_CREDENTIALS=inherit`). Each run wrote into a namespace of its own, with the destination's defaults: Parquet with zstd, and a `fileSize` of 256 MiB. |
+| Packages | `mysql` and `s3`, built from this repository's `main` at commit `e916cd72`, not the packages of the release above. That release's CLI packaged them for linux/arm64 with `openetl connector package`, and `openetl connector apply -f` applied each package's descriptor. |
+
+Each run used these specs, with a pipeline and a namespace of its own. The source's DSN was `USER:PASSWORD@tcp(HOST:3306)/data`, with no parameters. The yearly schedule starts no sync during a run, so `openetl sync` started each one.
+
+```yaml
+apiVersion: openetl.io/v1alpha1
+kind: Source
+metadata: { name: my-full }
+spec:
+  connector: mysql
+  config: { dsn: { secret: mysql-dsn }, database: data, tables: [bench], maxConnections: 8, tls: { mode: disabled } }
+---
+apiVersion: openetl.io/v1alpha1
+kind: Destination
+metadata: { name: s3-out }
+spec:
+  connector: s3
+  config: { url: s3://BUCKET/out, region: ap-southeast-2 }
+---
+apiVersion: openetl.io/v1alpha1
+kind: Pipeline
+metadata: { name: mysql-to-s3 }
+spec:
+  schedule: { cron: "0 0 1 1 *" }
+  heal: { mode: "off" }
+  resources: { size: { cpu: 8, memory: 13Gi } }
+  source:
+    ref: my-full
+    streams:
+      - { name: bench, sync: full_refresh }
+  destination:
+    ref: s3-out
+    namespace: NAMESPACE
+```
+
+Before each timed sync, a sync of a one-row copy of the table, under the same stream name, wrote the destination's table first. The timed sync then replaced it, as `overwrite` is the default write mode for a full refresh. Delivery was exactly once. Commits were requested every 256 MB that the source read (`delivery.commit.maxBytes`), the default, and each sync made 8 to 11 commits. The time does not include making the data, the one-row sync, or reading the table into MySQL's buffer pool.
+
+The runner's CPU limited the runs. The read, until 99% of the source's bytes had reached the runner, took 39.8 to 40.1 s. In it, the runner was 94 to 95% busy: `destination-s3` used 3.3 to 3.4 cores and `source-mysql` 3.0. The runner's network received about 250 MB/s and sent about 200 MB/s. MySQL used about 0.9 cores and had room.
+
+In each run, the runner's ENA driver counted 0.9 to 1.0 million packets over the outbound bandwidth allowance (`bw_out_allowance_exceeded`) and none over the inbound one. These counters do not show how much time that cost. The uploads were 99% done 39.8 to 40.9 s into the job, which ended 3.1 to 5.4 s later, with the last commit.
+
+After each run, Amazon Athena queried a table defined over the files that the run's manifest lists. Its row count, its count of distinct `id`s, and its sums of `f1`, `f6` and the lengths of `f8` were equal to the source's in all three runs.
+
+These numbers are for one case:
+
+- One row shape: 16 columns, with five random strings that compress poorly. Wider or narrower rows, other types and text that compresses change every number.
+- One machine size: a runner of 8 vCPUs and 16 GiB, with 8 lanes, whose CPU was the limit. A larger runner, or several workers (`resources.workers`), changes the numbers.
+- A cached source: MySQL read the table from its buffer pool. A source that reads from disk is slower.
+- Without TLS: the source's connections were plaintext, on a private network.
+- A full refresh of one stream into Parquet files. No incremental reads and no transforms.
+- MySQL in Docker on a neighboring EC2 machine, not a managed service, whose storage, network and CPU differ.
+- Three runs, one after another: the spread is that of three runs, not a distribution.
+
 ### Limits
 
 - Nothing is held on the server for a pipeline, so there's nothing to acknowledge, set up or tear down: binlog retention is the server's (see above).

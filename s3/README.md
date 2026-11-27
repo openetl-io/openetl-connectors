@@ -277,6 +277,125 @@ OpenETL runs discovery at the start of each attempt, and the read reads every Pa
 
 The destination adds new columns: later files have them, and earlier files don't. Readers expect a column to have one type across a table's files, so the destination keeps a record of each table's columns in `URL/_openetl/schemas/TABLE.json`, and doesn't change a column's type by itself. When a stream's column changes type, the destination refuses the change, the stream stops with a schema drift error, and the refusal says to remove that record. Once it's removed and the pipeline resumed, the next attempt writes the new type, and the table's files then hold the column with two types: make sure its readers can take that first. The pipeline's `destination.typeChanges: allow` lets the destination change the record itself. Neither role holds rows.
 
+## Throughput
+
+OpenETL 0.2.0-alpha, with the `postgres` and `s3` packages built from this repository's `main` at commit `e916cd72` rather than that release's packages, ran two sets of three full refreshes into Parquet files on Amazon S3. The first set read one Postgres table, and the second read the same rows from Parquet files on S3. Each run succeeded at its first attempt.
+
+### Postgres into S3
+
+| Run | Sync time | Rows/s | MB/s | GB/hour | CPU-seconds per GB | Job peak memory |
+|---|---:|---:|---:|---:|---:|---:|
+| 1 | 34.551 s | 1,099,702 | 310.7 | 1,118.4 | 18.07 | 5,682 MiB |
+| 2 | 33.252 s | 1,142,667 | 322.8 | 1,162.1 | 18.30 | 5,594 MiB |
+| 3 | 33.817 s | 1,123,571 | 317.4 | 1,142.7 | 18.12 | 5,641 MiB |
+| Mean | 33.87 s | 1,121,980 | 317.0 | 1,141.0 | 18.17 | 5,682 MiB, the highest |
+
+The sync time is the sync's own record, its end time less its start time. It includes placing the job, starting the connectors and the engine, planning, reading, writing and every commit. The spread of the three times, the slowest less the fastest over the mean, is 3.8%. The rates are of the source table's heap without its indexes: 10,733,748,224 bytes and 37,996,289 rows. MB is 1,000,000 bytes and GB is 1,000,000,000 bytes. The CPU time and the peak memory are the job's, for the engine and both connectors, from the sync's record.
+
+The runner's CPU limited the runs. The read, until 99% of the source's bytes had reached the runner, took 25.9 to 26.3 s. In it, the runner was 96 to 97% busy: `destination-s3`, which encodes the Parquet files, used 5.0 cores, and `source-postgres` 1.3 to 1.4. The runner's network received about 475 MB/s and sent about 265 MB/s. Postgres used about 1.5 cores and had room.
+
+In each run, the runner's ENA driver counted 0.7 to 0.9 million packets over the outbound bandwidth allowance (`bw_out_allowance_exceeded`) and 18,000 to 37,000 over the inbound one. These counters do not show how much time that cost. The uploads were 99% done 29.9 to 31.0 s into the job, which ended 2.7 to 3.6 s later, with the last commit.
+
+### S3 into S3
+
+| Run | Sync time | Rows/s | MB/s | GB/hour | CPU-seconds per GB | Job peak memory |
+|---|---:|---:|---:|---:|---:|---:|
+| 1 | 69.937 s | 543,290 | 153.5 | 552.5 | 22.08 | 6,736 MiB |
+| 2 | 66.160 s | 574,306 | 162.2 | 584.1 | 22.39 | 7,077 MiB |
+| 3 | 66.876 s | 568,162 | 160.5 | 577.8 | 22.32 | 6,624 MiB |
+| Mean | 67.66 s | 561,919 | 158.7 | 571.5 | 22.26 | 7,077 MiB, the highest |
+
+The sync time, the CPU time and the peak memory are as above. The spread of the three times is 5.6%. The rates are of the Postgres table that the source files were written from, its heap without indexes: 10,733,748,224 bytes and 37,996,289 rows. The 20 source files hold 6,544,909,015 bytes.
+
+The source's read limited the runs. The read, until 99% of the source's bytes had reached the runner, took 56.4 to 60.0 s. In it, the runner was 56 to 60% busy, and no process stayed at a whole number of cores: on average, `destination-s3` used 2.8 to 3.0 cores and `source-s3` 0.7. The runner's network received about 115 MB/s and sent about 130 MB/s. The lanes never waited for the destination: summed over the 8 lanes, they worked for 20 to 21 seconds of each sync and waited for rows for 503 to 533.
+
+In each run, the runner's ENA driver counted 3.9 to 4.1 million packets over the outbound bandwidth allowance and none over the inbound one. These counters do not show how much time that cost. The uploads were 99% done 59.4 to 63.0 s into the job, which ended 5.8 to 6.1 s later, with the last commit.
+
+### Set-up
+
+| Part | Set-up |
+|---|---|
+| Data | One table of 16 columns and 37,996,289 rows, 267 bytes a row on average, stored in key order, with no nulls: `id bigint` primary key, `f1` and `f2 bigint`, `f3 integer`, `f4` and `f5 double precision`, `f6 numeric(18,4)`, `f7 boolean`, `f10` and `f11 date`, `f12 timestamptz`, and five `text` columns, `f8`, `f9` and `f13` to `f15`. Each text value is 32 characters of base64 cut from SHA-512 digests of the key, so it compresses poorly. |
+| Source files | For the second set, the table's rows in 20 Parquet files of 132 to 360 MB, written from the Postgres table before the runs, compressed with zstd, in row groups of 122,880 rows. |
+| Postgres | Postgres 18.7 (`postgres:18`) with `shared_buffers=12GB`. `pg_prewarm` read the table and its key's index into the buffers before each run. The source read on up to 8 connections, without TLS. |
+| Runner | EC2 `c8g.2xlarge` in `ap-southeast-2a`: 8 vCPUs (Graviton4), 16 GiB, network up to 15 Gbit/s, and a 60 GB gp3 disk at 6,000 IOPS and 400 MB/s. It ran OpenETL's Compose stack from the release's `compose.yml`, with `OPENETL_RESERVE=0,1Gi` so that a job of 8 vCPUs fits. The job had 8 vCPUs, 13 GiB and 8 lanes. |
+| Database machine | For the first set, EC2 `c8g.4xlarge` in the same zone: 16 vCPUs, 32 GiB, and a 300 GB gp3 disk at 16,000 IOPS and 1,000 MB/s. Postgres ran there alone, in Docker with host networking, on the private network. |
+| Bucket | One Amazon S3 bucket in `ap-southeast-2`, for the source files and the destination's tables. The connectors used the runner's instance role (`OPENETL_CONNECTOR_AWS_CREDENTIALS=inherit`). Each run wrote into a namespace of its own, with the destination's defaults: Parquet with zstd, and a `fileSize` of 256 MiB. |
+| Packages | `postgres` and `s3`, built from this repository's `main` at commit `e916cd72`, not the packages of the release above. That release's CLI packaged them for linux/arm64 with `openetl connector package`, and `openetl connector apply -f` applied each package's descriptor. |
+
+Each run used these specs, with a pipeline and a namespace of its own. The Postgres source's DSN had `sslmode=disable`. The yearly schedule starts no sync during a run, so `openetl sync` started each one.
+
+```yaml
+apiVersion: openetl.io/v1alpha1
+kind: Source
+metadata: { name: pg-full }
+spec:
+  connector: postgres
+  config: { dsn: { secret: pg-src-dsn }, schema: data, tables: [bench], maxConnections: 8 }
+---
+apiVersion: openetl.io/v1alpha1
+kind: Source
+metadata: { name: s3-full }
+spec:
+  connector: s3
+  config:
+    url: s3://BUCKET/src
+    region: ap-southeast-2
+    streams: [{ name: bench, glob: "full/bench/*.parquet", format: parquet }]
+---
+apiVersion: openetl.io/v1alpha1
+kind: Destination
+metadata: { name: s3-out }
+spec:
+  connector: s3
+  config: { url: s3://BUCKET/out, region: ap-southeast-2 }
+---
+apiVersion: openetl.io/v1alpha1
+kind: Pipeline
+metadata: { name: pg-to-s3 }
+spec:
+  schedule: { cron: "0 0 1 1 *" }
+  heal: { mode: "off" }
+  resources: { size: { cpu: 8, memory: 13Gi } }
+  source:
+    ref: pg-full
+    streams:
+      - { name: bench, sync: full_refresh }
+  destination:
+    ref: s3-out
+    namespace: NAMESPACE
+---
+apiVersion: openetl.io/v1alpha1
+kind: Pipeline
+metadata: { name: s3-to-s3 }
+spec:
+  schedule: { cron: "0 0 1 1 *" }
+  heal: { mode: "off" }
+  resources: { size: { cpu: 8, memory: 13Gi } }
+  delivery: { require: at_least_once }
+  source:
+    ref: s3-full
+    streams:
+      - { name: bench, sync: full_refresh }
+  destination:
+    ref: s3-out
+    namespace: NAMESPACE
+```
+
+Before each timed sync, a sync of a one-row copy of the source, under the same stream name, wrote the table's first files. The timed sync then replaced them, as `overwrite` is the default write mode for a full refresh. From Postgres, delivery was exactly once. From S3, it was at least once, which a pipeline that reads this package's source has to accept, as [Exactly once](#exactly-once) says. Commits were requested every 256 MB that the source read (`delivery.commit.maxBytes`), the default: each sync from Postgres made 8 commits, and each sync from S3 made 6. The time does not include making the data, the one-row sync, or reading the table into Postgres's cache.
+
+After each run, Amazon Athena queried a table defined over the files that the run's manifest lists, as [Write modes](#write-modes) says. Its row count, its count of distinct `id`s, and its sums of `f1`, `f6` and the lengths of `f8` were equal to the source's in all six runs. Athena checked the source files the same way before the runs.
+
+These numbers are for one case:
+
+- One row shape: 16 columns, 267 bytes a row, with five random strings that compress poorly. Wider or narrower rows, other types and text that compresses change every number.
+- One machine size: a runner of 8 vCPUs and 16 GiB, with 8 lanes, whose CPU limited the runs from Postgres. A larger runner, or several workers (`resources.workers`), changes the numbers.
+- A cached source: Postgres read the table from its shared buffers. A source that reads from disk is slower.
+- One set of source files: 20 Parquet files of 132 to 360 MB, in a bucket in the runner's region. Other files, or a bucket in another region, change the numbers of the second set.
+- A full refresh of one stream. No incremental reads and no transforms.
+- Postgres in Docker on a neighboring EC2 machine, not a managed service, whose storage, network and CPU differ.
+- Three runs of each set, one after another: the spread is that of three runs, not a distribution.
+
 ## Limits
 
 - An Avro read that resumes within a file decodes the file from its start again, as the Avro library doesn't give blocks' offsets.
