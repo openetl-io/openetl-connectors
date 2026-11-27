@@ -185,7 +185,12 @@ The log then carries each updated or deleted row's old values in full, large val
 
 ### Delivery
 
-Full refresh and CDC streams replay exactly: a read resumed from a checkpoint yields the same rows in the same order. OpenETL counts incremental streams as ones that may repeat rows, because of the rows at the cursor's last value, and the destination's capabilities decide what guarantee that leaves.
+Full refresh and CDC streams replay exactly: a read resumed from a checkpoint yields the same rows in the same order, apart from the CDC snapshots below. OpenETL counts incremental streams as ones that may repeat rows, because of the rows at the cursor's last value, and the destination's capabilities decide what guarantee that leaves.
+
+A CDC snapshot reads each chunk of a table as the table is then, while the log brings every change after the stream's position in it. A row inserted after that position, or moved to a new key, comes from the log alone, even where a chunk reads it. Two kinds of row reach an append differently, while a merge keeps the latest version of each:
+
+- **A row that was in the table at the stream's position and changes before its chunk is read.** The chunk sends the version it reads, as an insert, after the log's change, so an append gets that version twice. The log doesn't hold the version from before the change, so that version never arrives. Such a row deleted before its chunk is read arrives as its delete alone.
+- **A row inserted while the snapshot is read, with a key the snapshot hadn't reached, before the checkpoint a read resumes from part-way through the snapshot.** The resumed read reads it again in a chunk, so an append gets it twice.
 
 A read that OpenETL gives an end stops there. OpenETL does this when it reads a writer lane's part of an epoch again on [several workers](https://github.com/openetl-io/openetl/blob/main/docs/pipelines/workers.md), so the second read returns what the first did. The end is a resume point the first read sent, or, where the stream's read completed in that epoch, as a scheduled pipeline's does in its last one, where it completed.
 
