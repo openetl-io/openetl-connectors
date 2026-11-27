@@ -70,6 +70,10 @@ func seqOf(commit pglogrepl.LSN, n uint64) decimal128.Num {
 	return decimal128.FromU64(uint64(commit)).Mul(seqShift).Add(decimal128.FromU64(n))
 }
 
+// beforeChunkSnapshot, if set, runs in a chunk's transaction before its
+// snapshot: for tests.
+var beforeChunkSnapshot func()
+
 // afterChunkSnapshot, if set, runs between a chunk's snapshot and its WAL
 // position: for tests.
 var afterChunkSnapshot func()
@@ -141,6 +145,11 @@ type cdcStream struct {
 	from pglogrepl.LSN
 	// What's left of the table's snapshot; empty once it has been read.
 	ranges []*snapshotRange
+	// While ranges are left, the keys whose rows, as far as the log has been
+	// read, came into them since from by an insert or a key change that sent
+	// every column. The log carries such a row whole, so a chunk whose
+	// snapshot saw it leaves it out.
+	born map[string]bool
 	// Converts each column's text as the engine reads it.
 	conv []func([]byte) []byte
 	// Emitted since its last resume point.
@@ -169,6 +178,9 @@ type relation struct {
 	conv []func([]byte) []byte
 	// Each column's name.
 	names []string
+	// It has each of the stream's columns. The log leaves out generated
+	// columns, and those a publication's column list doesn't name.
+	whole bool
 }
 
 type txn struct {
@@ -194,7 +206,7 @@ type chunk struct {
 	// Keys in key order.
 	keys []string
 	last []string
-	// It had chunkRows rows, so more may follow.
+	// Its snapshot saw rows of its range past it, so the range goes on.
 	full bool
 }
 
@@ -234,8 +246,11 @@ type cdcReader struct {
 // between them, a chunk of a key range per connection the read can hold. A
 // chunk is read in a transaction of its own; it's held until the log has
 // passed every transaction its snapshot saw, and a key a later transaction
-// changes gets its chunk row first. Nothing is written to the source but the
-// slot and, if missing, the publication.
+// changes gets its chunk row first. A row that came into a key in the log
+// since the stream's position, by an insert or a key change that sent every
+// column, comes from the log alone: a chunk that reads it leaves it out.
+// Nothing is written to the source but the slot and, if missing, the
+// publication.
 func (s *Source) readCDC(ctx context.Context, conns *connPool, req source.ReadRequest, cfgs []source.ConfiguredStream, tables []table, out source.Emitter) error {
 	for _, cs := range cfgs {
 		t := tables[slices.IndexFunc(tables, func(t table) bool { return t.name == cs.Name })]
@@ -871,6 +886,7 @@ func (r *cdcReader) relation(ctx context.Context, m *pglogrepl.RelationMessage) 
 			return fmt.Errorf("postgres: %s's log lacks a primary key column", st.t.name)
 		}
 	}
+	rel.whole = len(rel.at) == len(st.t.cols)
 	return nil
 }
 
@@ -929,7 +945,7 @@ func (r *cdcReader) change(id uint32, op string, oldType uint8, old, new *pglogr
 	}
 	if op == source.OpDelete {
 		vals, _ := rel.values(old, nil)
-		return r.emit(st, oldKey, op, vals, nil)
+		return r.emit(st, oldKey, op, vals, nil, false)
 	}
 	key, err := rel.keyOf(new)
 	if err != nil {
@@ -942,14 +958,15 @@ func (r *cdcReader) change(id uint32, op string, oldType uint8, old, new *pglogr
 	if oldType == 'O' {
 		full = old
 	}
-	if old != nil && oldKey != key {
+	moved := old != nil && oldKey != key
+	if moved {
 		vals, _ := rel.values(old, nil)
-		if err := r.emit(st, oldKey, source.OpDelete, vals, nil); err != nil {
+		if err := r.emit(st, oldKey, source.OpDelete, vals, nil, false); err != nil {
 			return err
 		}
 	}
 	vals, unchanged := rel.values(new, full)
-	return r.emit(st, key, op, vals, unchanged)
+	return r.emit(st, key, op, vals, unchanged, (op == source.OpInsert || moved) && rel.whole && len(unchanged) == 0)
 }
 
 var errKeyUnchanged = errors.New("postgres: a primary key value wasn't sent")
@@ -1004,16 +1021,19 @@ func convert(f func([]byte) []byte, v []byte) []byte {
 }
 
 // emit adds a change to its stream's batch, after the chunk row of its key
-// if the chunk's snapshot didn't see the change.
-func (r *cdcReader) emit(st *cdcStream, key, op string, vals [][]byte, unchanged []string) error {
+// if the chunk's snapshot didn't see the change, unless the log brought that
+// row in whole. born says the change brings its row in whole.
+func (r *cdcReader) emit(st *cdcStream, key, op string, vals [][]byte, unchanged []string, born bool) error {
 	for _, c := range r.chunks {
 		if c.stream != st {
 			continue
 		}
 		if row, ok := c.rows[key]; ok && !c.snap.sees(r.txn.xid) {
 			delete(c.rows, key)
-			if err := r.add(st, source.OpInsert, seqOf(r.txn.commit, 0), row, nil); err != nil {
-				return err
+			if !st.born[key] {
+				if err := r.add(st, source.OpInsert, seqOf(r.txn.commit, 0), row, nil); err != nil {
+					return err
+				}
 			}
 		}
 	}
@@ -1022,6 +1042,15 @@ func (r *cdcReader) emit(st *cdcStream, key, op string, vals [][]byte, unchanged
 			r.txn.keys = map[*cdcStream][]string{}
 		}
 		r.txn.keys[st] = append(r.txn.keys[st], key)
+		switch {
+		case born:
+			if st.born == nil {
+				st.born = map[string]bool{}
+			}
+			st.born[key] = true
+		case op == source.OpDelete:
+			delete(st.born, key)
+		}
 	}
 	r.txn.n++
 	return r.add(st, op, seqOf(r.txn.commit, r.txn.n), vals, unchanged)
@@ -1051,7 +1080,15 @@ func (r *cdcReader) passed() error {
 		st := c.stream
 		seq := seqOf(c.lsn, 0)
 		for _, k := range c.keys {
-			if row, ok := c.rows[k]; ok {
+			row, ok := c.rows[k]
+			switch {
+			case !ok:
+			case st.born[k]:
+				// The log has passed each change the snapshot saw, and a
+				// change it didn't see would have taken the row out, so the
+				// row it saw is the one the log brought in.
+				delete(st.born, k)
+			default:
 				if err := r.add(st, source.OpInsert, seq, row, nil); err != nil {
 					return err
 				}
@@ -1063,6 +1100,7 @@ func (r *cdcReader) passed() error {
 		default:
 			st.ranges = slices.DeleteFunc(st.ranges, func(rng *snapshotRange) bool { return rng == c.rng })
 			if len(st.ranges) == 0 {
+				st.born = nil
 				slog.Info("read a table's snapshot", "table", st.t.name)
 			}
 		}
@@ -1199,13 +1237,18 @@ func (r *cdcReader) readChunk(ctx context.Context, conn *pgx.Conn, st *cdcStream
 	if len(where) > 0 {
 		q += " WHERE " + strings.Join(where, " AND ")
 	}
-	q += " ORDER BY " + strings.Join(key, ", ") + " LIMIT " + strconv.Itoa(r.s.cfg.SnapshotChunkRows)
+	// A row past the chunk says the range goes on; without it, the range is
+	// read once the chunk is.
+	q += " ORDER BY " + strings.Join(key, ", ") + " LIMIT " + strconv.Itoa(min(r.s.cfg.SnapshotChunkRows, math.MaxInt-1)+1)
 
 	tx, err := conn.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
 	if err != nil {
 		return nil, classify(err)
 	}
 	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+	if beforeChunkSnapshot != nil {
+		beforeChunkSnapshot()
+	}
 	// The transaction's snapshot is taken by its first statement, and the
 	// WAL position after it.
 	var snapText, at string
@@ -1228,6 +1271,10 @@ func (r *cdcReader) readChunk(ctx context.Context, conn *pgx.Conn, st *cdcStream
 	n := len(t.cols)
 	rr := tx.Conn().PgConn().ExecParams(ctx, q, args, nil, nil, nil)
 	for rr.NextRow() {
+		if len(c.keys) == r.s.cfg.SnapshotChunkRows {
+			c.full = true
+			continue
+		}
 		vals := rr.Values()
 		row := make([][]byte, n)
 		for i, v := range vals[:n] {
@@ -1252,7 +1299,6 @@ func (r *cdcReader) readChunk(ctx context.Context, conn *pgx.Conn, st *cdcStream
 		return nil, classify(fmt.Errorf("postgres: snapshot of %s: %w", t.name, err))
 	}
 	c.last = append([]string(nil), c.last...)
-	c.full = len(c.keys) == r.s.cfg.SnapshotChunkRows
 	if err := tx.Commit(ctx); err != nil {
 		return nil, classify(err)
 	}
