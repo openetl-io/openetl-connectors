@@ -77,7 +77,7 @@ A connection's check reports each of these items, with what it found, or why it 
 |---|---|
 | `net.dns`, `net.connect` | The DSN's host resolves and takes a connection. Not for a Unix socket. |
 | `db.tls` | TLS is on, in `tls` or the DSN: the server takes it, with a certificate the config trusts. Under `preferred`, a server without TLS warns. |
-| `db.connect` | The user signs in. |
+| `db.connect` | The user signs in, and the session takes the DSN's parameters: one that sets a variable the server doesn't have fails it. |
 | `database.found` | The database exists, and the user has a privilege in it. |
 | `tables.found` | With `tables`: each table it names is in the database. |
 | `tables.read` | The user can select from each table the source offers, and the source can read each of their columns. |
@@ -130,7 +130,7 @@ spec:
 
 The connector's sessions are in `utf8mb4`, in UTC, in the SQL mode `STRICT_ALL_TABLES,NO_ENGINE_SUBSTITUTION`, without a `sql_select_limit`, and with `autocommit` on, whatever the DSN or the server set: each connection sets them last. The DSN's `collation` is the sessions' if it's one of `utf8mb4`'s, any the server has, and is left out otherwise, as its `charset`, `time_zone`, `sql_mode` and character set variables are. Each other parameter is one the driver takes, spelled as the driver spells it, such as `parseTime`, or else sets a session variable, such as `wait_timeout=60` or `@@session.wait_timeout=60`. The connector refuses a DSN with one of the driver's parameters spelled in another case, or with one that sets no session variable, such as a global or a user variable. A connection whose DSN sets a variable the server doesn't have fails with `CONFIG_INVALID`.
 
-`allowPublicKeyRetrieval=true`, which other MySQL clients take, is left out, and `allowPublicKeyRetrieval=false` is refused: without TLS, the connector always asks the server for its RSA public key when the server needs the password, as under `caching_sha2_password` or `sha256_password`. Anyone on the network path can then answer in the server's place, and TLS stops that.
+`allowPublicKeyRetrieval=true`, which other MySQL clients take, is left out, and `allowPublicKeyRetrieval=false` is refused: without TLS, the connector always asks the server for its RSA public key when the server needs the password, as under `caching_sha2_password` or `sha256_password`. Anyone on the network path can then answer in the server's place. TLS whose certificate the connector verifies, `tls.mode` `verify-ca` or `verify-identity`, stops that; under `preferred` or `required` it doesn't.
 
 ### TLS
 

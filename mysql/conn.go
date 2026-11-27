@@ -52,7 +52,7 @@ func parseDSN(dsn string) (*mysql.Config, error) {
 		}
 		if strings.EqualFold(k, "allowPublicKeyRetrieval") {
 			if on, err := strconv.ParseBool(v); err != nil || !on {
-				return nil, fmt.Errorf("mysql: dsn: %s=%s can't hold: without TLS, the connector asks the server for its public key whenever the server wants the password; leave the parameter out, or connect with tls", k, v)
+				return nil, fmt.Errorf("mysql: dsn: %s=%s can't hold: without TLS, the connector asks the server for its public key whenever the server wants the password; take the parameter out", k, v)
 			}
 			delete(c.Params, k)
 			continue

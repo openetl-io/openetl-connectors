@@ -160,28 +160,45 @@ func TestCheckTableDropped(t *testing.T) {
 	}
 }
 
-// nsCatalog is probeCatalog in a namespace that doesn't exist, which it
-// creates, and drops with dropErr.
+// nsCatalog creates the check's table and fails to load it, as
+// probeCatalog does, in a namespace that doesn't exist, which it creates. It
+// fails each drop of the table with tableErr and of the namespace with
+// nsErr, and logs the calls.
 type nsCatalog struct {
-	probeCatalog
-	dropErr error
-	ns      *[]string
+	catalog.Catalog
+	tableErr, nsErr error
+	calls           *[]string
 }
 
+func (c nsCatalog) ListNamespaces(context.Context, table.Identifier) ([]table.Identifier, error) {
+	return nil, nil
+}
 func (c nsCatalog) CheckNamespaceExists(context.Context, table.Identifier) (bool, error) {
 	return false, nil
 }
 func (c nsCatalog) CreateNamespace(_ context.Context, ns table.Identifier, _ ice.Properties) error {
-	*c.ns = append(*c.ns, "create "+ns[0])
+	*c.calls = append(*c.calls, "create "+ns[0])
 	return nil
 }
+func (c nsCatalog) CreateTable(context.Context, table.Identifier, *ice.Schema, ...catalog.CreateTableOpt) (*table.Table, error) {
+	return nil, errors.New("can't load it")
+}
+func (c nsCatalog) PurgeTable(context.Context, table.Identifier) error {
+	*c.calls = append(*c.calls, "purge")
+	return c.tableErr
+}
+func (c nsCatalog) DropTable(context.Context, table.Identifier) error {
+	*c.calls = append(*c.calls, "drop table")
+	return c.tableErr
+}
 func (c nsCatalog) DropNamespace(_ context.Context, ns table.Identifier) error {
-	*c.ns = append(*c.ns, "drop "+ns[0])
-	return c.dropErr
+	*c.calls = append(*c.calls, "drop "+ns[0])
+	return c.nsErr
 }
 
-// A namespace the checks created is dropped by catalog.drop, which warns,
-// naming it, when the catalog refuses, so that it isn't left unsaid.
+// What the checks created is dropped by catalog.drop, which warns, naming
+// what's left, when the catalog refuses: a table it can't drop doesn't keep
+// it from dropping the namespace, and the cleanup tries again what's left.
 func TestCheckNamespaceDropped(t *testing.T) {
 	srv := httptest.NewServer(http.NotFoundHandler())
 	defer srv.Close()
@@ -189,22 +206,31 @@ func TestCheckNamespaceDropped(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	denied := fmt.Errorf("failed to drop namespace made: %w", errors.New("AccessDeniedException: not authorized to perform: glue:DeleteDatabase"))
-	for dropErr, want := range map[error]check.Status{nil: check.Passed, denied: check.Warning} {
-		var ns []string
-		dropped := 0
-		cat := nsCatalog{probeCatalog: probeCatalog{err: errors.New("can't load it"), dropped: &dropped}, dropErr: dropErr, ns: &ns}
+	denied := fmt.Errorf("failed to drop: %w", errors.New("AccessDeniedException: not authorized"))
+	for _, c := range []struct {
+		name            string
+		tableErr, nsErr error
+		want            check.Status
+		left            string
+		calls           []string
+	}{
+		{"dropped", nil, nil, check.Passed, "", []string{"create made", "purge", "drop made"}},
+		{"namespace refused", nil, denied, check.Warning, "made", []string{"create made", "purge", "drop made", "drop made"}},
+		{"table refused", denied, nil, check.Warning, "_openetl_check_", []string{"create made", "purge", "drop table", "drop made", "purge", "drop table"}},
+	} {
+		var calls []string
+		cat := nsCatalog{tableErr: c.tableErr, nsErr: c.nsErr, calls: &calls}
 		r := check.Run(t.Context(), d.checks(&session{open: func(context.Context) (catalog.Catalog, error) { return cat, nil }}))
 		i := slices.IndexFunc(r.Items, func(it check.Item) bool { return it.Name == "catalog.drop" })
 		if i < 0 {
-			t.Fatalf("%v: no catalog.drop item in %v", dropErr, connectortest.Statuses(r))
+			t.Fatalf("%s: no catalog.drop item in %v", c.name, connectortest.Statuses(r))
 		}
 		it := r.Items[i].Rendered()
-		if it.Status != want || (want == check.Warning && !strings.Contains(it.Message, "made")) {
-			t.Errorf("%v: catalog.drop %v: %s", dropErr, it.Status, it.Message)
+		if it.Status != c.want || !strings.Contains(it.Message, c.left) {
+			t.Errorf("%s: catalog.drop %v: %s", c.name, it.Status, it.Message)
 		}
-		if !slices.Equal(ns, []string{"create made", "drop made"}) || dropped != 1 {
-			t.Errorf("%v: namespace %v, table dropped %d times", dropErr, ns, dropped)
+		if !slices.Equal(calls, c.calls) {
+			t.Errorf("%s: %v, want %v", c.name, calls, c.calls)
 		}
 	}
 }

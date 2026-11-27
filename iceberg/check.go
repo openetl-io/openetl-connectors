@@ -223,44 +223,45 @@ func (d *Destination) checks(s *session) []check.Check {
 	var probeFile string
 	ident := append(slices.Clone(ns), "_openetl_check_"+strings.ToLower(rand.Text())[:12])
 	params := check.Params{"namespace": strings.Join(ns, "."), "table": strings.Join(ident, ".")}
-	// What catalog.create made: a table that may exist, and the namespace if
-	// it created it.
+	// What catalog.create made and nothing has dropped yet: a table that
+	// may exist, and the namespace if it created it.
 	var mayExist, created bool
 	var dropMu sync.Mutex
-	dropped := false
-	// drop drops what catalog.create made, once: catalog.drop does, or else
-	// a cleanup. left is what it couldn't drop.
-	drop := func(ctx context.Context, cat catalog.Catalog) (left string, err error) {
+	// drop drops what's left of what catalog.create made: catalog.drop
+	// does, and then a cleanup, for what that couldn't. had is whether
+	// anything was left; left is what's left still.
+	drop := func(ctx context.Context, cat catalog.Catalog) (had bool, left string, err error) {
 		dropMu.Lock()
 		defer dropMu.Unlock()
-		if dropped {
-			return "", nil
-		}
-		dropped = true
+		had = mayExist || created
 		if probe != nil && probeFile != "" {
-			if fs, err := probe.FS(ctx); err == nil {
-				_ = fs.Remove(probeFile)
+			if fs, err := probe.FS(ctx); err == nil && fs.Remove(probeFile) == nil {
+				probeFile = ""
 			}
 		}
+		var lefts []string
+		var errs []error
 		if mayExist {
 			// Purging takes its metadata files too.
 			if pc, ok := cat.(interface {
 				PurgeTable(context.Context, table.Identifier) error
 			}); !ok || pc.PurgeTable(ctx, ident) != nil {
-				if err := cat.DropTable(ctx, ident); err != nil && !errors.Is(err, catalog.ErrNoSuchTable) {
-					if created {
-						return strings.Join(ident, ".") + " and " + strings.Join(ns, "."), err
-					}
-					return strings.Join(ident, "."), err
+				err := cat.DropTable(ctx, ident)
+				if err != nil && !errors.Is(err, catalog.ErrNoSuchTable) {
+					lefts, errs = append(lefts, strings.Join(ident, ".")), append(errs, err)
 				}
 			}
+			mayExist = len(errs) > 0
 		}
+		// A catalog refuses to drop a namespace that still has a table.
 		if created {
 			if err := cat.DropNamespace(ctx, ns); err != nil && !errors.Is(err, catalog.ErrNoSuchNamespace) {
-				return strings.Join(ns, "."), err
+				lefts, errs = append(lefts, strings.Join(ns, ".")), append(errs, err)
+			} else {
+				created = false
 			}
 		}
-		return "", nil
+		return had, strings.Join(lefts, " and "), errors.Join(errs...)
 	}
 	createField := "namespace"
 	if d.cfg.Catalog == "glue" {
@@ -295,7 +296,7 @@ func (d *Destination) checks(s *session) []check.Check {
 			createMu.Unlock()
 			// Glue may create the table and then fail to load it.
 			mayExist = !errors.Is(err, catalog.ErrTableAlreadyExists)
-			p.Cleanup(func(ctx context.Context) { _, _ = drop(ctx, cat) })
+			p.Cleanup(func(ctx context.Context) { _, _, _ = drop(ctx, cat) })
 			if err != nil {
 				if f := check.Classify(classify(err)); f != nil && f.Reason != check.Unknown.Name {
 					return f
@@ -374,15 +375,15 @@ func (d *Destination) checks(s *session) []check.Check {
 		Name: "catalog.drop", Kind: check.Permission, Title: "Drop {table}, and {namespace} if the checks created it", Params: params,
 		Description: "The checks drop what they created, and say what they couldn't.", Needs: []string{"catalog.namespace"},
 		Run: func(ctx context.Context, p *check.Probe) error {
-			if !mayExist && !created {
-				return check.Skip("the checks created nothing")
-			}
 			cat, err := s.catalog(ctx, p)
 			if err != nil {
 				return err
 			}
-			left, err := drop(ctx, cat)
-			if err == nil {
+			had, left, err := drop(ctx, cat)
+			switch {
+			case !had:
+				return check.Skip("the checks created nothing")
+			case err == nil:
 				return nil
 			}
 			f := check.Classify(classify(err)).With("left", left)
