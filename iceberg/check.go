@@ -212,7 +212,7 @@ func namespaceCheck(s *session, ns []string) check.Check {
 
 // Checks reach the catalog and sign in, find the namespace, then create a
 // table there, commit to it, and write and delete a file in its location,
-// as writes do, and drop it.
+// as writes do, and drop it, and the namespace if they created it.
 func (d *Destination) Checks() []check.Check { return d.checks(&session{open: d.conn.open}) }
 
 func (d *Destination) checks(s *session) []check.Check {
@@ -223,6 +223,45 @@ func (d *Destination) checks(s *session) []check.Check {
 	var probeFile string
 	ident := append(slices.Clone(ns), "_openetl_check_"+strings.ToLower(rand.Text())[:12])
 	params := check.Params{"namespace": strings.Join(ns, "."), "table": strings.Join(ident, ".")}
+	// What catalog.create made: a table that may exist, and the namespace if
+	// it created it.
+	var mayExist, created bool
+	var dropMu sync.Mutex
+	dropped := false
+	// drop drops what catalog.create made, once: catalog.drop does, or else
+	// a cleanup. left is what it couldn't drop.
+	drop := func(ctx context.Context, cat catalog.Catalog) (left string, err error) {
+		dropMu.Lock()
+		defer dropMu.Unlock()
+		if dropped {
+			return "", nil
+		}
+		dropped = true
+		if probe != nil && probeFile != "" {
+			if fs, err := probe.FS(ctx); err == nil {
+				_ = fs.Remove(probeFile)
+			}
+		}
+		if mayExist {
+			// Purging takes its metadata files too.
+			if pc, ok := cat.(interface {
+				PurgeTable(context.Context, table.Identifier) error
+			}); !ok || pc.PurgeTable(ctx, ident) != nil {
+				if err := cat.DropTable(ctx, ident); err != nil && !errors.Is(err, catalog.ErrNoSuchTable) {
+					if created {
+						return strings.Join(ident, ".") + " and " + strings.Join(ns, "."), err
+					}
+					return strings.Join(ident, "."), err
+				}
+			}
+		}
+		if created {
+			if err := cat.DropNamespace(ctx, ns); err != nil && !errors.Is(err, catalog.ErrNoSuchNamespace) {
+				return strings.Join(ns, "."), err
+			}
+		}
+		return "", nil
+	}
 	createField := "namespace"
 	if d.cfg.Catalog == "glue" {
 		createField = "warehouse"
@@ -240,7 +279,6 @@ func (d *Destination) checks(s *session) []check.Check {
 			if err != nil {
 				return err
 			}
-			created := false
 			if ok, err := cat.CheckNamespaceExists(ctx, ns); err == nil && !ok {
 				if err := cat.CreateNamespace(ctx, ns, nil); err != nil && !errors.Is(err, catalog.ErrNamespaceAlreadyExists) {
 					return classify(fmt.Errorf("iceberg: create namespace %s: %w", strings.Join(ns, "."), err))
@@ -256,25 +294,8 @@ func (d *Destination) checks(s *session) []check.Check {
 			probe, err = cat.CreateTable(ctx, ident, sc, opts...)
 			createMu.Unlock()
 			// Glue may create the table and then fail to load it.
-			mayExist := !errors.Is(err, catalog.ErrTableAlreadyExists)
-			p.Cleanup(func(ctx context.Context) {
-				if probe != nil && probeFile != "" {
-					if fs, err := probe.FS(ctx); err == nil {
-						_ = fs.Remove(probeFile)
-					}
-				}
-				if mayExist {
-					// Purging takes its metadata files too.
-					if pc, ok := cat.(interface {
-						PurgeTable(context.Context, table.Identifier) error
-					}); !ok || pc.PurgeTable(ctx, ident) != nil {
-						_ = cat.DropTable(ctx, ident)
-					}
-				}
-				if created {
-					_ = cat.DropNamespace(ctx, ns)
-				}
-			})
+			mayExist = !errors.Is(err, catalog.ErrTableAlreadyExists)
+			p.Cleanup(func(ctx context.Context) { _, _ = drop(ctx, cat) })
 			if err != nil {
 				if f := check.Classify(classify(err)); f != nil && f.Reason != check.Unknown.Name {
 					return f
@@ -348,6 +369,32 @@ func (d *Destination) checks(s *session) []check.Check {
 			}
 			probeFile = ""
 			return nil
+		},
+	}, check.Check{
+		Name: "catalog.drop", Kind: check.Permission, Title: "Drop {table}, and {namespace} if the checks created it", Params: params,
+		Description: "The checks drop what they created, and say what they couldn't.", Needs: []string{"catalog.namespace"},
+		Run: func(ctx context.Context, p *check.Probe) error {
+			if !mayExist && !created {
+				return check.Skip("the checks created nothing")
+			}
+			cat, err := s.catalog(ctx, p)
+			if err != nil {
+				return err
+			}
+			left, err := drop(ctx, cat)
+			if err == nil {
+				return nil
+			}
+			f := check.Classify(classify(err)).With("left", left)
+			f.Message = "The checks couldn't drop {left}, which they created, so it's still in the catalog."
+			f.Fix = "Drop {left} yourself."
+			if f.Code == protocolv1.ErrorCode_ERROR_CODE_PERMISSION_DENIED {
+				f.Fix = "Let the destination's identity drop tables and namespaces, or drop {left} yourself."
+				if d.cfg.Catalog == "glue" {
+					f.Fix = "Let the destination's identity glue:DeleteTable on the table, and glue:DeleteDatabase on the database, its tables and its user-defined functions (table/{namespace}/* and userDefinedFunction/{namespace}/*), or drop {left} yourself."
+				}
+			}
+			return check.Warn(f)
 		},
 	})
 }

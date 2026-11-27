@@ -3,10 +3,12 @@ package iceberg
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/apache/arrow-go/v18/arrow"
@@ -27,10 +29,10 @@ func TestCheckLists(t *testing.T) {
 	defer func(f func(*http.Request) (*url.URL, error)) { proxyFor = f }(proxyFor)
 	proxyFor = func(*http.Request) (*url.URL, error) { return nil, nil }
 	for config, want := range map[string][]string{
-		`{"uri": "https://catalog.example.com/api", "token": "t"}`: {"net.dns", "net.connect", "net.tls", "catalog.auth", "catalog.namespace", "catalog.create", "catalog.commit", "store.write", "store.delete"},
+		`{"uri": "https://catalog.example.com/api", "token": "t"}`: {"net.dns", "net.connect", "net.tls", "catalog.auth", "catalog.namespace", "catalog.create", "catalog.commit", "store.write", "store.delete", "catalog.drop"},
 		`{"uri": "http://catalog:8181", "s3Endpoint": "http://s3:8333"}`: {"net.dns", "net.connect", "catalog.auth", "catalog.namespace", "catalog.create", "catalog.commit",
-			"store.dns", "store.connect", "store.write", "store.delete"},
-		`{"catalog": "glue", "region": "eu-west-1", "warehouse": "s3://b/w"}`: {"net.dns", "net.connect", "net.tls", "catalog.auth", "catalog.namespace", "catalog.create", "catalog.commit", "store.write", "store.delete"},
+			"store.dns", "store.connect", "store.write", "store.delete", "catalog.drop"},
+		`{"catalog": "glue", "region": "eu-west-1", "warehouse": "s3://b/w"}`: {"net.dns", "net.connect", "net.tls", "catalog.auth", "catalog.namespace", "catalog.create", "catalog.commit", "store.write", "store.delete", "catalog.drop"},
 	} {
 		d, err := NewDestination([]byte(config))
 		if err != nil {
@@ -154,6 +156,55 @@ func TestCheckTableDropped(t *testing.T) {
 		}
 		if dropped != want {
 			t.Errorf("%v: dropped %d times, want %d", err, dropped, want)
+		}
+	}
+}
+
+// nsCatalog is probeCatalog in a namespace that doesn't exist, which it
+// creates, and drops with dropErr.
+type nsCatalog struct {
+	probeCatalog
+	dropErr error
+	ns      *[]string
+}
+
+func (c nsCatalog) CheckNamespaceExists(context.Context, table.Identifier) (bool, error) {
+	return false, nil
+}
+func (c nsCatalog) CreateNamespace(_ context.Context, ns table.Identifier, _ ice.Properties) error {
+	*c.ns = append(*c.ns, "create "+ns[0])
+	return nil
+}
+func (c nsCatalog) DropNamespace(_ context.Context, ns table.Identifier) error {
+	*c.ns = append(*c.ns, "drop "+ns[0])
+	return c.dropErr
+}
+
+// A namespace the checks created is dropped by catalog.drop, which warns,
+// naming it, when the catalog refuses, so that it isn't left unsaid.
+func TestCheckNamespaceDropped(t *testing.T) {
+	srv := httptest.NewServer(http.NotFoundHandler())
+	defer srv.Close()
+	d, err := NewDestination([]byte(`{"uri": "` + srv.URL + `", "namespace": "made"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	denied := fmt.Errorf("failed to drop namespace made: %w", errors.New("AccessDeniedException: not authorized to perform: glue:DeleteDatabase"))
+	for dropErr, want := range map[error]check.Status{nil: check.Passed, denied: check.Warning} {
+		var ns []string
+		dropped := 0
+		cat := nsCatalog{probeCatalog: probeCatalog{err: errors.New("can't load it"), dropped: &dropped}, dropErr: dropErr, ns: &ns}
+		r := check.Run(t.Context(), d.checks(&session{open: func(context.Context) (catalog.Catalog, error) { return cat, nil }}))
+		i := slices.IndexFunc(r.Items, func(it check.Item) bool { return it.Name == "catalog.drop" })
+		if i < 0 {
+			t.Fatalf("%v: no catalog.drop item in %v", dropErr, connectortest.Statuses(r))
+		}
+		it := r.Items[i].Rendered()
+		if it.Status != want || (want == check.Warning && !strings.Contains(it.Message, "made")) {
+			t.Errorf("%v: catalog.drop %v: %s", dropErr, it.Status, it.Message)
+		}
+		if !slices.Equal(ns, []string{"create made", "drop made"}) || dropped != 1 {
+			t.Errorf("%v: namespace %v, table dropped %d times", dropErr, ns, dropped)
 		}
 	}
 }
