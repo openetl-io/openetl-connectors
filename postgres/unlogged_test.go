@@ -119,14 +119,14 @@ func TestACrashBeforeTheApplyLosesTheEpoch(t *testing.T) {
 	if _, err := w1.Commit(ctx, e2, []destination.Staged{st2}); err == nil || codeOf(err) != protocolv1.ErrorCode_ERROR_CODE_TRANSIENT {
 		t.Fatalf("Commit of emptied staging: %v, want a transient error", err)
 	}
-	if got := env.text(rows); got != "1,2/10" || env.markers() != 1 {
+	if got := env.text(rows); got != "1,2/10" || env.markers() != 2 {
 		t.Fatalf("after a Commit of emptied staging: %s, %d markers", got, env.markers())
 	}
 	w2 := env.open(2, destination.ScopePipeline, "users", "orders")
 	if r := recov(t, w2, 2, e2, st2); r != destination.Lost {
 		t.Fatalf("Recover = %v, want lost", r)
 	}
-	if got := env.text(rows); got != "1,2/10" || env.markers() != 1 {
+	if got := env.text(rows); got != "1,2/10" || env.markers() != 2 {
 		t.Fatalf("after the epoch was lost: %s, %d markers", got, env.markers())
 	}
 	// The runner restores the epoch before, and reads the lost one again.
