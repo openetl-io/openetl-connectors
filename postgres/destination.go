@@ -1429,13 +1429,13 @@ func (w *writer) DropStaging(ctx context.Context, streams []stagedStream) {
 func (w *writer) ensureSchema(ctx context.Context) error {
 	var exists bool
 	if err := w.pool.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = $1)", w.schema).Scan(&exists); err != nil {
-		return fmt.Errorf("postgres: schema %s: %w", w.schema, err)
+		return classify(fmt.Errorf("postgres: schema %s: %w", w.schema, err))
 	}
 	if exists {
 		return nil
 	}
 	if _, err := w.pool.Exec(ctx, "CREATE SCHEMA IF NOT EXISTS "+pgx.Identifier{w.schema}.Sanitize()); err != nil {
-		return fmt.Errorf("postgres: create schema %s: %w", w.schema, err)
+		return classify(fmt.Errorf("postgres: create schema %s: %w", w.schema, err))
 	}
 	return nil
 }
@@ -1453,7 +1453,7 @@ func (w *writer) Fence(ctx context.Context, gen uint64) error {
 			PRIMARY KEY (pipeline, stream, generation, epoch))`,
 	} {
 		if _, err := w.pool.Exec(ctx, q); err != nil {
-			return fmt.Errorf("postgres: prepare %s: %w", w.schema, err)
+			return classify(fmt.Errorf("postgres: prepare %s: %w", w.schema, err))
 		}
 	}
 	// Waits for applies that hold the fence row.
