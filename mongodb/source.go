@@ -16,6 +16,7 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 	"golang.org/x/sync/errgroup"
+	"golang.org/x/sync/semaphore"
 
 	"github.com/openetl-io/openetl-connectors/docstore"
 	"github.com/openetl-io/openetl-connectors/keysplit"
@@ -57,6 +58,9 @@ type Source struct {
 	cfg SourceConfig
 	// From uri, as parsed when the source was made.
 	opts *options.ClientOptions
+	// Holds a unit for each discovery aggregation running, over every call,
+	// as splits each find their fields where a read doesn't name them.
+	discovering *semaphore.Weighted
 
 	keysplit.Reads
 }
@@ -87,7 +91,7 @@ func NewSource(config []byte) (*Source, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Source{cfg: cfg, opts: opts}, nil
+	return &Source{cfg: cfg, opts: opts, discovering: semaphore.NewWeighted(int64(cfg.DiscoveryConnections))}, nil
 }
 
 // client connects for one call; done disconnects it.
@@ -174,8 +178,9 @@ func (s *Source) Discover(ctx context.Context) (source.Catalog, error) {
 // top-level field's values, as $type names them, with "uuid" for 16-byte
 // binaries of subtype 4: from every document, or from sampleSize of them.
 // Up to discoveryConnections aggregations run at once, over every
-// collection's parts: where more than one may, a collection that isn't
-// sampled is read in the _id ranges cuts gives it, and else whole.
+// collection's parts and every call's: where more than one may, a
+// collection that isn't sampled is read in the _id ranges cuts gives it,
+// and else whole.
 func (s *Source) fieldTypes(ctx context.Context, db *mongo.Database, names []string) ([]map[string][]string, error) {
 	type part struct {
 		coll *mongo.Collection
@@ -204,6 +209,10 @@ func (s *Source) fieldTypes(ctx context.Context, db *mongo.Database, names []str
 	g.SetLimit(s.cfg.DiscoveryConnections)
 	for j, p := range parts {
 		g.Go(func() (err error) {
+			if err := s.discovering.Acquire(gctx, 1); err != nil {
+				return err
+			}
+			defer s.discovering.Release(1)
 			found[j], err = s.rangeTypes(gctx, p.coll, p.lo, p.hi)
 			return err
 		})
