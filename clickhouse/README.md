@@ -258,7 +258,7 @@ The sync time is the sync's own record, its end time less its start time. It inc
 | Runner | EC2 `c8g.2xlarge` in `ap-southeast-2a`: 8 vCPUs (Graviton4), 16 GiB, network up to 15 Gbit/s, and a 60 GB gp3 disk at 6,000 IOPS and 400 MB/s. It ran OpenETL's Compose stack from the release's `compose.yml`, with `OPENETL_RESERVE=0,1Gi` so that a job of 8 vCPUs fits. The job had 8 vCPUs, 13 GiB and 8 lanes. |
 | Database machine | EC2 `c8g.4xlarge` in the same zone: 16 vCPUs, 32 GiB, and a 300 GB gp3 disk at 16,000 IOPS and 1,000 MB/s, gp3's most. The source Postgres and ClickHouse ran there, in Docker with host networking, with their data on that disk. |
 | ClickHouse | ClickHouse 25.8.33.6 (`clickhouse/clickhouse-server:25.8`), with the image's default settings except a password for the `default` user and a `nofile` limit of 262144. The destination reached it over the native protocol on port 9000, without TLS. Each run wrote into a database of its own, to a `MergeTree` table ordered by `id` that the destination created. |
-| Packages | `openetl connector apply oci://ghcr.io/openetl-io/openetl-connectors/NAME:0.2.0-alpha`, for `postgres` and `clickhouse`, on linux/arm64. |
+| Packages | `postgres` and `clickhouse`, at the version above, from `openetl connector apply oci://ghcr.io/openetl-io/openetl-connectors/NAME:VERSION`, on linux/arm64. |
 
 Each run used these specs, with a pipeline and a namespace of its own. The source's DSN had `sslmode=disable`. The yearly schedule starts no sync during a run, so `openetl sync` started each one.
 
