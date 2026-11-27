@@ -13,6 +13,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/jackc/pglogrepl"
@@ -369,9 +370,95 @@ func TestCDCSnapshotEndsWithAFullChunk(t *testing.T) {
 	}
 }
 
+// A row the log doesn't send whole keeps its chunk row, which has what the
+// log left out: one inserted into a table with a generated column, which
+// the log doesn't send, and one a key change moved without its unchanged
+// TOAST value, into a key whose row the log had brought in whole and taken
+// out, while the chunk was held or before it was read.
+func TestCDCSnapshotKeepsRowsTheLogSendsInPart(t *testing.T) {
+	t.Run("generated column", func(t *testing.T) {
+		e := newSourceEnv(t)
+		e.exec("CREATE TABLE $schema.users (id int PRIMARY KEY, name text, doc text, twice int GENERATED ALWAYS AS (id * 2) STORED)")
+		e.exec("INSERT INTO $schema.users (id, name) SELECT i, 'n' || i FROM generate_series(1, 20) i")
+		s, pipeline := e.cdcSource(`, "snapshotChunkRows": 10`)
+		var once sync.Once
+		beforeStartReplication = func() {
+			once.Do(func() {
+				if _, err := e.conn.Exec(context.Background(), "INSERT INTO "+pgx.Identifier{e.schema, "users"}.Sanitize()+" (id, name) VALUES (25, 'new')"); err != nil {
+					t.Error(err)
+				}
+			})
+		}
+		t.Cleanup(func() { beforeStartReplication = nil })
+		c := readCDC(t, s, pipeline, map[string]string{"users": ""})
+		got, twice := c.changes(t, "users"), c.column("users", "twice")
+		last := -1
+		for i, ch := range got {
+			if ch.id == "25" && (last < 0 || ch.seq.Cmp(got[last].seq) > 0) {
+				last = i
+			}
+		}
+		if last < 0 || twice[last] != "50" {
+			t.Errorf("row 25's latest version has twice %q: %+v", twice, got)
+		}
+	})
+	for _, c := range []struct {
+		name string
+		// Writes before the read's first chunk, or in the first chunk after
+		// its snapshot and in the second before its snapshot.
+		start, first, second func(h *history)
+	}{
+		{
+			name: "while its chunk is held",
+			start: func(h *history) {
+				h.insert(7)
+				h.delete(7)
+				h.move(4, 7)
+			},
+		},
+		{
+			name:  "before its chunk is read",
+			first: func(h *history) { h.insert(21) },
+			second: func(h *history) {
+				h.delete(21)
+				h.move(4, 21)
+			},
+		},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			e := newSourceEnv(t)
+			h := e.newHistory(20)
+			e.exec("ALTER TABLE $schema.users ALTER COLUMN doc SET STORAGE EXTERNAL")
+			e.exec("UPDATE $schema.users SET doc = '" + strings.Repeat("x", 9000) + "' WHERE id = 4")
+			s, pipeline := e.cdcSource(`, "snapshotChunkRows": 10`)
+			var once sync.Once
+			var before, after atomic.Int64
+			beforeStartReplication = func() {
+				if c.start != nil {
+					once.Do(func() { c.start(h) })
+				}
+			}
+			afterChunkSnapshot = func() {
+				if after.Add(1) == 1 && c.first != nil {
+					c.first(h)
+				}
+			}
+			beforeChunkSnapshot = func() {
+				if before.Add(1) == 2 && c.second != nil {
+					c.second(h)
+				}
+			}
+			t.Cleanup(func() { beforeStartReplication, afterChunkSnapshot, beforeChunkSnapshot = nil, nil, nil })
+			got := readCDC(t, s, pipeline, map[string]string{"users": ""}).changes(t, "users")
+			sameRows(t, merged(got), e.rows("users"))
+		})
+	}
+}
+
 // keepInserting has writers, each on a connection of its own, insert rows of
 // odd ids up to ids, and update, move and delete only rows they inserted.
-func keepInserting(t *testing.T, h *history, seed uint64, ids, changes int) {
+// wrote, if set, runs once the first writer has made 10 changes.
+func keepInserting(t *testing.T, h *history, seed uint64, ids, changes int, wrote func()) {
 	t.Helper()
 	var wg sync.WaitGroup
 	for w := range 4 {
@@ -395,7 +482,10 @@ func keepInserting(t *testing.T, h *history, seed uint64, ids, changes int) {
 					}
 				}
 			}
-			for range changes {
+			for i := range changes {
+				if i == 10 && w == 0 && wrote != nil {
+					wrote()
+				}
 				switch n := rng.IntN(6); {
 				case len(ours) == 0 || n < 2:
 					id := fresh()
@@ -431,16 +521,46 @@ func TestCDCKeyRangesAppendRowsInsertedWhileReadOnce(t *testing.T) {
 			h := e.newHistory(3000)
 			e.exec("ANALYZE $schema.users")
 			s, pipeline := e.cdcSource(`, "snapshotChunkRows": 13`)
+			// The writers start in the snapshot's second round of chunks,
+			// which waits for their first changes, so they write while
+			// it's read.
+			var chunks atomic.Int64
+			reading, wrote := make(chan struct{}), make(chan struct{})
+			afterChunkSnapshot = func() {
+				if chunks.Add(1) != 8 {
+					return
+				}
+				close(reading)
+				select {
+				case <-wrote:
+				case <-time.After(30 * time.Second):
+					t.Error("no writes while the snapshot was read")
+				}
+			}
+			t.Cleanup(func() { afterChunkSnapshot = nil })
 			c := &capture{}
 			t.Cleanup(c.release)
 			ctx, cancel := context.WithCancel(t.Context())
 			f := &following{capture: c, cancel: cancel, done: make(chan error, 1)}
 			req := cdcRequest(pipeline, true, map[string]string{"users": ""})
 			req.Lanes = 4
-			go func() { f.done <- s.Read(ctx, req, c) }()
-			// The slot's there by the first resume point.
-			f.await(t, "a resume point", func() bool { return f.last("users") != "" })
-			keepInserting(t, h, uint64(run), 6400, 150)
+			ended := make(chan struct{})
+			go func() {
+				f.done <- s.Read(ctx, req, c)
+				close(ended)
+			}()
+			t.Cleanup(func() {
+				cancel()
+				<-ended
+			})
+			select {
+			case <-reading:
+			case err := <-f.done:
+				t.Fatalf("the read ended before its snapshot's second round: %v", err)
+			case <-time.After(30 * time.Second):
+				t.Fatal("waited for the snapshot's second round")
+			}
+			keepInserting(t, h, uint64(run), 6400, 150, func() { close(wrote) })
 			var end string
 			if err := e.conn.QueryRow(t.Context(), "SELECT pg_current_wal_lsn()::text").Scan(&end); err != nil {
 				t.Fatal(err)
@@ -484,7 +604,7 @@ func TestCDCRestartsMidSnapshotAfterInserts(t *testing.T) {
 	if st := stateOf(t, state); st.Snapshot == nil {
 		t.Fatalf("stopped at %s", state)
 	}
-	keepInserting(t, h, 7, 3200, 150)
+	keepInserting(t, h, 7, 3200, 150, nil)
 	rest := e.readCDCLanes(s, pipeline, 3, map[string]string{"users": state})
 	got := append(first.changes(t, "users"), rest.changes(t, "users")...)
 	h.appendsOnce(t, got)
