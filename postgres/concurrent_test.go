@@ -5,7 +5,6 @@ package postgres
 import (
 	"context"
 	"errors"
-	"fmt"
 	"strconv"
 	"sync"
 	"testing"
@@ -20,7 +19,8 @@ import (
 // connection, all succeed, whichever of them the server lets create it:
 // lanes a generation's alive table; pipelines a new schema, with its fence
 // and marker tables; and writers one target table, or one read's table,
-// each with a column of its own, which the table then has every one of.
+// each with a column of its own, which the table then has every one of. A
+// column that writers widen at once ends at the widest of their types.
 func TestConcurrentCreates(t *testing.T) {
 	const writers, rounds = 8, 30
 	e := newEnv(t)
@@ -51,6 +51,15 @@ func TestConcurrentCreates(t *testing.T) {
 		if err := errors.Join(errs...); err != nil {
 			t.Fatal(err)
 		}
+	}
+	// one is q's one value, as text.
+	one := func(t *testing.T, q string, args ...any) string {
+		t.Helper()
+		var v string
+		if err := e.conn.QueryRow(ctx, q, args...).Scan(&v); err != nil {
+			t.Fatal(err)
+		}
+		return v
 	}
 	// Each writer's columns: id, and one of its own.
 	columns := make([][]column, writers)
@@ -94,9 +103,41 @@ func TestConcurrentCreates(t *testing.T) {
 			for _, w := range ws {
 				_ = w.Close(ctx)
 			}
-			var n int
-			if err := e.conn.QueryRow(ctx, "SELECT count(*) FROM "+pgx.Identifier{schema, "_openetl_fence"}.Sanitize()).Scan(&n); err != nil || n != writers {
-				t.Fatalf("round %d: %d fences, %v", r, n, err)
+			if n := one(t, "SELECT count(*)::text FROM "+pgx.Identifier{schema, "_openetl_fence"}.Sanitize()); n != strconv.Itoa(writers) {
+				t.Fatalf("round %d: %s fences, want %d", r, n, writers)
+			}
+		}
+	})
+
+	// Writers that widen one column at once, to numeric(5,0) and to
+	// numeric(6,1), leave it at the wider whatever their order.
+	t.Run("widen", func(t *testing.T) {
+		wide := make([]*writer, writers)
+		cols := make([][]column, writers)
+		for i := range wide {
+			w, err := e.d.Open(ctx, destination.OpenConfig{Pipeline: "p1", Generation: 1, Lane: i, Namespace: e.schema, Scope: destination.ScopePipeline,
+				Streams: []destination.Stream{{Name: "s", Mode: destination.Append, AllowTypeChanges: true}}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			wide[i] = w.(*writer)
+			t.Cleanup(func() { _ = w.Close(context.Background()) })
+			v := &arrow.Decimal128Type{Precision: 5, Scale: 0}
+			if i%2 == 1 {
+				v = &arrow.Decimal128Type{Precision: 6, Scale: 1}
+			}
+			if cols[i], err = columnsOf(arrow.NewSchema([]arrow.Field{idField, {Name: "v", Type: v, Nullable: true}}, nil)); err != nil {
+				t.Fatal(err)
+			}
+		}
+		for r := range rounds {
+			table := pgx.Identifier{e.schema, "widen_" + strconv.Itoa(r)}.Sanitize()
+			if _, err := e.conn.Exec(ctx, "CREATE TABLE "+table+" (id bigint, v numeric(4,0))"); err != nil {
+				t.Fatal(err)
+			}
+			together(t, wide, func(i int, w *writer) error { return w.ensureTable(ctx, "s", "widen_"+strconv.Itoa(r), cols[i]) })
+			if typ := one(t, "SELECT format_type(atttypid, atttypmod) FROM pg_attribute WHERE attrelid = to_regclass($1) AND attname = 'v'", table); typ != "numeric(6,1)" {
+				t.Fatalf("round %d: v is %s, want numeric(6,1)", r, typ)
 			}
 		}
 	})
@@ -111,8 +152,8 @@ func TestConcurrentCreates(t *testing.T) {
 					}
 					return w.ensureTable(ctx, "s", table, columns[i])
 				})
-				if n := e.count(fmt.Sprintf("SELECT count(*) FROM information_schema.columns WHERE table_schema = '%s' AND table_name = '%s'", e.schema, table)); n != writers+1 {
-					t.Fatalf("round %d: %s has %d columns, want %d", r, table, n, writers+1)
+				if n := one(t, "SELECT count(*)::text FROM information_schema.columns WHERE table_schema = $1 AND table_name = $2", e.schema, table); n != strconv.Itoa(writers+1) {
+					t.Fatalf("round %d: %s has %s columns, want %d", r, table, n, writers+1)
 				}
 			}
 		})

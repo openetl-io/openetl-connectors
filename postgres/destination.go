@@ -1285,6 +1285,11 @@ func (w *writer) ApplySchema(ctx context.Context, streams []destination.StreamSc
 	out.Limits = make(map[string]destination.TableLimits, len(streams))
 	for i, s := range streams {
 		t := have[tables[i]]
+		if t == nil {
+			if t, err = w.create(ctx, tables[i], want[i]); err != nil {
+				return destination.SchemaApplied{}, err
+			}
+		}
 		refused, err := w.alter(ctx, tables[i], want[i], t, w.streams[s.Name].AllowTypeChanges)
 		if err != nil {
 			return destination.SchemaApplied{}, err
@@ -1292,9 +1297,6 @@ func (w *writer) ApplySchema(ctx context.Context, streams []destination.StreamSc
 		for _, r := range refused {
 			r.Stream = s.Name
 			out.Refused = append(out.Refused, r)
-		}
-		if t == nil {
-			t = &tableInfo{attrs: len(want[i])}
 		}
 		out.Limits[s.Name] = t.limits()
 		w.SetTable(s.Name, tables[i])
@@ -1309,7 +1311,13 @@ func (w *writer) ensureTable(ctx context.Context, stream, table string, cols []c
 	if err != nil {
 		return err
 	}
-	refused, err := w.alter(ctx, table, cols, have[table], w.streams[stream].AllowTypeChanges)
+	t := have[table]
+	if t == nil {
+		if t, err = w.create(ctx, table, cols); err != nil {
+			return err
+		}
+	}
+	refused, err := w.alter(ctx, table, cols, t, w.streams[stream].AllowTypeChanges)
 	if err != nil {
 		return err
 	}
@@ -1382,27 +1390,31 @@ func (w *writer) catalog(ctx context.Context, tables []string) (map[string]*tabl
 	return out, nil
 }
 
-// alter creates the table with cols if it doesn't exist, or adds its new
-// columns in one ALTER TABLE, and returns the columns it refused, with why.
-// It widens a column's type only if the stream allows type changes, since
-// that can rewrite the table. have is updated to match.
-func (w *writer) alter(ctx context.Context, table string, cols []column, have *tableInfo, allow bool) ([]destination.RefusedColumn, error) {
-	if have == nil {
-		err := w.ddl(ctx, "CREATE TABLE IF NOT EXISTS "+w.ident(table)+" ("+columnDefs(cols)+")")
-		if err != nil && !w.createdMeanwhile(ctx, err, relationExists, w.ident(table)) {
-			return nil, fmt.Errorf("postgres: create %s: %w", table, err)
-		}
-		// Another writer may have created it first, without some of cols.
-		got, err := w.catalog(ctx, []string{table})
-		if err != nil {
-			return nil, err
-		}
-		// The catalog lists a table by its columns, so one without any isn't
-		// in it.
-		if have = got[table]; have == nil {
-			have = &tableInfo{notNull: map[string]bool{}}
-		}
+// create creates table with cols if it doesn't exist, and gives it as the
+// catalog has it then: another writer may have created it first, without
+// some of cols, which alter then adds.
+func (w *writer) create(ctx context.Context, table string, cols []column) (*tableInfo, error) {
+	err := w.ddl(ctx, "CREATE TABLE IF NOT EXISTS "+w.ident(table)+" ("+columnDefs(cols)+")")
+	if err != nil && !w.createdMeanwhile(ctx, err, relationExists, w.ident(table)) {
+		return nil, fmt.Errorf("postgres: create %s: %w", table, err)
 	}
+	got, err := w.catalog(ctx, []string{table})
+	if err != nil {
+		return nil, err
+	}
+	// The catalog lists a table by its columns, so one without any isn't in
+	// it.
+	if t := got[table]; t != nil {
+		return t, nil
+	}
+	return &tableInfo{notNull: map[string]bool{}}, nil
+}
+
+// alter adds the columns of cols that the table, as have has it, lacks, in
+// one ALTER TABLE, and returns the columns it refused, with why. It widens
+// a column's type only if the stream allows type changes, since that can
+// rewrite the table. have is updated to match.
+func (w *writer) alter(ctx context.Context, table string, cols []column, have *tableInfo, allow bool) ([]destination.RefusedColumn, error) {
 	var refused []destination.RefusedColumn
 	full := func(c column, why string) destination.RefusedColumn {
 		return destination.RefusedColumn{Column: c.name, Reason: "it takes no more columns: " + why, ToType: c.typ}
@@ -1445,7 +1457,24 @@ func (w *writer) alter(ctx context.Context, table string, cols []column, have *t
 	for _, i := range slices.Sorted(maps.Keys(widen)) {
 		c := widen[i]
 		q := pgx.Identifier{c.name}.Sanitize()
-		err := w.ddl(ctx, "ALTER TABLE "+w.ident(table)+" ALTER COLUMN "+q+" TYPE "+c.typ+" USING "+q+"::"+c.typ)
+		// The type the column has under the ALTER's lock: another writer may
+		// have changed it since the catalog was read, and a widening never
+		// narrows it.
+		var now string
+		err := w.ddlFunc(ctx, func(tx pgx.Tx) error {
+			if _, err := tx.Exec(ctx, "LOCK TABLE "+w.ident(table)+" IN ACCESS EXCLUSIVE MODE"); err != nil {
+				return err
+			}
+			if err := tx.QueryRow(ctx, `SELECT format_type(atttypid, atttypmod) FROM pg_attribute
+				WHERE attrelid = to_regclass($1) AND attname = $2 AND attnum > 0 AND NOT attisdropped`, w.ident(table), c.name).Scan(&now); err != nil {
+				return err
+			}
+			if widens(c.typ, now) || !widens(now, c.typ) {
+				return nil
+			}
+			_, err := tx.Exec(ctx, "ALTER TABLE "+w.ident(table)+" ALTER COLUMN "+q+" TYPE "+c.typ+" USING "+q+"::"+c.typ)
+			return err
+		})
 		// Such as a view that depends on the column.
 		if pe, ok := errors.AsType[*pgconn.PgError](err); ok && pe.Code == "0A000" {
 			refused = append(refused, destination.RefusedColumn{Column: c.name, Reason: "it can't change the column's type: " + pe.Message, FromType: have.cols[i].typ, ToType: c.typ})
@@ -1454,7 +1483,17 @@ func (w *writer) alter(ctx context.Context, table string, cols []column, have *t
 		if err != nil {
 			return nil, fmt.Errorf("postgres: change the type of column %q of %s to %s: %w", c.name, table, c.typ, err)
 		}
-		have.cols[i].typ = c.typ
+		switch {
+		case widens(c.typ, now):
+			have.cols[i].typ = now
+		case !widens(now, c.typ):
+			have.cols[i].typ = now
+			refused = append(refused, destination.RefusedColumn{
+				Column: c.name, Reason: fmt.Sprintf("it can't change a column from %s to %s", now, c.typ), FromType: now, ToType: c.typ,
+			})
+		default:
+			have.cols[i].typ = c.typ
+		}
 	}
 	if len(clauses) == 0 {
 		return refused, nil
@@ -1503,6 +1542,15 @@ var (
 )
 
 func (w *writer) ddl(ctx context.Context, stmt string) error {
+	return w.ddlFunc(ctx, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, stmt)
+		return err
+	})
+}
+
+// ddlFunc runs f in a transaction whose locks wait up to lockTimeout, and
+// again, after a backoff, when they don't come in that time.
+func (w *writer) ddlFunc(ctx context.Context, f func(tx pgx.Tx) error) error {
 	backoff := lockTimeout / 5
 	var err error
 	for range ddlAttempts {
@@ -1510,8 +1558,7 @@ func (w *writer) ddl(ctx context.Context, stmt string) error {
 			if _, err := tx.Exec(ctx, fmt.Sprintf("SET LOCAL lock_timeout = %d", lockTimeout.Milliseconds())); err != nil {
 				return err
 			}
-			_, err := tx.Exec(ctx, stmt)
-			return err
+			return f(tx)
 		})
 		if pe, ok := errors.AsType[*pgconn.PgError](err); !ok || pe.Code != "55P03" {
 			return err
