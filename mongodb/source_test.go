@@ -5,6 +5,7 @@ package mongodb
 import (
 	"context"
 	"fmt"
+	"slices"
 	"testing"
 	"time"
 
@@ -117,6 +118,87 @@ func TestSourceSampleSize(t *testing.T) {
 	cs = discovered(t, newTestSource(t, db, ""), "c")
 	if _, ok := cs.Schema.FieldsByName("rare"); !ok {
 		t.Errorf("reading every document didn't declare rare: %s", cs.Schema)
+	}
+}
+
+// Discovery reads a collection of several chunks as aggregations over its
+// _id ranges, none of which reads every document, and declares what one
+// that reads them all does: each field and type below is in one document,
+// in a range of its own, where a sample would miss it.
+func TestDiscoverInRanges(t *testing.T) {
+	db := testDB(t)
+	var docs []any
+	for i := range 2000 {
+		doc := bson.D{{Key: "_id", Value: i}, {Key: "n", Value: i}, {Key: "s", Value: "x"}}
+		if i == 1234 {
+			doc = append(doc, bson.E{Key: "mid", Value: true})
+		}
+		docs = append(docs, doc)
+	}
+	docs = append(docs,
+		bson.D{{Key: "_id", Value: bson.MinKey{}}, {Key: "first", Value: int64(1)}},
+		bson.D{{Key: "_id", Value: nil}, {Key: "n", Value: 2}},
+		bson.D{{Key: "_id", Value: "text"}, {Key: "n", Value: 1.5}},
+		bson.D{{Key: "_id", Value: bson.NewObjectID()}, {Key: "at", Value: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)}},
+		bson.D{{Key: "_id", Value: bson.MaxKey{}}, {Key: "last", Value: bson.Binary{Subtype: bson.TypeBinaryUUID, Data: make([]byte, 16)}}},
+	)
+	insert(t, db.Collection("c"), docs...)
+	want := map[string]arrow.DataType{
+		"_id": arrow.BinaryTypes.String, "n": arrow.PrimitiveTypes.Float64, "s": arrow.BinaryTypes.String,
+		"mid": arrow.FixedWidthTypes.Boolean, "first": arrow.PrimitiveTypes.Int64, "at": timestampType, "last": extensions.NewUUIDType(),
+	}
+	for _, tc := range []struct {
+		config string
+		// Whether discovery's aggregations divide the documents, rather
+		// than one reading them all.
+		split bool
+	}{
+		{`, "chunkDocuments": 100`, true},
+		{`, "chunkDocuments": 100, "discoveryConnections": 1`, false},
+	} {
+		if err := db.RunCommand(t.Context(), bson.D{{Key: "profile", Value: 2}}).Err(); err != nil {
+			t.Fatal(err)
+		}
+		cs := discovered(t, newTestSource(t, db, tc.config), "c")
+		if err := db.RunCommand(t.Context(), bson.D{{Key: "profile", Value: 0}}).Err(); err != nil {
+			t.Fatal(err)
+		}
+		if cs.Schema.NumFields() != len(want) {
+			t.Errorf("%s: schema %s", tc.config, cs.Schema)
+		}
+		for _, f := range cs.Schema.Fields() {
+			if w, ok := want[f.Name]; !ok || !arrow.TypeEqual(f.Type, w) {
+				t.Errorf("%s: %s is declared %s, want %v", tc.config, f.Name, f.Type, w)
+			}
+		}
+
+		profile := db.Collection("system.profile")
+		cur, err := profile.Find(t.Context(), bson.D{{Key: "command.aggregate", Value: "c"}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var ops []struct {
+			Command struct {
+				Pipeline []bson.Raw `bson:"pipeline"`
+			} `bson:"command"`
+			DocsExamined int `bson:"docsExamined"`
+		}
+		if err := cur.All(t.Context(), &ops); err != nil {
+			t.Fatal(err)
+		}
+		if err := profile.Drop(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		aggregations, most, total := 0, 0, 0
+		for _, op := range ops {
+			if slices.ContainsFunc(op.Command.Pipeline, func(stage bson.Raw) bool { return stage.Lookup("$unwind").Type != 0 }) {
+				aggregations++
+				most, total = max(most, op.DocsExamined), total+op.DocsExamined
+			}
+		}
+		if split := aggregations > 1 && most < len(docs); split != tc.split || total != len(docs) {
+			t.Errorf("%s: %d aggregations examined %d documents, at most %d, of %d", tc.config, aggregations, total, most, len(docs))
+		}
 	}
 }
 

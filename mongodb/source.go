@@ -34,6 +34,9 @@ type SourceConfig struct {
 	// How many documents of each collection discovery reads, at random, to
 	// find its fields and their types. 0: every document.
 	SampleSize int `json:"sampleSize"`
+	// The most aggregations discovery runs at once, each over a collection
+	// or a range of its _ids. Default 4.
+	DiscoveryConnections int `json:"discoveryConnections"`
 	// Documents per query; each chunk ends at a resume point. Default 10000.
 	ChunkDocuments int `json:"chunkDocuments"`
 	// Each stream is _id and data, the whole document in canonical Extended
@@ -66,7 +69,7 @@ var (
 )
 
 func NewSource(config []byte) (*Source, error) {
-	cfg := SourceConfig{ChunkDocuments: 10_000}
+	cfg := SourceConfig{ChunkDocuments: 10_000, DiscoveryConnections: 4}
 	dec := json.NewDecoder(bytes.NewReader(config))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&cfg); err != nil {
@@ -77,8 +80,8 @@ func NewSource(config []byte) (*Source, error) {
 		return nil, errors.New("mongodb: config needs a uri")
 	case cfg.Database == "":
 		return nil, errors.New("mongodb: config needs a database")
-	case cfg.SampleSize < 0 || cfg.ChunkDocuments <= 0:
-		return nil, errors.New("mongodb: sampleSize can't be negative, and chunkDocuments must be positive")
+	case cfg.SampleSize < 0 || cfg.ChunkDocuments <= 0 || cfg.DiscoveryConnections <= 0:
+		return nil, errors.New("mongodb: sampleSize can't be negative, and chunkDocuments and discoveryConnections must be positive")
 	}
 	opts, err := clientOptions(cfg.URI.Reveal())
 	if err != nil {
@@ -136,24 +139,22 @@ func (s *Source) Discover(ctx context.Context) (source.Catalog, error) {
 	if err != nil {
 		return source.Catalog{}, err
 	}
+	var types []map[string][]string
+	if !s.cfg.Packed {
+		if types, err = s.fieldTypes(ctx, db, names); err != nil {
+			return source.Catalog{}, err
+		}
+	}
 	var cat source.Catalog
-	for _, name := range names {
+	for i, name := range names {
 		fields := []arrow.Field{{Name: "_id", Type: arrow.BinaryTypes.String}}
 		if s.cfg.Packed {
 			fields = append(fields, arrow.Field{Name: dataColumn, Type: jsonType, Nullable: true})
 		} else {
-			types, err := s.fieldTypes(ctx, db.Collection(name))
-			if err != nil {
-				return source.Catalog{}, err
-			}
-			for _, f := range slices.Sorted(func(yield func(string) bool) {
-				for k := range types {
-					if k != "_id" && !yield(k) {
-						return
-					}
+			for _, f := range slices.Sorted(maps.Keys(types[i])) {
+				if f != "_id" {
+					fields = append(fields, arrow.Field{Name: f, Type: fieldType(types[i][f]), Nullable: true})
 				}
-			}) {
-				fields = append(fields, arrow.Field{Name: f, Type: fieldType(types[f]), Nullable: true})
 			}
 		}
 		cs := source.CatalogStream{
@@ -169,28 +170,91 @@ func (s *Source) Discover(ctx context.Context) (source.Catalog, error) {
 	return cat, nil
 }
 
-// fieldTypes are the BSON types of each top-level field's values, as $type
-// names them, with "uuid" for 16-byte binaries of subtype 4: a binary's
-// length, then its subtype, orders it.
-func (s *Source) fieldTypes(ctx context.Context, coll *mongo.Collection) (map[string][]string, error) {
-	var lo, hi [16]byte
-	for i := range hi {
-		hi[i] = 0xff
+// fieldTypes are, for each collection named, the BSON types of each
+// top-level field's values, as $type names them, with "uuid" for 16-byte
+// binaries of subtype 4: from every document, or from sampleSize of them.
+// Up to discoveryConnections aggregations run at once, over every
+// collection's parts: where more than one may, a collection that isn't
+// sampled is read in the _id ranges cuts gives it, and else whole.
+func (s *Source) fieldTypes(ctx context.Context, db *mongo.Database, names []string) ([]map[string][]string, error) {
+	type part struct {
+		coll *mongo.Collection
+		// The collection's index in names.
+		of     int
+		lo, hi *value
+	}
+	var parts []part
+	for i, name := range names {
+		coll := db.Collection(name)
+		var cuts []*value
+		if s.cfg.SampleSize == 0 && s.cfg.DiscoveryConnections > 1 {
+			var err error
+			if cuts, err = s.cuts(ctx, coll); err != nil {
+				return nil, err
+			}
+		}
+		var lo *value
+		for _, hi := range append(cuts, nil) {
+			parts = append(parts, part{coll: coll, of: i, lo: lo, hi: hi})
+			lo = hi
+		}
+	}
+	found := make([]map[string][]string, len(parts))
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(s.cfg.DiscoveryConnections)
+	for j, p := range parts {
+		g.Go(func() (err error) {
+			found[j], err = s.rangeTypes(gctx, p.coll, p.lo, p.hi)
+			return err
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return nil, err
+	}
+	out := make([]map[string][]string, len(names))
+	for i := range out {
+		out[i] = map[string][]string{}
+	}
+	for j, p := range parts {
+		for f, ts := range found[j] {
+			out[p.of][f] = append(out[p.of][f], ts...)
+		}
+	}
+	for _, types := range out {
+		for f, ts := range types {
+			slices.Sort(ts)
+			types[f] = slices.Compact(ts)
+		}
+	}
+	return out, nil
+}
+
+// rangeTypes are the BSON types of each top-level field's values in the
+// documents of a collection whose _ids are from lo and below hi, nil for no
+// bound, or in sampleSize of them. A binary's length, then its subtype,
+// orders it, which finds the UUIDs.
+func (s *Source) rangeTypes(ctx context.Context, coll *mongo.Collection, lo, hi *value) (map[string][]string, error) {
+	var zeros, ones [16]byte
+	for i := range ones {
+		ones[i] = 0xff
 	}
 	typ := bson.D{{Key: "$let", Value: bson.D{
 		{Key: "vars", Value: bson.D{{Key: "t", Value: bson.D{{Key: "$type", Value: "$f.v"}}}}},
 		{Key: "in", Value: bson.D{{Key: "$cond", Value: bson.A{
 			bson.D{{Key: "$and", Value: bson.A{
 				bson.D{{Key: "$eq", Value: bson.A{"$$t", "binData"}}},
-				bson.D{{Key: "$gte", Value: bson.A{"$f.v", bson.Binary{Subtype: bson.TypeBinaryUUID, Data: lo[:]}}}},
-				bson.D{{Key: "$lte", Value: bson.A{"$f.v", bson.Binary{Subtype: bson.TypeBinaryUUID, Data: hi[:]}}}},
+				bson.D{{Key: "$gte", Value: bson.A{"$f.v", bson.Binary{Subtype: bson.TypeBinaryUUID, Data: zeros[:]}}}},
+				bson.D{{Key: "$lte", Value: bson.A{"$f.v", bson.Binary{Subtype: bson.TypeBinaryUUID, Data: ones[:]}}}},
 			}}},
 			"uuid", "$$t",
 		}}}},
 	}}}
 	var pipeline mongo.Pipeline
-	if s.cfg.SampleSize > 0 {
+	switch {
+	case s.cfg.SampleSize > 0:
 		pipeline = append(pipeline, bson.D{{Key: "$sample", Value: bson.D{{Key: "size", Value: s.cfg.SampleSize}}}})
+	case lo != nil || hi != nil:
+		pipeline = append(pipeline, idRange(lo, false, hi))
 	}
 	pipeline = append(pipeline,
 		bson.D{{Key: "$project", Value: bson.D{{Key: "_id", Value: 0}, {Key: "f", Value: bson.D{{Key: "$objectToArray", Value: "$$ROOT"}}}}}},
@@ -533,11 +597,11 @@ func (s *Source) knownFields(ctx context.Context, coll *mongo.Collection, cs sou
 	if cs.Columns != nil {
 		return cs.Columns, nil
 	}
-	types, err := s.fieldTypes(ctx, coll)
+	types, err := s.fieldTypes(ctx, coll.Database(), []string{coll.Name()})
 	if err != nil {
 		return nil, err
 	}
-	return slices.Sorted(maps.Keys(types)), nil
+	return slices.Sorted(maps.Keys(types[0])), nil
 }
 
 // batchBytes is about how many bytes of text a batch holds.
