@@ -63,24 +63,9 @@ func (s *Source) Splits(ctx context.Context, cs source.ConfiguredStream, ended [
 			return whole(st)
 		}
 	}
-	n, err := coll.EstimatedDocumentCount(ctx)
-	if err != nil {
-		return nil, classify(fmt.Errorf("mongodb: count %s: %w", cs.Name, err))
-	}
-	ranges := min(maxRanges, (n+int64(s.cfg.ChunkDocuments)-1)/int64(s.cfg.ChunkDocuments))
-	if ranges < 2 {
-		return whole(st)
-	}
-	bounds, err := sampleIDs(ctx, coll, int(ranges)*16, nil, nil)
+	cuts, err := s.cuts(ctx, coll)
 	if err != nil {
 		return nil, err
-	}
-	var cuts []*value
-	for i := 1; i < int(ranges) && len(bounds) > 0; i++ {
-		b := bounds[i*len(bounds)/int(ranges)]
-		if bound(b) && (len(cuts) == 0 || !cuts[len(cuts)-1].Equal(b.RawValue)) {
-			cuts = append(cuts, b)
-		}
 	}
 	if len(cuts) == 0 {
 		return whole(st)
@@ -103,25 +88,62 @@ func (s *Source) Splits(ctx context.Context, cs source.ConfiguredStream, ended [
 	return splits, nil
 }
 
-// sampleIDs are the _ids of n random documents, those strictly between lo
-// and hi where they're set, in the _id index's order: aggregation compares
-// values of different types in the order the index keeps them. A range is
-// sampled from the collection's sample, which is cheap, or where that has
-// fewer than two of its _ids, from all of them.
-func sampleIDs(ctx context.Context, coll *mongo.Collection, n int, lo, hi *value) ([]*value, error) {
+// cuts are the _ids that cut a collection into ranges of about
+// chunkDocuments documents, at most maxRanges of them, at a random sample's
+// _ids, in the _id index's order; none for a collection of one chunk.
+func (s *Source) cuts(ctx context.Context, coll *mongo.Collection) ([]*value, error) {
+	n, err := coll.EstimatedDocumentCount(ctx)
+	if err != nil {
+		return nil, classify(fmt.Errorf("mongodb: count %s: %w", coll.Name(), err))
+	}
+	ranges := min(maxRanges, (n+int64(s.cfg.ChunkDocuments)-1)/int64(s.cfg.ChunkDocuments))
+	if ranges < 2 {
+		return nil, nil
+	}
+	bounds, err := sampleIDs(ctx, coll, int(ranges)*16, nil, nil)
+	if err != nil {
+		return nil, err
+	}
+	var cuts []*value
+	for i := 1; i < int(ranges) && len(bounds) > 0; i++ {
+		b := bounds[i*len(bounds)/int(ranges)]
+		if bound(b) && (len(cuts) == 0 || !cuts[len(cuts)-1].Equal(b.RawValue)) {
+			cuts = append(cuts, b)
+		}
+	}
+	return cuts, nil
+}
+
+// idRange is a $match of the _ids from lo, or after it if after is set, and
+// below hi, nil for no bound, in the _id index's order: aggregation compares
+// values of different types in the order the index keeps them, and the
+// index bounds the scan.
+func idRange(lo *value, after bool, hi *value) bson.D {
 	// $literal, so that a bound such as the string "$a" isn't a field path.
 	var in bson.A
 	if lo != nil {
-		in = append(in, bson.D{{Key: "$gt", Value: bson.A{"$_id", bson.D{{Key: "$literal", Value: lo.RawValue}}}}})
+		op := "$gte"
+		if after {
+			op = "$gt"
+		}
+		in = append(in, bson.D{{Key: op, Value: bson.A{"$_id", bson.D{{Key: "$literal", Value: lo.RawValue}}}}})
 	}
 	if hi != nil {
 		in = append(in, bson.D{{Key: "$lt", Value: bson.A{"$_id", bson.D{{Key: "$literal", Value: hi.RawValue}}}}})
 	}
+	return bson.D{{Key: "$match", Value: bson.D{{Key: "$expr", Value: bson.D{{Key: "$and", Value: in}}}}}}
+}
+
+// sampleIDs are the _ids of n random documents, those strictly between lo
+// and hi where they're set, in the _id index's order. A range is sampled
+// from the collection's sample, which is cheap, or where that has fewer
+// than two of its _ids, from all of them.
+func sampleIDs(ctx context.Context, coll *mongo.Collection, n int, lo, hi *value) ([]*value, error) {
 	sample := bson.D{{Key: "$sample", Value: bson.D{{Key: "size", Value: n}}}}
-	if len(in) == 0 {
+	if lo == nil && hi == nil {
 		return aggregateIDs(ctx, coll, mongo.Pipeline{sample})
 	}
-	match := bson.D{{Key: "$match", Value: bson.D{{Key: "$expr", Value: bson.D{{Key: "$and", Value: in}}}}}}
+	match := idRange(lo, true, hi)
 	ids, err := aggregateIDs(ctx, coll, mongo.Pipeline{sample, match})
 	if err != nil || len(ids) >= 2 {
 		return ids, err

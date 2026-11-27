@@ -43,7 +43,7 @@ func valid(t *testing.T, what string, checks []check.Check, fields ...string) {
 // The lists are valid for any config and request, streams whose names make
 // the same check name included, and hold what the config calls for.
 func TestCheckLists(t *testing.T) {
-	srcFields := []string{"uri", "database", "collections", "sampleSize", "chunkDocuments", "packed"}
+	srcFields := []string{"uri", "database", "collections", "sampleSize", "discoveryConnections", "chunkDocuments", "packed"}
 	for _, tc := range []struct {
 		config string
 		want   []string
