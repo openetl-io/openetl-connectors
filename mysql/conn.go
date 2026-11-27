@@ -10,6 +10,8 @@ import (
 	"fmt"
 	"net"
 	"net/url"
+	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -22,13 +24,16 @@ import (
 // user:password@tcp(host:3306)/database?param=value, or as a URL,
 // mysql://user:password@host:3306/database?param=value. It refuses a
 // parameter the driver doesn't take that doesn't set a session variable,
-// and a collation that isn't a name.
+// one of the driver's spelled in another case, and a collation that isn't
+// a name. allowPublicKeyRetrieval=true, which other MySQL clients take, is
+// left out: the connector's clients, the binlog's too, ask the server for
+// its public key without it.
 func parseDSN(dsn string) (*mysql.Config, error) {
 	u, err := url.Parse(dsn)
 	var c *mysql.Config
 	if err != nil || (u.Scheme != "mysql" && u.Scheme != "mariadb") {
-		if c, err = mysql.ParseDSN(dsn); err != nil {
-			return nil, fmt.Errorf("mysql: dsn: %w", err)
+		if c, err = driverDSN(dsn); err != nil {
+			return nil, err
 		}
 	} else {
 		host := u.Host
@@ -36,12 +41,22 @@ func parseDSN(dsn string) (*mysql.Config, error) {
 			host = net.JoinHostPort(u.Hostname(), "3306")
 		}
 		pass, _ := u.User.Password()
-		if c, err = mysql.ParseDSN(fmt.Sprintf("tcp(%s)/%s?%s", host, strings.TrimPrefix(u.Path, "/"), u.RawQuery)); err != nil {
-			return nil, fmt.Errorf("mysql: dsn: %w", err)
+		if c, err = driverDSN(fmt.Sprintf("tcp(%s)/%s?%s", host, strings.TrimPrefix(u.Path, "/"), u.RawQuery)); err != nil {
+			return nil, err
 		}
 		c.User, c.Passwd = u.User.Username(), pass
 	}
-	for k := range c.Params {
+	for k, v := range c.Params {
+		if i := slices.IndexFunc(driverParams, func(p string) bool { return strings.EqualFold(p, k) }); i >= 0 {
+			return nil, fmt.Errorf("mysql: dsn: the driver's parameter %q is spelled %q", k, driverParams[i])
+		}
+		if strings.EqualFold(k, "allowPublicKeyRetrieval") {
+			if on, err := strconv.ParseBool(v); err != nil || !on {
+				return nil, fmt.Errorf("mysql: dsn: %s=%s can't hold: without TLS, the connector asks the server for its public key whenever the server wants the password; leave the parameter out, or connect with tls", k, v)
+			}
+			delete(c.Params, k)
+			continue
+		}
 		if _, ok := sessionVariable(k); !ok {
 			return nil, fmt.Errorf("mysql: dsn: the parameter %q doesn't set a session variable, as wait_timeout or @@session.wait_timeout would", k)
 		}
@@ -50,6 +65,29 @@ func parseDSN(dsn string) (*mysql.Config, error) {
 		return nil, fmt.Errorf("mysql: dsn: the collation %q isn't a collation's name", c.Collation)
 	}
 	return c, nil
+}
+
+// driverDSN is the driver's ParseDSN, which panics on a parameter it has
+// dropped, strict.
+func driverDSN(dsn string) (c *mysql.Config, err error) {
+	defer func() {
+		if p := recover(); p != nil {
+			c, err = nil, fmt.Errorf("mysql: dsn: %v", p)
+		}
+	}()
+	if c, err = mysql.ParseDSN(dsn); err != nil {
+		return nil, fmt.Errorf("mysql: dsn: %w", err)
+	}
+	return c, nil
+}
+
+// driverParams are the parameters the Go driver takes, spelled as it takes
+// them. strict, which it panics on, isn't among them.
+var driverParams = []string{
+	"allowAllFiles", "allowCleartextPasswords", "allowFallbackToPlaintext", "allowNativePasswords", "allowOldPasswords",
+	"charset", "checkConnLiveness", "clientFoundRows", "collation", "columnsWithAlias", "compress", "connectionAttributes",
+	"interpolateParams", "loc", "maxAllowedPacket", "multiStatements", "parseTime", "readTimeout", "rejectReadOnly",
+	"serverPubKey", "timeTruncate", "timeout", "tls", "writeTimeout",
 }
 
 // sessionVariable is the system variable that a DSN parameter's key sets
@@ -169,8 +207,16 @@ type sessionConnector struct {
 	set string
 }
 
+// unknownVariable is the server's error for a variable it doesn't have,
+// which, while the driver sets a connection up, only a DSN's parameter
+// names.
+const unknownVariable = 1193
+
 func (s sessionConnector) Connect(ctx context.Context) (driver.Conn, error) {
 	conn, err := s.Connector.Connect(ctx)
+	if n, _ := serverError(err); n == unknownVariable {
+		return nil, sdk.WithCode(configInvalidCode, fmt.Errorf("mysql: dsn: a parameter is neither one of the Go driver's nor a session variable of the server: %w", err))
+	}
 	if err != nil {
 		return nil, err
 	}

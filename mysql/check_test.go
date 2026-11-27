@@ -117,6 +117,25 @@ func TestSourceCheckItems(t *testing.T) {
 		if got["db.connect"] != "failed credentials_rejected" || got["tables.read"] != "skipped" || got["cdc.log-bin"] != "skipped" {
 			t.Errorf("with a wrong password: %v", got)
 		}
+
+		// allowPublicKeyRetrieval=true isn't the server's to set, and a
+		// variable the server doesn't have is the dsn's mistake.
+		sep := "?"
+		if strings.Contains(srv.dsn, "?") {
+			sep = "&"
+		}
+		retrieve, err := NewSource(fmt.Appendf(nil, `{"dsn": %q, "database": %q}`, srv.dsn+sep+"allowPublicKeyRetrieval=true", e.database))
+		if err != nil {
+			t.Fatal(err)
+		}
+		expectItems(t, connectortest.Items(t, retrieve.Checks()), nil)
+		unknown, err := NewSource(fmt.Appendf(nil, `{"dsn": %q, "database": %q}`, srv.dsn+sep+"no_such_variable=1", e.database))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := connectortest.Items(t, unknown.Checks()); got["db.connect"] != "failed config_invalid" || got["tables.read"] != "skipped" {
+			t.Errorf("with a variable the server doesn't have: %v", got)
+		}
 	})
 }
 

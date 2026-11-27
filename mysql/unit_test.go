@@ -20,6 +20,7 @@ import (
 
 	"github.com/openetl-io/openetl-connectors/connectortest"
 	sdk "github.com/openetl-io/openetl/sdk/go"
+	"github.com/openetl-io/openetl/sdk/go/check"
 	protocolv1 "github.com/openetl-io/openetl/sdk/go/protocol/v1"
 	"github.com/openetl-io/openetl/sdk/go/source"
 )
@@ -382,11 +383,66 @@ func TestSessionsAreUTF8WithBackslashEscapes(t *testing.T) {
 	}
 }
 
+// The driver's own parameters are the driver's, by the spelling it takes,
+// and the rest are session variables: allowPublicKeyRetrieval=true, which
+// asks for what the driver does without it, isn't sent to the server, and
+// a parameter the driver drops is refused rather than panicking.
+func TestDriverParameters(t *testing.T) {
+	for _, name := range driverParams {
+		if c, err := mysql.ParseDSN("u:p@tcp(h)/d?" + name + "=x"); err == nil && c.Params[name] != "" {
+			t.Errorf("%s isn't a parameter of the driver's", name)
+		}
+	}
+	if c, err := mysql.ParseDSN("u:p@tcp(h)/d?allowPublicKeyRetrieval=true"); err != nil || c.Params["allowPublicKeyRetrieval"] == "" {
+		t.Errorf("allowPublicKeyRetrieval is the driver's: %+v %v", c, err)
+	}
+
+	for _, dsn := range []string{"u:p@tcp(h)/d?allowPublicKeyRetrieval=true", "mysql://u:p@h/d?AllowPublicKeyRetrieval=1&wait_timeout=60"} {
+		c, err := parseDSN(dsn)
+		if err != nil {
+			t.Fatalf("%s: %v", dsn, err)
+		}
+		cfg, err := connConfig(c)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := cfg.Params["allowpublickeyretrieval"]; ok {
+			t.Errorf("%s: sent to the server as a session variable: %v", dsn, cfg.Params)
+		}
+	}
+
+	for dsn, want := range map[string]string{
+		"u:p@tcp(h)/d?allowPublicKeyRetrieval=false": "allowPublicKeyRetrieval",
+		"u:p@tcp(h)/d?ParseTime=true":                `spelled "parseTime"`,
+		"u:p@tcp(h)/d?TLS=true":                      `spelled "tls"`,
+		"u:p@tcp(h)/d?strict=true":                   "strict mode has been removed",
+	} {
+		_, err := parseDSN(dsn)
+		if err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("%s: %v, want an error with %q", dsn, err, want)
+		}
+	}
+}
+
+// A connection whose DSN sets a variable the server doesn't have fails as
+// invalid config, saying it's the DSN's, and its check says so too.
+func TestUnknownSessionVariableIsConfig(t *testing.T) {
+	unknown := &mysql.MySQLError{Number: 1193, Message: "Unknown system variable 'allowpublickeyretrieval'"}
+	s := sessionConnector{Connector: fakeConnector{fail: unknown}, set: "SET x = 1"}
+	_, err := s.Connect(context.Background())
+	if code := connectortest.CodeOf(classify(fmt.Errorf("mysql: connect: %w", err))); code != protocolv1.ErrorCode_ERROR_CODE_CONFIG_INVALID || !strings.Contains(err.Error(), "dsn") {
+		t.Errorf("%v (%v)", err, code)
+	}
+	if f := failure(err); f == nil || f.Reason != check.ConfigInvalid.Name || !strings.Contains(f.Message, "dsn") {
+		t.Errorf("the check's failure: %+v", f)
+	}
+}
+
 // A session's statement runs once the driver's connection is set up, and a
 // connection it fails on is closed.
 func TestSessionConnectorSetsLast(t *testing.T) {
 	conn := &fakeConn{}
-	s := sessionConnector{Connector: fakeConnector{conn}, set: "SET x = 1"}
+	s := sessionConnector{Connector: fakeConnector{conn: conn}, set: "SET x = 1"}
 	if _, err := s.Connect(context.Background()); err != nil || !slices.Equal(conn.ran, []string{"SET x = 1"}) || conn.closed {
 		t.Fatalf("%v %v", conn, err)
 	}
@@ -396,10 +452,19 @@ func TestSessionConnectorSetsLast(t *testing.T) {
 	}
 }
 
-type fakeConnector struct{ conn *fakeConn }
+type fakeConnector struct {
+	conn *fakeConn
+	fail error
+}
 
-func (f fakeConnector) Connect(context.Context) (driver.Conn, error) { return f.conn, nil }
-func (f fakeConnector) Driver() driver.Driver                        { return nil }
+func (f fakeConnector) Connect(context.Context) (driver.Conn, error) {
+	if f.fail != nil {
+		return nil, f.fail
+	}
+	return f.conn, nil
+}
+
+func (f fakeConnector) Driver() driver.Driver { return nil }
 
 type fakeConn struct {
 	ran    []string
