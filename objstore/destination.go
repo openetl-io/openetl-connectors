@@ -512,6 +512,7 @@ func (w *writer) apply(ctx context.Context, d staged, st stagedStream, copies *s
 		return err
 	}
 	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(commitConcurrency)
 	for _, f := range st.Files {
 		g.Go(func() error {
 			if err := copies.Acquire(gctx, 1); err != nil {
