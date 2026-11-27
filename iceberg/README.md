@@ -156,6 +156,77 @@ Each commit adds a snapshot, and a metadata file, to each table it writes, and t
 
 An epoch's data files are in its tables' locations from when they're written until the epoch commits, which can be long after for a pipeline that stops with an epoch staged, and a table's catalog knows nothing of them until then. A `remove_orphan_files` that runs with an `older_than` shorter than that deletes them, and the epoch can't commit: its recovery reports it lost. An overwrite read's files are there too, out of the table, until the read ends, with its manifests under the table's `_openetl/reads`; a paused stream's read goes on once the stream is resumed. Keep `older_than` longer than a pipeline may stay stopped or a stream paused, and longer than an overwrite read takes.
 
+## Throughput
+
+OpenETL 0.2.0-alpha, with the `postgres` and `iceberg` packages at 0.2.0-alpha, ran three full refreshes of one Postgres table into an Iceberg table in AWS Glue and Amazon S3. Each run succeeded at its first attempt.
+
+| Run | Sync time | Rows/s | MB/s | GB/hour | CPU-seconds per GB | Job peak memory |
+|---|---:|---:|---:|---:|---:|---:|
+| 1 | 31.539 s | 1,204,733 | 340.3 | 1,225.2 | 11.76 | 5,857 MiB |
+| 2 | 32.229 s | 1,178,945 | 333.0 | 1,199.0 | 11.78 | 4,902 MiB |
+| 3 | 30.092 s | 1,262,685 | 356.7 | 1,284.1 | 11.62 | 5,845 MiB |
+| Mean | 31.29 s | 1,215,454 | 343.3 | 1,236.1 | 11.72 | 5,857 MiB, the highest |
+
+The sync time is the sync's own record, its end time less its start time. It includes placing the job, starting the connectors and the engine, planning, reading, writing and every commit. The spread of the three times, the slowest less the fastest over the mean, is 6.8%. The rates are of the source table's heap without its indexes: 10,733,748,224 bytes and 37,996,289 rows. MB is 1,000,000 bytes and GB is 1,000,000,000 bytes. The CPU time and the peak memory are the job's, for the engine and both connectors, from the sync's record.
+
+| Part | Set-up |
+|---|---|
+| Data | One table of 16 columns and 37,996,289 rows, 267 bytes a row on average, stored in key order, with no nulls: `id bigint` primary key, `f1` and `f2 bigint`, `f3 integer`, `f4` and `f5 double precision`, `f6 numeric(18,4)`, `f7 boolean`, `f10` and `f11 date`, `f12 timestamptz`, and five `text` columns, `f8`, `f9` and `f13` to `f15`. Each text value is 32 characters of base64 cut from SHA-512 digests of the key, so it compresses poorly. |
+| Source | Postgres 18.7 (`postgres:18`) with `shared_buffers=12GB`. `pg_prewarm` read the table and its key's index into the buffers before each run. The source read on up to 8 connections, without TLS. |
+| Runner | EC2 `c8g.2xlarge` in `ap-southeast-2a`: 8 vCPUs (Graviton4), 16 GiB, network up to 15 Gbit/s, and a 60 GB gp3 disk at 6,000 IOPS and 400 MB/s. It ran OpenETL's Compose stack from the release's `compose.yml`, with `OPENETL_RESERVE=0,1Gi` so that a job of 8 vCPUs fits. The job had 8 vCPUs, 13 GiB and 8 lanes. |
+| Database machine | EC2 `c8g.4xlarge` in the same zone: 16 vCPUs, 32 GiB, and a 300 GB gp3 disk at 16,000 IOPS and 1,000 MB/s. Postgres ran there alone, in Docker with host networking, on the private network. |
+| Catalog and table | AWS Glue, with the warehouse in an S3 bucket, both in `ap-southeast-2`. The connectors used the runner's instance role (`OPENETL_CONNECTOR_AWS_CREDENTIALS=inherit`). Each run wrote into a Glue database of its own, to a table that the destination created with its defaults: format 2, unpartitioned, Parquet with zstd at level 1. |
+| Packages | `postgres` and `iceberg`, at the version above, from `openetl connector apply oci://ghcr.io/openetl-io/openetl-connectors/NAME:VERSION`, on linux/arm64. |
+
+Each run used these specs, with a pipeline and a namespace of its own. The source's DSN had `sslmode=disable`. The yearly schedule starts no sync during a run, so `openetl sync` started each one.
+
+```yaml
+apiVersion: openetl.io/v1alpha1
+kind: Source
+metadata: { name: pg-full }
+spec:
+  connector: postgres
+  config: { dsn: { secret: pg-src-dsn }, schema: data, tables: [bench], maxConnections: 8 }
+---
+apiVersion: openetl.io/v1alpha1
+kind: Destination
+metadata: { name: ice }
+spec:
+  connector: iceberg
+  config: { catalog: glue, region: ap-southeast-2, warehouse: s3://BUCKET/iceberg }
+---
+apiVersion: openetl.io/v1alpha1
+kind: Pipeline
+metadata: { name: pg-to-iceberg }
+spec:
+  schedule: { cron: "0 0 1 1 *" }
+  heal: { mode: "off" }
+  resources: { size: { cpu: 8, memory: 13Gi } }
+  delivery: { commit: { scope: stream } }
+  source:
+    ref: pg-full
+    streams:
+      - { name: bench, sync: full_refresh }
+  destination:
+    ref: ice
+    namespace: NAMESPACE
+```
+
+Before each timed sync, a sync of a one-row copy of the table, under the same stream name, created the Glue table. The timed sync then replaced the table's rows, as `overwrite` is the default write mode for a full refresh. Delivery was exactly once, with a commit every 256 MB that the source read (`delivery.commit.maxBytes`), the defaults. The time does not include making the data, the one-row sync, or reading the table into Postgres's cache.
+
+The runner's CPU limited the runs. The read, until 99% of the source's bytes had reached the runner, took 19.4 to 20.1 s. In it, the runner was 88 to 90% busy: `destination-iceberg` used 3.2 to 3.4 cores and `source-postgres` 1.6 to 1.7. The runner's network received about 625 MB/s and sent about 360 MB/s. In each run, its ENA driver counted 0.9 to 1.3 million packets over the outbound bandwidth allowance (`bw_out_allowance_exceeded`) and 55,000 to 126,000 over the inbound one. These counters do not show how much time that cost. Postgres used about 1.9 cores and had room. The commits to Glue then took 10 to 12 s.
+
+After each run, Amazon Athena queried the Glue table. Its row count, its count of distinct `id`s, and its sums of `f1`, `f6` and the lengths of `f8` were equal to the source's in all three runs.
+
+These numbers are for one case:
+
+- One row shape: 16 columns, 267 bytes a row, with five random strings that compress poorly. Wider or narrower rows, other types and text that compresses change every number.
+- One machine size: a runner of 8 vCPUs and 16 GiB, with 8 lanes, whose CPU was the limit. A larger runner, or several workers (`resources.workers`), changes the numbers.
+- A cached source: Postgres read the table from its shared buffers. A source that reads from disk is slower.
+- A full refresh of one stream. No CDC, no incremental reads, no merges and no transforms.
+- Postgres in Docker on a neighboring EC2 machine, not a managed service, whose storage, network and CPU differ.
+- Three runs, one after another: the spread is that of three runs, not a distribution.
+
 ## Limits
 
 - New tables are unpartitioned and unsorted: the destination has no setting for a new table's partitioning or sort order. Partition a table with an engine that can, such as Spark's `ALTER TABLE … ADD PARTITION FIELD`, and the destination writes into its partitions from then on.

@@ -99,12 +99,13 @@ func (d *Destination) Open(ctx context.Context, cfg destination.OpenConfig) (des
 		return nil, classify(fmt.Errorf("postgres: connect: %w", err))
 	}
 	w := &writer{
-		pool:    pool,
-		cfg:     cfg,
-		schema:  cfg.Namespace,
-		Epochs:  sqlstage.NewEpochs[*stagingTable](),
-		streams: map[string]destination.Stream{},
-		indexed: map[string]bool{},
+		pool:     pool,
+		cfg:      cfg,
+		schema:   cfg.Namespace,
+		Epochs:   sqlstage.NewEpochs[*stagingTable](),
+		streams:  map[string]destination.Stream{},
+		indexed:  map[string]bool{},
+		unlogged: cfg.Scope != destination.ScopeStream,
 	}
 	if w.schema == "" {
 		w.schema = d.cfg.Schema
@@ -126,6 +127,12 @@ type writer struct {
 	// Only Commit and Recover use it: tables with an _openetl_id index, or
 	// one on their key.
 	indexed map[string]bool
+	// Stage creates unlogged staging: with pipeline scope, where an epoch is
+	// applied whole or not at all, so one whose staging a crash emptied is
+	// lost whole and read again.
+	unlogged bool
+	// The generation whose alive table Stage made sure of; 0 for none.
+	alive uint64
 }
 
 type stagingTable struct {
@@ -179,8 +186,7 @@ func (w *writer) Stage(ctx context.Context, tables map[uint64]map[string]*stagin
 	st := byStream[stream]
 	if st == nil {
 		st = &stagingTable{Table: sqlstage.Table{Name: name, Target: target, Key: key}}
-		label := sqlstage.StagingLabel{Pipeline: w.cfg.Pipeline, Generation: e.Generation, Epoch: e.N}
-		if err := w.createLabelled(ctx, st.Name, label, cols); err != nil {
+		if err := w.createStaging(ctx, st.Name, e, cols); err != nil {
 			return nil, fmt.Errorf("postgres: create staging for %s: %w", stream, err)
 		}
 		st.cols = cols
@@ -190,8 +196,7 @@ func (w *writer) Stage(ctx context.Context, tables map[uint64]map[string]*stagin
 	} else if wider != nil {
 		st.Earlier = append(st.Earlier, st.Name)
 		st.Name = name + "_" + strconv.Itoa(len(st.Earlier)+1)
-		label := sqlstage.StagingLabel{Pipeline: w.cfg.Pipeline, Generation: e.Generation, Epoch: e.N}
-		if err := w.createLabelled(ctx, st.Name, label, wider); err != nil {
+		if err := w.createStaging(ctx, st.Name, e, wider); err != nil {
 			return nil, fmt.Errorf("postgres: create staging for %s: %w", stream, err)
 		}
 		st.cols = wider
@@ -254,18 +259,87 @@ func stageError(stream string, cols []column, err error) error {
 	return sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_DATA_INVALID, fmt.Errorf("postgres: stage %s: %w", stream, err))
 }
 
-func (w *writer) createLabelled(ctx context.Context, name string, label any, cols []column) error {
+// createLabelled runs create, which creates the table name if it doesn't
+// exist, and labels the table.
+func (w *writer) createLabelled(ctx context.Context, create, name string, label any) error {
 	b, err := json.Marshal(label)
 	if err != nil {
 		return err
 	}
 	return pgx.BeginFunc(ctx, w.pool, func(tx pgx.Tx) error {
-		if _, err := tx.Exec(ctx, "CREATE TABLE IF NOT EXISTS "+w.ident(name)+" ("+columnDefs(cols)+")"); err != nil {
+		if _, err := tx.Exec(ctx, create); err != nil {
 			return err
 		}
 		_, err := tx.Exec(ctx, "COMMENT ON TABLE "+w.ident(name)+" IS "+quoteLiteral(string(b)))
 		return err
 	})
+}
+
+// createStaging creates a staging table of epoch e, unlogged once its
+// generation's alive table is there to say whether a crash emptied it.
+func (w *writer) createStaging(ctx context.Context, name string, e destination.Epoch, cols []column) error {
+	if w.unlogged {
+		if err := w.ensureAlive(ctx, e.Generation); err != nil {
+			return err
+		}
+	}
+	label := sqlstage.StagingLabel{Pipeline: w.cfg.Pipeline, Generation: e.Generation, Epoch: e.N}
+	return w.createLabelled(ctx, stagingDDL(w.ident(name), cols, w.unlogged), name, label)
+}
+
+// stagingDDL creates a staging table. Unlogged, its rows write no WAL, nor
+// do the hint bits the apply's read sets, and checkpoints leave its pages.
+// Autovacuum never takes it: it lives until its epoch is applied, and a
+// worker on it would hold up the DROP that follows.
+func stagingDDL(table string, cols []column, unlogged bool) string {
+	persistence := ""
+	if unlogged {
+		persistence = "UNLOGGED "
+	}
+	return "CREATE " + persistence + "TABLE IF NOT EXISTS " + table + " (" + columnDefs(cols) + ") WITH (autovacuum_enabled = false)"
+}
+
+// aliveName names the unlogged table whose one row says that a generation's
+// unlogged staging still holds what was staged. A crash, or a failover to a
+// standby, empties every unlogged table, it among them, and nothing writes
+// its row again.
+func aliveName(pipeline string, gen uint64) string {
+	return sqlstage.HashName("_openetl_alive_", pipeline, strconv.FormatUint(gen, 10))
+}
+
+// ensureAlive creates generation gen's alive table, with its row, before any
+// of gen's unlogged staging. One that exists, emptied or not, stays as it is.
+func (w *writer) ensureAlive(ctx context.Context, gen uint64) error {
+	if w.alive == gen {
+		return nil
+	}
+	name := aliveName(w.cfg.Pipeline, gen)
+	label := sqlstage.StagingLabel{Pipeline: w.cfg.Pipeline, Generation: gen}
+	err := w.createLabelled(ctx, "CREATE UNLOGGED TABLE IF NOT EXISTS "+w.ident(name)+" AS SELECT true AS alive", name, label)
+	// Another lane created it at the same time, and committed.
+	if pe, ok := errors.AsType[*pgconn.PgError](err); ok && (pe.Code == "23505" || pe.Code == "42P07") {
+		err = nil
+	}
+	if err != nil {
+		return fmt.Errorf("postgres: create %s: %w", name, err)
+	}
+	w.alive = gen
+	return nil
+}
+
+// intact reports whether generation gen's unlogged staging holds what was
+// staged: its alive table has its row. In an apply's transaction, it holds
+// for what the transaction reads, since a crash would end it.
+func (w *writer) intact(ctx context.Context, q interface {
+	QueryRow(context.Context, string, ...any) pgx.Row
+}, gen uint64) (bool, error) {
+	name := w.ident(aliveName(w.cfg.Pipeline, gen))
+	var ok bool
+	if err := q.QueryRow(ctx, "SELECT to_regclass($1) IS NOT NULL", name).Scan(&ok); err != nil || !ok {
+		return false, err
+	}
+	err := q.QueryRow(ctx, "SELECT EXISTS (SELECT FROM "+name+")").Scan(&ok)
+	return ok, err
 }
 
 // quoteLiteral quotes s as Postgres's quote_literal does, whatever
@@ -299,8 +373,9 @@ func (w *writer) copyCast(ctx context.Context, st *stagingTable, cols []column, 
 			sel[i] = q + "::" + st.cols[j].typ
 		}
 	}
+	// Unlogged: it's dropped in the transaction that creates it.
 	return pgx.BeginFunc(ctx, w.pool, func(tx pgx.Tx) error {
-		if _, err := tx.Exec(ctx, "CREATE TABLE "+w.ident(tmp)+" ("+columnDefs(cols)+")"); err != nil {
+		if _, err := tx.Exec(ctx, "CREATE UNLOGGED TABLE "+w.ident(tmp)+" ("+columnDefs(cols)+")"); err != nil {
 			return err
 		}
 		if _, err := tx.CopyFrom(ctx, pgx.Identifier{w.schema, tmp}, names(cols), src); err != nil {
@@ -421,20 +496,49 @@ func (w *writer) Apply(ctx context.Context, desc staged, streams []stagedStream,
 			return err
 		}
 	}
-	if w.cfg.Scope == destination.ScopeStream {
+	unlogged, err := w.unloggedStaging(ctx, todo)
+	if err != nil {
+		return err
+	}
+	// Unlogged staging, from an attempt with pipeline scope, is applied in
+	// one transaction whatever the scope: a crash between two would leave
+	// the epoch partly applied, and the rest's staging emptied.
+	if w.cfg.Scope == destination.ScopeStream && !unlogged {
 		for _, s := range todo {
-			if err := w.applyTx(ctx, desc, []stagedStream{s}, prep, "FOR SHARE", collapsed); err != nil {
+			if err := w.applyTx(ctx, desc, []stagedStream{s}, prep, "FOR SHARE", false, collapsed); err != nil {
 				return err
 			}
 		}
-	} else if err := w.applyTx(ctx, desc, todo, prep, "FOR UPDATE", collapsed); err != nil {
+	} else if err := w.applyTx(ctx, desc, todo, prep, "FOR UPDATE", unlogged, collapsed); err != nil {
 		return err
 	}
 	w.DropStaging(ctx, todo)
 	return nil
 }
 
-func (w *writer) applyTx(ctx context.Context, desc staged, streams []stagedStream, prep map[string]prepared, lock string, collapsed map[string]uint64) error {
+// unloggedStaging reports whether any of streams' staging is unlogged.
+func (w *writer) unloggedStaging(ctx context.Context, streams []stagedStream) (bool, error) {
+	var tables []string
+	for _, s := range streams {
+		for _, t := range slices.Concat(s.Stagings, s.Patches) {
+			tables = append(tables, w.ident(t))
+		}
+	}
+	if len(tables) == 0 {
+		return false, nil
+	}
+	var unlogged bool
+	err := w.pool.QueryRow(ctx, `SELECT EXISTS (SELECT FROM unnest($1::text[]) t(name) JOIN pg_class c ON c.oid = to_regclass(t.name)
+		WHERE c.relpersistence = 'u')`, tables).Scan(&unlogged)
+	if err != nil {
+		return false, fmt.Errorf("postgres: read the staging's persistence: %w", err)
+	}
+	return unlogged, nil
+}
+
+// applyTx applies streams in one transaction. With unlogged staging, it
+// applies nothing unless the staging holds what was staged.
+func (w *writer) applyTx(ctx context.Context, desc staged, streams []stagedStream, prep map[string]prepared, lock string, unlogged bool, collapsed map[string]uint64) error {
 	skipped := map[string]uint64{}
 	err := pgx.BeginFunc(ctx, w.pool, func(tx pgx.Tx) error {
 		var fence uint64
@@ -447,6 +551,17 @@ func (w *writer) applyTx(ctx context.Context, desc staged, streams []stagedStrea
 		}
 		if fence > w.cfg.Generation {
 			return fmt.Errorf("%w: fence is %d, applier is %d", destination.ErrFenced, fence, w.cfg.Generation)
+		}
+		if unlogged {
+			ok, err := w.intact(ctx, tx, desc.Generation)
+			if err != nil {
+				return fmt.Errorf("postgres: read the staging's alive table: %w", err)
+			}
+			if !ok {
+				return sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_TRANSIENT, fmt.Errorf(
+					"postgres: the unlogged staging of epoch %d-g%d was emptied after it was staged, as a crash or a failover empties it; the next attempt reads the epoch again",
+					desc.Epoch, desc.Generation))
+			}
 		}
 		for _, s := range streams {
 			var done bool
@@ -1009,7 +1124,7 @@ func (w *writer) ensureRead(ctx context.Context, s stagedStream, cols []column) 
 			want[i] = targetType(c)
 		}
 		label := sqlstage.ReadLabel{Pipeline: w.cfg.Pipeline, Stream: s.Name, Table: s.Table}
-		if err := w.createLabelled(ctx, s.Read, label, want); err != nil {
+		if err := w.createLabelled(ctx, "CREATE TABLE IF NOT EXISTS "+w.ident(s.Read)+" ("+columnDefs(want)+")", s.Read, label); err != nil {
 			return fmt.Errorf("postgres: create the read table for %s: %w", s.Name, err)
 		}
 		return nil
@@ -1394,7 +1509,7 @@ func (w *writer) tableColumns(ctx context.Context, table string) ([]column, bool
 	if err != nil || len(cols) > 0 {
 		return cols, err == nil, err
 	}
-	ok, err := w.Exists(ctx, table)
+	ok, err := w.exists(ctx, table)
 	return cols, ok, err
 }
 
@@ -1470,12 +1585,33 @@ func (w *writer) Fence(ctx context.Context, gen uint64) error {
 	return nil
 }
 
-func (w *writer) Exists(ctx context.Context, table string) (bool, error) {
+func (w *writer) exists(ctx context.Context, table string) (bool, error) {
 	var ok bool
 	if err := w.pool.QueryRow(ctx, "SELECT to_regclass($1) IS NOT NULL", w.ident(table)).Scan(&ok); err != nil {
 		return false, err
 	}
 	return ok, nil
+}
+
+// Exists is what Recover asks of a staging table it would apply: whether it
+// holds what was staged. An unlogged one does only while its generation's
+// alive table has its row.
+func (w *writer) Exists(ctx context.Context, table string) (bool, error) {
+	var persistence string
+	var label *string
+	err := w.pool.QueryRow(ctx, "SELECT relpersistence::text, obj_description(oid, 'pg_class') FROM pg_class WHERE oid = to_regclass($1)",
+		w.ident(table)).Scan(&persistence, &label)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil || persistence != "u" {
+		return err == nil, err
+	}
+	var l sqlstage.StagingLabel
+	if label == nil || json.Unmarshal([]byte(*label), &l) != nil {
+		return false, nil
+	}
+	return w.intact(ctx, w.pool, l.Generation)
 }
 
 // TrimMarkers deletes the pipeline's markers below an applied epoch. Recovery
@@ -1511,14 +1647,16 @@ func (w *writer) labelled(ctx context.Context, q querier, prefix string) ([][2]s
 // it can be applied once HEAD's epoch is recovered: the fence stops their
 // commits. Best effort, like dropStaging.
 func (w *writer) DropStale(ctx context.Context, gen uint64) {
-	labelled, err := w.labelled(ctx, w.pool, "_openetl_stage_")
-	if err != nil {
-		return
-	}
-	for _, t := range labelled {
-		var l sqlstage.StagingLabel
-		if json.Unmarshal([]byte(t[1]), &l) == nil && l.Pipeline == w.cfg.Pipeline && l.Generation < gen {
-			_, _ = w.pool.Exec(ctx, "DROP TABLE IF EXISTS "+w.ident(t[0]))
+	for _, prefix := range []string{"_openetl_stage_", "_openetl_alive_"} {
+		labelled, err := w.labelled(ctx, w.pool, prefix)
+		if err != nil {
+			return
+		}
+		for _, t := range labelled {
+			var l sqlstage.StagingLabel
+			if json.Unmarshal([]byte(t[1]), &l) == nil && l.Pipeline == w.cfg.Pipeline && l.Generation < gen {
+				_, _ = w.pool.Exec(ctx, "DROP TABLE IF EXISTS "+w.ident(t[0]))
+			}
 		}
 	}
 }
