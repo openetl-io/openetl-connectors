@@ -1397,8 +1397,10 @@ func (w *writer) alter(ctx context.Context, table string, cols []column, have *t
 		if err != nil {
 			return nil, err
 		}
+		// The catalog lists a table by its columns, so one without any isn't
+		// in it.
 		if have = got[table]; have == nil {
-			return nil, fmt.Errorf("postgres: %s is gone after its CREATE", table)
+			have = &tableInfo{notNull: map[string]bool{}}
 		}
 	}
 	var refused []destination.RefusedColumn
