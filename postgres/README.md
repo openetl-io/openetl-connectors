@@ -217,6 +217,8 @@ All three write modes work:
 
 Each epoch is staged into tables of its own, then applied behind a fence row in `_openetl_fence` with a marker per stream in `_openetl_loads`: in one transaction for the epoch, or one per stream under the pipeline's `delivery.commit.scope: stream`. Before it takes the fence, it creates any missing target and read tables, adds new columns and builds indexes (`CREATE INDEX CONCURRENTLY`), outside that transaction. A replaced attempt can't apply, and an epoch is never applied twice. Append and overwrite also skip rows a source sends again, by their `_openetl_id`, and merge keeps each key's latest version. So a stream lands exactly once, or effectively once when it's merged from a source that may repeat rows, unless the pipeline asks for less. Leave `_openetl_fence` and `_openetl_loads` in place.
 
+With the default commit scope, `pipeline`, the staging tables are `UNLOGGED`: their rows write no WAL and don't reach standbys. A crash of the server, or a failover to a standby, empties unlogged tables, so an epoch that's staged but not yet applied when it happens is lost as a whole: its commit applies nothing, and OpenETL reads the epoch again from the source. An overwrite's read table, which holds the read's applied epochs until it ends, is logged, and so is staging under `delivery.commit.scope: stream`, whose streams are applied one at a time. Autovacuum leaves staging tables alone, as they last only until their epoch is applied.
+
 A continuous pipeline commits every 10 seconds unless it sets its own `delivery.commit.interval`.
 
 ### Set it up

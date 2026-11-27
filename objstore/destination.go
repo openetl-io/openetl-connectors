@@ -5,9 +5,12 @@
 // The destination writes each stream's table as a directory of Parquet, CSV
 // or JSON Lines files. Writes stream each stream's batches into files staged
 // under the pipeline's _openetl/{pipeline}/staging, which PreCommit lists in
-// the writer lane's staged descriptor. Commit copies every lane's to names
-// derived from the pipeline, the epoch, its generation and the lane, then
-// writes the stream's marker. A repeated or stale commit of an append copies
+// the writer lane's staged descriptor. Commit copies every lane's, several at
+// once, to names derived from the pipeline, the epoch, its generation and the
+// lane, then, once a stream's are all in place, writes the stream's marker,
+// and once every stream's is written, deletes the staged files. A failure
+// partway leaves each stream with any of its files copied and no marker,
+// which Recover applies again. A repeated or stale commit of an append copies
 // the same files to the same names, so it needs no fence: an epoch is only
 // committed once the checkpoint log has recorded it, under the generation in
 // its names. An overwrite's files go to a directory of the read's, and the
@@ -32,6 +35,8 @@ import (
 	"github.com/apache/arrow-go/v18/arrow"
 	"gocloud.dev/blob"
 	"gocloud.dev/gcerrors"
+	"golang.org/x/sync/errgroup"
+	"golang.org/x/sync/semaphore"
 
 	"github.com/openetl-io/openetl/sdk/go/destination"
 
@@ -64,8 +69,8 @@ const (
 	manifestPath = "_symlink_format_manifest/manifest"
 )
 
-// DestinationCapabilities: files appear one at a time as Commit copies them,
-// so an epoch is never visible at once across streams.
+// DestinationCapabilities: files appear as Commit copies them, so an epoch is
+// never visible at once across streams.
 var DestinationCapabilities = destination.Capabilities{
 	Class:                 destination.StageAndApply,
 	Scopes:                []destination.Scope{destination.ScopeStream},
@@ -469,33 +474,56 @@ func (w *writer) Commit(ctx context.Context, e destination.Epoch, committables [
 	if err != nil {
 		return destination.Committed{}, err
 	}
-	for _, st := range d.Streams {
-		if err := w.apply(ctx, d, st); err != nil {
-			return destination.Committed{}, err
-		}
+	if err := w.applyAll(ctx, d, d.Streams); err != nil {
+		return destination.Committed{}, err
 	}
 	w.dropStaged(ctx, d)
 	return destination.Committed{}, nil
 }
 
-// apply copies each staged file to its target, swaps an ended read's
-// manifest in, then writes the stream's marker. A target whose staged file
-// is gone was copied by an earlier apply.
-func (w *writer) apply(ctx context.Context, d staged, st stagedStream) error {
+// commitConcurrency is how many files a commit copies at once, across its
+// streams, how many streams it applies at once, and how many files a cleanup
+// deletes at once. It's DestinationCapabilities' WriterLanes, so a stream's
+// part of an epoch that is one file per lane, as one under fileSize per lane
+// is, copies in one round. S3, GCS and Azure each take thousands of a
+// bucket's writes a second, and a copy within a bucket moves no bytes
+// through the connector.
+const commitConcurrency = 16
+
+// applyAll applies the streams. A stream that fails leaves the others to
+// finish, and applyAll returns the first error once they have.
+func (w *writer) applyAll(ctx context.Context, d staged, streams []stagedStream) error {
+	copies := semaphore.NewWeighted(commitConcurrency)
+	var g errgroup.Group
+	g.SetLimit(commitConcurrency)
+	for _, st := range streams {
+		g.Go(func() error { return w.apply(ctx, d, st, copies) })
+	}
+	return g.Wait()
+}
+
+// apply copies each staged file to its target, each copy holding one of
+// copies' slots, swaps an ended read's manifest in, then writes the stream's
+// marker. It writes neither unless every file was copied, and the first copy
+// that fails cancels the stream's others.
+func (w *writer) apply(ctx context.Context, d staged, st stagedStream, copies *semaphore.Weighted) error {
 	marker := w.marker(st.Name, d.Epoch, d.Generation)
 	if done, err := w.b.Exists(ctx, marker); err != nil || done {
 		return err
 	}
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(commitConcurrency)
 	for _, f := range st.Files {
-		err := w.b.Copy(ctx, f.Target, f.Staged, nil)
-		if gcerrors.Code(err) == gcerrors.NotFound {
-			if ok, xerr := w.b.Exists(ctx, f.Target); xerr == nil && ok {
-				err = nil
+		g.Go(func() error {
+			if err := copies.Acquire(gctx, 1); err != nil {
+				return err
 			}
-		}
-		if err != nil {
-			return fmt.Errorf("objstore: apply %s: %w", st.Name, err)
-		}
+			defer copies.Release(1)
+			return w.copyFile(gctx, st.Name, f)
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return err
 	}
 	if st.Ended {
 		if err := w.publish(ctx, d, st); err != nil {
@@ -508,6 +536,21 @@ func (w *writer) apply(ctx context.Context, d staged, st stagedStream) error {
 	}
 	if err := w.b.WriteAll(ctx, marker, body, w.d.store.writeOptions(w.b, blob.WriterOptions{ContentType: "application/json"}, nil)); err != nil {
 		return fmt.Errorf("objstore: write the marker of %s: %w", st.Name, err)
+	}
+	return nil
+}
+
+// copyFile copies the staged file to its target. A target whose staged file
+// is gone was copied by an earlier apply.
+func (w *writer) copyFile(ctx context.Context, stream string, f stagedFile) error {
+	err := w.b.Copy(ctx, f.Target, f.Staged, nil)
+	if gcerrors.Code(err) == gcerrors.NotFound {
+		if ok, xerr := w.b.Exists(ctx, f.Target); xerr == nil && ok {
+			return nil
+		}
+	}
+	if err != nil {
+		return fmt.Errorf("objstore: apply %s: %w", stream, err)
 	}
 	return nil
 }
@@ -621,13 +664,19 @@ func (w *writer) dropReads(ctx context.Context, table string, current int64) {
 }
 
 func (w *writer) deleteAll(ctx context.Context, prefix string) {
+	var g errgroup.Group
+	g.SetLimit(commitConcurrency)
+	defer func() { _ = g.Wait() }()
 	it := w.b.List(&blob.ListOptions{Prefix: prefix})
 	for {
 		f, err := it.Next(ctx)
 		if err != nil {
 			return
 		}
-		_ = w.b.Delete(ctx, f.Key)
+		g.Go(func() error {
+			_ = w.b.Delete(ctx, f.Key)
+			return nil
+		})
 	}
 }
 
@@ -638,11 +687,17 @@ func (w *writer) deleteAll(ctx context.Context, prefix string) {
 func (w *writer) dropStaged(ctx context.Context, d staged) {
 	ctx, cancel := context.WithTimeout(ctx, cleanupTimeout)
 	defer cancel()
+	var g errgroup.Group
+	g.SetLimit(commitConcurrency)
 	for _, st := range d.Streams {
 		for _, f := range st.Files {
-			_ = w.b.Delete(ctx, f.Staged)
+			g.Go(func() error {
+				_ = w.b.Delete(ctx, f.Staged)
+				return nil
+			})
 		}
 	}
+	_ = g.Wait()
 }
 
 func (w *writer) Recover(ctx context.Context, gen uint64, e destination.Epoch, committables []destination.Staged) (_ destination.Recovery, err error) {
@@ -698,10 +753,8 @@ func (w *writer) recover(ctx context.Context, e destination.Epoch, committables 
 		w.dropStaged(ctx, d)
 		return destination.Applied, nil
 	case present == needs:
-		for _, st := range missing {
-			if err := w.apply(ctx, d, st); err != nil {
-				return 0, err
-			}
+		if err := w.applyAll(ctx, d, missing); err != nil {
+			return 0, err
 		}
 		w.dropStaged(ctx, d)
 		return destination.Redone, nil
