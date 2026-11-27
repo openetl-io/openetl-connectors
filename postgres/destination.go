@@ -299,6 +299,36 @@ func stagingDDL(table string, cols []column, unlogged bool) string {
 	return "CREATE " + persistence + "TABLE IF NOT EXISTS " + table + " (" + columnDefs(cols) + ") WITH (autovacuum_enabled = false)"
 }
 
+// Queries of whether a relation, by its quoted name, and a schema exist.
+const (
+	relationExists = "SELECT to_regclass($1) IS NOT NULL"
+	schemaExists   = "SELECT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = $1)"
+)
+
+// createdMeanwhile reports whether err, a CREATE ... IF NOT EXISTS's, says
+// only that another session created the same object between the
+// statement's check and its own entry in the catalog, and the object
+// exists now, as exists, given name, says. The server tells it as a
+// unique violation on a catalog's index, or as the object, or a table's
+// row type, existing already.
+func (w *writer) createdMeanwhile(ctx context.Context, err error, exists, name string) bool {
+	pe, ok := errors.AsType[*pgconn.PgError](err)
+	if !ok {
+		return false
+	}
+	switch pe.Code {
+	case "42P06", "42P07", "42710":
+	case "23505":
+		if !strings.HasPrefix(pe.ConstraintName, "pg_") {
+			return false
+		}
+	default:
+		return false
+	}
+	var there bool
+	return w.pool.QueryRow(ctx, exists, name).Scan(&there) == nil && there
+}
+
 // aliveName names the unlogged table whose one row says that a generation's
 // unlogged staging still holds what was staged. A crash, or a failover to a
 // standby, empties every unlogged table, it among them, and nothing writes
@@ -316,11 +346,7 @@ func (w *writer) ensureAlive(ctx context.Context, gen uint64) error {
 	name := aliveName(w.cfg.Pipeline, gen)
 	label := sqlstage.StagingLabel{Pipeline: w.cfg.Pipeline, Generation: gen}
 	err := w.createLabelled(ctx, "CREATE UNLOGGED TABLE IF NOT EXISTS "+w.ident(name)+" AS SELECT true AS alive", name, label)
-	// Another lane created it at the same time, and committed.
-	if pe, ok := errors.AsType[*pgconn.PgError](err); ok && (pe.Code == "23505" || pe.Code == "42P07") {
-		err = nil
-	}
-	if err != nil {
+	if err != nil && !w.createdMeanwhile(ctx, err, relationExists, w.ident(name)) {
 		return fmt.Errorf("postgres: create %s: %w", name, err)
 	}
 	w.alive = gen
@@ -1124,10 +1150,17 @@ func (w *writer) ensureRead(ctx context.Context, s stagedStream, cols []column) 
 			want[i] = targetType(c)
 		}
 		label := sqlstage.ReadLabel{Pipeline: w.cfg.Pipeline, Stream: s.Name, Table: s.Table}
-		if err := w.createLabelled(ctx, "CREATE TABLE IF NOT EXISTS "+w.ident(s.Read)+" ("+columnDefs(want)+")", s.Read, label); err != nil {
+		err := w.createLabelled(ctx, "CREATE TABLE IF NOT EXISTS "+w.ident(s.Read)+" ("+columnDefs(want)+")", s.Read, label)
+		if err != nil && !w.createdMeanwhile(ctx, err, relationExists, w.ident(s.Read)) {
 			return fmt.Errorf("postgres: create the read table for %s: %w", s.Name, err)
 		}
-		return nil
+		// Another writer may have created it first, without some of cols.
+		if have, ok, err = w.tableColumns(ctx, s.Read); err != nil {
+			return err
+		}
+		if !ok {
+			return fmt.Errorf("postgres: the read table for %s is gone", s.Name)
+		}
 	}
 	for _, c := range have {
 		t := targetType(c)
@@ -1355,10 +1388,18 @@ func (w *writer) catalog(ctx context.Context, tables []string) (map[string]*tabl
 // that can rewrite the table. have is updated to match.
 func (w *writer) alter(ctx context.Context, table string, cols []column, have *tableInfo, allow bool) ([]destination.RefusedColumn, error) {
 	if have == nil {
-		if err := w.ddl(ctx, "CREATE TABLE IF NOT EXISTS "+w.ident(table)+" ("+columnDefs(cols)+")"); err != nil {
+		err := w.ddl(ctx, "CREATE TABLE IF NOT EXISTS "+w.ident(table)+" ("+columnDefs(cols)+")")
+		if err != nil && !w.createdMeanwhile(ctx, err, relationExists, w.ident(table)) {
 			return nil, fmt.Errorf("postgres: create %s: %w", table, err)
 		}
-		return nil, nil
+		// Another writer may have created it first, without some of cols.
+		got, err := w.catalog(ctx, []string{table})
+		if err != nil {
+			return nil, err
+		}
+		if have = got[table]; have == nil {
+			return nil, fmt.Errorf("postgres: %s is gone after its CREATE", table)
+		}
 	}
 	var refused []destination.RefusedColumn
 	full := func(c column, why string) destination.RefusedColumn {
@@ -1543,13 +1584,14 @@ func (w *writer) DropStaging(ctx context.Context, streams []stagedStream) {
 // user with CREATE on only the schema, as on public, lacks.
 func (w *writer) ensureSchema(ctx context.Context) error {
 	var exists bool
-	if err := w.pool.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = $1)", w.schema).Scan(&exists); err != nil {
+	if err := w.pool.QueryRow(ctx, schemaExists, w.schema).Scan(&exists); err != nil {
 		return classify(fmt.Errorf("postgres: schema %s: %w", w.schema, err))
 	}
 	if exists {
 		return nil
 	}
-	if _, err := w.pool.Exec(ctx, "CREATE SCHEMA IF NOT EXISTS "+pgx.Identifier{w.schema}.Sanitize()); err != nil {
+	_, err := w.pool.Exec(ctx, "CREATE SCHEMA IF NOT EXISTS "+pgx.Identifier{w.schema}.Sanitize())
+	if err != nil && !w.createdMeanwhile(ctx, err, schemaExists, w.schema) {
 		return classify(fmt.Errorf("postgres: create schema %s: %w", w.schema, err))
 	}
 	return nil
@@ -1561,13 +1603,15 @@ func (w *writer) Fence(ctx context.Context, gen uint64) error {
 	if err := w.ensureSchema(ctx); err != nil {
 		return err
 	}
-	for _, q := range []string{
-		"CREATE TABLE IF NOT EXISTS " + w.ident("_openetl_fence") + " (pipeline text PRIMARY KEY, generation bigint NOT NULL)",
-		"CREATE TABLE IF NOT EXISTS " + w.ident("_openetl_loads") + ` (pipeline text NOT NULL, stream text NOT NULL,
+	// Each pipeline writing the schema creates them if they're missing.
+	for _, t := range [][2]string{
+		{"_openetl_fence", "(pipeline text PRIMARY KEY, generation bigint NOT NULL)"},
+		{"_openetl_loads", `(pipeline text NOT NULL, stream text NOT NULL,
 			generation bigint NOT NULL, epoch bigint NOT NULL, loaded_at timestamptz NOT NULL DEFAULT now(),
-			PRIMARY KEY (pipeline, stream, generation, epoch))`,
+			PRIMARY KEY (pipeline, stream, generation, epoch))`},
 	} {
-		if _, err := w.pool.Exec(ctx, q); err != nil {
+		_, err := w.pool.Exec(ctx, "CREATE TABLE IF NOT EXISTS "+w.ident(t[0])+" "+t[1])
+		if err != nil && !w.createdMeanwhile(ctx, err, relationExists, w.ident(t[0])) {
 			return classify(fmt.Errorf("postgres: prepare %s: %w", w.schema, err))
 		}
 	}
