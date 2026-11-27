@@ -214,7 +214,7 @@ func testVersion(t *testing.T, db *mongo.Database) serverVersion {
 // server's profiler on, and checks that it declares want, and that its
 // aggregations examine each document once: several, none of them all, if
 // split, and else one. A clustered scan examines the document past its
-// range's end too, before it stops.
+// range's end too, before it stops: one at each boundary between ranges.
 func discoveryWork(t *testing.T, db *mongo.Database, s *Source, what string, n int, split bool, want map[string]arrow.DataType) {
 	t.Helper()
 	if err := db.RunCommand(t.Context(), bson.D{{Key: "profile", Value: 2}}).Err(); err != nil {
@@ -258,7 +258,7 @@ func discoveryWork(t *testing.T, db *mongo.Database, s *Source, what string, n i
 		}
 	}
 	divided := aggregations > 1 && most < n
-	if divided != split || total < n || total > n+aggregations || !divided && aggregations != 1 {
+	if divided != split || total < n || total > n+aggregations-1 || !divided && aggregations != 1 {
 		t.Errorf("%s: %d aggregations examined %d documents, at most %d, of %d; want them divided: %v", what, aggregations, total, most, n, split)
 	}
 }
