@@ -184,11 +184,11 @@ A table keeps what an earlier mode wrote, and the destination doesn't use it aga
 
 ### Exactly once
 
-Writes go to staging first. To commit an epoch, the destination copies each staged file to its final name, then writes the stream's marker. An epoch is committed only once OpenETL's checkpoint has recorded it, under the generation in its file names, and a repeated commit copies the same files to the same names, so a file never appears twice. The marker shows that an epoch is done.
+Writes go to staging first. To commit an epoch, the destination copies the staged files to their final names, 16 at a time, and writes each stream's marker once all of the stream's files are in place. It deletes the staged files once every stream's marker is written. An epoch is committed only once OpenETL's checkpoint has recorded it, under the generation in its file names, and a repeated commit copies the same files to the same names, so a file never appears twice. The marker shows that an epoch is done.
 
 Streams whose source replays exactly land exactly once. A stream whose source may send rows again, such as a Postgres table read incrementally, or this package's own source, gets at least once: the destination can't drop the rows sent again, so a pipeline with such a stream has to accept that with `delivery: { require: at_least_once }`, and readers drop the repeats by `_openetl_id`.
 
-In append mode each file appears when it's copied, so readers can see part of an epoch while it commits, and different streams' files land at different times.
+In append mode each file appears when it's copied, in no set order, so readers can see part of an epoch while it commits, and different streams' files land at different times.
 
 A continuous pipeline commits every minute unless it sets its own `delivery.commit.interval`. Each commit adds at least one file per stream, so shorter intervals make more, smaller files.
 
