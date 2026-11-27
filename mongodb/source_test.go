@@ -12,6 +12,8 @@ import (
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/extensions"
 	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/mongo"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
 
 	"github.com/openetl-io/openetl-connectors/connectortest"
 	protocolv1 "github.com/openetl-io/openetl/sdk/go/protocol/v1"
@@ -122,9 +124,10 @@ func TestSourceSampleSize(t *testing.T) {
 }
 
 // Discovery reads a collection of several chunks as aggregations over its
-// _id ranges, none of which reads every document, and declares what one
-// that reads them all does: each field and type below is in one document,
-// in a range of its own, where a sample would miss it.
+// _id ranges, where the server bounds them, none of which reads every
+// document, and declares what one that reads them all does: each field and
+// type below is in one document, in a range of its own, where a sample would
+// miss it.
 func TestDiscoverInRanges(t *testing.T) {
 	db := testDB(t)
 	var docs []any
@@ -147,58 +150,115 @@ func TestDiscoverInRanges(t *testing.T) {
 		"_id": arrow.BinaryTypes.String, "n": arrow.PrimitiveTypes.Float64, "s": arrow.BinaryTypes.String,
 		"mid": arrow.FixedWidthTypes.Boolean, "first": arrow.PrimitiveTypes.Int64, "at": timestampType, "last": extensions.NewUUIDType(),
 	}
+	v := testVersion(t, db)
 	for _, tc := range []struct {
 		config string
+		// The server's version as the source takes it; nil: as it is.
+		version *serverVersion
 		// Whether discovery's aggregations divide the documents, rather
 		// than one reading them all.
 		split bool
 	}{
-		{`, "chunkDocuments": 100`, true},
-		{`, "chunkDocuments": 100, "discoveryConnections": 1`, false},
+		{`, "chunkDocuments": 100`, nil, rangesBounded(v, false)},
+		{`, "chunkDocuments": 100, "discoveryConnections": 1`, nil, false},
+		// Where $expr's comparisons have no index bounds, each range would
+		// read every document.
+		{`, "chunkDocuments": 100`, &serverVersion{4, 4, 29}, false},
 	} {
-		if err := db.RunCommand(t.Context(), bson.D{{Key: "profile", Value: 2}}).Err(); err != nil {
-			t.Fatal(err)
-		}
-		cs := discovered(t, newTestSource(t, db, tc.config), "c")
-		if err := db.RunCommand(t.Context(), bson.D{{Key: "profile", Value: 0}}).Err(); err != nil {
-			t.Fatal(err)
-		}
-		if cs.Schema.NumFields() != len(want) {
-			t.Errorf("%s: schema %s", tc.config, cs.Schema)
-		}
-		for _, f := range cs.Schema.Fields() {
-			if w, ok := want[f.Name]; !ok || !arrow.TypeEqual(f.Type, w) {
-				t.Errorf("%s: %s is declared %s, want %v", tc.config, f.Name, f.Type, w)
-			}
-		}
+		s := newTestSource(t, db, tc.config)
+		s.version = tc.version
+		discoveryWork(t, db, s, fmt.Sprintf("%s on %v", tc.config, tc.version), len(docs), tc.split, want)
+	}
+}
 
-		profile := db.Collection("system.profile")
-		cur, err := profile.Find(t.Context(), bson.D{{Key: "command.aggregate", Value: "c"}})
-		if err != nil {
-			t.Fatal(err)
+// A clustered collection, which has no _id index, is read in ranges where
+// the server bounds its clustered scan by them, and else whole.
+func TestDiscoverClustered(t *testing.T) {
+	db := testDB(t)
+	v := testVersion(t, db)
+	if !v.atLeast(5, 3, 0) {
+		t.Skipf("MongoDB %v has no clustered collections", v)
+	}
+	clustered := options.CreateCollection().SetClusteredIndex(bson.D{{Key: "key", Value: bson.D{{Key: "_id", Value: 1}}}, {Key: "unique", Value: true}})
+	if err := db.CreateCollection(t.Context(), "c", clustered); err != nil {
+		t.Fatal(err)
+	}
+	var docs []any
+	for i := range 1000 {
+		docs = append(docs, bson.D{{Key: "_id", Value: i}, {Key: "n", Value: i}})
+	}
+	docs = append(docs,
+		bson.D{{Key: "_id", Value: "text"}, {Key: "n", Value: 1.5}},
+		bson.D{{Key: "_id", Value: bson.NewObjectID()}, {Key: "at", Value: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)}},
+	)
+	insert(t, db.Collection("c"), docs...)
+	want := map[string]arrow.DataType{"_id": arrow.BinaryTypes.String, "n": arrow.PrimitiveTypes.Float64, "at": timestampType}
+	discoveryWork(t, db, newTestSource(t, db, `, "chunkDocuments": 100`), "clustered", len(docs), rangesBounded(v, true), want)
+	// A release whose clustered scans take no bounds from $expr reads it
+	// whole, though it bounds a collection's _id index.
+	s := newTestSource(t, db, `, "chunkDocuments": 100`)
+	s.version = &serverVersion{7, 0, 12}
+	discoveryWork(t, db, s, "clustered on 7.0.12", len(docs), false, want)
+}
+
+func testVersion(t *testing.T, db *mongo.Database) serverVersion {
+	t.Helper()
+	v, err := newTestSource(t, db, "").buildVersion(t.Context(), db.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return v
+}
+
+// discoveryWork discovers collection c of n documents with s, with the
+// server's profiler on, and checks that it declares want, and that its
+// aggregations examine each document once: several, none of them all, if
+// split, and else one.
+func discoveryWork(t *testing.T, db *mongo.Database, s *Source, what string, n int, split bool, want map[string]arrow.DataType) {
+	t.Helper()
+	if err := db.RunCommand(t.Context(), bson.D{{Key: "profile", Value: 2}}).Err(); err != nil {
+		t.Fatal(err)
+	}
+	cs := discovered(t, s, "c")
+	if err := db.RunCommand(t.Context(), bson.D{{Key: "profile", Value: 0}}).Err(); err != nil {
+		t.Fatal(err)
+	}
+	if cs.Schema.NumFields() != len(want) {
+		t.Errorf("%s: schema %s", what, cs.Schema)
+	}
+	for _, f := range cs.Schema.Fields() {
+		if w, ok := want[f.Name]; !ok || !arrow.TypeEqual(f.Type, w) {
+			t.Errorf("%s: %s is declared %s, want %v", what, f.Name, f.Type, w)
 		}
-		var ops []struct {
-			Command struct {
-				Pipeline []bson.Raw `bson:"pipeline"`
-			} `bson:"command"`
-			DocsExamined int `bson:"docsExamined"`
+	}
+
+	profile := db.Collection("system.profile")
+	cur, err := profile.Find(t.Context(), bson.D{{Key: "command.aggregate", Value: "c"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ops []struct {
+		Command struct {
+			Pipeline []bson.Raw `bson:"pipeline"`
+		} `bson:"command"`
+		DocsExamined int `bson:"docsExamined"`
+	}
+	if err := cur.All(t.Context(), &ops); err != nil {
+		t.Fatal(err)
+	}
+	if err := profile.Drop(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	aggregations, most, total := 0, 0, 0
+	for _, op := range ops {
+		if slices.ContainsFunc(op.Command.Pipeline, func(stage bson.Raw) bool { return stage.Lookup("$unwind").Type != 0 }) {
+			aggregations++
+			most, total = max(most, op.DocsExamined), total+op.DocsExamined
 		}
-		if err := cur.All(t.Context(), &ops); err != nil {
-			t.Fatal(err)
-		}
-		if err := profile.Drop(t.Context()); err != nil {
-			t.Fatal(err)
-		}
-		aggregations, most, total := 0, 0, 0
-		for _, op := range ops {
-			if slices.ContainsFunc(op.Command.Pipeline, func(stage bson.Raw) bool { return stage.Lookup("$unwind").Type != 0 }) {
-				aggregations++
-				most, total = max(most, op.DocsExamined), total+op.DocsExamined
-			}
-		}
-		if split := aggregations > 1 && most < len(docs); split != tc.split || total != len(docs) {
-			t.Errorf("%s: %d aggregations examined %d documents, at most %d, of %d", tc.config, aggregations, total, most, len(docs))
-		}
+	}
+	divided := aggregations > 1 && most < n
+	if divided != split || total != n || !divided && aggregations != 1 {
+		t.Errorf("%s: %d aggregations examined %d documents, at most %d, of %d; want them divided: %v", what, aggregations, total, most, n, split)
 	}
 }
 

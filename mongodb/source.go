@@ -9,6 +9,7 @@ import (
 	"maps"
 	"slices"
 	"strings"
+	"sync"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/decimal128"
@@ -61,6 +62,10 @@ type Source struct {
 	// Holds a unit for each discovery aggregation running, over every call,
 	// as splits each find their fields where a read doesn't name them.
 	discovering *semaphore.Weighted
+	// The server's version, read by the first discovery that needs it; nil
+	// before.
+	versionMu sync.Mutex
+	version   *serverVersion
 
 	keysplit.Reads
 }
@@ -179,8 +184,8 @@ func (s *Source) Discover(ctx context.Context) (source.Catalog, error) {
 // binaries of subtype 4: from every document, or from sampleSize of them.
 // Up to discoveryConnections aggregations run at once, over every
 // collection's parts and every call's: where more than one may, a
-// collection that isn't sampled is read in the _id ranges cuts gives it,
-// and else whole.
+// collection that isn't sampled, and whose ranges the server bounds, is read
+// in the _id ranges cuts gives it, and else whole.
 func (s *Source) fieldTypes(ctx context.Context, db *mongo.Database, names []string) ([]map[string][]string, error) {
 	type part struct {
 		coll *mongo.Collection
@@ -188,11 +193,18 @@ func (s *Source) fieldTypes(ctx context.Context, db *mongo.Database, names []str
 		of     int
 		lo, hi *value
 	}
+	var ranged map[string]bool
+	if s.cfg.SampleSize == 0 && s.cfg.DiscoveryConnections > 1 {
+		var err error
+		if ranged, err = s.ranged(ctx, db, names); err != nil {
+			return nil, err
+		}
+	}
 	var parts []part
 	for i, name := range names {
 		coll := db.Collection(name)
 		var cuts []*value
-		if s.cfg.SampleSize == 0 && s.cfg.DiscoveryConnections > 1 {
+		if ranged[name] {
 			var err error
 			if cuts, err = s.cuts(ctx, coll); err != nil {
 				return nil, err
@@ -236,6 +248,81 @@ func (s *Source) fieldTypes(ctx context.Context, db *mongo.Database, names []str
 		}
 	}
 	return out, nil
+}
+
+// ranged are the collections named whose _id ranges the server bounds, as
+// rangesBounded says, which discovery reads in ranges.
+func (s *Source) ranged(ctx context.Context, db *mongo.Database, names []string) (map[string]bool, error) {
+	v, err := s.buildVersion(ctx, db.Client())
+	if err != nil || !rangesBounded(v, false) {
+		return nil, err
+	}
+	out := map[string]bool{}
+	for _, n := range names {
+		out[n] = true
+	}
+	if rangesBounded(v, true) {
+		return out, nil
+	}
+	specs, err := db.ListCollectionSpecifications(ctx, bson.D{{Key: "name", Value: bson.D{{Key: "$in", Value: names}}}})
+	if err != nil {
+		return nil, classify(fmt.Errorf("mongodb: list collections of %s: %w", db.Name(), err))
+	}
+	for _, sp := range specs {
+		if _, err := sp.Options.LookupErr("clusteredIndex"); err == nil {
+			out[sp.Name] = false
+		}
+	}
+	return out, nil
+}
+
+// serverVersion is a server's major, minor and patch version.
+type serverVersion [3]int
+
+func (v serverVersion) atLeast(major, minor, patch int) bool {
+	return slices.Compare(v[:], []int{major, minor, patch}) >= 0
+}
+
+// buildVersion is the version of the server c connects to, as buildInfo
+// gives it, read once: a sharded cluster's router's, which is upgraded
+// after its shards.
+func (s *Source) buildVersion(ctx context.Context, c *mongo.Client) (serverVersion, error) {
+	s.versionMu.Lock()
+	defer s.versionMu.Unlock()
+	if s.version != nil {
+		return *s.version, nil
+	}
+	var info struct {
+		VersionArray []int `bson:"versionArray"`
+	}
+	if err := c.Database("admin").RunCommand(ctx, bson.D{{Key: "buildInfo", Value: 1}}).Decode(&info); err != nil {
+		return serverVersion{}, classify(fmt.Errorf("mongodb: buildInfo: %w", err))
+	}
+	var v serverVersion
+	copy(v[:], info.VersionArray)
+	s.version = &v
+	return v, nil
+}
+
+// rangesBounded reports whether a server of version v bounds a range of
+// _ids, as idRange matches it, by the scan it plans, so that a range reads
+// only its own documents. The _id index bounds it from 5.0, which first
+// gives $expr's $gt, $gte, $lt and $lte index bounds. A clustered
+// collection, which has no _id index, bounds its clustered scan by them
+// from 6.0.17, 7.0.13 and 7.3; the releases before, and 6.1 to 6.3, 7.1 and
+// 7.2, scan it all.
+func rangesBounded(v serverVersion, clustered bool) bool {
+	switch {
+	case !clustered:
+		return v.atLeast(5, 0, 0)
+	case v.atLeast(7, 3, 0):
+		return true
+	case v.atLeast(7, 0, 13):
+		return !v.atLeast(7, 1, 0)
+	case v.atLeast(6, 0, 17):
+		return !v.atLeast(6, 1, 0)
+	}
+	return false
 }
 
 // rangeTypes are the BSON types of each top-level field's values in the
