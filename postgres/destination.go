@@ -1167,8 +1167,7 @@ func (w *writer) ensureRead(ctx context.Context, s stagedStream, cols []column) 
 		if t.typ == c.typ {
 			continue
 		}
-		q := pgx.Identifier{c.name}.Sanitize()
-		if err := w.ddl(ctx, "ALTER TABLE "+w.ident(s.Read)+" ALTER COLUMN "+q+" TYPE "+t.typ+" USING "+q+"::"+t.typ); err != nil {
+		if _, err := w.widenColumn(ctx, s.Read, c.name, t.typ); err != nil {
 			return fmt.Errorf("postgres: column %q of the read table for %s, as its target has it: %w", c.name, s.Name, err)
 		}
 	}
@@ -1456,25 +1455,7 @@ func (w *writer) alter(ctx context.Context, table string, cols []column, have *t
 	}
 	for _, i := range slices.Sorted(maps.Keys(widen)) {
 		c := widen[i]
-		q := pgx.Identifier{c.name}.Sanitize()
-		// The type the column has under the ALTER's lock: another writer may
-		// have changed it since the catalog was read, and a widening never
-		// narrows it.
-		var now string
-		err := w.ddlFunc(ctx, func(tx pgx.Tx) error {
-			if _, err := tx.Exec(ctx, "LOCK TABLE "+w.ident(table)+" IN ACCESS EXCLUSIVE MODE"); err != nil {
-				return err
-			}
-			if err := tx.QueryRow(ctx, `SELECT format_type(atttypid, atttypmod) FROM pg_attribute
-				WHERE attrelid = to_regclass($1) AND attname = $2 AND attnum > 0 AND NOT attisdropped`, w.ident(table), c.name).Scan(&now); err != nil {
-				return err
-			}
-			if widens(c.typ, now) || !widens(now, c.typ) {
-				return nil
-			}
-			_, err := tx.Exec(ctx, "ALTER TABLE "+w.ident(table)+" ALTER COLUMN "+q+" TYPE "+c.typ+" USING "+q+"::"+c.typ)
-			return err
-		})
+		now, err := w.widenColumn(ctx, table, c.name, c.typ)
 		// Such as a view that depends on the column.
 		if pe, ok := errors.AsType[*pgconn.PgError](err); ok && pe.Code == "0A000" {
 			refused = append(refused, destination.RefusedColumn{Column: c.name, Reason: "it can't change the column's type: " + pe.Message, FromType: have.cols[i].typ, ToType: c.typ})
@@ -1522,6 +1503,29 @@ func (w *writer) alter(ctx context.Context, table string, cols []column, have *t
 	have.attrs = attrs
 	have.cols = append(have.cols, changed...)
 	return refused, nil
+}
+
+// widenColumn changes the type of table's column name to typ, under the
+// table's lock, if its type then widens to typ and isn't as wide already:
+// another writer may have changed it since it was read, and a widening
+// never narrows it. now is its type then.
+func (w *writer) widenColumn(ctx context.Context, table, name, typ string) (now string, err error) {
+	q := pgx.Identifier{name}.Sanitize()
+	err = w.ddlFunc(ctx, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, "LOCK TABLE "+w.ident(table)+" IN ACCESS EXCLUSIVE MODE"); err != nil {
+			return err
+		}
+		if err := tx.QueryRow(ctx, `SELECT format_type(atttypid, atttypmod) FROM pg_attribute
+			WHERE attrelid = to_regclass($1) AND attname = $2 AND attnum > 0 AND NOT attisdropped`, w.ident(table), name).Scan(&now); err != nil {
+			return err
+		}
+		if widens(typ, now) || !widens(now, typ) {
+			return nil
+		}
+		_, err := tx.Exec(ctx, "ALTER TABLE "+w.ident(table)+" ALTER COLUMN "+q+" TYPE "+typ+" USING "+q+"::"+typ)
+		return err
+	})
+	return now, err
 }
 
 // refusal is why adding columns failed, if the table can't take them: it
