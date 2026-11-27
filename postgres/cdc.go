@@ -117,8 +117,8 @@ func (l *lsn) UnmarshalText(b []byte) error {
 	return err
 }
 
-// slotName is the pipeline's replication slot: the config's, or one named
-// after the pipeline.
+// slotName is the pipeline's replication slot: the config's, or openetl_ and
+// the lowercase letters and digits of pipeline, the pipeline's ID.
 func (s *Source) slotName(pipeline string) string {
 	if s.cfg.Slot != "" {
 		return s.cfg.Slot
@@ -613,8 +613,12 @@ func (r *cdcReader) createSlot(ctx context.Context) (pglogrepl.LSN, error) {
 	}
 	var at string
 	if err := r.conn.QueryRow(ctx, q, r.slot).Scan(&at); err != nil {
-		if pe, ok := errors.AsType[*pgconn.PgError](err); ok && pe.Code == "55000" {
+		pe, ok := errors.AsType[*pgconn.PgError](err)
+		if ok && pe.Code == "55000" {
 			return 0, configInvalid("postgres: %s (CDC needs wal_level = logical)", pe.Message)
+		}
+		if ok && pe.Code == "53400" {
+			return 0, classify(fmt.Errorf("postgres: create replication slot %q (drop the slots no pipeline uses, or raise max_replication_slots): %w", r.slot, err))
 		}
 		return 0, classify(fmt.Errorf("postgres: create replication slot %q: %w", r.slot, err))
 	}
@@ -1477,10 +1481,11 @@ func (s *Source) Teardown(ctx context.Context, pipeline string) error {
 		return classify(err)
 	}
 	for attempt := 0; ; attempt++ {
-		_, err := conn.Exec(ctx, "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_name = $1", slot)
+		tag, err := conn.Exec(ctx, "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_name = $1", slot)
 		pe, ok := errors.AsType[*pgconn.PgError](err)
 		if !ok || pe.Code != "55006" || attempt >= 20 {
-			if err == nil {
+			// No row: there was no slot to drop.
+			if err == nil && tag.RowsAffected() > 0 {
 				slog.Info("dropped the replication slot", "slot", slot)
 			}
 			return classify(err)

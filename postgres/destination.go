@@ -299,6 +299,36 @@ func stagingDDL(table string, cols []column, unlogged bool) string {
 	return "CREATE " + persistence + "TABLE IF NOT EXISTS " + table + " (" + columnDefs(cols) + ") WITH (autovacuum_enabled = false)"
 }
 
+// Queries of whether a relation, by its quoted name, and a schema exist.
+const (
+	relationExists = "SELECT to_regclass($1) IS NOT NULL"
+	schemaExists   = "SELECT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = $1)"
+)
+
+// createdMeanwhile reports whether err, a CREATE ... IF NOT EXISTS's, says
+// only that another session created the same object between the
+// statement's check and its own entry in the catalog, and the object
+// exists now, as exists, given name, says. The server tells it as a
+// unique violation on a catalog's index, or as the object, or a table's
+// row type, existing already.
+func (w *writer) createdMeanwhile(ctx context.Context, err error, exists, name string) bool {
+	pe, ok := errors.AsType[*pgconn.PgError](err)
+	if !ok {
+		return false
+	}
+	switch pe.Code {
+	case "42P06", "42P07", "42710":
+	case "23505":
+		if !strings.HasPrefix(pe.ConstraintName, "pg_") {
+			return false
+		}
+	default:
+		return false
+	}
+	var there bool
+	return w.pool.QueryRow(ctx, exists, name).Scan(&there) == nil && there
+}
+
 // aliveName names the unlogged table whose one row says that a generation's
 // unlogged staging still holds what was staged. A crash, or a failover to a
 // standby, empties every unlogged table, it among them, and nothing writes
@@ -316,11 +346,7 @@ func (w *writer) ensureAlive(ctx context.Context, gen uint64) error {
 	name := aliveName(w.cfg.Pipeline, gen)
 	label := sqlstage.StagingLabel{Pipeline: w.cfg.Pipeline, Generation: gen}
 	err := w.createLabelled(ctx, "CREATE UNLOGGED TABLE IF NOT EXISTS "+w.ident(name)+" AS SELECT true AS alive", name, label)
-	// Another lane created it at the same time, and committed.
-	if pe, ok := errors.AsType[*pgconn.PgError](err); ok && (pe.Code == "23505" || pe.Code == "42P07") {
-		err = nil
-	}
-	if err != nil {
+	if err != nil && !w.createdMeanwhile(ctx, err, relationExists, w.ident(name)) {
 		return fmt.Errorf("postgres: create %s: %w", name, err)
 	}
 	w.alive = gen
@@ -1124,18 +1150,24 @@ func (w *writer) ensureRead(ctx context.Context, s stagedStream, cols []column) 
 			want[i] = targetType(c)
 		}
 		label := sqlstage.ReadLabel{Pipeline: w.cfg.Pipeline, Stream: s.Name, Table: s.Table}
-		if err := w.createLabelled(ctx, "CREATE TABLE IF NOT EXISTS "+w.ident(s.Read)+" ("+columnDefs(want)+")", s.Read, label); err != nil {
+		err := w.createLabelled(ctx, "CREATE TABLE IF NOT EXISTS "+w.ident(s.Read)+" ("+columnDefs(want)+")", s.Read, label)
+		if err != nil && !w.createdMeanwhile(ctx, err, relationExists, w.ident(s.Read)) {
 			return fmt.Errorf("postgres: create the read table for %s: %w", s.Name, err)
 		}
-		return nil
+		// Another writer may have created it first, without some of cols.
+		if have, ok, err = w.tableColumns(ctx, s.Read); err != nil {
+			return err
+		}
+		if !ok {
+			return fmt.Errorf("postgres: the read table for %s is gone", s.Name)
+		}
 	}
 	for _, c := range have {
 		t := targetType(c)
 		if t.typ == c.typ {
 			continue
 		}
-		q := pgx.Identifier{c.name}.Sanitize()
-		if err := w.ddl(ctx, "ALTER TABLE "+w.ident(s.Read)+" ALTER COLUMN "+q+" TYPE "+t.typ+" USING "+q+"::"+t.typ); err != nil {
+		if _, err := w.widenColumn(ctx, s.Read, c.name, t.typ); err != nil {
 			return fmt.Errorf("postgres: column %q of the read table for %s, as its target has it: %w", c.name, s.Name, err)
 		}
 	}
@@ -1252,6 +1284,11 @@ func (w *writer) ApplySchema(ctx context.Context, streams []destination.StreamSc
 	out.Limits = make(map[string]destination.TableLimits, len(streams))
 	for i, s := range streams {
 		t := have[tables[i]]
+		if t == nil {
+			if t, err = w.create(ctx, tables[i], want[i]); err != nil {
+				return destination.SchemaApplied{}, err
+			}
+		}
 		refused, err := w.alter(ctx, tables[i], want[i], t, w.streams[s.Name].AllowTypeChanges)
 		if err != nil {
 			return destination.SchemaApplied{}, err
@@ -1259,9 +1296,6 @@ func (w *writer) ApplySchema(ctx context.Context, streams []destination.StreamSc
 		for _, r := range refused {
 			r.Stream = s.Name
 			out.Refused = append(out.Refused, r)
-		}
-		if t == nil {
-			t = &tableInfo{attrs: len(want[i])}
 		}
 		out.Limits[s.Name] = t.limits()
 		w.SetTable(s.Name, tables[i])
@@ -1276,7 +1310,13 @@ func (w *writer) ensureTable(ctx context.Context, stream, table string, cols []c
 	if err != nil {
 		return err
 	}
-	refused, err := w.alter(ctx, table, cols, have[table], w.streams[stream].AllowTypeChanges)
+	t := have[table]
+	if t == nil {
+		if t, err = w.create(ctx, table, cols); err != nil {
+			return err
+		}
+	}
+	refused, err := w.alter(ctx, table, cols, t, w.streams[stream].AllowTypeChanges)
 	if err != nil {
 		return err
 	}
@@ -1349,17 +1389,31 @@ func (w *writer) catalog(ctx context.Context, tables []string) (map[string]*tabl
 	return out, nil
 }
 
-// alter creates the table with cols if it doesn't exist, or adds its new
-// columns in one ALTER TABLE, and returns the columns it refused, with why.
-// It widens a column's type only if the stream allows type changes, since
-// that can rewrite the table. have is updated to match.
-func (w *writer) alter(ctx context.Context, table string, cols []column, have *tableInfo, allow bool) ([]destination.RefusedColumn, error) {
-	if have == nil {
-		if err := w.ddl(ctx, "CREATE TABLE IF NOT EXISTS "+w.ident(table)+" ("+columnDefs(cols)+")"); err != nil {
-			return nil, fmt.Errorf("postgres: create %s: %w", table, err)
-		}
-		return nil, nil
+// create creates table with cols if it doesn't exist, and gives it as the
+// catalog has it then: another writer may have created it first, without
+// some of cols, which alter then adds.
+func (w *writer) create(ctx context.Context, table string, cols []column) (*tableInfo, error) {
+	err := w.ddl(ctx, "CREATE TABLE IF NOT EXISTS "+w.ident(table)+" ("+columnDefs(cols)+")")
+	if err != nil && !w.createdMeanwhile(ctx, err, relationExists, w.ident(table)) {
+		return nil, fmt.Errorf("postgres: create %s: %w", table, err)
 	}
+	got, err := w.catalog(ctx, []string{table})
+	if err != nil {
+		return nil, err
+	}
+	// The catalog lists a table by its columns, so one without any isn't in
+	// it.
+	if t := got[table]; t != nil {
+		return t, nil
+	}
+	return &tableInfo{notNull: map[string]bool{}}, nil
+}
+
+// alter adds the columns of cols that the table, as have has it, lacks, in
+// one ALTER TABLE, and returns the columns it refused, with why. It widens
+// a column's type only if the stream allows type changes, since that can
+// rewrite the table. have is updated to match.
+func (w *writer) alter(ctx context.Context, table string, cols []column, have *tableInfo, allow bool) ([]destination.RefusedColumn, error) {
 	var refused []destination.RefusedColumn
 	full := func(c column, why string) destination.RefusedColumn {
 		return destination.RefusedColumn{Column: c.name, Reason: "it takes no more columns: " + why, ToType: c.typ}
@@ -1401,8 +1455,7 @@ func (w *writer) alter(ctx context.Context, table string, cols []column, have *t
 	}
 	for _, i := range slices.Sorted(maps.Keys(widen)) {
 		c := widen[i]
-		q := pgx.Identifier{c.name}.Sanitize()
-		err := w.ddl(ctx, "ALTER TABLE "+w.ident(table)+" ALTER COLUMN "+q+" TYPE "+c.typ+" USING "+q+"::"+c.typ)
+		now, err := w.widenColumn(ctx, table, c.name, c.typ)
 		// Such as a view that depends on the column.
 		if pe, ok := errors.AsType[*pgconn.PgError](err); ok && pe.Code == "0A000" {
 			refused = append(refused, destination.RefusedColumn{Column: c.name, Reason: "it can't change the column's type: " + pe.Message, FromType: have.cols[i].typ, ToType: c.typ})
@@ -1411,7 +1464,17 @@ func (w *writer) alter(ctx context.Context, table string, cols []column, have *t
 		if err != nil {
 			return nil, fmt.Errorf("postgres: change the type of column %q of %s to %s: %w", c.name, table, c.typ, err)
 		}
-		have.cols[i].typ = c.typ
+		switch {
+		case widens(c.typ, now):
+			have.cols[i].typ = now
+		case !widens(now, c.typ):
+			have.cols[i].typ = now
+			refused = append(refused, destination.RefusedColumn{
+				Column: c.name, Reason: fmt.Sprintf("it can't change a column from %s to %s", now, c.typ), FromType: now, ToType: c.typ,
+			})
+		default:
+			have.cols[i].typ = c.typ
+		}
 	}
 	if len(clauses) == 0 {
 		return refused, nil
@@ -1442,6 +1505,29 @@ func (w *writer) alter(ctx context.Context, table string, cols []column, have *t
 	return refused, nil
 }
 
+// widenColumn changes the type of table's column name to typ, under the
+// table's lock, if its type then widens to typ and isn't as wide already:
+// another writer may have changed it since it was read, and a widening
+// never narrows it. now is its type then.
+func (w *writer) widenColumn(ctx context.Context, table, name, typ string) (now string, err error) {
+	q := pgx.Identifier{name}.Sanitize()
+	err = w.ddlFunc(ctx, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, "LOCK TABLE "+w.ident(table)+" IN ACCESS EXCLUSIVE MODE"); err != nil {
+			return err
+		}
+		if err := tx.QueryRow(ctx, `SELECT format_type(atttypid, atttypmod) FROM pg_attribute
+			WHERE attrelid = to_regclass($1) AND attname = $2 AND attnum > 0 AND NOT attisdropped`, w.ident(table), name).Scan(&now); err != nil {
+			return err
+		}
+		if widens(typ, now) || !widens(now, typ) {
+			return nil
+		}
+		_, err := tx.Exec(ctx, "ALTER TABLE "+w.ident(table)+" ALTER COLUMN "+q+" TYPE "+typ+" USING "+q+"::"+typ)
+		return err
+	})
+	return now, err
+}
+
 // refusal is why adding columns failed, if the table can't take them: it
 // has too many columns.
 func refusal(err error) (string, bool) {
@@ -1460,6 +1546,15 @@ var (
 )
 
 func (w *writer) ddl(ctx context.Context, stmt string) error {
+	return w.ddlFunc(ctx, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, stmt)
+		return err
+	})
+}
+
+// ddlFunc runs f in a transaction whose locks wait up to lockTimeout, and
+// again, after a backoff, when they don't come in that time.
+func (w *writer) ddlFunc(ctx context.Context, f func(tx pgx.Tx) error) error {
 	backoff := lockTimeout / 5
 	var err error
 	for range ddlAttempts {
@@ -1467,8 +1562,7 @@ func (w *writer) ddl(ctx context.Context, stmt string) error {
 			if _, err := tx.Exec(ctx, fmt.Sprintf("SET LOCAL lock_timeout = %d", lockTimeout.Milliseconds())); err != nil {
 				return err
 			}
-			_, err := tx.Exec(ctx, stmt)
-			return err
+			return f(tx)
 		})
 		if pe, ok := errors.AsType[*pgconn.PgError](err); !ok || pe.Code != "55P03" {
 			return err
@@ -1543,14 +1637,15 @@ func (w *writer) DropStaging(ctx context.Context, streams []stagedStream) {
 // user with CREATE on only the schema, as on public, lacks.
 func (w *writer) ensureSchema(ctx context.Context) error {
 	var exists bool
-	if err := w.pool.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = $1)", w.schema).Scan(&exists); err != nil {
-		return fmt.Errorf("postgres: schema %s: %w", w.schema, err)
+	if err := w.pool.QueryRow(ctx, schemaExists, w.schema).Scan(&exists); err != nil {
+		return classify(fmt.Errorf("postgres: schema %s: %w", w.schema, err))
 	}
 	if exists {
 		return nil
 	}
-	if _, err := w.pool.Exec(ctx, "CREATE SCHEMA IF NOT EXISTS "+pgx.Identifier{w.schema}.Sanitize()); err != nil {
-		return fmt.Errorf("postgres: create schema %s: %w", w.schema, err)
+	_, err := w.pool.Exec(ctx, "CREATE SCHEMA IF NOT EXISTS "+pgx.Identifier{w.schema}.Sanitize())
+	if err != nil && !w.createdMeanwhile(ctx, err, schemaExists, w.schema) {
+		return classify(fmt.Errorf("postgres: create schema %s: %w", w.schema, err))
 	}
 	return nil
 }
@@ -1561,14 +1656,16 @@ func (w *writer) Fence(ctx context.Context, gen uint64) error {
 	if err := w.ensureSchema(ctx); err != nil {
 		return err
 	}
-	for _, q := range []string{
-		"CREATE TABLE IF NOT EXISTS " + w.ident("_openetl_fence") + " (pipeline text PRIMARY KEY, generation bigint NOT NULL)",
-		"CREATE TABLE IF NOT EXISTS " + w.ident("_openetl_loads") + ` (pipeline text NOT NULL, stream text NOT NULL,
+	// Each pipeline writing the schema creates them if they're missing.
+	for _, t := range [][2]string{
+		{"_openetl_fence", "(pipeline text PRIMARY KEY, generation bigint NOT NULL)"},
+		{"_openetl_loads", `(pipeline text NOT NULL, stream text NOT NULL,
 			generation bigint NOT NULL, epoch bigint NOT NULL, loaded_at timestamptz NOT NULL DEFAULT now(),
-			PRIMARY KEY (pipeline, stream, generation, epoch))`,
+			PRIMARY KEY (pipeline, stream, generation, epoch))`},
 	} {
-		if _, err := w.pool.Exec(ctx, q); err != nil {
-			return fmt.Errorf("postgres: prepare %s: %w", w.schema, err)
+		_, err := w.pool.Exec(ctx, "CREATE TABLE IF NOT EXISTS "+w.ident(t[0])+" "+t[1])
+		if err != nil && !w.createdMeanwhile(ctx, err, relationExists, w.ident(t[0])) {
+			return classify(fmt.Errorf("postgres: prepare %s: %w", w.schema, err))
 		}
 	}
 	// Waits for applies that hold the fence row.

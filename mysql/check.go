@@ -124,6 +124,10 @@ func failure(err error) *check.Failure {
 		f = check.NotFound.Wrap(err, "resource", "The database")
 	case 1146:
 		f = check.NotFound.Wrap(err, "resource", "The table")
+	case unknownVariable:
+		f = check.ConfigInvalid.Wrap(err)
+		f.Message = "A parameter of the dsn is neither one of the Go driver's nor a session variable the server has."
+		f.Fix = "Take the parameter out of the dsn, or spell it as the driver or the server does."
 	case 1040, 1053, 1129, 1203, 1205, 1213, 1226, 1927, 2006, 2013, 3024:
 		f = check.Unavailable.Wrap(err)
 	default:

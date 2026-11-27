@@ -1,14 +1,17 @@
 package postgres
 
 import (
+	"fmt"
 	"slices"
 	"testing"
 
 	"github.com/apache/arrow-go/v18/arrow"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/openetl-io/openetl-connectors/connectortest"
 	"github.com/openetl-io/openetl/sdk/go/check"
 	"github.com/openetl-io/openetl/sdk/go/destination"
+	protocolv1 "github.com/openetl-io/openetl/sdk/go/protocol/v1"
 	"github.com/openetl-io/openetl/sdk/go/source"
 )
 
@@ -95,6 +98,21 @@ func TestPreflightMergeKey(t *testing.T) {
 		i := slices.IndexFunc(pf, func(ch check.Check) bool { return ch.Name == c.item })
 		if got := check.Classify(pf[i].Run(t.Context(), &check.Probe{})); got == nil || got.Reason != c.reason {
 			t.Errorf("%s: %v, want %s", c.item, got, c.reason)
+		}
+	}
+}
+
+// A schema name the server reserves is the config's to change, and a slot
+// the server has no room for waits for one, as the check says of both.
+func TestClassifyRefusals(t *testing.T) {
+	for state, want := range map[string]protocolv1.ErrorCode{
+		"42939": protocolv1.ErrorCode_ERROR_CODE_CONFIG_INVALID,
+		"53400": protocolv1.ErrorCode_ERROR_CODE_RESOURCE_EXHAUSTED,
+		"42501": protocolv1.ErrorCode_ERROR_CODE_PERMISSION_DENIED,
+	} {
+		err := classify(fmt.Errorf("postgres: x: %w", &pgconn.PgError{Code: state}))
+		if code := connectortest.CodeOf(err); code != want {
+			t.Errorf("%s: %v, want %v", state, code, want)
 		}
 	}
 }

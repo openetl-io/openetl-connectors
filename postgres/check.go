@@ -90,6 +90,11 @@ var (
 		Message: "The replication slot {slot} was invalidated, so a read with a position in it fails with POSITION_LOST until its tables are read again from a new snapshot.",
 		Fix:     "Reset the pipeline's positions with openetl reset; then sync more often, or raise max_slot_wal_keep_size, so that the slot keeps up.",
 	}
+	schemaReserved = check.Reason{
+		Name: "schema_name_reserved", Code: protocolv1.ErrorCode_ERROR_CODE_CONFIG_INVALID,
+		Message: "PostgreSQL won't create a schema named {schema}: names that start with pg_ are its own.",
+		Fix:     "Write to a schema whose name doesn't start with pg_: set schema, or the pipeline's destination.namespace.",
+	}
 	slotsFull = check.Reason{
 		Name: "replication_slots_full", Code: protocolv1.ErrorCode_ERROR_CODE_RESOURCE_EXHAUSTED,
 		Message: "The server's {max} replication slots are all taken, so the slot {slot} can't be created.",
@@ -557,6 +562,12 @@ func (d *Destination) schemaCheck(k *sqlcheck.Kit, schema string) check.Check {
 				f.Message = "{schema} doesn't exist, and {principal} has no {privilege} on {object} to create it."
 				return f
 			}
+			if err := tryCreateSchema(ctx, db, schema); err != nil {
+				if pe, ok := errors.AsType[*pgconn.PgError](err); ok && pe.Code == "42939" {
+					return schemaReserved.Wrap(err)
+				}
+				return k.Failure(err)
+			}
 			p.Found("{schema} doesn't exist, and the first write creates it.")
 			return nil
 		case err != nil:
@@ -568,6 +579,18 @@ func (d *Destination) schemaCheck(k *sqlcheck.Kit, schema string) check.Check {
 	})
 	c.Field, c.Params = "schema", check.Params{"schema": schema}
 	return c
+}
+
+// tryCreateSchema creates schema as the first write does, in a transaction
+// it rolls back, which finds a name the server refuses.
+func tryCreateSchema(ctx context.Context, db *sql.DB, schema string) error {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	_, err = tx.ExecContext(ctx, "CREATE SCHEMA IF NOT EXISTS "+pgx.Identifier{schema}.Sanitize())
+	return err
 }
 
 // Preflight looks at the pipeline's schema, and at each stream's table:
@@ -698,12 +721,16 @@ func classify(err error) error {
 	switch {
 	case pe.Code == "28P01" || pe.Code == "28000":
 		return sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_AUTH_INVALID, err)
-	case pe.Code == "3D000":
+	case pe.Code == "3D000" || pe.Code == "42939":
 		return sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_CONFIG_INVALID, err)
 	case pe.Code == "42501":
 		return sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_PERMISSION_DENIED, err)
 	case strings.HasPrefix(pe.Code, "08") || pe.Code == "53300" || pe.Code == "57P03":
 		return sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_TRANSIENT, err)
+	case pe.Code == "53400":
+		// A limit of the server's settings, such as max_replication_slots,
+		// all of whose slots are taken.
+		return sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_RESOURCE_EXHAUSTED, err)
 	}
 	return err
 }

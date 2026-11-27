@@ -5,6 +5,7 @@ package postgres
 import (
 	"context"
 	"crypto/rand"
+	"encoding/json"
 	"fmt"
 	"net/url"
 	"slices"
@@ -18,6 +19,7 @@ import (
 	"github.com/openetl-io/openetl-connectors/sqlstage"
 	"github.com/openetl-io/openetl/sdk/go/check"
 	"github.com/openetl-io/openetl/sdk/go/destination"
+	protocolv1 "github.com/openetl-io/openetl/sdk/go/protocol/v1"
 	"github.com/openetl-io/openetl/sdk/go/source"
 )
 
@@ -135,6 +137,70 @@ func TestChecksItemByItem(t *testing.T) {
 	})
 	dpf = check.Run(t.Context(), d.Preflight(destination.PreflightRequest{Namespace: missing}))
 	connectortest.ExpectItems(t, "a schema to create", dpf, map[string]string{"schema.create": "passed"})
+}
+
+// A schema name PostgreSQL reserves fails the preflight, and the writer's
+// first statement as invalid config, which isn't retried. A keyword, or a
+// name with capitals, spaces and quotes, takes writes like any other.
+func TestDestinationSchemaNames(t *testing.T) {
+	ctx := t.Context()
+	conn, err := pgx.Connect(ctx, dsn())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = conn.Close(context.Background()) })
+	streams := []destination.Stream{{Name: "full", Mode: destination.Append}}
+	open := func(t *testing.T, schema string) (*Destination, destination.Writer) {
+		t.Helper()
+		cfg, _ := json.Marshal(map[string]string{"dsn": dsn(), "schema": schema})
+		d, err := NewDestination(cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		w, err := d.Open(ctx, destination.OpenConfig{Pipeline: "p1", Generation: 1, Scope: destination.ScopePipeline, Streams: streams})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = w.Close(context.Background()) })
+		return d, w
+	}
+
+	reserved := "pg_" + strings.ToLower(rand.Text())[:10]
+	d, w := open(t, reserved)
+	connectortest.ExpectItems(t, "a reserved schema", check.Run(ctx, d.Preflight(destination.PreflightRequest{Streams: streams})), map[string]string{
+		"schema.create": "failed schema_name_reserved", "stream.full.write": "skipped",
+	})
+	if _, err := w.Recover(ctx, 1, destination.Epoch{}, []destination.Staged{nil}); codeOf(err) != protocolv1.ErrorCode_ERROR_CODE_CONFIG_INVALID {
+		t.Errorf("recover into %s: %v (%v)", reserved, err, codeOf(err))
+	}
+
+	names := []string{`Full "Name" ` + strings.ToLower(rand.Text())[:10]}
+	var taken bool
+	if err := conn.QueryRow(ctx, "SELECT EXISTS (SELECT FROM pg_namespace WHERE nspname = 'full')").Scan(&taken); err != nil {
+		t.Fatal(err)
+	}
+	if !taken {
+		names = append(names, "full")
+	}
+	for _, schema := range names {
+		t.Cleanup(func() {
+			_, _ = conn.Exec(context.Background(), "DROP SCHEMA IF EXISTS "+pgx.Identifier{schema}.Sanitize()+" CASCADE")
+		})
+		d, w := open(t, schema)
+		connectortest.ExpectStatuses(t, connectortest.Statuses(check.Run(ctx, d.Preflight(destination.PreflightRequest{Streams: streams}))), nil)
+		recov(t, w, 1, destination.Epoch{}, nil)
+		e := destination.Epoch{Generation: 1, N: 1}
+		if err := w.Write(ctx, e, "full", batch(t, []arrow.Field{idField, nameField}, `[{"id": 1, "name": "a"}]`)); err != nil {
+			t.Fatalf("%s: %v", schema, err)
+		}
+		if _, err := w.Commit(ctx, e, []destination.Staged{precommit(t, w, e)}); err != nil {
+			t.Fatalf("%s: %v", schema, err)
+		}
+		var n int
+		if err := conn.QueryRow(ctx, "SELECT count(*) FROM "+pgx.Identifier{schema, "full"}.Sanitize()).Scan(&n); err != nil || n != 1 {
+			t.Errorf("%s: %d rows, %v", schema, n, err)
+		}
+	}
 }
 
 // An append deduped against a table the user doesn't own fails the preflight

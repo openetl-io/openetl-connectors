@@ -3,11 +3,13 @@
 package postgres
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math/big"
 	mrand "math/rand/v2"
 	"slices"
@@ -568,17 +570,54 @@ func TestCDCSlotTakeoverAndLoss(t *testing.T) {
 	}
 	readCDC(t, s, pipeline, map[string]string{"users": state})
 
-	if err := s.Teardown(t.Context(), pipeline); err != nil {
+	out := logged(func() { err = s.Teardown(t.Context(), pipeline) })
+	if err != nil {
 		t.Fatal(err)
+	}
+	if n := strings.Count(out, "dropped the replication slot"); n != 1 {
+		t.Errorf("the teardown logged %d drops: %s", n, out)
 	}
 	err = s.Read(t.Context(), cdcRequest(pipeline, false, map[string]string{"users": state}), &capture{})
 	if code := codeOf(err); code != protocolv1.ErrorCode_ERROR_CODE_POSITION_LOST {
 		t.Errorf("read without the slot: %v (%v)", err, code)
 	}
-	// Teardown again finds nothing to drop.
-	if err := s.Teardown(t.Context(), pipeline); err != nil {
+	// Teardown again finds nothing to drop, and doesn't say it dropped it.
+	out = logged(func() { err = s.Teardown(t.Context(), pipeline) })
+	if err != nil {
 		t.Error(err)
 	}
+	if strings.Contains(out, "dropped the replication slot") {
+		t.Errorf("a teardown with no slot logged a drop: %s", out)
+	}
+}
+
+// logged runs f with slog's default logger writing to a buffer, and gives
+// what it wrote.
+func logged(f func()) string {
+	var b lockedBuffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&b, nil)))
+	defer slog.SetDefault(prev)
+	f()
+	return b.String()
+}
+
+// lockedBuffer is a buffer that goroutines still logging can write to.
+type lockedBuffer struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (l *lockedBuffer) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.Write(p)
+}
+
+func (l *lockedBuffer) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.String()
 }
 
 // A slot advanced after the read checked its position, and before the read
