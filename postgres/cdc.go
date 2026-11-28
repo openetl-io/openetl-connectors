@@ -1344,13 +1344,20 @@ func (r *cdcReader) unseenFor(ctx context.Context, x *txn) error {
 			return classify(err)
 		}
 	}
+	return unseenError(x.xid, state, app)
+}
+
+// unseenError is unseenFor's error for transaction xid, given the read's
+// walsender's pg_stat_replication.sync_state and application_name, empty if
+// it has none.
+func unseenError(xid uint32, state, app string) error {
 	switch state {
 	case "sync":
-		return configInvalid("postgres: transaction %d, which the log has read, isn't visible to new snapshots after %v: it waits for synchronous standbys, and synchronous_standby_names makes one of them this read's replication connection (application_name %q), which confirms only what the pipeline has checkpointed, and the pipeline can't checkpoint past the transaction until new snapshots see it; leave the connection out of synchronous_standby_names, or give it an application_name of its own in the source's dsn", x.xid, visibleWithin, app)
+		return configInvalid("postgres: transaction %d, which the log has read, isn't visible to new snapshots after %v: it waits for synchronous standbys, and synchronous_standby_names makes one of them this read's replication connection (application_name %q), which confirms only what the pipeline has checkpointed, and the pipeline can't checkpoint past the transaction until new snapshots see it; leave the connection out of synchronous_standby_names, or give it an application_name of its own in the source's dsn", xid, visibleWithin, app)
 	case "quorum":
-		return sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_TRANSIENT, fmt.Errorf("postgres: transaction %d, which the log has read, isn't visible to new snapshots after %v, as while synchronous standbys haven't confirmed it; synchronous_standby_names counts this read's replication connection (application_name %q) among them, which confirms only what the pipeline has checkpointed; the read starts again", x.xid, visibleWithin, app))
+		return sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_TRANSIENT, fmt.Errorf("postgres: transaction %d, which the log has read, isn't visible to new snapshots after %v, as while synchronous standbys haven't confirmed it; synchronous_standby_names counts this read's replication connection (application_name %q) among them, which confirms only what the pipeline has checkpointed; the read starts again", xid, visibleWithin, app))
 	}
-	return sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_TRANSIENT, fmt.Errorf("postgres: transaction %d, which the log has read, isn't visible to new snapshots after %v, as while a synchronous standby hasn't confirmed it; the read starts again", x.xid, visibleWithin))
+	return sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_TRANSIENT, fmt.Errorf("postgres: transaction %d, which the log has read, isn't visible to new snapshots after %v, as while a synchronous standby hasn't confirmed it; the read starts again", xid, visibleWithin))
 }
 
 // snapshot is a new snapshot of which transactions are visible.

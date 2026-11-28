@@ -465,3 +465,31 @@ func TestAChunkPassesBeforeATransactionAfterIt(t *testing.T) {
 		t.Errorf("the chunk holds %d changes; %d chunks held, %d ranges left", len(c.after), len(r.chunks), len(st.ranges))
 	}
 }
+
+// A transaction new snapshots don't see in time fails the read for good
+// when the read's own walsender is a synchronous standby it waits for, which
+// confirms only what the pipeline has checkpointed, and retryably otherwise,
+// naming the walsender where it's among a quorum.
+func TestUnseenTransactionsErrors(t *testing.T) {
+	for _, c := range []struct {
+		state, app string
+		code       protocolv1.ErrorCode
+		names      bool
+	}{
+		{"sync", "syncme", protocolv1.ErrorCode_ERROR_CODE_CONFIG_INVALID, true},
+		{"sync", "", protocolv1.ErrorCode_ERROR_CODE_CONFIG_INVALID, true},
+		{"quorum", "q", protocolv1.ErrorCode_ERROR_CODE_TRANSIENT, true},
+		{"potential", "p", protocolv1.ErrorCode_ERROR_CODE_TRANSIENT, false},
+		{"async", "", protocolv1.ErrorCode_ERROR_CODE_TRANSIENT, false},
+		{"", "", protocolv1.ErrorCode_ERROR_CODE_TRANSIENT, false},
+	} {
+		err := unseenError(42, c.state, c.app)
+		var coded interface{ ErrorCode() protocolv1.ErrorCode }
+		if !errors.As(err, &coded) || coded.ErrorCode() != c.code {
+			t.Errorf("%s: %v, want %v", c.state, err, c.code)
+		}
+		if named := strings.Contains(err.Error(), "synchronous_standby_names") && strings.Contains(err.Error(), fmt.Sprintf("application_name %q", c.app)); named != c.names || !strings.Contains(err.Error(), "transaction 42") {
+			t.Errorf("%s: %v", c.state, err)
+		}
+	}
+}

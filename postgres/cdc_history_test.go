@@ -966,3 +966,93 @@ func TestCDCDropsAChunkWhoseChangesOutgrowIt(t *testing.T) {
 	}
 	sameRows(t, merged(got), e.rows("users"))
 }
+
+// A dropped chunk's transactions are owed to its stream, so the chunk that
+// reads its keys again waits until new snapshots see them: here, while the
+// read's snapshots stay as they were before the inserts the dropped chunk
+// held.
+func TestCDCDroppedChunksTransactionsAreWaitedFor(t *testing.T) {
+	e := newSourceEnv(t)
+	h := e.newHistory(20)
+	s, pipeline := e.cdcSource(`, "snapshotChunkRows": 10, "batchBytes": 64`)
+	old := &stale{id: exported(t)}
+	var chunks atomic.Int64
+	afterChunkSnapshot = func() {
+		if chunks.Add(1) == 2 {
+			for id := 41; id < 100; id += 2 {
+				h.insert(id)
+			}
+			h.update(24)
+			old.left.Store(3)
+		}
+	}
+	snapshotFrom = old.from
+	t.Cleanup(func() { afterChunkSnapshot, snapshotFrom = nil, nil })
+	got := readCDC(t, s, pipeline, map[string]string{"users": ""}).changes(t, "users")
+	if n := chunks.Load(); n != 6 {
+		t.Errorf("%d chunks, want 6, the second dropped", n)
+	}
+	if left := old.left.Load(); left > 0 {
+		t.Errorf("%d snapshots that don't see the inserts left", left)
+	}
+	h.fromChunks(t, got)
+	for _, id := range []string{"41", "43", "99"} {
+		if got := appended(got, id); len(got) != 1 || !strings.HasPrefix(got[0], "chunk ") {
+			t.Errorf("appended, %s is %q", id, got)
+		}
+	}
+	sameRows(t, merged(got), e.rows("users"))
+}
+
+// The server places a text-keyed stream's changes in batches. A change placed
+// in a chunk that an earlier change of its batch dropped is one no chunk has
+// read, owed to its stream: here, ten inserts of 20 bytes each into the last
+// chunk, which may hold 100, placed 5 at a time, so the sixth drops it and
+// the seventh to tenth are placed in it. The read's snapshots then stay as
+// one taken after the sixth, which sees what the dropped chunk held.
+func TestCDCChangesPlacedInADroppedChunkAreWaitedFor(t *testing.T) {
+	e := newSourceEnv(t)
+	e.exec(`CREATE TABLE $schema.users (id text COLLATE "C" PRIMARY KEY, name text, doc text)`)
+	e.exec("INSERT INTO $schema.users SELECT 'a' || lpad(i::text, 2, '0'), 'n' || i, NULL FROM generate_series(1, 20) i")
+	s, pipeline := e.cdcSource(`, "snapshotChunkRows": 10, "batchBytes": 100`)
+	exp, err := pgx.Connect(t.Context(), dsn())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = exp.Close(context.Background()) })
+	old := &stale{}
+	var chunks atomic.Int64
+	afterChunkSnapshot = func() {
+		if chunks.Add(1) != 2 {
+			return
+		}
+		for i := 1; i <= 10; i++ {
+			e.exec(fmt.Sprintf("INSERT INTO $schema.users VALUES ('k%03d', 'xxxxxx', 'yyyyyyyyyy')", i))
+			if i == 6 {
+				if _, err := exp.Exec(context.Background(), "BEGIN ISOLATION LEVEL REPEATABLE READ"); err != nil {
+					t.Error(err)
+				}
+				if err := exp.QueryRow(context.Background(), "SELECT pg_export_snapshot()").Scan(&old.id); err != nil {
+					t.Error(err)
+				}
+			}
+		}
+		old.left.Store(3)
+	}
+	snapshotFrom = old.from
+	t.Cleanup(func() { afterChunkSnapshot, snapshotFrom = nil, nil })
+	got := readCDC(t, s, pipeline, map[string]string{"users": ""}).changes(t, "users")
+	if n := chunks.Load(); n != 4 {
+		t.Errorf("%d chunks, want 4, the second dropped", n)
+	}
+	if left := old.left.Load(); left > 0 {
+		t.Errorf("%d snapshots that don't see the last inserts left", left)
+	}
+	for i := 1; i <= 10; i++ {
+		id := fmt.Sprintf("k%03d", i)
+		if got := appended(got, id); !slices.Equal(got, []string{"chunk xxxxxx"}) {
+			t.Errorf("appended, %s is %q", id, got)
+		}
+	}
+	sameRows(t, merged(got), e.rows("users"))
+}
