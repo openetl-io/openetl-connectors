@@ -262,6 +262,23 @@ func TestDestinationPreflightDedupeIndex(t *testing.T) {
 		"stream.unowned-nonleading-idx.write": "failed table_not_owned",
 	})
 
+	// An overwrite of a table the user doesn't own copies its rows in, and
+	// with overwriteTruncate needs TRUNCATE too.
+	ow := slices.IndexFunc(dpf.Items, func(it check.Item) bool { return it.Name == "stream.unowned-overwrite.write" })
+	if ow < 0 || !strings.Contains(dpf.Items[ow].Rendered().Message, "copies the read's rows into it") {
+		t.Errorf("the unowned overwrite's item doesn't say it copies: %+v", dpf.Items)
+	}
+	truncating, err := NewDestination(fmt.Appendf(nil, `{"dsn": %q, "schema": %q, "overwriteTruncate": true}`, u.String(), e.schema))
+	if err != nil {
+		t.Fatal(err)
+	}
+	connectortest.ExpectItems(t, "truncating overwrite preflight", check.Run(t.Context(), truncating.Preflight(destination.PreflightRequest{
+		Streams: []destination.Stream{{Name: "unowned_overwrite", Mode: destination.Overwrite}},
+	})), map[string]string{
+		"schema.create":                  "passed",
+		"stream.unowned-overwrite.write": "failed privilege_missing",
+	})
+
 	i := slices.IndexFunc(dpf.Items, func(it check.Item) bool { return it.Name == "stream.unowned-no-idx.write" })
 	if i < 0 {
 		t.Fatal("missing stream.unowned-no-idx.write item")

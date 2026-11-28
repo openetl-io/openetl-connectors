@@ -628,6 +628,8 @@ func (d *Destination) Preflight(req destination.PreflightRequest) []check.Check 
 		switch {
 		case st.Mode == destination.Merge:
 			privileges = append(privileges, "SELECT", "UPDATE", "DELETE")
+		case st.Mode == destination.Overwrite && d.cfg.OverwriteTruncate:
+			privileges = append(privileges, "DELETE", "TRUNCATE")
 		case st.Mode == destination.Overwrite:
 			privileges = append(privileges, "DELETE")
 		case st.Dedupe == destination.DedupeTarget:
@@ -693,6 +695,10 @@ func (d *Destination) Preflight(req destination.PreflightRequest) []check.Check 
 				f.Message = "{principal} doesn't own {table}, so the index on _openetl_id that target deduplication needs can't be created."
 				f.Fix = "Run ALTER TABLE {table} OWNER TO {principal}; or CREATE INDEX {index} ON {table} (\"_openetl_id\");"
 				return f
+			case st.Mode == destination.Overwrite && d.cfg.OverwriteSwap:
+				f := notOwned.Fail()
+				f.Message = "{principal} doesn't own {table}, so a column the stream gains can't be added to it, and an overwrite copies the read's rows into it rather than swapping the read's table in."
+				return check.Warn(f)
 			}
 			return check.Warn(notOwned.Fail())
 		})

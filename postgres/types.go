@@ -15,6 +15,8 @@ import (
 type column struct {
 	name string
 	typ  string
+	// The column's collation, quoted, if it isn't its type's.
+	collation string
 	// The value of row i, which is not null, or an error.
 	value func(arr arrow.Array, i int) any
 }

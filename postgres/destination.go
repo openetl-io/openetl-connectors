@@ -5,8 +5,9 @@
 // behind a fence row with a marker per stream in _openetl_loads. Deduped
 // streams insert one row per _openetl_id in the epoch, and with DedupeTarget
 // only IDs the target doesn't have yet. Overwrite applies a read's epochs to a
-// table of its own, which replaces the target's rows when the read ends. Merge
-// upserts each key's latest version, guarded by _openetl_seq.
+// table of its own, which takes the target's place when the read ends, or
+// whose rows replace the target's. Merge upserts each key's latest version,
+// guarded by _openetl_seq.
 package postgres
 
 import (
@@ -37,6 +38,13 @@ type DestinationConfig struct {
 	DSN sdk.Secret `json:"dsn"`
 	// Used when the pipeline names no namespace. Default "public".
 	Schema string `json:"schema"`
+	// When an overwrite's read ends, put the read's table in the target's
+	// place, if that changes nothing about the target but its OID. Default
+	// true.
+	OverwriteSwap bool `json:"overwriteSwap"`
+	// When an overwrite copies the read's rows into the target, empty it
+	// with TRUNCATE rather than DELETE.
+	OverwriteTruncate bool `json:"overwriteTruncate"`
 	TLS
 }
 
@@ -53,7 +61,7 @@ var (
 )
 
 func NewDestination(config []byte) (*Destination, error) {
-	cfg := DestinationConfig{Schema: "public"}
+	cfg := DestinationConfig{Schema: "public", OverwriteSwap: true}
 	dec := json.NewDecoder(bytes.NewReader(config))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&cfg); err != nil {
@@ -106,6 +114,8 @@ func (d *Destination) Open(ctx context.Context, cfg destination.OpenConfig) (des
 		streams:  map[string]destination.Stream{},
 		indexed:  map[string]bool{},
 		unlogged: cfg.Scope != destination.ScopeStream,
+		swap:     d.cfg.OverwriteSwap,
+		truncate: d.cfg.OverwriteTruncate,
 	}
 	if w.schema == "" {
 		w.schema = d.cfg.Schema
@@ -131,8 +141,12 @@ type writer struct {
 	// applied whole or not at all, so one whose staging a crash emptied is
 	// lost whole and read again.
 	unlogged bool
+	// The config's OverwriteSwap and OverwriteTruncate.
+	swap, truncate bool
 	// The generation whose alive table Stage made sure of; 0 for none.
 	alive uint64
+	// The server's server_version_num, once settle has read it.
+	version int
 }
 
 type stagingTable struct {
@@ -448,6 +462,9 @@ func (w *writer) addColumns(ctx context.Context, st *stagingTable, cols []column
 // before it was added.
 func columnDef(c column) string {
 	def := pgx.Identifier{c.name}.Sanitize() + " " + c.typ
+	if c.collation != "" {
+		def += " COLLATE " + c.collation
+	}
 	if c.name == deletedColumn {
 		def += " NOT NULL DEFAULT false"
 	}
@@ -472,6 +489,8 @@ type prepared struct {
 	// if hasRead: the read has a table.
 	read    []string
 	hasRead bool
+	// Overwrite: the read's table's blocks before the epoch's rows.
+	blocks int64
 	// Merge: the columns an update in the staging didn't send.
 	unchanged []string
 	// The patches' staging's columns; none if there's nothing to patch.
@@ -526,20 +545,56 @@ func (w *writer) Apply(ctx context.Context, desc staged, streams []stagedStream,
 	if err != nil {
 		return err
 	}
+	// The streams whose read's table took their target's place.
+	swapped := map[string]bool{}
 	// Unlogged staging, from an attempt with pipeline scope, is applied in
 	// one transaction whatever the scope: a crash between two would leave
 	// the epoch partly applied, and the rest's staging emptied.
 	if w.cfg.Scope == destination.ScopeStream && !unlogged {
 		for _, s := range todo {
-			if err := w.applyTx(ctx, desc, []stagedStream{s}, prep, "FOR SHARE", false, collapsed); err != nil {
+			if err := w.applyTx(ctx, desc, []stagedStream{s}, prep, "FOR SHARE", false, collapsed, swapped); err != nil {
 				return err
 			}
 		}
-	} else if err := w.applyTx(ctx, desc, todo, prep, "FOR UPDATE", unlogged, collapsed); err != nil {
+	} else if err := w.applyTx(ctx, desc, todo, prep, "FOR UPDATE", unlogged, collapsed, swapped); err != nil {
 		return err
 	}
+	w.settle(ctx, todo, prep, swapped)
 	w.DropStaging(ctx, todo)
 	return nil
+}
+
+// settle sets the hint bits of the rows that overwrites took into their
+// reads' tables in the epoch, reading the pages they went to: those that
+// have swapped are the targets' now, and those that copied are gone.
+// Setting a hint bit on a page for the first time after a checkpoint logs
+// the page whole, where the server has data checksums or wal_log_hints, so
+// it's done while the epoch's pages are recent, rather than when the
+// read's end, or the target's readers, read them. It needs a TID range
+// scan, from Postgres 14. Best effort, like DropStaging.
+func (w *writer) settle(ctx context.Context, streams []stagedStream, prep map[string]prepared, swapped map[string]bool) {
+	if w.version == 0 {
+		if err := w.pool.QueryRow(ctx, "SELECT current_setting('server_version_num')::int").Scan(&w.version); err != nil {
+			return
+		}
+	}
+	if w.version < 140000 {
+		return
+	}
+	for _, s := range streams {
+		table := s.Read
+		switch {
+		case s.Mode != modeOverwrite || len(s.Stagings) == 0:
+			continue
+		case s.Ended && !swapped[s.Name]:
+			continue
+		case s.Ended:
+			table = s.Table
+		}
+		// The rows may start on the last page before them.
+		from := max(prep[s.Name].blocks-1, 0)
+		_, _ = w.pool.Exec(ctx, "SELECT count(*) FROM "+w.ident(table)+" WHERE ctid >= $1::tid", fmt.Sprintf("(%d,0)", from))
+	}
 }
 
 // unloggedStaging reports whether any of streams' staging is unlogged.
@@ -564,8 +619,9 @@ func (w *writer) unloggedStaging(ctx context.Context, streams []stagedStream) (b
 
 // applyTx applies streams in one transaction. With unlogged staging, it
 // applies nothing unless the staging holds what was staged.
-func (w *writer) applyTx(ctx context.Context, desc staged, streams []stagedStream, prep map[string]prepared, lock string, unlogged bool, collapsed map[string]uint64) error {
+func (w *writer) applyTx(ctx context.Context, desc staged, streams []stagedStream, prep map[string]prepared, lock string, unlogged bool, collapsed map[string]uint64, swapped map[string]bool) error {
 	skipped := map[string]uint64{}
+	var swaps []string
 	err := pgx.BeginFunc(ctx, w.pool, func(tx pgx.Tx) error {
 		var fence uint64
 		err := tx.QueryRow(ctx, "SELECT generation FROM "+w.ident("_openetl_fence")+" WHERE pipeline = $1 "+lock, w.cfg.Pipeline).Scan(&fence)
@@ -589,6 +645,9 @@ func (w *writer) applyTx(ctx context.Context, desc staged, streams []stagedStrea
 					desc.Epoch, desc.Generation))
 			}
 		}
+		// Overwrite streams whose read ends, replaced once the rest is
+		// applied, so that the locks they take are held for least time.
+		var ended []stagedStream
 		for _, s := range streams {
 			var done bool
 			if err := tx.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM "+w.ident("_openetl_loads")+" WHERE pipeline = $1 AND stream = $2 AND generation = $3 AND epoch = $4)",
@@ -597,6 +656,9 @@ func (w *writer) applyTx(ctx context.Context, desc staged, streams []stagedStrea
 			}
 			if done {
 				continue
+			}
+			if s.Mode == modeOverwrite && s.Ended {
+				ended = append(ended, s)
 			}
 			n, err := w.applyStream(ctx, tx, s, prep[s.Name])
 			if err != nil {
@@ -612,11 +674,15 @@ func (w *writer) applyTx(ctx context.Context, desc staged, streams []stagedStrea
 				return fmt.Errorf("postgres: write marker for %s: %w", s.Name, err)
 			}
 		}
-		return nil
+		swaps, err = w.replace(ctx, tx, ended, prep)
+		return err
 	})
 	if err == nil {
 		for name, n := range skipped {
 			collapsed[name] += n
+		}
+		for _, name := range swaps {
+			swapped[name] = true
 		}
 	}
 	return err
@@ -665,9 +731,6 @@ func (w *writer) applyRows(ctx context.Context, tx pgx.Tx, s stagedStream, p pre
 			return 0, fmt.Errorf("postgres: the insert reported %d rows", affected)
 		}
 		n = uint64(affected)
-	}
-	if s.Ended {
-		return n, w.replace(ctx, tx, s, p)
 	}
 	return n, nil
 }
@@ -898,33 +961,6 @@ func (w *writer) latestResolved(s stagedStream, prep prepared, hasSeq bool) stri
 		"s AS (SELECT " + strings.Join(sel, ", ") + " FROM " + from + ") "
 }
 
-// replace makes the read's rows the target's, and drops the read's table.
-// Readers see the old rows until the transaction commits.
-func (w *writer) replace(ctx context.Context, tx pgx.Tx, s stagedStream, p prepared) error {
-	switch {
-	case s.Table == "" && p.hasRead:
-		return fmt.Errorf("its read has rows in %s, and no target table", s.Read)
-	case s.Table == "":
-		// The stream never had a schema, so it has no table to empty.
-		return nil
-	}
-	var exists bool
-	if err := tx.QueryRow(ctx, "SELECT to_regclass($1) IS NOT NULL", w.ident(s.Table)).Scan(&exists); err != nil || !exists {
-		return err
-	}
-	if _, err := tx.Exec(ctx, "DELETE FROM "+w.ident(s.Table)); err != nil {
-		return err
-	}
-	if !p.hasRead {
-		return nil
-	}
-	if _, err := tx.Exec(ctx, "INSERT INTO "+w.ident(s.Table)+columnList(p.read)+"SELECT "+quoteAll(p.read)+" FROM "+w.ident(s.Read)); err != nil {
-		return err
-	}
-	_, err := tx.Exec(ctx, "DROP TABLE "+w.ident(s.Read))
-	return err
-}
-
 // columnList is an INSERT's list of cols, spaced; none for no columns, whose
 // rows take each column's default.
 func columnList(cols []string) string {
@@ -976,6 +1012,9 @@ func (w *writer) prepare(ctx context.Context, desc staged, s stagedStream) (prep
 	if s.Mode == modeOverwrite {
 		if hasStaging {
 			if err := w.ensureRead(ctx, s, cols); err != nil {
+				return p, err
+			}
+			if err := w.pool.QueryRow(ctx, "SELECT pg_relation_size($1) / current_setting('block_size')::bigint", w.ident(s.Read)).Scan(&p.blocks); err != nil {
 				return p, err
 			}
 		}
@@ -1126,7 +1165,9 @@ func (w *writer) preparePatch(ctx context.Context, desc staged, s stagedStream) 
 // where it has the column, or adds its columns to hold cols. A column it has
 // narrower than the target's takes the target's type: only a person widens a
 // target, after ApplySchema refused to and said how, and the read's table
-// replaces the target's rows.
+// replaces the target's rows. Its columns have the target's collations, and
+// are in the target's order, then the rest in cols', so that the table can
+// take the target's place.
 func (w *writer) ensureRead(ctx context.Context, s stagedStream, cols []column) error {
 	have, ok, err := w.tableColumns(ctx, s.Read)
 	if err != nil {
@@ -1139,16 +1180,21 @@ func (w *writer) ensureRead(ctx context.Context, s stagedStream, cols []column) 
 		}
 	}
 	targetType := func(c column) column {
-		if i := slices.IndexFunc(target, func(x column) bool { return x.name == c.name }); i >= 0 && widens(c.typ, target[i].typ) {
+		i := slices.IndexFunc(target, func(x column) bool { return x.name == c.name })
+		if i < 0 {
+			return c
+		}
+		if widens(c.typ, target[i].typ) {
 			c.typ = target[i].typ
 		}
+		c.collation = target[i].collation
 		return c
 	}
+	want := inOrderOf(cols, target)
+	for i, c := range want {
+		want[i] = targetType(c)
+	}
 	if !ok {
-		want := make([]column, len(cols))
-		for i, c := range cols {
-			want[i] = targetType(c)
-		}
 		label := sqlstage.ReadLabel{Pipeline: w.cfg.Pipeline, Stream: s.Name, Table: s.Table}
 		err := w.createLabelled(ctx, "CREATE TABLE IF NOT EXISTS "+w.ident(s.Read)+" ("+columnDefs(want)+")", s.Read, label)
 		if err != nil && !w.createdMeanwhile(ctx, err, relationExists, w.ident(s.Read)) {
@@ -1171,7 +1217,21 @@ func (w *writer) ensureRead(ctx context.Context, s stagedStream, cols []column) 
 			return fmt.Errorf("postgres: column %q of the read table for %s, as its target has it: %w", c.name, s.Name, err)
 		}
 	}
-	return w.ensureTable(ctx, s.Name, s.Read, cols)
+	return w.ensureTable(ctx, s.Name, s.Read, want)
+}
+
+// inOrderOf is cols with those order has first, in order's order, then the
+// rest as they were.
+func inOrderOf(cols, order []column) []column {
+	at := func(c column) int {
+		if i := slices.IndexFunc(order, func(x column) bool { return x.name == c.name }); i >= 0 {
+			return i
+		}
+		return len(order)
+	}
+	out := slices.Clone(cols)
+	slices.SortStableFunc(out, func(a, b column) int { return at(a) - at(b) })
+	return out
 }
 
 // ensureIndex builds the index without blocking the table's writers, unless
@@ -1582,14 +1642,17 @@ func (w *writer) ddlFunc(ctx context.Context, f func(tx pgx.Tx) error) error {
 // columnTypes returns a table's columns in order, or none if it doesn't
 // exist or has none: tableColumns tells those apart.
 func (w *writer) columnTypes(ctx context.Context, table string) ([]column, error) {
-	rows, err := w.pool.Query(ctx, `SELECT attname, format_type(atttypid, atttypmod) FROM pg_attribute
-		WHERE attrelid = to_regclass($1) AND attnum > 0 AND NOT attisdropped ORDER BY attnum`, w.ident(table))
+	rows, err := w.pool.Query(ctx, `SELECT a.attname, format_type(a.atttypid, a.atttypmod),
+			coalesce((SELECT quote_ident(n.nspname) || '.' || quote_ident(co.collname) FROM pg_collation co JOIN pg_namespace n ON n.oid = co.collnamespace
+				WHERE co.oid = a.attcollation AND a.attcollation <> t.typcollation), '')
+		FROM pg_attribute a JOIN pg_type t ON t.oid = a.atttypid
+		WHERE a.attrelid = to_regclass($1) AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum`, w.ident(table))
 	if err != nil {
 		return nil, fmt.Errorf("postgres: read the columns of %s: %w", table, err)
 	}
 	cols, err := pgx.CollectRows(rows, func(r pgx.CollectableRow) (column, error) {
 		var c column
-		return c, r.Scan(&c.name, &c.typ)
+		return c, r.Scan(&c.name, &c.typ, &c.collation)
 	})
 	if err != nil {
 		return nil, fmt.Errorf("postgres: read the columns of %s: %w", table, err)
