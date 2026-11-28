@@ -289,6 +289,46 @@ func TestOverwriteSwapsANewTargetAndAnEmptyRead(t *testing.T) {
 	if n := env.leftovers(); n != 0 {
 		t.Errorf("%d read or swap relations left", n)
 	}
+
+	// The table that took the target's place is no read's: a stream that
+	// stops overwriting keeps it.
+	swapped := env.relid("users")
+	w2 := env.openStreams(2, destination.ScopePipeline, destination.Stream{Name: "users", Mode: destination.Append})
+	recov(t, w2, 2, destination.Epoch{}, nil)
+	if env.relid("users") != swapped {
+		t.Error("the swapped table is gone once the stream appends")
+	}
+}
+
+// Lanes that each staged part of a read's epochs swap its table in once,
+// from lane 0.
+func TestOverwriteSwapsAcrossLanes(t *testing.T) {
+	env := newEnv(t)
+	why := reasons(t)
+	stream := destination.Stream{Name: "users", Mode: destination.Overwrite}
+	ws := env.openLanes(1, 2, destination.Epoch{}, nil, stream)
+	for _, w := range ws {
+		startReads(t, w, map[string]time.Time{"users": time.UnixMicro(1000)})
+	}
+	applySchema(t, ws[0], "users", userFields)
+	oid := env.relid("users")
+	e1, e2 := destination.Epoch{Generation: 1, N: 1}, destination.Epoch{Generation: 1, N: 2}
+	write(t, ws[0], e1, "users", batch(t, userFields, `[{"id": 1, "name": "a", "n": 1}]`))
+	write(t, ws[1], e1, "users", batch(t, userFields, `[{"id": 2, "name": "b", "n": 2}]`))
+	if _, err := ws[0].Commit(t.Context(), e1, precommitAll(t, e1, ws...)); err != nil {
+		t.Fatal(err)
+	}
+	write(t, ws[1], e2, "users", batch(t, userFields, secondRows))
+	endRead(t, ws[0].(destination.ReadTracker), e2, "users")
+	if _, err := ws[0].Commit(t.Context(), e2, precommitAll(t, e2, ws...)); err != nil {
+		t.Fatal(err)
+	}
+	if got := env.text(users); got != "1:a,2:b,3:c" || env.relid("users") == oid {
+		t.Errorf("after the read ended: %s, swapped %v; logged %q", got, env.relid("users") != oid, why())
+	}
+	if n := env.leftovers(); n != 0 {
+		t.Errorf("%d read or swap relations left", n)
+	}
 }
 
 // Whatever a swap can't make again, or would leave without the table it
