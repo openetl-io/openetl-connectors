@@ -676,9 +676,9 @@ func (d *Destination) Preflight(req destination.PreflightRequest) []check.Check 
 				return k.Failure(err)
 			case lacks.Valid:
 				return check.PrivilegeMissing.Fail("privilege", lacks.String, "object", ident)
-			case st.Mode == destination.Overwrite && d.cfg.OverwriteTruncate && !truncates:
+			case owner && st.Mode == destination.Overwrite && d.cfg.OverwriteTruncate && !truncates:
 				f := check.PrivilegeMissing.Fail("privilege", "TRUNCATE", "object", ident)
-				f.Message = "{principal} has no TRUNCATE on {object}, so an overwrite deletes its rows rather than truncating it."
+				f.Message = "{principal} has no TRUNCATE on {object}, so an overwrite that copies its rows in deletes the old ones rather than truncating it."
 				return check.Warn(f)
 			case owner:
 				return nil

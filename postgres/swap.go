@@ -69,14 +69,18 @@ func (w *writer) replace(ctx context.Context, tx pgx.Tx, ended []stagedStream, p
 			return nil, fmt.Errorf("postgres: apply %s: %w", e.s.Name, err)
 		}
 	}
-	// A swap whose lock or check fails gives up every lock taken so far,
-	// copies, and the rest try again.
+	// A swap whose lock, check or switch fails undoes every swap's, letting
+	// go of their locks, then copies, and the rest try again: no copy runs
+	// while a swap holds its target.
 	for len(swaps) > 0 {
-		i, why, err := w.lockAll(ctx, tx, swaps)
+		i, why, err := w.switchAll(ctx, tx, swaps)
 		if err != nil {
 			return nil, fmt.Errorf("postgres: apply %s: swap its read's table in: %w", swaps[max(i, 0)].s.Name, err)
 		}
 		if i < 0 {
+			for _, e := range swaps {
+				swapped = append(swapped, e.s.Name)
+			}
 			break
 		}
 		e := swaps[i]
@@ -85,20 +89,6 @@ func (w *writer) replace(ctx context.Context, tx pgx.Tx, ended []stagedStream, p
 			return nil, fmt.Errorf("postgres: apply %s: %w", e.s.Name, err)
 		}
 		swaps = slices.Delete(swaps, i, i+1)
-	}
-	for _, e := range swaps {
-		why, err := w.switchIn(ctx, tx, e.s, e.plan)
-		if err != nil {
-			return nil, fmt.Errorf("postgres: apply %s: swap its read's table in: %w", e.s.Name, err)
-		}
-		if why == "" {
-			swapped = append(swapped, e.s.Name)
-			continue
-		}
-		w.copiesIn(e.s, why)
-		if err := w.copyIn(ctx, tx, e.s, e.p, e.plan.created); err != nil {
-			return nil, fmt.Errorf("postgres: apply %s: %w", e.s.Name, err)
-		}
 	}
 	return swapped, nil
 }
@@ -110,11 +100,15 @@ type ending struct {
 	plan *swapPlan
 }
 
-// lockAll locks each swap's target in tx, waiting up to lockTimeout for
-// each, and checks it again, in one savepoint, which it rolls back, letting
-// go of every lock, at the first that fails: i is that swap's, and why says
-// why; -1 if none failed.
-func (w *writer) lockAll(ctx context.Context, tx pgx.Tx, swaps []ending) (i int, why string, _ error) {
+// switchAll puts each swap's read's table in its target's place in tx, in
+// one savepoint: it locks every target, waiting up to lockTimeout for each,
+// and checks it and the read's table again; then, for each, it gives the
+// read's table the target's privileges, drops the target, gives the read's
+// table its names, and checks that the table then is as the target was,
+// but for its OID. At the first that fails, it rolls the savepoint back,
+// undoing them all and letting go of every lock: i is that swap's, and why
+// says why; -1 if none failed.
+func (w *writer) switchAll(ctx context.Context, tx pgx.Tx, swaps []ending) (i int, why string, _ error) {
 	i = -1
 	why, err := inSavepoint(ctx, tx, func(tx pgx.Tx) (string, error) {
 		for j, e := range swaps {
@@ -142,6 +136,12 @@ func (w *writer) lockAll(ctx context.Context, tx pgx.Tx, swaps []ending) (i int,
 				return "it changed while the read's table was made to match it: its " + differs(e.plan.before, now), nil
 			}
 		}
+		for j, e := range swaps {
+			i = j
+			if why, err := w.switchIn(ctx, tx, e.s, e.plan); err != nil || why != "" {
+				return why, err
+			}
+		}
 		i = -1
 		return "", nil
 	})
@@ -159,19 +159,28 @@ func (w *writer) copiesIn(s stagedStream, why string) {
 // copyIn replaces the target's rows with the read's, which readers see once
 // tx commits, and drops the read's table; created says a swap created it.
 // With OverwriteTruncate, it truncates the target if it can within
-// lockTimeout, and deletes its rows otherwise, or where a publication would
-// send the inserts and not the truncate.
+// lockTimeout, and deletes its rows otherwise, or where a publication of
+// the target or a table it truncates would send the inserts and not the
+// truncate.
 func (w *writer) copyIn(ctx context.Context, tx pgx.Tx, s stagedStream, p prepared, created bool) error {
 	target := w.ident(s.Table)
 	emptied := false
 	if w.truncate {
 		why, err := inSavepoint(ctx, tx, func(tx pgx.Tx) (string, error) {
+			// The lock, on the table and those it truncates, holds off a
+			// change to their publications.
+			if err := lockBriefly(ctx, tx, "LOCK TABLE "+target+" IN ACCESS EXCLUSIVE MODE"); err != nil {
+				return "", err
+			}
 			var dropped bool
-			if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT FROM pg_publication_tables t JOIN pg_publication p USING (pubname)
-				WHERE t.schemaname = $1 AND t.tablename = $2 AND NOT p.pubtruncate)`, w.schema, s.Table).Scan(&dropped); err != nil || dropped {
+			if err := tx.QueryRow(ctx, `WITH RECURSIVE t(oid) AS (SELECT to_regclass($1)::oid UNION SELECT i.inhrelid FROM pg_inherits i JOIN t ON i.inhparent = t.oid)
+				SELECT EXISTS (SELECT FROM t JOIN pg_class c ON c.oid = t.oid JOIN pg_namespace n ON n.oid = c.relnamespace
+					JOIN pg_publication_tables pt ON pt.schemaname = n.nspname AND pt.tablename = c.relname
+					JOIN pg_publication p ON p.pubname = pt.pubname WHERE NOT p.pubtruncate)`, target).Scan(&dropped); err != nil || dropped {
 				return "a publication publishes its rows' changes, but not a truncate", err
 			}
-			return "", lockBriefly(ctx, tx, "TRUNCATE "+target)
+			_, err := tx.Exec(ctx, "TRUNCATE "+target)
+			return "", err
 		})
 		if err != nil {
 			return err
@@ -294,33 +303,36 @@ func (w *writer) prepareSwap(ctx context.Context, tx pgx.Tx, s stagedStream, p p
 	return plan, "", nil
 }
 
-// switchIn puts the read's table in the target's place in tx, once lockAll
-// has the target's lock: it drops the target, gives the read's table its
-// names, and checks that the table then is as the target was, but for its
-// OID. why says why it didn't.
+// switchIn puts the read's table in the target's place in tx, once
+// switchAll has the target's lock. why says why it didn't; switchAll rolls
+// back what it did. The read's table takes the target's privileges only
+// here, as one whose owner gave up its own SELECT couldn't be copied from.
 func (w *writer) switchIn(ctx context.Context, tx pgx.Tx, s stagedStream, plan *swapPlan) (string, error) {
 	target, read := w.ident(s.Table), w.ident(s.Read)
-	return inSavepoint(ctx, tx, func(tx pgx.Tx) (string, error) {
-		if _, err := tx.Exec(ctx, "DROP TABLE "+target); err != nil {
+	rows, err := tx.Query(ctx, grantsQuery, target, read)
+	if err != nil {
+		return "", err
+	}
+	stmts, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		return "", err
+	}
+	stmts = append(stmts, "DROP TABLE "+target)
+	stmts = append(stmts, plan.renames...)
+	stmts = append(stmts, "ALTER TABLE "+read+" RENAME TO "+pgx.Identifier{s.Table}.Sanitize())
+	for _, q := range stmts {
+		if _, err := tx.Exec(ctx, q); err != nil {
 			return "", err
 		}
-		for _, q := range plan.renames {
-			if _, err := tx.Exec(ctx, q); err != nil {
-				return "", err
-			}
-		}
-		if _, err := tx.Exec(ctx, "ALTER TABLE "+read+" RENAME TO "+pgx.Identifier{s.Table}.Sanitize()); err != nil {
-			return "", err
-		}
-		after, err := signature(ctx, tx, target)
-		if err != nil {
-			return "", err
-		}
-		if after != plan.before {
-			return "the read's table would differ from it in its " + differs(plan.before, after), nil
-		}
-		return "", swapStep(ctx, tx, "swapped")
-	})
+	}
+	after, err := signature(ctx, tx, target)
+	if err != nil {
+		return "", err
+	}
+	if after != plan.before {
+		return "the read's table would differ from it in its " + differs(plan.before, after), nil
+	}
+	return "", swapStep(ctx, tx, "swapped")
 }
 
 // differs names the parts of two signatures that differ.
@@ -386,6 +398,8 @@ var unswappableQuery = `SELECT CASE
 		AND (coalesce(attstattarget::int, -1) >= 0 OR EXISTS (SELECT FROM unnest(a.attoptions) o WHERE o NOT LIKE 'pg\_%'))) THEN 'a column has options or a statistics target'
 	WHEN EXISTS (SELECT FROM pg_index i JOIN pg_class ic ON ic.oid = i.indexrelid WHERE i.indrelid = c.oid
 		AND (NOT i.indisvalid OR NOT i.indisready OR NOT i.indislive OR i.indisclustered OR ic.reltablespace <> 0)) THEN 'an index of it is clustered, in a tablespace of its own, being built or invalid'
+	WHEN EXISTS (SELECT FROM pg_index i JOIN pg_attribute ia ON ia.attrelid = i.indexrelid WHERE i.indrelid = c.oid AND coalesce(ia.attstattarget::int, -1) >= 0)
+		THEN 'an index of it has a statistics target'
 	WHEN EXISTS (SELECT FROM pg_description d WHERE (d.classoid = 'pg_class'::regclass AND d.objoid IN (SELECT indexrelid FROM pg_index WHERE indrelid = c.oid))
 		OR (d.classoid = 'pg_constraint'::regclass AND d.objoid IN (SELECT oid FROM pg_constraint WHERE conrelid = c.oid))) THEN 'an index or a constraint of it has a comment'
 	WHEN EXISTS (SELECT FROM aclexplode(coalesce(c.relacl, acldefault('r', c.relowner))) x WHERE x.grantor <> c.relowner)
@@ -545,8 +559,8 @@ func (r swapTable) notNull(column string) *relConstraint {
 
 // match makes the read's table, which has the target's columns, match the
 // target in tx: its columns' defaults, NOT NULL and comments, its
-// constraints and indexes, its statistics, owner, privileges, comment and
-// storage parameters. Constraints and indexes whose names the target holds
+// constraints and indexes, its statistics, owner, comment and storage
+// parameters; switchIn gives it the target's privileges. Constraints and indexes whose names the target holds
 // get names of their own; renames gives them the target's once it's gone.
 // Checking the rows against the target's constraints and building its
 // indexes are the only steps that read them.
@@ -677,20 +691,6 @@ func (w *writer) match(ctx context.Context, tx pgx.Tx, s stagedStream, target, r
 		after = append(after, "ALTER TABLE "+read+" "+strings.Join(change, ", "))
 	}
 	for _, q := range after {
-		if _, err := tx.Exec(ctx, q); err != nil {
-			return nil, "", err
-		}
-	}
-	// Privileges last: the owner's own are its, whoever it is.
-	rows, err := tx.Query(ctx, grantsQuery, target, read)
-	if err != nil {
-		return nil, "", err
-	}
-	grants, err := pgx.CollectRows(rows, pgx.RowTo[string])
-	if err != nil {
-		return nil, "", err
-	}
-	for _, q := range grants {
 		if _, err := tx.Exec(ctx, q); err != nil {
 			return nil, "", err
 		}

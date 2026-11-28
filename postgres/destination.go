@@ -489,7 +489,8 @@ type prepared struct {
 	// if hasRead: the read has a table.
 	read    []string
 	hasRead bool
-	// Overwrite: the read's table's blocks before the epoch's rows.
+	// Overwrite: the read's table's blocks before the epoch's rows; -1 if
+	// unknown.
 	blocks int64
 	// Merge: the columns an update in the staging didn't send.
 	unchanged []string
@@ -565,13 +566,15 @@ func (w *writer) Apply(ctx context.Context, desc staged, streams []stagedStream,
 }
 
 // settle sets the hint bits of the rows that overwrites took into their
-// reads' tables in the epoch, reading the pages they went to: those that
-// have swapped are the targets' now, and those that copied are gone.
-// Setting a hint bit on a page for the first time after a checkpoint logs
-// the page whole, where the server has data checksums or wal_log_hints, so
-// it's done while the epoch's pages are recent, rather than when the
-// read's end, or the target's readers, read them. It needs a TID range
-// scan, from Postgres 14. Best effort, like DropStaging.
+// reads' tables in the epoch, reading the pages at each table's end that
+// they went to: those that have swapped are the targets' now, and those
+// that copied are gone. Rows that went into free space earlier in the
+// table aren't read. Setting a hint bit on a page for the first time after
+// a checkpoint logs the page whole, where the server has data checksums or
+// wal_log_hints, so it's done while the epoch's pages are recent, rather
+// than when the read's end, or the target's readers, read them. It needs a
+// TID range scan, from Postgres 14, and waits up to lockTimeout for a
+// lock. Best effort, like DropStaging.
 func (w *writer) settle(ctx context.Context, streams []stagedStream, prep map[string]prepared, swapped map[string]bool) {
 	if w.version == 0 {
 		if err := w.pool.QueryRow(ctx, "SELECT current_setting('server_version_num')::int").Scan(&w.version); err != nil {
@@ -584,7 +587,7 @@ func (w *writer) settle(ctx context.Context, streams []stagedStream, prep map[st
 	for _, s := range streams {
 		table := s.Read
 		switch {
-		case s.Mode != modeOverwrite || len(s.Stagings) == 0:
+		case s.Mode != modeOverwrite || len(s.Stagings) == 0 || prep[s.Name].blocks < 0:
 			continue
 		case s.Ended && !swapped[s.Name]:
 			continue
@@ -593,7 +596,13 @@ func (w *writer) settle(ctx context.Context, streams []stagedStream, prep map[st
 		}
 		// The rows may start on the last page before them.
 		from := max(prep[s.Name].blocks-1, 0)
-		_, _ = w.pool.Exec(ctx, "SELECT count(*) FROM "+w.ident(table)+" WHERE ctid >= $1::tid", fmt.Sprintf("(%d,0)", from))
+		_ = pgx.BeginFunc(ctx, w.pool, func(tx pgx.Tx) error {
+			if _, err := tx.Exec(ctx, fmt.Sprintf("SET LOCAL lock_timeout = %d", lockTimeout.Milliseconds())); err != nil {
+				return err
+			}
+			_, err := tx.Exec(ctx, "SELECT count(*) FROM "+w.ident(table)+" WHERE ctid >= $1::tid", fmt.Sprintf("(%d,0)", from))
+			return err
+		})
 	}
 }
 
@@ -1014,8 +1023,9 @@ func (w *writer) prepare(ctx context.Context, desc staged, s stagedStream) (prep
 			if err := w.ensureRead(ctx, s, cols); err != nil {
 				return p, err
 			}
+			// For settle, which doesn't read the table without it.
 			if err := w.pool.QueryRow(ctx, "SELECT pg_relation_size($1) / current_setting('block_size')::bigint", w.ident(s.Read)).Scan(&p.blocks); err != nil {
-				return p, err
+				p.blocks = -1
 			}
 		}
 		have, ok, err := w.tableColumns(ctx, s.Read)
