@@ -870,8 +870,9 @@ func (b *batcher) newField(k string) error {
 // discovery declares the type that takes it, as for a new field. Where that
 // discovery mightn't see the value either, as a sample can miss it, or
 // won't, as no document has such a value any more, which a cdc change from
-// before can find, it goes to i as text, which the engine quarantines or
-// holds. A delete's is left out, -1, as its values only say what it
+// before can find, it goes to i as text, which the engine parses as it
+// does any value's, and quarantines or holds where it doesn't parse. A
+// delete's is left out, -1, as its values only say what it
 // deleted.
 func (b *batcher) unfit(k string, i int, v bson.RawValue, op string) (int, error) {
 	switch {
