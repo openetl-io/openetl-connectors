@@ -263,7 +263,7 @@ func TestDestinationPreflightDedupeIndex(t *testing.T) {
 	})
 
 	// An overwrite of a table the user doesn't own copies its rows in, and
-	// with overwriteTruncate needs TRUNCATE too.
+	// with overwriteTruncate deletes them without TRUNCATE.
 	ow := slices.IndexFunc(dpf.Items, func(it check.Item) bool { return it.Name == "stream.unowned-overwrite.write" })
 	if ow < 0 || !strings.Contains(dpf.Items[ow].Rendered().Message, "copies the read's rows into it") {
 		t.Errorf("the unowned overwrite's item doesn't say it copies: %+v", dpf.Items)
@@ -276,7 +276,7 @@ func TestDestinationPreflightDedupeIndex(t *testing.T) {
 		Streams: []destination.Stream{{Name: "unowned_overwrite", Mode: destination.Overwrite}},
 	})), map[string]string{
 		"schema.create":                  "passed",
-		"stream.unowned-overwrite.write": "failed privilege_missing",
+		"stream.unowned-overwrite.write": "warning privilege_missing",
 	})
 
 	i := slices.IndexFunc(dpf.Items, func(it check.Item) bool { return it.Name == "stream.unowned-no-idx.write" })

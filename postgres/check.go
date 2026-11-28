@@ -628,8 +628,6 @@ func (d *Destination) Preflight(req destination.PreflightRequest) []check.Check 
 		switch {
 		case st.Mode == destination.Merge:
 			privileges = append(privileges, "SELECT", "UPDATE", "DELETE")
-		case st.Mode == destination.Overwrite && d.cfg.OverwriteTruncate:
-			privileges = append(privileges, "DELETE", "TRUNCATE")
 		case st.Mode == destination.Overwrite:
 			privileges = append(privileges, "DELETE")
 		case st.Dedupe == destination.DedupeTarget:
@@ -652,7 +650,7 @@ func (d *Destination) Preflight(req destination.PreflightRequest) []check.Check 
 			// would otherwise create, and whether it has an _openetl_id index
 			// for target-deduped append.
 			var lacks, gains sql.NullString
-			var owner, keyed, dedupeIndexed bool
+			var owner, keyed, dedupeIndexed, truncates bool
 			err := db.QueryRowContext(ctx, `SELECT
 					(SELECT string_agg(p, ', ') FROM unnest($3::text[]) p WHERE NOT has_table_privilege(c.oid, p)),
 					(SELECT string_agg(f, ', ') FROM unnest($4::text[]) f WHERE NOT EXISTS
@@ -666,9 +664,10 @@ func (d *Destination) Preflight(req destination.PreflightRequest) []check.Check 
 					EXISTS (SELECT FROM pg_index i
 						JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = (i.indkey::int2[])[0]
 						WHERE i.indrelid = c.oid AND i.indisvalid AND i.indpred IS NULL AND i.indnkeyatts >= 1
-							AND a.attname = $6 AND a.attnum > 0 AND NOT a.attisdropped)
+							AND a.attname = $6 AND a.attnum > 0 AND NOT a.attisdropped),
+					has_table_privilege(c.oid, 'TRUNCATE')
 				FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
-				WHERE n.nspname = $1 AND c.relname = $2 AND c.relkind IN ('r', 'p')`, schema, table, privileges, fields, key, idColumn).Scan(&lacks, &gains, &owner, &keyed, &dedupeIndexed)
+				WHERE n.nspname = $1 AND c.relname = $2 AND c.relkind IN ('r', 'p')`, schema, table, privileges, fields, key, idColumn).Scan(&lacks, &gains, &owner, &keyed, &dedupeIndexed, &truncates)
 			switch {
 			case errors.Is(err, sql.ErrNoRows):
 				p.Found("{table} doesn't exist, and the first write creates it.")
@@ -677,6 +676,10 @@ func (d *Destination) Preflight(req destination.PreflightRequest) []check.Check 
 				return k.Failure(err)
 			case lacks.Valid:
 				return check.PrivilegeMissing.Fail("privilege", lacks.String, "object", ident)
+			case st.Mode == destination.Overwrite && d.cfg.OverwriteTruncate && !truncates:
+				f := check.PrivilegeMissing.Fail("privilege", "TRUNCATE", "object", ident)
+				f.Message = "{principal} has no TRUNCATE on {object}, so an overwrite deletes its rows rather than truncating it."
+				return check.Warn(f)
 			case owner:
 				return nil
 			case gains.Valid:

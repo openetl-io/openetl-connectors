@@ -1187,7 +1187,9 @@ func (w *writer) ensureRead(ctx context.Context, s stagedStream, cols []column) 
 		if widens(c.typ, target[i].typ) {
 			c.typ = target[i].typ
 		}
-		c.collation = target[i].collation
+		if c.typ == target[i].typ {
+			c.collation = target[i].collation
+		}
 		return c
 	}
 	want := inOrderOf(cols, target)

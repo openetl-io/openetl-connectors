@@ -375,6 +375,7 @@ func TestOverwriteCopiesInWhereASwapIsntExact(t *testing.T) {
 		{name: "replica identity", setup: []string{"ALTER TABLE $schema.users REPLICA IDENTITY FULL"}, reason: "replica identity"},
 		{name: "clustered", setup: []string{"CREATE INDEX users_id ON $schema.users (id)", "ALTER TABLE $schema.users CLUSTER ON users_id"}, reason: "clustered"},
 		{name: "index comment", setup: []string{"CREATE INDEX users_id ON $schema.users (id)", "COMMENT ON INDEX $schema.users_id IS 'x'"}, reason: "comment"},
+		{name: "row type comment", setup: []string{"COMMENT ON TYPE $schema.users IS 'x'"}, reason: "row type"},
 		{name: "constraint not validated", setup: []string{"ALTER TABLE $schema.users ADD CONSTRAINT small CHECK (id < 100) NOT VALID"}, reason: "validated"},
 		{name: "statistics target", setup: []string{"ALTER TABLE $schema.users ALTER COLUMN name SET STATISTICS 500"}, reason: "statistics target"},
 		{name: "column options", setup: []string{"ALTER TABLE $schema.users ALTER COLUMN name SET (n_distinct = 10)"}, reason: "options"},
@@ -822,6 +823,8 @@ func TestOverwriteSettings(t *testing.T) {
 		{name: "truncate under a foreign key", config: map[string]any{"overwriteSwap": false, "overwriteTruncate": true},
 			setup: []string{"ALTER TABLE $schema.users ADD PRIMARY KEY (id)", "CREATE TABLE $schema.refs (id bigint REFERENCES $schema.users)"}, reason: "foreign key"},
 		{name: "truncate behind a reader", config: map[string]any{"overwriteSwap": false, "overwriteTruncate": true}, lock: true, reason: "held a lock"},
+		{name: "truncate under a publication of deletes only", config: map[string]any{"overwriteSwap": false, "overwriteTruncate": true},
+			setup: []string{"ALTER TABLE $schema.users ADD PRIMARY KEY (id)", "CREATE PUBLICATION pub_$name FOR TABLE $schema.users WITH (publish = 'insert, update, delete')"}, reason: "not a truncate"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			env := newEnv(t)
@@ -831,8 +834,9 @@ func TestOverwriteSettings(t *testing.T) {
 			env.exec("CREATE TABLE $schema.users (id bigint, name text, n bigint)")
 			env.exec("INSERT INTO $schema.users VALUES (9, 'old', 9)")
 			for _, q := range tc.setup {
-				env.exec(q)
+				env.exec(strings.ReplaceAll(q, "$name", env.schema))
 			}
+			t.Cleanup(func() { _, _ = env.conn.Exec(context.Background(), "DROP PUBLICATION IF EXISTS pub_"+env.schema) })
 			if tc.lock {
 				reader, err := pgx.Connect(t.Context(), dsn())
 				if err != nil {
@@ -916,4 +920,117 @@ func TestAppliedRowsHaveTheirHintBits(t *testing.T) {
 	if free := env.count(`SELECT upper - lower FROM $schema.page_header($schema.get_raw_page($$` + pgx.Identifier{env.schema, "users"}.Sanitize() + `$$, 0))`); free < 3500 {
 		t.Errorf("the first page, at fillfactor 50, has %d bytes free", free)
 	}
+}
+
+// Where one of an epoch's swaps can't have its lock, every lock is let go
+// before that stream's rows are copied, so the copy never runs while
+// another swap holds its target; the others then swap.
+func TestASwapThatCantLockCopiesWithoutTheOthersLocks(t *testing.T) {
+	timeout := lockTimeout
+	lockTimeout = 200 * time.Millisecond
+	t.Cleanup(func() { lockTimeout = timeout })
+	env := newEnv(t)
+	why := reasons(t)
+	env.exec("CREATE SCHEMA $schema")
+	env.exec("CREATE TABLE $schema.users (id bigint, name text, n bigint)")
+	// Each row copied into orders checks that its backend doesn't hold
+	// users' exclusive lock.
+	env.exec(`CREATE FUNCTION $schema.users_unlocked() RETURNS boolean LANGUAGE sql AS $$
+		SELECT NOT EXISTS (SELECT FROM pg_locks WHERE pid = pg_backend_pid() AND granted AND mode = 'AccessExclusiveLock'
+			AND relation = to_regclass('` + pgx.Identifier{env.schema, "users"}.Sanitize() + `'))$$`)
+	env.exec("CREATE TABLE $schema.orders (id bigint, name text, n bigint CHECK ($schema.users_unlocked()))")
+	reader, err := pgx.Connect(t.Context(), dsn())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = reader.Close(context.Background()) })
+	if _, err := reader.Exec(t.Context(), "BEGIN"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reader.Exec(t.Context(), "SELECT FROM "+pgx.Identifier{env.schema, "orders"}.Sanitize()); err != nil {
+		t.Fatal(err)
+	}
+	usersOID, ordersOID := env.relid("users"), env.relid("orders")
+	streams := []destination.Stream{{Name: "users", Mode: destination.Overwrite}, {Name: "orders", Mode: destination.Overwrite}}
+	w := env.openStreams(1, destination.ScopePipeline, streams...)
+	recov(t, w, 1, destination.Epoch{}, nil)
+	rt := startReads(t, w, map[string]time.Time{"users": time.UnixMicro(1000), "orders": time.UnixMicro(1000)})
+	applySchema(t, w, "users", userFields)
+	applySchema(t, w, "orders", userFields)
+	e1 := destination.Epoch{Generation: 1, N: 1}
+	write(t, w, e1, "users", batch(t, userFields, firstRows))
+	write(t, w, e1, "orders", batch(t, userFields, firstRows))
+	endRead(t, rt, e1, "users")
+	endRead(t, rt, e1, "orders")
+	commit(t, w, e1)
+	if env.relid("users") == usersOID || env.relid("orders") != ordersOID {
+		t.Errorf("users swapped %v, orders %v; logged %q", env.relid("users") != usersOID, env.relid("orders") != ordersOID, why())
+	}
+	if got := env.text("SELECT string_agg(id::text, ',' ORDER BY id) FROM $schema.orders"); got != "1,2" {
+		t.Errorf("orders: %s", got)
+	}
+}
+
+// A column whose type the stream changed from the target's keeps the
+// stream's type in the read's table, without the target's collation.
+func TestAReadsColumnOfAnotherTypeTakesNoCollation(t *testing.T) {
+	env := newEnv(t)
+	env.exec("CREATE SCHEMA $schema")
+	env.exec(`CREATE TABLE $schema.users (id bigint, code varchar(20) COLLATE "C")`)
+	w := env.openStreams(1, destination.ScopePipeline, destination.Stream{Name: "users", Mode: destination.Overwrite})
+	recov(t, w, 1, destination.Epoch{}, nil)
+	startReads(t, w, map[string]time.Time{"users": time.UnixMicro(1000)})
+	code := arrow.Field{Name: "code", Type: arrow.PrimitiveTypes.Int64, Nullable: true}
+	e1 := destination.Epoch{Generation: 1, N: 1}
+	write(t, w, e1, "users", batch(t, []arrow.Field{idField, code}, `[{"id": 1, "code": 7}]`))
+	commit(t, w, e1)
+	read := pgx.Identifier{env.schema, sqlstage.ReadName("p1", "users", time.UnixMicro(1000))}.Sanitize()
+	if got := env.text(`SELECT format_type(atttypid, atttypmod) || ' ' || attcollation FROM pg_attribute WHERE attrelid = '` + read + `'::regclass AND attname = 'code'`); got != "bigint 0" {
+		t.Errorf("the read's code is %s", got)
+	}
+}
+
+// What hangs off the read's table, as off the target, makes the overwrite
+// copy; so does a logical replication slot that decodes every table.
+func TestOverwriteCopiesForTheReadsTableAndLogicalSlots(t *testing.T) {
+	t.Run("trigger on the read's table", func(t *testing.T) {
+		env := newEnv(t)
+		why := reasons(t)
+		w := env.openStreams(1, destination.ScopePipeline, destination.Stream{Name: "users", Mode: destination.Overwrite})
+		recov(t, w, 1, destination.Epoch{}, nil)
+		rt := startReads(t, w, map[string]time.Time{"users": time.UnixMicro(1000)})
+		applySchema(t, w, "users", userFields)
+		oid := env.relid("users")
+		e1, e2 := destination.Epoch{Generation: 1, N: 1}, destination.Epoch{Generation: 1, N: 2}
+		write(t, w, e1, "users", batch(t, userFields, firstRows))
+		commit(t, w, e1)
+		env.exec("CREATE FUNCTION $schema.f() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN NEW; END'")
+		env.exec("CREATE TRIGGER t BEFORE INSERT ON $schema." + sqlstage.ReadName("p1", "users", time.UnixMicro(1000)) + " FOR EACH ROW EXECUTE FUNCTION $schema.f()")
+		write(t, w, e2, "users", batch(t, userFields, secondRows))
+		endRead(t, rt, e2, "users")
+		commit(t, w, e2)
+		if got := env.text(users); got != "1:a,2:b,3:c" || env.relid("users") != oid {
+			t.Errorf("users: %s, swapped %v", got, env.relid("users") != oid)
+		}
+		if got := why(); len(got) != 1 || !strings.Contains(got[0], "the read's table: it has triggers") {
+			t.Errorf("logged %q", got)
+		}
+	})
+	t.Run("logical slot", func(t *testing.T) {
+		env := newEnv(t)
+		why := reasons(t)
+		slot := "pgdest_" + env.schema
+		env.exec("SELECT pg_create_logical_replication_slot('" + slot + "', 'test_decoding')")
+		t.Cleanup(func() { _, _ = env.conn.Exec(context.Background(), "SELECT pg_drop_replication_slot('"+slot+"')") })
+		env.exec("CREATE SCHEMA $schema")
+		env.exec("CREATE TABLE $schema.users (id bigint, name text, n bigint)")
+		oid := env.relid("users")
+		env.overwrite(destination.ScopePipeline, firstRows, secondRows)
+		if env.relid("users") != oid {
+			t.Error("the read's table took the target's place")
+		}
+		if got := why(); len(got) != 1 || !strings.Contains(got[0], "logical replication slot") {
+			t.Errorf("logged %q", got)
+		}
+	})
 }

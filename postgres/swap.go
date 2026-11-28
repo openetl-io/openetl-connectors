@@ -26,14 +26,11 @@ var swapStep = func(context.Context, pgx.Tx, string) error { return nil }
 // is on and exact, the read's table takes the target's place, by name, and
 // the target is dropped; otherwise the target's rows are deleted, or
 // truncated, and the read's inserted, and the read's table dropped. Copies
-// go first, so that a swap's lock on its target is held for least time.
-// swapped are the streams that swapped.
+// go first, and then the swaps take every lock they need before any of
+// them drops a target, so that a swap's lock on its target is held for
+// least time, and not while another stream copies. swapped are the streams
+// that swapped.
 func (w *writer) replace(ctx context.Context, tx pgx.Tx, ended []stagedStream, prep map[string]prepared) (swapped []string, _ error) {
-	type ending struct {
-		s    stagedStream
-		p    prepared
-		plan *swapPlan
-	}
 	var todo []ending
 	for _, s := range ended {
 		p := prep[s.Name]
@@ -64,17 +61,32 @@ func (w *writer) replace(ctx context.Context, tx pgx.Tx, ended []stagedStream, p
 		}
 		todo = append(todo, e)
 	}
+	var swaps []ending
 	for _, e := range todo {
-		if e.plan == nil {
-			if err := w.copyIn(ctx, tx, e.s, e.p, false); err != nil {
-				return nil, fmt.Errorf("postgres: apply %s: %w", e.s.Name, err)
-			}
+		if e.plan != nil {
+			swaps = append(swaps, e)
+		} else if err := w.copyIn(ctx, tx, e.s, e.p, false); err != nil {
+			return nil, fmt.Errorf("postgres: apply %s: %w", e.s.Name, err)
 		}
 	}
-	for _, e := range todo {
-		if e.plan == nil {
-			continue
+	// A swap whose lock or check fails gives up every lock taken so far,
+	// copies, and the rest try again.
+	for len(swaps) > 0 {
+		i, why, err := w.lockAll(ctx, tx, swaps)
+		if err != nil {
+			return nil, fmt.Errorf("postgres: apply %s: swap its read's table in: %w", swaps[max(i, 0)].s.Name, err)
 		}
+		if i < 0 {
+			break
+		}
+		e := swaps[i]
+		w.copiesIn(e.s, why)
+		if err := w.copyIn(ctx, tx, e.s, e.p, e.plan.created); err != nil {
+			return nil, fmt.Errorf("postgres: apply %s: %w", e.s.Name, err)
+		}
+		swaps = slices.Delete(swaps, i, i+1)
+	}
+	for _, e := range swaps {
 		why, err := w.switchIn(ctx, tx, e.s, e.plan)
 		if err != nil {
 			return nil, fmt.Errorf("postgres: apply %s: swap its read's table in: %w", e.s.Name, err)
@@ -91,6 +103,54 @@ func (w *writer) replace(ctx context.Context, tx pgx.Tx, ended []stagedStream, p
 	return swapped, nil
 }
 
+// ending is an overwrite stream whose read ends: a swap if plan isn't nil.
+type ending struct {
+	s    stagedStream
+	p    prepared
+	plan *swapPlan
+}
+
+// lockAll locks each swap's target in tx, waiting up to lockTimeout for
+// each, and checks it again, in one savepoint, which it rolls back, letting
+// go of every lock, at the first that fails: i is that swap's, and why says
+// why; -1 if none failed.
+func (w *writer) lockAll(ctx context.Context, tx pgx.Tx, swaps []ending) (i int, why string, _ error) {
+	i = -1
+	why, err := inSavepoint(ctx, tx, func(tx pgx.Tx) (string, error) {
+		for j, e := range swaps {
+			i = j
+			target, read := w.ident(e.s.Table), w.ident(e.s.Read)
+			if err := lockBriefly(ctx, tx, "LOCK TABLE "+target+" IN ACCESS EXCLUSIVE MODE"); err != nil {
+				return "", err
+			}
+			if err := swapStep(ctx, tx, "locked"); err != nil {
+				return "", err
+			}
+			// Another session may have changed the target, or the read's
+			// table, since they were read.
+			if why, err := unswappable(ctx, tx, target, read); err != nil || why != "" {
+				return why, err
+			}
+			if why, err := unswappable(ctx, tx, read, read); err != nil || why != "" {
+				return "the read's table: " + why, err
+			}
+			now, err := signature(ctx, tx, target)
+			if err != nil {
+				return "", err
+			}
+			if now != e.plan.before {
+				return "it changed while the read's table was made to match it: its " + differs(e.plan.before, now), nil
+			}
+		}
+		i = -1
+		return "", nil
+	})
+	if err != nil || why == "" {
+		return i, "", err
+	}
+	return i, why, nil
+}
+
 func (w *writer) copiesIn(s stagedStream, why string) {
 	slog.Info("an overwrite copies its read's rows into its table, rather than putting the read's table in its place",
 		"stream", s.Name, "table", w.ident(s.Table), "reason", why)
@@ -99,12 +159,20 @@ func (w *writer) copiesIn(s stagedStream, why string) {
 // copyIn replaces the target's rows with the read's, which readers see once
 // tx commits, and drops the read's table; created says a swap created it.
 // With OverwriteTruncate, it truncates the target if it can within
-// lockTimeout, and deletes its rows otherwise.
+// lockTimeout, and deletes its rows otherwise, or where a publication would
+// send the inserts and not the truncate.
 func (w *writer) copyIn(ctx context.Context, tx pgx.Tx, s stagedStream, p prepared, created bool) error {
 	target := w.ident(s.Table)
 	emptied := false
 	if w.truncate {
-		why, err := inSavepoint(ctx, tx, func(tx pgx.Tx) (string, error) { return "", lockBriefly(ctx, tx, "TRUNCATE "+target) })
+		why, err := inSavepoint(ctx, tx, func(tx pgx.Tx) (string, error) {
+			var dropped bool
+			if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT FROM pg_publication_tables t JOIN pg_publication p USING (pubname)
+				WHERE t.schemaname = $1 AND t.tablename = $2 AND NOT p.pubtruncate)`, w.schema, s.Table).Scan(&dropped); err != nil || dropped {
+				return "a publication publishes its rows' changes, but not a truncate", err
+			}
+			return "", lockBriefly(ctx, tx, "TRUNCATE "+target)
+		})
 		if err != nil {
 			return err
 		}
@@ -198,6 +266,11 @@ func (w *writer) prepareSwap(ctx context.Context, tx pgx.Tx, s stagedStream, p p
 		if why, err := unswappable(ctx, tx, target, read); err != nil || why != "" {
 			return why, err
 		}
+		if p.hasRead {
+			if why, err := unswappable(ctx, tx, read, read); err != nil || why != "" {
+				return "the read's table: " + why, err
+			}
+		}
 		var err error
 		if plan.before, err = signature(ctx, tx, target); err != nil {
 			return "", err
@@ -221,30 +294,13 @@ func (w *writer) prepareSwap(ctx context.Context, tx pgx.Tx, s stagedStream, p p
 	return plan, "", nil
 }
 
-// switchIn puts the read's table in the target's place in tx, once it has
-// the target's lock: it drops the target, gives the read's table its names,
-// and checks that the table then is as the target was, but for its OID. why
-// says why it didn't.
+// switchIn puts the read's table in the target's place in tx, once lockAll
+// has the target's lock: it drops the target, gives the read's table its
+// names, and checks that the table then is as the target was, but for its
+// OID. why says why it didn't.
 func (w *writer) switchIn(ctx context.Context, tx pgx.Tx, s stagedStream, plan *swapPlan) (string, error) {
 	target, read := w.ident(s.Table), w.ident(s.Read)
 	return inSavepoint(ctx, tx, func(tx pgx.Tx) (string, error) {
-		if err := lockBriefly(ctx, tx, "LOCK TABLE "+target+" IN ACCESS EXCLUSIVE MODE"); err != nil {
-			return "", err
-		}
-		if err := swapStep(ctx, tx, "locked"); err != nil {
-			return "", err
-		}
-		// Another session may have changed the target since it was read.
-		if why, err := unswappable(ctx, tx, target, read); err != nil || why != "" {
-			return why, err
-		}
-		now, err := signature(ctx, tx, target)
-		if err != nil {
-			return "", err
-		}
-		if now != plan.before {
-			return "it changed while the read's table was made to match it: its " + differs(plan.before, now), nil
-		}
 		if _, err := tx.Exec(ctx, "DROP TABLE "+target); err != nil {
 			return "", err
 		}
@@ -314,10 +370,16 @@ var unswappableQuery = `SELECT CASE
 	WHEN EXISTS (SELECT FROM pg_constraint WHERE contype = 'f' AND (conrelid = c.oid OR confrelid = c.oid)) THEN 'a foreign key refers to it or from it'
 	WHEN EXISTS (SELECT FROM pg_constraint WHERE conrelid = c.oid AND NOT convalidated) THEN 'it has a constraint that isn''t validated'
 	WHEN EXISTS (SELECT FROM pg_constraint WHERE conrelid = c.oid AND contype NOT IN ('p', 'u', 'x', 'c', 'n')) THEN 'it has a constraint trigger'
-	WHEN EXISTS (SELECT FROM pg_publication_tables WHERE schemaname = n.nspname AND tablename = c.relname) THEN 'a publication publishes it'
+	WHEN EXISTS (SELECT FROM pg_publication WHERE puballtables) OR EXISTS (SELECT FROM pg_publication_rel WHERE prrelid = c.oid) THEN 'a publication publishes it'
+	WHEN EXISTS (SELECT FROM pg_publication_tables WHERE pubname IN (SELECT pubname FROM pg_publication WHERE NOT puballtables)
+		AND schemaname = n.nspname AND tablename = c.relname) THEN 'a publication publishes it'
+	WHEN EXISTS (SELECT FROM pg_replication_slots WHERE slot_type = 'logical' AND database = current_database() AND plugin <> 'pgoutput')
+		THEN 'a logical replication slot decodes its database''s changes, which a swap has none of'
 	WHEN EXISTS (SELECT FROM pg_subscription_rel WHERE srrelid = c.oid) THEN 'a subscription writes to it'
 	WHEN EXISTS (SELECT FROM pg_statistic_ext WHERE stxrelid = c.oid) THEN 'it has extended statistics'
 	WHEN EXISTS (SELECT FROM pg_seclabel WHERE classoid = 'pg_class'::regclass AND objoid = c.oid) THEN 'it has security labels'
+	WHEN EXISTS (SELECT FROM pg_description WHERE classoid = 'pg_type'::regclass AND objoid = c.reltype)
+		OR EXISTS (SELECT FROM pg_seclabel WHERE classoid = 'pg_type'::regclass AND objoid = c.reltype) THEN 'its row type has a comment or a security label'
 	WHEN EXISTS (SELECT FROM pg_depend WHERE classid = 'pg_class'::regclass AND objid = c.oid AND deptype = 'e') THEN 'it belongs to an extension'
 	WHEN EXISTS (SELECT FROM pg_attribute WHERE attrelid = c.oid AND attnum > 0 AND NOT attisdropped AND (attidentity <> '' OR attgenerated <> '')) THEN 'it has identity or generated columns'
 	WHEN EXISTS (SELECT FROM pg_attribute a WHERE attrelid = c.oid AND attnum > 0 AND NOT attisdropped
