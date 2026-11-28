@@ -10,7 +10,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/jackc/pglogrepl"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/openetl-io/openetl-connectors/keysplit"
 )
@@ -226,44 +225,6 @@ func TestStatesSpelling(t *testing.T) {
 		if err != nil || string(b) != c.want {
 			t.Errorf("%s, %v, want %s", b, err, c.want)
 		}
-	}
-}
-
-// Each new chunk loses the keys of the transactions its own snapshot didn't
-// see. A transaction goes once every chunk's snapshot sees it from then on.
-func TestReconcileChunks(t *testing.T) {
-	st, other := &cdcStream{}, &cdcStream{}
-	newChunk := func(s *cdcStream, snap pgSnapshot, keys ...string) *chunk {
-		c := &chunk{stream: s, snap: snap, rows: map[string][][]byte{}, keys: keys, lsn: pglogrepl.LSN(1)}
-		for _, k := range keys {
-			c.rows[k] = nil
-		}
-		return c
-	}
-	// Transaction 105 is running in a's snapshot, finished in b's; 101 is
-	// finished in both, though above a's xmin; 90 is below both.
-	a := newChunk(st, pgSnapshot{xmin: 100, xmax: 110, xip: map[uint64]bool{105: true}}, "a1", "a2")
-	b := newChunk(st, pgSnapshot{xmin: 103, xmax: 112, xip: map[uint64]bool{}}, "b1", "b2")
-	c := newChunk(other, pgSnapshot{xmin: 100, xmax: 110, xip: map[uint64]bool{105: true}}, "a1")
-	x105 := &txn{xid: 105, keys: map[*cdcStream][]string{st: {"a1", "b1"}}}
-	x101 := &txn{xid: 101, keys: map[*cdcStream][]string{st: {"a2", "b2"}}}
-	x90 := &txn{xid: 90, keys: map[*cdcStream][]string{st: {"a2", "b2"}}}
-	r := &cdcReader{recent: []*txn{x90, x101, x105}}
-	r.reconcile([]*chunk{a, b, c})
-	if _, ok := a.rows["a1"]; ok {
-		t.Error("a kept the key of a transaction its snapshot didn't see")
-	}
-	if _, ok := a.rows["a2"]; !ok {
-		t.Error("a lost a key of transactions its snapshot saw")
-	}
-	if _, ok := b.rows["b1"]; !ok {
-		t.Error("b lost a key of a transaction its snapshot saw")
-	}
-	if _, ok := c.rows["a1"]; !ok {
-		t.Error("c, of another stream, lost a key the transaction changed in the first")
-	}
-	if !slices.Equal(r.recent, []*txn{x101, x105}) {
-		t.Errorf("kept %d transactions, want those some chunk's xmin doesn't pass", len(r.recent))
 	}
 }
 

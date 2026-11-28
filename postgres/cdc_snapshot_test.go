@@ -7,8 +7,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math/big"
 	mrand "math/rand/v2"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -22,9 +24,10 @@ import (
 	"github.com/openetl-io/openetl/sdk/go/source"
 )
 
-// history is users' history as a test writes it: its rows from before the
-// read's slot, as inserts, then each change, which an append of the stream
-// holds once each. Its copies from on share it.
+// history is a table's history as a test writes it: each key's changes, in
+// order, its rows from before the read's slot as inserts. A test changes a
+// key on one connection at a time, so the order it writes a key's changes
+// in is the order they commit in. Its copies from on share it.
 type history struct {
 	e    *sourceEnv
 	conn *pgx.Conn
@@ -32,20 +35,38 @@ type history struct {
 }
 
 type written struct {
-	mu   sync.Mutex
-	want []string
-	n    int
+	mu    sync.Mutex
+	table string
+	want  []string
+	n     int
+	// How ids are spelled as keys.
+	key func(id int) string
 }
 
-// newHistory creates users with the even ids 2 to 2*rows.
+// newHistory creates users with the even ids 2 to 2*rows as its key.
 func (e *sourceEnv) newHistory(rows int) *history {
 	e.t.Helper()
-	e.exec("CREATE TABLE $schema.users (id int PRIMARY KEY, name text, doc text)")
-	e.exec(fmt.Sprintf("INSERT INTO $schema.users SELECT 2 * i, 'n' || 2 * i, NULL FROM generate_series(1, %d) i", rows))
-	h := &history{e: e, conn: e.conn, written: &written{}}
+	return e.historyOf(rows, "int", strconv.Itoa)
+}
+
+// historyOf creates users with the even ids 2 to 2*rows spelled by key, in
+// a key column of typ.
+func (e *sourceEnv) historyOf(rows int, typ string, key func(int) string) *history {
+	e.t.Helper()
+	return e.tableHistory("users", rows, typ, key)
+}
+
+// tableHistory creates table as historyOf creates users.
+func (e *sourceEnv) tableHistory(table string, rows int, typ string, key func(int) string) *history {
+	e.t.Helper()
+	h := &history{e: e, conn: e.conn, written: &written{table: table, key: key}}
+	e.exec("CREATE TABLE " + h.ident() + " (id " + typ + " PRIMARY KEY, name text, doc text)")
+	var rowsIn []string
 	for i := 1; i <= rows; i++ {
-		h.want = append(h.want, fmt.Sprintf("insert %d n%d", 2*i, 2*i))
+		rowsIn = append(rowsIn, fmt.Sprintf("(%s, 'n%d', NULL)", quoteLiteral(key(2*i)), 2*i))
+		h.want = append(h.want, fmt.Sprintf("insert %s n%d", key(2*i), 2*i))
 	}
+	e.exec("INSERT INTO " + h.ident() + " VALUES " + strings.Join(rowsIn, ", "))
 	return h
 }
 
@@ -54,16 +75,35 @@ func (h *history) on(conn *pgx.Conn) *history {
 	return &history{e: h.e, conn: conn, written: h.written}
 }
 
-// write runs q, whose changes are those given; it may run on a read's
-// goroutine.
-func (h *history) write(q string, changes ...string) {
-	if _, err := h.conn.Exec(context.Background(), strings.ReplaceAll(q, "$schema", pgx.Identifier{h.e.schema}.Sanitize())); err != nil {
+func (h *history) ident() string { return pgx.Identifier{h.e.schema, h.table}.Sanitize() }
+
+// op is a statement of a history's, and the changes it makes.
+type op struct {
+	h       *history
+	q       string
+	changes []string
+}
+
+// run runs ops on h's connection, in one transaction, and records their
+// changes; it may run on a read's goroutine.
+func (h *history) run(ops ...op) {
+	var qs []string
+	for _, o := range ops {
+		qs = append(qs, o.q)
+	}
+	q := strings.Join(qs, "; ")
+	if len(ops) > 1 {
+		q = "BEGIN; " + q + "; COMMIT"
+	}
+	if _, err := h.conn.Exec(context.Background(), q); err != nil {
 		h.e.t.Errorf("%s: %v", q, err)
 		return
 	}
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	h.want = append(h.want, changes...)
+	for _, o := range ops {
+		o.h.mu.Lock()
+		o.h.want = append(o.h.want, o.changes...)
+		o.h.mu.Unlock()
+	}
 }
 
 func (h *history) name() string {
@@ -73,26 +113,33 @@ func (h *history) name() string {
 	return fmt.Sprintf("w%d", h.n)
 }
 
-func (h *history) insert(id int) {
+func (h *history) lit(id int) string { return quoteLiteral(h.key(id)) }
+
+func (h *history) inserting(id int) op {
 	name := h.name()
-	h.write(fmt.Sprintf("INSERT INTO $schema.users VALUES (%d, '%s', NULL)", id, name), fmt.Sprintf("insert %d %s", id, name))
+	return op{h, fmt.Sprintf("INSERT INTO %s VALUES (%s, '%s', NULL)", h.ident(), h.lit(id), name), []string{fmt.Sprintf("insert %s %s", h.key(id), name)}}
 }
 
-func (h *history) update(id int) {
+func (h *history) updating(id int) op {
 	name := h.name()
-	h.write(fmt.Sprintf("UPDATE $schema.users SET name = '%s' WHERE id = %d", name, id), fmt.Sprintf("update %d %s", id, name))
+	return op{h, fmt.Sprintf("UPDATE %s SET name = '%s' WHERE id = %s", h.ident(), name, h.lit(id)), []string{fmt.Sprintf("update %s %s", h.key(id), name)}}
 }
 
-func (h *history) delete(id int) {
-	h.write(fmt.Sprintf("DELETE FROM $schema.users WHERE id = %d", id), fmt.Sprintf("delete %d", id))
+func (h *history) deleting(id int) op {
+	return op{h, fmt.Sprintf("DELETE FROM %s WHERE id = %s", h.ident(), h.lit(id)), []string{"delete " + h.key(id)}}
 }
 
-// move changes a row's key, which the log carries as a delete and the row
+// moving changes a row's key, which the log carries as a delete and the row
 // under its new key.
-func (h *history) move(from, to int) {
+func (h *history) moving(from, to int) op {
 	name := h.name()
-	h.write(fmt.Sprintf("UPDATE $schema.users SET id = %d, name = '%s' WHERE id = %d", to, name, from), fmt.Sprintf("delete %d", from), fmt.Sprintf("update %d %s", to, name))
+	return op{h, fmt.Sprintf("UPDATE %s SET id = %s, name = '%s' WHERE id = %s", h.ident(), h.lit(to), name, h.lit(from)), []string{"delete " + h.key(from), fmt.Sprintf("update %s %s", h.key(to), name)}}
 }
+
+func (h *history) insert(id int)     { h.run(h.inserting(id)) }
+func (h *history) update(id int)     { h.run(h.updating(id)) }
+func (h *history) delete(id int)     { h.run(h.deleting(id)) }
+func (h *history) move(from, to int) { h.run(h.moving(from, to)) }
 
 func (ch change) entry() string {
 	if ch.op == source.OpDelete {
@@ -101,33 +148,88 @@ func (ch change) entry() string {
 	return ch.op + " " + ch.id + " " + ch.name
 }
 
-// appendsOnce checks that got, appended, holds each change of the history
-// once, and nothing else.
-func (h *history) appendsOnce(t *testing.T, got []change) {
+// read says ch is a row a chunk read, whose seq is its chunk's position
+// alone.
+func (ch change) read() bool {
+	return new(big.Int).Mod(ch.seq, big.NewInt(1_000_000_000_000_000_000)).Sign() == 0
+}
+
+// appended spells what an append of got holds of id: a row a chunk read as
+// "chunk NAME", and a change as its entry.
+func appended(got []change, id string) []string {
+	var out []string
+	for _, ch := range got {
+		switch {
+		case ch.id != id:
+		case ch.read():
+			out = append(out, "chunk "+ch.name)
+		default:
+			out = append(out, ch.entry())
+		}
+	}
+	return out
+}
+
+// fromChunks checks that got, appended, holds each key's history from where
+// a chunk read it: the row the chunk read, if it had one, then each change
+// after the chunk's snapshot, once, in order, with seqs in that order too,
+// and nothing else.
+func (h *history) fromChunks(t *testing.T, got []change) {
 	t.Helper()
 	h.mu.Lock()
-	count := map[string]int{}
+	wrote := map[string][]string{}
 	for _, w := range h.want {
-		count[w]++
+		id := strings.Fields(w)[1]
+		wrote[id] = append(wrote[id], w)
 	}
 	h.mu.Unlock()
+	ids := map[string]bool{}
+	for id := range wrote {
+		ids[id] = true
+	}
 	for _, ch := range got {
-		count[ch.entry()]--
+		ids[ch.id] = true
 	}
-	var extra, missing []string
-	for k, n := range count {
-		for ; n < 0; n++ {
-			extra = append(extra, k)
+	// Each key's versions as a merge orders them, by seq, are in the order
+	// they were emitted in.
+	last := map[string]change{}
+	for _, ch := range got {
+		if prev, ok := last[ch.id]; ok && ch.seq.Cmp(prev.seq) <= 0 {
+			t.Errorf("%s: %s, seq %v, after %s, seq %v", ch.id, ch.entry(), ch.seq, prev.entry(), prev.seq)
 		}
-		for ; n > 0; n-- {
-			missing = append(missing, k)
+		last[ch.id] = ch
+	}
+	bad := 0
+	for id := range ids {
+		if got := appended(got, id); !fromAChunk(wrote[id], got) {
+			if bad++; bad <= 20 {
+				t.Errorf("appended, %s is %q, which isn't its history %q from where a chunk read it", id, got, wrote[id])
+			}
 		}
 	}
-	slices.Sort(extra)
-	slices.Sort(missing)
-	if len(extra) > 0 || len(missing) > 0 {
-		t.Errorf("appended, the stream has %d changes the table didn't make, %q, and lacks %d it made, %q", len(extra), extra, len(missing), missing)
+	if bad > 20 {
+		t.Errorf("and %d keys more", bad-20)
 	}
+}
+
+// fromAChunk says got is wrote after one of its changes, or from its start,
+// with the row as that change left it, if it left one, as a chunk's.
+func fromAChunk(wrote, got []string) bool {
+	for i := 0; i <= len(wrote); i++ {
+		rest := got
+		if i > 0 {
+			if f := strings.Fields(wrote[i-1]); f[0] != "delete" {
+				if len(rest) == 0 || rest[0] != "chunk "+f[2] {
+					continue
+				}
+				rest = rest[1:]
+			}
+		}
+		if slices.Equal(rest, wrote[i:]) {
+			return true
+		}
+	}
+	return false
 }
 
 // upTo is what c emitted of stream before its resume point with state, as
@@ -181,17 +283,21 @@ func (c *capture) stateAfter(t *testing.T, stream, key string) string {
 
 // A table written to while its snapshot is read, or between a read that
 // stopped part-way through it and the read that resumes there, reaches an
-// append once: each row that was there before the slot, as an insert, then
-// each change, once. A row inserted, or moved to a new key, comes from the
-// log alone, whichever chunk would read it.
+// append with each key's history from where a chunk read it: the row as the
+// chunk read it, then each change after the chunk's snapshot, once. A change
+// to a key no chunk has read yet isn't sent, nor is one the chunk's snapshot
+// saw: the chunk's row has it.
 func TestCDCSnapshotUnderWrites(t *testing.T) {
 	for _, c := range []struct {
 		name string
 		// users has the even ids 2 to 2*rows, read 10 at a time.
 		rows int
 		// Writes in the first read: as it starts, before its first chunk's
-		// snapshot, or after the snapshot of its chunk-th chunk.
+		// snapshot, before the snapshot of its before-th chunk, or after the
+		// snapshot of its chunk-th chunk.
 		start  func(h *history)
+		before int
+		ahead  func(h *history)
 		chunk  int
 		during func(h *history)
 		// Where a read stopped, whose resume point a checkpoint holds; nil:
@@ -199,7 +305,74 @@ func TestCDCSnapshotUnderWrites(t *testing.T) {
 		at func(t *testing.T, first *capture) string
 		// Writes after the first read, before the read from at.
 		between func(h *history)
+		// What an append holds of some keys, as appended spells it.
+		exact map[int][]string
 	}{
+		{
+			name:  "changes before its chunk is read",
+			rows:  40,
+			chunk: 1,
+			during: func(h *history) {
+				h.update(30)
+				h.update(30)
+				h.delete(32)
+				h.move(34, 35)
+				h.delete(36)
+				h.insert(36)
+				h.insert(37)
+			},
+			exact: map[int][]string{30: {"chunk w2"}, 32: nil, 34: nil, 35: {"chunk w3"}, 36: {"chunk w4"}, 37: {"chunk w5"}},
+		},
+		{
+			name:   "changes its chunk's snapshot saw, read while the chunk's held",
+			rows:   20,
+			before: 1,
+			ahead: func(h *history) {
+				h.update(4)
+				h.delete(6)
+				h.move(8, 9)
+				h.insert(11)
+			},
+			exact: map[int][]string{4: {"chunk w1"}, 6: nil, 8: nil, 9: {"chunk w2"}, 11: {"chunk w3"}},
+		},
+		{
+			name:   "changes the next chunk's snapshot saw, read while the chunk before is held",
+			rows:   40,
+			before: 2,
+			ahead: func(h *history) {
+				h.update(24)
+				h.delete(26)
+				h.insert(27)
+				h.move(28, 61)
+			},
+			exact: map[int][]string{24: {"chunk w1"}, 26: nil, 27: {"chunk w2"}, 28: nil, 61: {"chunk w3"}},
+		},
+		{
+			name:  "keys moved behind it, ahead of it, and within its chunk",
+			rows:  40,
+			chunk: 2,
+			during: func(h *history) {
+				h.move(4, 45)
+				h.move(60, 5)
+				h.move(30, 31)
+			},
+			exact: map[int][]string{4: {"chunk n4", "delete 4"}, 45: {"chunk w1"}, 60: nil, 5: {"update 5 w2"}, 30: {"chunk n30", "delete 30"}, 31: {"update 31 w3"}},
+		},
+		{
+			name:  "resumed mid-snapshot, rows inserted ahead of it before its resume point",
+			rows:  40,
+			chunk: 1,
+			during: func(h *history) {
+				h.insert(51)
+				h.update(51)
+				h.insert(53)
+				h.insert(55)
+				h.delete(55)
+				h.update(30)
+			},
+			at:    func(t *testing.T, c *capture) string { return c.stateAfter(t, "users", "20") },
+			exact: map[int][]string{51: {"chunk w2"}, 53: {"chunk w3"}, 55: nil, 30: {"chunk w5"}},
+		},
 		{
 			name: "resumed after its last row, rows inserted since",
 			rows: 20,
@@ -302,6 +475,7 @@ func TestCDCSnapshotUnderWrites(t *testing.T) {
 				h.insert(7)
 				h.update(7)
 			},
+			exact: map[int][]string{4: {"chunk n4", "update 4 w1"}, 6: {"chunk n6", "delete 6"}, 7: {"insert 7 w2", "update 7 w3"}},
 		},
 		{
 			name:  "changes behind it while it's read",
@@ -324,6 +498,15 @@ func TestCDCSnapshotUnderWrites(t *testing.T) {
 				beforeStartReplication = func() { once.Do(func() { c.start(h) }) }
 				t.Cleanup(func() { beforeStartReplication = nil })
 			}
+			if c.ahead != nil {
+				var chunks atomic.Int64
+				beforeChunkSnapshot = func() {
+					if chunks.Add(1) == int64(c.before) {
+						c.ahead(h)
+					}
+				}
+				t.Cleanup(func() { beforeChunkSnapshot = nil })
+			}
 			if c.during != nil {
 				var chunks atomic.Int64
 				afterChunkSnapshot = func() {
@@ -334,7 +517,7 @@ func TestCDCSnapshotUnderWrites(t *testing.T) {
 				t.Cleanup(func() { afterChunkSnapshot = nil })
 			}
 			first := readCDC(t, s, pipeline, map[string]string{"users": ""})
-			beforeStartReplication, afterChunkSnapshot = nil, nil
+			beforeStartReplication, beforeChunkSnapshot, afterChunkSnapshot = nil, nil, nil
 			state := first.last("users")
 			got := first.changes(t, "users")
 			if c.at != nil {
@@ -346,7 +529,12 @@ func TestCDCSnapshotUnderWrites(t *testing.T) {
 			}
 			rest := readCDC(t, s, pipeline, map[string]string{"users": state})
 			got = append(got, rest.changes(t, "users")...)
-			h.appendsOnce(t, got)
+			h.fromChunks(t, got)
+			for id, want := range c.exact {
+				if got := appended(got, strconv.Itoa(id)); !slices.Equal(got, want) {
+					t.Errorf("appended, %d is %q, want %q", id, got, want)
+				}
+			}
 			sameRows(t, merged(got), e.rows("users"))
 		})
 	}
@@ -370,11 +558,11 @@ func TestCDCSnapshotEndsWithAFullChunk(t *testing.T) {
 	}
 }
 
-// A row the log doesn't send whole keeps its chunk row, which has what the
-// log left out: one inserted into a table with a generated column, which
-// the log doesn't send, and one a key change moved without its unchanged
-// TOAST value, into a key whose row the log had brought in whole and taken
-// out, while the chunk was held or before it was read.
+// A row whose chunk reads it arrives whole, with what the log leaves out of
+// its changes: one inserted into a table with a generated column, which the
+// log doesn't send, and one a key change moved without its unchanged TOAST
+// value, into a key whose row the log had brought in whole and taken out,
+// while the chunk was held or before it was read.
 func TestCDCSnapshotKeepsRowsTheLogSendsInPart(t *testing.T) {
 	t.Run("generated column", func(t *testing.T) {
 		e := newSourceEnv(t)
@@ -450,6 +638,7 @@ func TestCDCSnapshotKeepsRowsTheLogSendsInPart(t *testing.T) {
 			}
 			t.Cleanup(func() { beforeStartReplication, afterChunkSnapshot, beforeChunkSnapshot = nil, nil, nil })
 			got := readCDC(t, s, pipeline, map[string]string{"users": ""}).changes(t, "users")
+			h.fromChunks(t, got)
 			sameRows(t, merged(got), e.rows("users"))
 		})
 	}
@@ -513,8 +702,9 @@ func keepInserting(t *testing.T, h *history, seed uint64, ids, changes int, wrot
 
 // Writers insert rows throughout a continuous read in key ranges, ahead of
 // and behind each range's chunks, and change only rows they inserted.
-// Appended, the stream holds each change once; merged, it's the table.
-func TestCDCKeyRangesAppendRowsInsertedWhileReadOnce(t *testing.T) {
+// Appended, the stream holds each key's history from its chunk; merged,
+// it's the table.
+func TestCDCKeyRangesAppendRowsInsertedWhileReadFromTheirChunks(t *testing.T) {
 	for run := range 3 {
 		t.Run(fmt.Sprint(run), func(t *testing.T) {
 			e := newSourceEnv(t)
@@ -575,14 +765,15 @@ func TestCDCKeyRangesAppendRowsInsertedWhileReadOnce(t *testing.T) {
 				t.Fatal(err)
 			}
 			got := c.changes(t, "users")
-			h.appendsOnce(t, got)
+			h.fromChunks(t, got)
 			sameRows(t, merged(got), e.rows("users"))
 		})
 	}
 }
 
 // A read stopped mid-snapshot in key ranges, then resumed after writers
-// inserted rows and changed only those, appends each change once.
+// inserted rows and changed only those, appends each key's history from its
+// chunk.
 func TestCDCRestartsMidSnapshotAfterInserts(t *testing.T) {
 	e := newSourceEnv(t)
 	h := e.newHistory(1500)
@@ -607,6 +798,6 @@ func TestCDCRestartsMidSnapshotAfterInserts(t *testing.T) {
 	keepInserting(t, h, 7, 3200, 150, nil)
 	rest := e.readCDCLanes(s, pipeline, 3, map[string]string{"users": state})
 	got := append(first.changes(t, "users"), rest.changes(t, "users")...)
-	h.appendsOnce(t, got)
+	h.fromChunks(t, got)
 	sameRows(t, merged(got), e.rows("users"))
 }
