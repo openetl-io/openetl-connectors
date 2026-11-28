@@ -171,6 +171,74 @@ func atStep(t *testing.T, step string, f func(ctx context.Context, tx pgx.Tx) er
 	t.Cleanup(func() { swapStep = prev })
 }
 
+// asRole makes the env's destination sign in as role, which it lets sign in.
+func (e *env) asRole(role string) {
+	e.t.Helper()
+	e.exec("ALTER ROLE " + role + " LOGIN PASSWORD 'pw'")
+	u, err := url.Parse(dsn())
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	u.User = url.UserPassword(role, "pw")
+	cfg, _ := json.Marshal(map[string]string{"dsn": u.String(), "schema": e.schema})
+	if e.d, err = NewDestination(cfg); err != nil {
+		e.t.Fatal(err)
+	}
+}
+
+// holdLock reads table in a transaction that stays open, holding its lock,
+// until the test ends.
+func (e *env) holdLock(table string) {
+	e.t.Helper()
+	reader, err := pgx.Connect(e.t.Context(), dsn())
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	e.t.Cleanup(func() { _ = reader.Close(context.Background()) })
+	for _, q := range []string{"BEGIN", "SELECT FROM " + pgx.Identifier{e.schema, table}.Sanitize()} {
+		if _, err := reader.Exec(e.t.Context(), q); err != nil {
+			e.t.Fatal(err)
+		}
+	}
+}
+
+// shortLocks makes lockTimeout short until the test ends.
+func shortLocks(t *testing.T) {
+	timeout := lockTimeout
+	lockTimeout = 200 * time.Millisecond
+	t.Cleanup(func() { lockTimeout = timeout })
+}
+
+// overwriteTwo overwrites users and orders in one epoch that ends both
+// reads, after before; each row copied into orders checks that its backend
+// doesn't hold users' exclusive lock. It reports which swapped.
+func (e *env) overwriteTwo(before func()) (usersSwapped, ordersSwapped bool) {
+	e.t.Helper()
+	t := e.t
+	e.exec("CREATE SCHEMA $schema")
+	e.exec("CREATE TABLE $schema.users (id bigint, name text, n bigint)")
+	e.exec(`CREATE FUNCTION $schema.users_unlocked() RETURNS boolean LANGUAGE sql AS $$
+		SELECT NOT EXISTS (SELECT FROM pg_locks WHERE pid = pg_backend_pid() AND granted AND mode = 'AccessExclusiveLock'
+			AND relation = to_regclass('` + pgx.Identifier{e.schema, "users"}.Sanitize() + `'))$$`)
+	e.exec("CREATE TABLE $schema.orders (id bigint, name text, n bigint CHECK ($schema.users_unlocked()))")
+	before()
+	usersOID, ordersOID := e.relid("users"), e.relid("orders")
+	w := e.openStreams(1, destination.ScopePipeline, destination.Stream{Name: "users", Mode: destination.Overwrite}, destination.Stream{Name: "orders", Mode: destination.Overwrite})
+	recov(t, w, 1, destination.Epoch{}, nil)
+	rt := startReads(t, w, map[string]time.Time{"users": time.UnixMicro(1000), "orders": time.UnixMicro(1000)})
+	e1 := destination.Epoch{Generation: 1, N: 1}
+	for _, stream := range []string{"users", "orders"} {
+		applySchema(t, w, stream, userFields)
+		write(t, w, e1, stream, batch(t, userFields, firstRows))
+		endRead(t, rt, e1, stream)
+	}
+	commit(t, w, e1)
+	if got := e.text("SELECT string_agg(id::text, ',' ORDER BY id) FROM $schema.users") + "/" + e.text("SELECT string_agg(id::text, ',' ORDER BY id) FROM $schema.orders"); got != "1,2/1,2" {
+		t.Errorf("users/orders: %s", got)
+	}
+	return e.relid("users") != usersOID, e.relid("orders") != ordersOID
+}
+
 var userFields = []arrow.Field{idField, nameField, nField}
 
 // overwrite reads rows into stream users in two epochs, the second of which
@@ -468,20 +536,11 @@ func TestOverwriteOfATableTheUserDoesntOwn(t *testing.T) {
 	env := newEnv(t)
 	why := reasons(t)
 	role := env.role()
-	env.exec("ALTER ROLE " + role + " LOGIN PASSWORD 'pw'")
 	env.exec("CREATE SCHEMA $schema")
 	env.exec("GRANT USAGE, CREATE ON SCHEMA $schema TO " + role)
 	env.exec("CREATE TABLE $schema.users (id bigint, name text, n bigint)")
 	env.exec("GRANT SELECT, INSERT, DELETE ON $schema.users TO " + role)
-	u, err := url.Parse(dsn())
-	if err != nil {
-		t.Fatal(err)
-	}
-	u.User = url.UserPassword(role, "pw")
-	cfg, _ := json.Marshal(map[string]string{"dsn": u.String(), "schema": env.schema})
-	if env.d, err = NewDestination(cfg); err != nil {
-		t.Fatal(err)
-	}
+	env.asRole(role)
 	oid := env.relid("users")
 	env.overwrite(destination.ScopePipeline, firstRows, secondRows)
 	if got := env.text(users); got != "1:a,2:b,3:c" || env.relid("users") != oid {
@@ -598,9 +657,7 @@ func TestAFencedWriterDoesntSwap(t *testing.T) {
 // table first after it, sees the rows the read had when the snapshot was
 // taken.
 func TestReadersOfASwap(t *testing.T) {
-	timeout := lockTimeout
-	lockTimeout = 200 * time.Millisecond
-	t.Cleanup(func() { lockTimeout = timeout })
+	shortLocks(t)
 	connect := func(t *testing.T) *pgx.Conn {
 		c, err := pgx.Connect(t.Context(), dsn())
 		if err != nil {
@@ -814,9 +871,7 @@ func TestAnOverwriteWithoutATable(t *testing.T) {
 // truncates it; a truncate that can't have its lock in time, or that a
 // foreign key refuses, deletes the rows instead.
 func TestOverwriteSettings(t *testing.T) {
-	timeout := lockTimeout
-	lockTimeout = 200 * time.Millisecond
-	t.Cleanup(func() { lockTimeout = timeout })
+	shortLocks(t)
 	for _, tc := range []struct {
 		name   string
 		config map[string]any
@@ -847,17 +902,7 @@ func TestOverwriteSettings(t *testing.T) {
 			}
 			t.Cleanup(func() { _, _ = env.conn.Exec(context.Background(), "DROP PUBLICATION IF EXISTS pub_"+env.schema) })
 			if tc.lock {
-				reader, err := pgx.Connect(t.Context(), dsn())
-				if err != nil {
-					t.Fatal(err)
-				}
-				t.Cleanup(func() { _ = reader.Close(context.Background()) })
-				if _, err := reader.Exec(t.Context(), "BEGIN"); err != nil {
-					t.Fatal(err)
-				}
-				if _, err := reader.Exec(t.Context(), "SELECT FROM "+pgx.Identifier{env.schema, "users"}.Sanitize()); err != nil {
-					t.Fatal(err)
-				}
+				env.holdLock("users")
 			}
 			oid, node := env.relid("users"), env.filenode("users")
 			env.overwrite(destination.ScopePipeline, firstRows, secondRows)
@@ -935,48 +980,11 @@ func TestAppliedRowsHaveTheirHintBits(t *testing.T) {
 // before that stream's rows are copied, so the copy never runs while
 // another swap holds its target; the others then swap.
 func TestASwapThatCantLockCopiesWithoutTheOthersLocks(t *testing.T) {
-	timeout := lockTimeout
-	lockTimeout = 200 * time.Millisecond
-	t.Cleanup(func() { lockTimeout = timeout })
+	shortLocks(t)
 	env := newEnv(t)
 	why := reasons(t)
-	env.exec("CREATE SCHEMA $schema")
-	env.exec("CREATE TABLE $schema.users (id bigint, name text, n bigint)")
-	// Each row copied into orders checks that its backend doesn't hold
-	// users' exclusive lock.
-	env.exec(`CREATE FUNCTION $schema.users_unlocked() RETURNS boolean LANGUAGE sql AS $$
-		SELECT NOT EXISTS (SELECT FROM pg_locks WHERE pid = pg_backend_pid() AND granted AND mode = 'AccessExclusiveLock'
-			AND relation = to_regclass('` + pgx.Identifier{env.schema, "users"}.Sanitize() + `'))$$`)
-	env.exec("CREATE TABLE $schema.orders (id bigint, name text, n bigint CHECK ($schema.users_unlocked()))")
-	reader, err := pgx.Connect(t.Context(), dsn())
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = reader.Close(context.Background()) })
-	if _, err := reader.Exec(t.Context(), "BEGIN"); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := reader.Exec(t.Context(), "SELECT FROM "+pgx.Identifier{env.schema, "orders"}.Sanitize()); err != nil {
-		t.Fatal(err)
-	}
-	usersOID, ordersOID := env.relid("users"), env.relid("orders")
-	streams := []destination.Stream{{Name: "users", Mode: destination.Overwrite}, {Name: "orders", Mode: destination.Overwrite}}
-	w := env.openStreams(1, destination.ScopePipeline, streams...)
-	recov(t, w, 1, destination.Epoch{}, nil)
-	rt := startReads(t, w, map[string]time.Time{"users": time.UnixMicro(1000), "orders": time.UnixMicro(1000)})
-	applySchema(t, w, "users", userFields)
-	applySchema(t, w, "orders", userFields)
-	e1 := destination.Epoch{Generation: 1, N: 1}
-	write(t, w, e1, "users", batch(t, userFields, firstRows))
-	write(t, w, e1, "orders", batch(t, userFields, firstRows))
-	endRead(t, rt, e1, "users")
-	endRead(t, rt, e1, "orders")
-	commit(t, w, e1)
-	if env.relid("users") == usersOID || env.relid("orders") != ordersOID {
-		t.Errorf("users swapped %v, orders %v; logged %q", env.relid("users") != usersOID, env.relid("orders") != ordersOID, why())
-	}
-	if got := env.text("SELECT string_agg(id::text, ',' ORDER BY id) FROM $schema.orders"); got != "1,2" {
-		t.Errorf("orders: %s", got)
+	if users, orders := env.overwriteTwo(func() { env.holdLock("orders") }); !users || orders {
+		t.Errorf("users swapped %v, orders %v; logged %q", users, orders, why())
 	}
 	if got := why(); len(got) != 1 || !strings.Contains(got[0], "held a lock") {
 		t.Errorf("logged %q, want orders' lock", got)
@@ -1051,38 +1059,17 @@ func TestOverwriteCopiesForTheReadsTableAndLogicalSlots(t *testing.T) {
 // its lock: the read's table takes the target's privileges only in the
 // swap.
 func TestACopyAfterAFailedSwapReadsTheReadsTable(t *testing.T) {
-	timeout := lockTimeout
-	lockTimeout = 200 * time.Millisecond
-	t.Cleanup(func() { lockTimeout = timeout })
+	shortLocks(t)
 	env := newEnv(t)
 	why := reasons(t)
 	role := env.role()
-	env.exec("ALTER ROLE " + role + " LOGIN PASSWORD 'pw'")
 	env.exec("CREATE SCHEMA $schema")
 	env.exec("GRANT USAGE, CREATE ON SCHEMA $schema TO " + role)
 	env.exec("CREATE TABLE $schema.users (id bigint, name text, n bigint)")
 	env.exec("ALTER TABLE $schema.users OWNER TO " + role)
 	env.exec("REVOKE SELECT ON $schema.users FROM " + role)
-	u, err := url.Parse(dsn())
-	if err != nil {
-		t.Fatal(err)
-	}
-	u.User = url.UserPassword(role, "pw")
-	cfg, _ := json.Marshal(map[string]string{"dsn": u.String(), "schema": env.schema})
-	if env.d, err = NewDestination(cfg); err != nil {
-		t.Fatal(err)
-	}
-	reader, err := pgx.Connect(t.Context(), dsn())
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = reader.Close(context.Background()) })
-	if _, err := reader.Exec(t.Context(), "BEGIN"); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := reader.Exec(t.Context(), "SELECT FROM "+pgx.Identifier{env.schema, "users"}.Sanitize()); err != nil {
-		t.Fatal(err)
-	}
+	env.asRole(role)
+	env.holdLock("users")
 	oid := env.relid("users")
 	env.overwrite(destination.ScopePipeline, firstRows, secondRows)
 	if got := env.text(users); got != "1:a,2:b,3:c" || env.relid("users") != oid {
@@ -1099,12 +1086,6 @@ func TestACopyAfterAFailedSwapReadsTheReadsTable(t *testing.T) {
 func TestALateSwapFailureUndoesTheOthers(t *testing.T) {
 	env := newEnv(t)
 	why := reasons(t)
-	env.exec("CREATE SCHEMA $schema")
-	env.exec("CREATE TABLE $schema.users (id bigint, name text, n bigint)")
-	env.exec(`CREATE FUNCTION $schema.users_unlocked() RETURNS boolean LANGUAGE sql AS $$
-		SELECT NOT EXISTS (SELECT FROM pg_locks WHERE pid = pg_backend_pid() AND granted AND mode = 'AccessExclusiveLock'
-			AND relation = to_regclass('` + pgx.Identifier{env.schema, "users"}.Sanitize() + `'))$$`)
-	env.exec("CREATE TABLE $schema.orders (id bigint, name text, n bigint CHECK ($schema.users_unlocked()))")
 	// The second swap, orders', fails as the server would.
 	calls := 0
 	atStep(t, "swapped", func(ctx context.Context, tx pgx.Tx) error {
@@ -1114,24 +1095,8 @@ func TestALateSwapFailureUndoesTheOthers(t *testing.T) {
 		}
 		return nil
 	})
-	usersOID, ordersOID := env.relid("users"), env.relid("orders")
-	streams := []destination.Stream{{Name: "users", Mode: destination.Overwrite}, {Name: "orders", Mode: destination.Overwrite}}
-	w := env.openStreams(1, destination.ScopePipeline, streams...)
-	recov(t, w, 1, destination.Epoch{}, nil)
-	rt := startReads(t, w, map[string]time.Time{"users": time.UnixMicro(1000), "orders": time.UnixMicro(1000)})
-	applySchema(t, w, "users", userFields)
-	applySchema(t, w, "orders", userFields)
-	e1 := destination.Epoch{Generation: 1, N: 1}
-	write(t, w, e1, "users", batch(t, userFields, firstRows))
-	write(t, w, e1, "orders", batch(t, userFields, firstRows))
-	endRead(t, rt, e1, "users")
-	endRead(t, rt, e1, "orders")
-	commit(t, w, e1)
-	if env.relid("users") == usersOID || env.relid("orders") != ordersOID {
-		t.Errorf("users swapped %v, orders %v; logged %q", env.relid("users") != usersOID, env.relid("orders") != ordersOID, why())
-	}
-	if got := env.text("SELECT string_agg(id::text, ',' ORDER BY id) FROM $schema.users") + "/" + env.text("SELECT string_agg(id::text, ',' ORDER BY id) FROM $schema.orders"); got != "1,2/1,2" {
-		t.Errorf("users/orders: %s", got)
+	if users, orders := env.overwriteTwo(func() {}); !users || orders {
+		t.Errorf("users swapped %v, orders %v; logged %q", users, orders, why())
 	}
 	if got := why(); len(got) != 1 || !strings.Contains(got[0], "division by zero") {
 		t.Errorf("logged %q", got)
