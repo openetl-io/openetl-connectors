@@ -244,6 +244,7 @@ func TestOverwriteSwapsTheReadsTableIn(t *testing.T) {
 			if n := env.count("SELECT count(*) FROM pg_stats WHERE schemaname = '" + env.schema + "' AND tablename = 'users'"); n == 0 {
 				t.Error("the table has no statistics")
 			}
+
 		})
 	}
 }
@@ -868,7 +869,8 @@ func TestOverwriteSettings(t *testing.T) {
 // The rows an epoch takes into a read's table have their hint bits set
 // once it's applied, as do the last epoch's once its table has swapped in:
 // a scan of them later sets none, which, with data checksums, would log
-// each page whole.
+// each page whole. The read's table fills its pages as the target's
+// fillfactor has it.
 func TestAppliedRowsHaveTheirHintBits(t *testing.T) {
 	env := newEnv(t)
 	env.exec("CREATE SCHEMA $schema")
@@ -894,6 +896,7 @@ func TestAppliedRowsHaveTheirHintBits(t *testing.T) {
 	recov(t, w, 1, destination.Epoch{}, nil)
 	rt := startReads(t, w, map[string]time.Time{"users": time.UnixMicro(1000)})
 	applySchema(t, w, "users", userFields)
+	env.exec("ALTER TABLE $schema.users SET (fillfactor = 50)")
 	oid := env.relid("users")
 	e1, e2 := destination.Epoch{Generation: 1, N: 1}, destination.Epoch{Generation: 1, N: 2}
 	write(t, w, e1, "users", batch(t, userFields, rows(1, 2000)))
@@ -909,5 +912,8 @@ func TestAppliedRowsHaveTheirHintBits(t *testing.T) {
 	}
 	if n, all := unhinted("users"), env.count("SELECT count(*) FROM $schema.users"); n != 0 || all != 4000 {
 		t.Errorf("%d of the swapped table's %d rows have no hint bit", n, all)
+	}
+	if free := env.count(`SELECT upper - lower FROM $schema.page_header($schema.get_raw_page($$` + pgx.Identifier{env.schema, "users"}.Sanitize() + `$$, 0))`); free < 3500 {
+		t.Errorf("the first page, at fillfactor 50, has %d bytes free", free)
 	}
 }

@@ -1166,8 +1166,8 @@ func (w *writer) preparePatch(ctx context.Context, desc staged, s stagedStream) 
 // narrower than the target's takes the target's type: only a person widens a
 // target, after ApplySchema refused to and said how, and the read's table
 // replaces the target's rows. Its columns have the target's collations, and
-// are in the target's order, then the rest in cols', so that the table can
-// take the target's place.
+// are in the target's order, then the rest in cols', and it has the
+// target's fillfactor, so that the table can take the target's place.
 func (w *writer) ensureRead(ctx context.Context, s stagedStream, cols []column) error {
 	have, ok, err := w.tableColumns(ctx, s.Read)
 	if err != nil {
@@ -1195,8 +1195,20 @@ func (w *writer) ensureRead(ctx context.Context, s stagedStream, cols []column) 
 		want[i] = targetType(c)
 	}
 	if !ok {
+		// Its pages fill as the target's would.
+		with := ""
+		if s.Table != "" {
+			var fill *string
+			if err := w.pool.QueryRow(ctx, `SELECT option_value FROM pg_class c, pg_options_to_table(c.reloptions)
+				WHERE c.oid = to_regclass($1) AND option_name = 'fillfactor'`, w.ident(s.Table)).Scan(&fill); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+				return err
+			}
+			if fill != nil {
+				with = " WITH (fillfactor = " + quoteLiteral(*fill) + ")"
+			}
+		}
 		label := sqlstage.ReadLabel{Pipeline: w.cfg.Pipeline, Stream: s.Name, Table: s.Table}
-		err := w.createLabelled(ctx, "CREATE TABLE IF NOT EXISTS "+w.ident(s.Read)+" ("+columnDefs(want)+")", s.Read, label)
+		err := w.createLabelled(ctx, "CREATE TABLE IF NOT EXISTS "+w.ident(s.Read)+" ("+columnDefs(want)+")"+with, s.Read, label)
 		if err != nil && !w.createdMeanwhile(ctx, err, relationExists, w.ident(s.Read)) {
 			return fmt.Errorf("postgres: create the read table for %s: %w", s.Name, err)
 		}
