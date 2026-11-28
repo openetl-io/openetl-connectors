@@ -206,10 +206,15 @@ type txn struct {
 	at     time.Time
 	// Changes read so far.
 	n uint64
-	// The streams it changed a key of that no chunk had read, or that a
-	// held chunk's snapshot didn't see it change: a chunk read later, here
-	// or after a restart, must see it.
-	deferred []*cdcStream
+	// What a chunk read later must see it for, here or after a restart: the
+	// streams it changed a key of that no chunk had read, until each one's
+	// snapshot is read, and the held chunks whose snapshots didn't see it
+	// change their keys, until each one passes.
+	ahead []*cdcStream
+	held  []*chunk
+	// It's in the reader's unseen; a snapshot saw it, and so every later one
+	// does.
+	listed, seen bool
 }
 
 // version is a version of a row as a stream's batch takes it.
@@ -247,6 +252,10 @@ type chunk struct {
 	// snapshot didn't see came to, the row it read of the key, if any, then
 	// each change to the key, in the log's order.
 	after []version
+	// Its rows' bytes, and the changes' in after.
+	bytes, afterBytes int
+	// It passed, or was dropped (drop).
+	done, dropped bool
 }
 
 type cdcReader struct {
@@ -275,9 +284,10 @@ type cdcReader struct {
 	txn        *txn
 	// Chunks held, of different key ranges.
 	chunks []*chunk
-	// Transactions read with deferred streams that no snapshot is known to
-	// see yet: the log can read a transaction's commit before its backend
-	// leaves the proc array, and a snapshot taken between doesn't see it.
+	// Transactions read that a chunk read later must see (txn.ahead,
+	// txn.held), and no snapshot is known to see yet: the log can read a
+	// transaction's commit before its backend leaves the proc array, and a
+	// snapshot taken between doesn't see it.
 	unseen []*txn
 }
 
@@ -759,7 +769,7 @@ func (r *cdcReader) run(ctx context.Context) error {
 				r.serverEnd = max(r.serverEnd, k.ServerWALEnd)
 				if r.txn == nil && k.ServerWALEnd > r.pos {
 					r.pos = k.ServerWALEnd
-					if err := r.passed(ctx); err != nil {
+					if err := r.passed(ctx, r.pos); err != nil {
 						return err
 					}
 				}
@@ -850,6 +860,12 @@ func (r *cdcReader) message(ctx context.Context, data []byte) error {
 	case *pglogrepl.RelationMessage:
 		return r.relation(ctx, m)
 	case *pglogrepl.BeginMessage:
+		// A transaction whose commit is at or after a chunk's position isn't
+		// one its snapshot saw, and the log has read every one before it, so
+		// the chunk passes before its changes, which it doesn't hold then.
+		if err := r.passed(ctx, m.FinalLSN); err != nil {
+			return err
+		}
 		r.txn = &txn{xid: m.Xid, commit: m.FinalLSN, at: m.CommitTime}
 	case *pglogrepl.CommitMessage:
 		if r.txn == nil {
@@ -858,7 +874,7 @@ func (r *cdcReader) message(ctx context.Context, data []byte) error {
 		r.lastCommit = r.txn.at
 		r.txn = nil
 		r.pos = m.TransactionEndLSN
-		return r.passed(ctx)
+		return r.passed(ctx, r.pos)
 	case *pglogrepl.InsertMessage:
 		return r.change(ctx, m.RelationID, source.OpInsert, 0, nil, m.Tuple)
 	case *pglogrepl.UpdateMessage:
@@ -1113,25 +1129,75 @@ func (r *cdcReader) settle(ctx context.Context, st *cdcStream) error {
 // emits its row of the key, if it has one, then the change.
 func (r *cdcReader) apply(st *cdcStream, ch *logChange, at placed) error {
 	c := at.chunk
+	if c != nil && c.dropped {
+		// Placed before the chunk was dropped: no chunk has read it now.
+		c = nil
+	}
 	switch {
 	case at.behind:
 		return r.add(st, ch.version)
-	case c != nil && c.snap.sees(ch.x.xid):
-		return nil
-	case c != nil:
+	case c == nil:
+		r.owe(ch.x, st, nil)
+	case c.snap.sees(ch.x.xid):
+		ch.x.seen = true
+	default:
 		if vals, ok := c.rows[ch.key]; ok {
 			delete(c.rows, ch.key)
 			c.after = append(c.after, version{op: source.OpInsert, seq: seqOf(ch.x.commit, 0), vals: vals})
 		}
 		c.after = append(c.after, ch.version)
-	}
-	if len(ch.x.deferred) == 0 {
-		r.unseen = append(r.unseen, ch.x)
-	}
-	if !slices.Contains(ch.x.deferred, st) {
-		ch.x.deferred = append(ch.x.deferred, st)
+		for _, v := range ch.vals {
+			c.afterBytes += len(v)
+		}
+		r.owe(ch.x, nil, c)
+		if c.afterBytes > max(r.s.cfg.BatchBytes, c.bytes) {
+			r.drop(c)
+		}
 	}
 	return nil
+}
+
+// owe has a chunk read later see x: one of st, or, after a restart while c
+// is held, the one that reads c's keys again.
+func (r *cdcReader) owe(x *txn, st *cdcStream, c *chunk) {
+	if x.seen {
+		return
+	}
+	if st != nil && !slices.Contains(x.ahead, st) {
+		x.ahead = append(x.ahead, st)
+	}
+	if c != nil && !slices.Contains(x.held, c) {
+		x.held = append(x.held, c)
+	}
+	if !x.listed {
+		x.listed = true
+		r.unseen = append(r.unseen, x)
+	}
+}
+
+// owed says a chunk read later must see x: of st, or of any stream if st is
+// nil. A held chunk that passed leaves its keys read, so a read resumed after
+// it reads them from the log; one that was dropped left them to its stream.
+func owed(x *txn, st *cdcStream) bool {
+	return slices.ContainsFunc(x.ahead, func(a *cdcStream) bool { return len(a.ranges) > 0 && (st == nil || a == st) }) ||
+		slices.ContainsFunc(x.held, func(c *chunk) bool { return !c.done && (st == nil || c.stream == st) })
+}
+
+// drop gives up a held chunk whose changes after its snapshot outgrew what
+// it may hold, its rows' bytes or batchBytes: it emits nothing, the next
+// round reads its keys again, and that round's chunk must see the
+// transactions whose changes it held.
+func (r *cdcReader) drop(c *chunk) {
+	c.done, c.dropped = true, true
+	r.chunks = slices.DeleteFunc(r.chunks, func(h *chunk) bool { return h == c })
+	for _, x := range r.unseen {
+		if slices.Contains(x.held, c) {
+			r.owe(x, c.stream, nil)
+		}
+	}
+	c.rows, c.after = nil, nil
+	r.replan()
+	slog.Debug("a held chunk of a table's snapshot outgrew what it may hold, and is read again", "table", c.stream.t.name)
 }
 
 func (r *cdcReader) add(st *cdcStream, v version) error {
@@ -1145,34 +1211,37 @@ func (r *cdcReader) add(st *cdcStream, v version) error {
 	return nil
 }
 
-// passed runs once the read has reached pos: each chunk is emitted if the
-// log has passed every transaction its snapshot saw, its rows and then what
-// it holds after them.
-func (r *cdcReader) passed(ctx context.Context) error {
-	var held []*chunk
-	var moved []*cdcStream
+// passed runs once the log has read every transaction that committed
+// before at: each chunk whose position is at or before it is emitted, its
+// rows and then what it holds after them.
+func (r *cdcReader) passed(ctx context.Context, at pglogrepl.LSN) error {
+	var moving []*cdcStream
 	for _, c := range r.chunks {
-		switch {
-		case r.pos < c.lsn:
-			held = append(held, c)
-		case !slices.Contains(moved, c.stream):
-			moved = append(moved, c.stream)
+		if c.lsn <= at && !slices.Contains(moving, c.stream) {
+			moving = append(moving, c.stream)
 		}
 	}
-	if len(moved) == 0 {
+	if len(moving) == 0 {
 		return nil
 	}
-	// Changes are placed against the chunks held while they were read.
-	for _, st := range moved {
+	// Changes are placed against the chunks held while they were read, which
+	// can drop a chunk.
+	for _, st := range moving {
 		if err := r.settle(ctx, st); err != nil {
 			return err
 		}
 	}
+	var held []*chunk
+	var moved []*cdcStream
 	for _, c := range r.chunks {
-		if r.pos < c.lsn {
+		if c.lsn > at {
+			held = append(held, c)
 			continue
 		}
 		st := c.stream
+		if !slices.Contains(moved, st) {
+			moved = append(moved, st)
+		}
 		seq := seqOf(c.lsn, 0)
 		for _, k := range c.keys {
 			if vals, ok := c.rows[k]; ok {
@@ -1186,6 +1255,7 @@ func (r *cdcReader) passed(ctx context.Context) error {
 				return err
 			}
 		}
+		c.done = true
 		switch {
 		case c.full:
 			c.rng.After = c.last
@@ -1206,25 +1276,30 @@ func (r *cdcReader) passed(ctx context.Context) error {
 	return nil
 }
 
-// replan drops the streams' plans, once chunks are read or passed.
+// replan drops the streams' plans, once chunks are read, passed or dropped.
 func (r *cdcReader) replan() {
 	for _, st := range r.streams {
 		st.plan = nil
 	}
 }
 
-// visible waits until every transaction that deferred st, or any stream if
-// st is nil, is visible to new snapshots. A chunk read later, here or after
-// a restart, then sees each of them: a read resumed from st's next resume
-// point doesn't read them from the log again.
+// visible waits until new snapshots see every transaction that a chunk read
+// later must see (owed): for st, or any stream if st is nil. Before a round
+// of chunks, that's what they read; before st's resume point, what a read
+// resumed there reads, which doesn't read these transactions from the log.
 func (r *cdcReader) visible(ctx context.Context, st *cdcStream) error {
 	waits := func() *txn {
-		// Streams whose snapshot is read have no chunk left to see it.
+		// A transaction owed nothing now can be owed again, as its changes
+		// to another stream are placed: owe lists it again.
 		r.unseen = slices.DeleteFunc(r.unseen, func(x *txn) bool {
-			return !slices.ContainsFunc(x.deferred, func(d *cdcStream) bool { return len(d.ranges) > 0 })
+			if x.seen || !owed(x, nil) {
+				x.listed = false
+				return true
+			}
+			return false
 		})
 		for _, x := range r.unseen {
-			if st == nil || slices.Contains(x.deferred, st) {
+			if owed(x, st) {
 				return x
 			}
 		}
@@ -1236,14 +1311,15 @@ func (r *cdcReader) visible(ctx context.Context, st *cdcStream) error {
 		if err != nil {
 			return err
 		}
-		// Once a snapshot sees a transaction, every later one does.
-		r.unseen = slices.DeleteFunc(r.unseen, func(x *txn) bool { return snap.sees(x.xid) })
+		for _, x := range r.unseen {
+			x.seen = x.seen || snap.sees(x.xid)
+		}
 		x := waits()
 		if x == nil {
 			return nil
 		}
 		if time.Now().After(giveUp) {
-			return sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_TRANSIENT, fmt.Errorf("postgres: transaction %d, which the log has read, isn't visible to new snapshots after %v, as while a synchronous standby hasn't confirmed it; the read starts again", x.xid, visibleWithin))
+			return r.unseenFor(ctx, x)
 		}
 		select {
 		case <-time.After(wait):
@@ -1253,6 +1329,28 @@ func (r *cdcReader) visible(ctx context.Context, st *cdcStream) error {
 		wait = min(2*wait, 100*time.Millisecond)
 	}
 	return nil
+}
+
+// unseenFor is the error for a transaction the log read that new snapshots
+// still don't see after visibleWithin. Its backend waits for synchronous
+// standbys to confirm it; if the read's own replication connection is one
+// of them, it confirms only what the pipeline has checkpointed, which can't
+// pass the transaction while the read waits for it, so retrying is no use.
+func (r *cdcReader) unseenFor(ctx context.Context, x *txn) error {
+	var state, app string
+	if r.repl != nil {
+		err := r.conn.QueryRow(ctx, "SELECT sync_state, application_name FROM pg_stat_replication WHERE pid = $1", r.repl.PID()).Scan(&state, &app)
+		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			return classify(err)
+		}
+	}
+	switch state {
+	case "sync":
+		return configInvalid("postgres: transaction %d, which the log has read, isn't visible to new snapshots after %v: it waits for synchronous standbys, and synchronous_standby_names makes one of them this read's replication connection (application_name %q), which confirms only what the pipeline has checkpointed, and the pipeline can't checkpoint past the transaction until new snapshots see it; leave the connection out of synchronous_standby_names, or give it an application_name of its own in the source's dsn", x.xid, visibleWithin, app)
+	case "quorum":
+		return sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_TRANSIENT, fmt.Errorf("postgres: transaction %d, which the log has read, isn't visible to new snapshots after %v, as while synchronous standbys haven't confirmed it; synchronous_standby_names counts this read's replication connection (application_name %q) among them, which confirms only what the pipeline has checkpointed; the read starts again", x.xid, visibleWithin, app))
+	}
+	return sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_TRANSIENT, fmt.Errorf("postgres: transaction %d, which the log has read, isn't visible to new snapshots after %v, as while a synchronous standby hasn't confirmed it; the read starts again", x.xid, visibleWithin))
 }
 
 // snapshot is a new snapshot of which transactions are visible.
@@ -1615,7 +1713,7 @@ func (r *cdcReader) readChunks(ctx context.Context) error {
 	}
 	r.chunks = chunks
 	r.replan()
-	return r.passed(ctx)
+	return r.passed(ctx, r.pos)
 }
 
 // readChunk reads a key range's next chunk, on a connection only it is using.
@@ -1694,6 +1792,7 @@ func (r *cdcReader) readChunk(ctx context.Context, conn *pgx.Conn, st *cdcStream
 		for i, v := range vals[:n] {
 			if v != nil {
 				row[i] = convert(st.conv[i], append([]byte{}, v...))
+				c.bytes += len(v)
 			}
 		}
 		c.last = c.last[:0]
@@ -1753,7 +1852,7 @@ func (st *cdcStream) cursor() *snapshotCursor {
 }
 
 // resumeStream emits the stream's resume point where the read is, once its
-// changes are placed and the transactions that deferred it are visible.
+// changes are placed and new snapshots see what a read resumed there must.
 func (r *cdcReader) resumeStream(ctx context.Context, st *cdcStream) error {
 	if err := r.settle(ctx, st); err != nil {
 		return err

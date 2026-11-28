@@ -24,7 +24,7 @@ import (
 	"github.com/openetl-io/openetl/sdk/go/source"
 )
 
-// history is users' history as a test writes it: each key's changes, in
+// history is a table's history as a test writes it: each key's changes, in
 // order, its rows from before the read's slot as inserts. A test changes a
 // key on one connection at a time, so the order it writes a key's changes
 // in is the order they commit in. Its copies from on share it.
@@ -35,9 +35,10 @@ type history struct {
 }
 
 type written struct {
-	mu   sync.Mutex
-	want []string
-	n    int
+	mu    sync.Mutex
+	table string
+	want  []string
+	n     int
 	// How ids are spelled as keys.
 	key func(id int) string
 }
@@ -52,14 +53,20 @@ func (e *sourceEnv) newHistory(rows int) *history {
 // a key column of typ.
 func (e *sourceEnv) historyOf(rows int, typ string, key func(int) string) *history {
 	e.t.Helper()
-	e.exec("CREATE TABLE $schema.users (id " + typ + " PRIMARY KEY, name text, doc text)")
-	h := &history{e: e, conn: e.conn, written: &written{key: key}}
+	return e.tableHistory("users", rows, typ, key)
+}
+
+// tableHistory creates table as historyOf creates users.
+func (e *sourceEnv) tableHistory(table string, rows int, typ string, key func(int) string) *history {
+	e.t.Helper()
+	h := &history{e: e, conn: e.conn, written: &written{table: table, key: key}}
+	e.exec("CREATE TABLE " + h.ident() + " (id " + typ + " PRIMARY KEY, name text, doc text)")
 	var rowsIn []string
 	for i := 1; i <= rows; i++ {
 		rowsIn = append(rowsIn, fmt.Sprintf("(%s, 'n%d', NULL)", quoteLiteral(key(2*i)), 2*i))
 		h.want = append(h.want, fmt.Sprintf("insert %s n%d", key(2*i), 2*i))
 	}
-	e.exec("INSERT INTO $schema.users VALUES " + strings.Join(rowsIn, ", "))
+	e.exec("INSERT INTO " + h.ident() + " VALUES " + strings.Join(rowsIn, ", "))
 	return h
 }
 
@@ -68,16 +75,35 @@ func (h *history) on(conn *pgx.Conn) *history {
 	return &history{e: h.e, conn: conn, written: h.written}
 }
 
-// write runs q, whose changes are those given; it may run on a read's
-// goroutine.
-func (h *history) write(q string, changes ...string) {
-	if _, err := h.conn.Exec(context.Background(), strings.ReplaceAll(q, "$schema", pgx.Identifier{h.e.schema}.Sanitize())); err != nil {
+func (h *history) ident() string { return pgx.Identifier{h.e.schema, h.table}.Sanitize() }
+
+// op is a statement of a history's, and the changes it makes.
+type op struct {
+	h       *history
+	q       string
+	changes []string
+}
+
+// run runs ops on h's connection, in one transaction, and records their
+// changes; it may run on a read's goroutine.
+func (h *history) run(ops ...op) {
+	var qs []string
+	for _, o := range ops {
+		qs = append(qs, o.q)
+	}
+	q := strings.Join(qs, "; ")
+	if len(ops) > 1 {
+		q = "BEGIN; " + q + "; COMMIT"
+	}
+	if _, err := h.conn.Exec(context.Background(), q); err != nil {
 		h.e.t.Errorf("%s: %v", q, err)
 		return
 	}
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	h.want = append(h.want, changes...)
+	for _, o := range ops {
+		o.h.mu.Lock()
+		o.h.want = append(o.h.want, o.changes...)
+		o.h.mu.Unlock()
+	}
 }
 
 func (h *history) name() string {
@@ -89,26 +115,31 @@ func (h *history) name() string {
 
 func (h *history) lit(id int) string { return quoteLiteral(h.key(id)) }
 
-func (h *history) insert(id int) {
+func (h *history) inserting(id int) op {
 	name := h.name()
-	h.write(fmt.Sprintf("INSERT INTO $schema.users VALUES (%s, '%s', NULL)", h.lit(id), name), fmt.Sprintf("insert %s %s", h.key(id), name))
+	return op{h, fmt.Sprintf("INSERT INTO %s VALUES (%s, '%s', NULL)", h.ident(), h.lit(id), name), []string{fmt.Sprintf("insert %s %s", h.key(id), name)}}
 }
 
-func (h *history) update(id int) {
+func (h *history) updating(id int) op {
 	name := h.name()
-	h.write(fmt.Sprintf("UPDATE $schema.users SET name = '%s' WHERE id = %s", name, h.lit(id)), fmt.Sprintf("update %s %s", h.key(id), name))
+	return op{h, fmt.Sprintf("UPDATE %s SET name = '%s' WHERE id = %s", h.ident(), name, h.lit(id)), []string{fmt.Sprintf("update %s %s", h.key(id), name)}}
 }
 
-func (h *history) delete(id int) {
-	h.write(fmt.Sprintf("DELETE FROM $schema.users WHERE id = %s", h.lit(id)), "delete "+h.key(id))
+func (h *history) deleting(id int) op {
+	return op{h, fmt.Sprintf("DELETE FROM %s WHERE id = %s", h.ident(), h.lit(id)), []string{"delete " + h.key(id)}}
 }
 
-// move changes a row's key, which the log carries as a delete and the row
+// moving changes a row's key, which the log carries as a delete and the row
 // under its new key.
-func (h *history) move(from, to int) {
+func (h *history) moving(from, to int) op {
 	name := h.name()
-	h.write(fmt.Sprintf("UPDATE $schema.users SET id = %s, name = '%s' WHERE id = %s", h.lit(to), name, h.lit(from)), "delete "+h.key(from), fmt.Sprintf("update %s %s", h.key(to), name))
+	return op{h, fmt.Sprintf("UPDATE %s SET id = %s, name = '%s' WHERE id = %s", h.ident(), h.lit(to), name, h.lit(from)), []string{"delete " + h.key(from), fmt.Sprintf("update %s %s", h.key(to), name)}}
 }
+
+func (h *history) insert(id int)     { h.run(h.inserting(id)) }
+func (h *history) update(id int)     { h.run(h.updating(id)) }
+func (h *history) delete(id int)     { h.run(h.deleting(id)) }
+func (h *history) move(from, to int) { h.run(h.moving(from, to)) }
 
 func (ch change) entry() string {
 	if ch.op == source.OpDelete {
@@ -141,7 +172,8 @@ func appended(got []change, id string) []string {
 
 // fromChunks checks that got, appended, holds each key's history from where
 // a chunk read it: the row the chunk read, if it had one, then each change
-// after the chunk's snapshot, once, in order, and nothing else.
+// after the chunk's snapshot, once, in order, with seqs in that order too,
+// and nothing else.
 func (h *history) fromChunks(t *testing.T, got []change) {
 	t.Helper()
 	h.mu.Lock()
@@ -157,6 +189,15 @@ func (h *history) fromChunks(t *testing.T, got []change) {
 	}
 	for _, ch := range got {
 		ids[ch.id] = true
+	}
+	// Each key's versions as a merge orders them, by seq, are in the order
+	// they were emitted in.
+	last := map[string]change{}
+	for _, ch := range got {
+		if prev, ok := last[ch.id]; ok && ch.seq.Cmp(prev.seq) <= 0 {
+			t.Errorf("%s: %s, seq %v, after %s, seq %v", ch.id, ch.entry(), ch.seq, prev.entry(), prev.seq)
+		}
+		last[ch.id] = ch
 	}
 	bad := 0
 	for id := range ids {

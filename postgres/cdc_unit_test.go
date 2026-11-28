@@ -380,8 +380,21 @@ func TestApplyChangesAgainstAHeldChunk(t *testing.T) {
 	if _, ok := c.rows["6"]; ok {
 		t.Error("the chunk kept its row of 6, which goes before the change its snapshot didn't see")
 	}
-	if !slices.Equal(r.unseen, []*txn{running, after}) || len(seen.deferred) != 0 || !slices.Equal(running.deferred, []*cdcStream{st}) {
+	if !slices.Equal(r.unseen, []*txn{running, after}) || !seen.seen || seen.listed {
 		t.Errorf("transactions a chunk must see: %v", r.unseen)
+	}
+	if !slices.Equal(running.ahead, []*cdcStream{st}) || !slices.Equal(running.held, []*chunk{c}) || len(after.ahead) != 0 || !slices.Equal(after.held, []*chunk{c}) {
+		t.Errorf("105 is owed to %v and %v, 120 to %v and %v", running.ahead, running.held, after.ahead, after.held)
+	}
+	// Once the chunk passes, a read resumed after it reads its keys from the
+	// log: only the key no chunk has read is owed.
+	c.done = true
+	if !owed(running, st) || owed(after, st) || owed(after, nil) {
+		t.Errorf("owed once the chunk passed: 105 %v, 120 %v", owed(running, st), owed(after, st))
+	}
+	st.ranges = nil
+	if owed(running, nil) {
+		t.Error("owed once the snapshot is read")
 	}
 }
 
@@ -416,5 +429,39 @@ func TestHeldChangesOutliveTheLogsBuffer(t *testing.T) {
 	}
 	if !slices.Equal(held, []string{"6", "8"}) {
 		t.Errorf("the chunk holds %q", held)
+	}
+}
+
+// A chunk passes at the begin of a transaction that committed at or after
+// its position, before that transaction's changes: they're behind it then,
+// and the chunk holds none of them.
+func TestAChunkPassesBeforeATransactionAfterIt(t *testing.T) {
+	st := &cdcStream{t: table{name: "users", cols: []sourceColumn{{name: "id", oid: 23}}, key: []int{0}}, ints: true, conv: []func([]byte) []byte{nil}}
+	st.b = newChangeBatcher(memory.DefaultAllocator, st.t.cols)
+	defer st.b.release()
+	st.ranges = []*snapshotRange{{}}
+	c := &chunk{stream: st, rng: st.ranges[0], snap: pgSnapshot{xmin: 100, xmax: 110, xip: map[uint64]bool{}}, rows: map[string][][]byte{"4": {[]byte("4")}}, keys: []string{"4"}, lsn: 1000}
+	out := &events{}
+	r := &cdcReader{s: &Source{cfg: SourceConfig{BatchBytes: 1 << 20}}, out: out, slot: "s", streams: []*cdcStream{st}, chunks: []*chunk{c}, pos: 500,
+		rels: map[uint32]*relation{7: {stream: st, at: []int{0}, key: []int{0}, conv: []func([]byte) []byte{nil}, names: []string{"id"}}}}
+	for _, m := range [][]byte{
+		logMessage('B', pglogrepl.LSN(1000), pglogrepl.LSN(0), uint32(120)),
+		logMessage('I', uint32(7), "6"),
+		logMessage('I', uint32(7), "8"),
+		logMessage('C', uint8(0), pglogrepl.LSN(1000), pglogrepl.LSN(1100), pglogrepl.LSN(0)),
+	} {
+		if err := r.message(t.Context(), m); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := st.b.flush("users", out); err != nil {
+		t.Fatal(err)
+	}
+	state, _ := json.Marshal(cdcState{Slot: "s", LSN: 500})
+	if want := []string{"users:4", "users@" + string(state), "users:6,8"}; !slices.Equal(out.log, want) {
+		t.Errorf("emitted %q, want %q", out.log, want)
+	}
+	if len(c.after) != 0 || len(r.chunks) != 0 || len(st.ranges) != 0 {
+		t.Errorf("the chunk holds %d changes; %d chunks held, %d ranges left", len(c.after), len(r.chunks), len(st.ranges))
 	}
 }
