@@ -72,8 +72,9 @@ type cdcReader struct {
 	// The cluster time of the change being read.
 	at bson.Timestamp
 	// Fields the run doesn't declare that no document had at a cluster
-	// time, by field.
-	gone map[string]bson.Timestamp
+	// time, by field and "", and types of values no document had in a
+	// field, by field and type, as fieldGone asks.
+	gone map[[2]string]bson.Timestamp
 }
 
 func (r *cdcReader) read(ctx context.Context) error {
@@ -340,26 +341,37 @@ var unused = mongo.Pipeline{
 }
 
 // fieldGone reports whether no document of the collection has a field
-// anymore, as a change from before it was removed can: none has it at a
-// cluster time at or after the change's. A change after that time is
-// checked again, since a document can have brought the field back.
-func (r *cdcReader) fieldGone(ctx context.Context) func(string) (bool, error) {
-	return func(field string) (bool, error) {
-		if t, ok := r.gone[field]; ok && !after(r.at, t) {
+// anymore, or, given a type, a value of that type in it, as typeExpr names
+// it, as a change from before it was removed can: none has it at a cluster
+// time at or after the change's. A change after that time is checked again,
+// since a document can have brought it back.
+func (r *cdcReader) fieldGone(ctx context.Context) func(field, typ string) (bool, error) {
+	return func(field, typ string) (bool, error) {
+		key := [2]string{field, typ}
+		if t, ok := r.gone[key]; ok && !after(r.at, t) {
 			return true, nil
 		}
 		t, err := clusterTime(ctx, r.db.Client())
 		if err != nil {
 			return false, err
 		}
-		filter := bson.D{{Key: field, Value: bson.D{{Key: "$exists", Value: true}}}}
-		if strings.Contains(field, ".") || strings.HasPrefix(field, "$") {
-			// A query takes such a name for a path or an operator, and
-			// $getField takes it as the name it is.
-			filter = bson.D{{Key: "$expr", Value: bson.D{{Key: "$ne", Value: bson.A{
-				bson.D{{Key: "$type", Value: bson.D{{Key: "$getField", Value: bson.D{{Key: "field", Value: bson.D{{Key: "$literal", Value: field}}}, {Key: "input", Value: "$$ROOT"}}}}}},
-				"missing",
-			}}}}}
+		// A query takes a name with a dot for a path, and one that starts
+		// with $ for an operator; an expression's field path takes neither,
+		// nor an empty name; $getField takes each as the name it is. A
+		// query's $type would match an array's elements too.
+		odd := strings.Contains(field, ".") || strings.HasPrefix(field, "$")
+		var ref any = "$" + field
+		if odd || field == "" {
+			ref = bson.D{{Key: "$getField", Value: bson.D{{Key: "field", Value: bson.D{{Key: "$literal", Value: field}}}, {Key: "input", Value: "$$ROOT"}}}}
+		}
+		var filter bson.D
+		switch {
+		case typ != "":
+			filter = bson.D{{Key: "$expr", Value: bson.D{{Key: "$eq", Value: bson.A{typeExpr(ref), typ}}}}}
+		case odd:
+			filter = bson.D{{Key: "$expr", Value: bson.D{{Key: "$ne", Value: bson.A{bson.D{{Key: "$type", Value: ref}}, "missing"}}}}}
+		default:
+			filter = bson.D{{Key: field, Value: bson.D{{Key: "$exists", Value: true}}}}
 		}
 		err = atLeast(ctx, r.coll, t, func(ctx context.Context, coll *mongo.Collection) error {
 			return coll.FindOne(ctx, filter, options.FindOne().SetProjection(bson.D{{Key: "_id", Value: 1}})).Err()
@@ -371,9 +383,9 @@ func (r *cdcReader) fieldGone(ctx context.Context) func(string) (bool, error) {
 			return false, classify(fmt.Errorf("mongodb: read %s: %w", r.cs.Name, err))
 		}
 		if r.gone == nil {
-			r.gone = map[string]bson.Timestamp{}
+			r.gone = map[[2]string]bson.Timestamp{}
 		}
-		r.gone[field] = t
+		r.gone[key] = t
 		return !after(r.at, t), nil
 	}
 }

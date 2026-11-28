@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/apache/arrow-go/v18/arrow"
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
@@ -35,13 +36,17 @@ func waitFor(t *testing.T, d time.Duration, what string, cond func() bool) {
 // ends; done has its error.
 func follow(t *testing.T, s *Source, stream string, state []byte, columns []string) (*connectortest.Recorder, <-chan error) {
 	t.Helper()
+	return followStream(t, s, source.ConfiguredStream{Name: stream, SyncMode: source.CDC, State: state, Columns: columns})
+}
+
+// followStream starts a continuous read of cs, as follow does.
+func followStream(t *testing.T, s *Source, cs source.ConfiguredStream) (*connectortest.Recorder, <-chan error) {
+	t.Helper()
 	ctx := t.Context()
 	rec := &connectortest.Recorder{}
 	done := make(chan error, 1)
 	go func() {
-		done <- s.Read(ctx, source.ReadRequest{Continuous: true, Streams: []source.ConfiguredStream{
-			{Name: stream, SyncMode: source.CDC, State: state, Columns: columns},
-		}}, rec)
+		done <- s.Read(ctx, source.ReadRequest{Continuous: true, Streams: []source.ConfiguredStream{cs}}, rec)
 		close(done)
 	}()
 	// t.Context() is canceled before cleanups run.
@@ -263,6 +268,64 @@ func TestCDCNewField(t *testing.T) {
 	case <-time.After(20 * time.Second):
 		t.Fatal("a new field didn't end the read")
 	}
+}
+
+// A change with a value of a type its field's declared type doesn't take
+// fails the read, retryably, and the read again from its state, with the
+// types the next discovery declares, takes it. A change whose value no
+// document has any more, which that discovery wouldn't declare a type for,
+// is sent, and a delete leaves such a value out.
+func TestCDCUnfit(t *testing.T) {
+	db := testDB(t)
+	ctx := t.Context()
+	if err := db.CreateCollection(ctx, "c", options.CreateCollection().SetChangeStreamPreAndPostImages(bson.D{{Key: "enabled", Value: true}})); err != nil {
+		t.Fatal(err)
+	}
+	coll := db.Collection("c")
+	// Fields whose names a query or a field path doesn't take as they are.
+	insert(t, coll, bson.D{{Key: "_id", Value: 1}, {Key: "n", Value: 1}, {Key: "a.b", Value: 1}, {Key: "", Value: 1}})
+	s := newTestSource(t, db, "")
+	cs := declare(discovered(t, s, "c"), source.CDC)
+	rec := &connectortest.Recorder{}
+	if err := s.Read(ctx, source.ReadRequest{Streams: []source.ConfiguredStream{cs}}, rec); err != nil {
+		t.Fatal(err)
+	}
+	cs.State, _ = rec.Last("c")
+
+	insert(t, coll, bson.D{{Key: "_id", Value: 2}, {Key: "n", Value: "gone"}, {Key: "a.b", Value: "gone"}, {Key: "", Value: "gone"}})
+	if _, err := coll.ReplaceOne(ctx, bson.D{{Key: "_id", Value: 2}}, bson.D{{Key: "n", Value: 2}, {Key: "a.b", Value: 2}, {Key: "", Value: 2}}); err != nil {
+		t.Fatal(err)
+	}
+	insert(t, coll, bson.D{{Key: "_id", Value: 3}, {Key: "n", Value: "deleted"}})
+	if _, err := coll.DeleteOne(ctx, bson.D{{Key: "_id", Value: 3}}); err != nil {
+		t.Fatal(err)
+	}
+	rec, done := followStream(t, s, cs)
+	checkRows(t, changes(t, rec, done, "c", 0, 4),
+		map[string]string{"_id": intID(2), "n": "gone", "a.b": "gone", "": "gone", "openetl.op": "insert"},
+		map[string]string{"_id": intID(2), "n": "2", "a.b": "2", "": "2", "openetl.op": "update"},
+		map[string]string{"_id": intID(3), "n": "deleted", "openetl.op": "insert"},
+		map[string]string{"_id": intID(3), "openetl.op": "delete"},
+	)
+
+	insert(t, coll, bson.D{{Key: "_id", Value: 4}, {Key: "n", Value: "four"}})
+	select {
+	case err := <-done:
+		if connectortest.CodeOf(err) != protocolv1.ErrorCode_ERROR_CODE_TRANSIENT ||
+			!strings.Contains(err.Error(), `c's field "n" is declared int64, and a document has a string value there`) || strings.Contains(err.Error(), "four") {
+			t.Errorf("an unfit value: %s: %v", connectortest.CodeOf(err), err)
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("an unfit value didn't end the read")
+	}
+	state, _ := rec.Last("c")
+	again := declare(discovered(t, s, "c"), source.CDC)
+	if f, _ := again.Schema.FieldsByName("n"); len(f) != 1 || f[0].Type.ID() != arrow.STRING {
+		t.Fatalf("discovered again, n is %v", f)
+	}
+	again.State = state
+	rec, done = followStream(t, s, again)
+	checkRows(t, changes(t, rec, done, "c", 0, 1), map[string]string{"_id": intID(4), "n": "four", "openetl.op": "insert"})
 }
 
 func TestCDCEnds(t *testing.T) {

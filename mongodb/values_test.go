@@ -325,7 +325,7 @@ func TestBatcher(t *testing.T) {
 	if connectortest.CodeOf(err) != protocolv1.ErrorCode_ERROR_CODE_TRANSIENT || !strings.Contains(err.Error(), "sample of 100") || !strings.Contains(err.Error(), "packed") {
 		t.Errorf("an undeclared field, sampled: %v", err)
 	}
-	b.gone = func(string) (bool, error) { return true, nil }
+	b.gone = func(string, string) (bool, error) { return true, nil }
 	if err := b.add(doc(bson.D{{Key: "_id", Value: 4}, {Key: "z", Value: 1}}), source.OpUpdate, q); err != nil {
 		t.Errorf("a field no document has: %v", err)
 	}

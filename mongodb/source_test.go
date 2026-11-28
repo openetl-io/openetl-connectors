@@ -5,7 +5,9 @@ package mongodb
 import (
 	"context"
 	"fmt"
+	"maps"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -33,6 +35,16 @@ func discovered(t *testing.T, s *Source, stream string) source.CatalogStream {
 	}
 	t.Fatalf("discovery has no %s: %v", stream, cat.Streams)
 	return source.CatalogStream{}
+}
+
+// declare is a read of a discovered stream as the platform asks for one,
+// with its columns and their types.
+func declare(cs source.CatalogStream, mode source.SyncMode) source.ConfiguredStream {
+	c := source.ConfiguredStream{Name: cs.Name, SyncMode: mode, Schema: cs.Schema}
+	for _, f := range cs.Schema.Fields() {
+		c.Columns = append(c.Columns, f.Name)
+	}
+	return c
 }
 
 func readAll(t *testing.T, s *Source, streams ...source.ConfiguredStream) *connectortest.Recorder {
@@ -71,7 +83,8 @@ func TestSourceTypes(t *testing.T) {
 		t.Errorf("stream: %+v", cs)
 	}
 
-	rows := readAll(t, s, source.ConfiguredStream{Name: "kinds", SyncMode: source.FullRefresh}).RowsOf("kinds")
+	// With the types discovery declared, which take each document's values.
+	rows := readAll(t, s, declare(cs, source.FullRefresh)).RowsOf("kinds")
 	if len(rows) != 3 {
 		t.Fatalf("rows: %v", rows)
 	}
@@ -102,6 +115,71 @@ func TestSourceTypes(t *testing.T) {
 		if rows[2][k] != w {
 			t.Errorf("document 3's %s is %q, want %q", k, rows[2][k], w)
 		}
+	}
+}
+
+// Discovery names each value's type as a read's check of it does.
+func TestTypeNames(t *testing.T) {
+	db := testDB(t)
+	coll := db.Collection("kinds")
+	insert(t, coll, kinds()...)
+	found, err := newTestSource(t, db, "").rangeTypes(t.Context(), coll, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cur, err := coll.Find(t.Context(), bson.D{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string][]string{}
+	for cur.Next(t.Context()) {
+		elems, err := cur.Current.Elements()
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, e := range elems {
+			want[e.Key()] = append(want[e.Key()], typeNames[kindOf(e.Value())].name)
+		}
+	}
+	for f, ts := range want {
+		slices.Sort(ts)
+		want[f] = slices.Compact(ts)
+	}
+	if !maps.EqualFunc(found, want, slices.Equal) {
+		t.Errorf("discovery found %v, the read names %v", found, want)
+	}
+}
+
+// A document with a value of a type its field's declared type doesn't take,
+// written since discovery, fails a full refresh or an incremental read,
+// retryably, and the next attempt's discovery declares a type that takes
+// it. Discovery that samples can miss it again, so then the read sends it.
+func TestReadUnfit(t *testing.T) {
+	db := testDB(t)
+	coll := db.Collection("c")
+	insert(t, coll, bson.D{{Key: "_id", Value: 1}, {Key: "n", Value: 1}}, bson.D{{Key: "_id", Value: 2}, {Key: "n", Value: int64(2)}})
+	s := newTestSource(t, db, "")
+	before := discovered(t, s, "c")
+	insert(t, coll, bson.D{{Key: "_id", Value: 3}, {Key: "n", Value: "three"}})
+	for _, mode := range []source.SyncMode{source.FullRefresh, source.Incremental} {
+		cs := declare(before, mode)
+		cs.Cursor = "_id"
+		err := s.Read(t.Context(), source.ReadRequest{Streams: []source.ConfiguredStream{cs}}, &connectortest.Recorder{})
+		if connectortest.CodeOf(err) != protocolv1.ErrorCode_ERROR_CODE_TRANSIENT ||
+			!strings.Contains(err.Error(), `c's field "n" is declared int64, and a document has a string value there`) || strings.Contains(err.Error(), "three") {
+			t.Errorf("%v: %s: %v", mode, connectortest.CodeOf(err), err)
+		}
+	}
+	after := discovered(t, s, "c")
+	if f, _ := after.Schema.FieldsByName("n"); len(f) != 1 || f[0].Type.ID() != arrow.STRING {
+		t.Fatalf("discovered again, n is %v", f)
+	}
+	if rows := readAll(t, s, declare(after, source.FullRefresh)).RowsOf("c"); len(rows) != 3 || rows[2]["n"] != "three" {
+		t.Errorf("read again: %v", rows)
+	}
+	sampled := newTestSource(t, db, `, "sampleSize": 1000`)
+	if rows := readAll(t, sampled, declare(before, source.FullRefresh)).RowsOf("c"); len(rows) != 3 || rows[2]["n"] != "three" {
+		t.Errorf("sampled: %v", rows)
 	}
 }
 
