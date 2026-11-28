@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"math"
+	"slices"
 	"strconv"
 	"time"
 
@@ -15,13 +16,14 @@ import (
 )
 
 // A source sends every field as text, which the engine parses into the type
-// discovery declared: a read knows a run's columns but not their types, so
-// text is what parses into any of them. Each BSON value has one spelling:
-// strings as they are, numbers and booleans as JSON spells them, dates in
-// RFC 3339 with milliseconds, ObjectIds in hex, UUIDs canonically, other
-// binaries in base64, and documents, arrays and the rest in relaxed Extended
-// JSON. A value that doesn't parse into its column's type is quarantined.
-// _id is the exception: keyText spells it.
+// discovery declared: text is what values of each BSON type a column takes,
+// as takes says, parse from. Each BSON value has one spelling: strings as
+// they are, numbers and booleans as JSON spells them, dates in RFC 3339 with
+// milliseconds, ObjectIds in hex, UUIDs canonically, other binaries in
+// base64, and documents, arrays and the rest in relaxed Extended JSON. A
+// value of a type its column doesn't take fails the read, where the run
+// gives its types (unfit), and one that still doesn't parse into it, as a
+// date past 9999, is quarantined. _id is the exception: keyText spells it.
 
 // keyText is an _id's text, which differs for every two _ids a collection
 // can hold, whatever their types, and doesn't depend on discovery: an
@@ -91,6 +93,96 @@ var (
 		return t
 	}()
 )
+
+// typeNames are the BSON types as $type names them, and "uuid" for a 16-byte
+// binary of subtype 4, as discovery names it apart. A value's kind is its
+// type's index here.
+var typeNames = [...]struct {
+	t    bson.Type
+	name string
+}{
+	{bson.TypeDouble, "double"}, {bson.TypeString, "string"}, {bson.TypeEmbeddedDocument, "object"},
+	{bson.TypeArray, "array"}, {bson.TypeBinary, "binData"}, {bson.TypeUndefined, "undefined"},
+	{bson.TypeObjectID, "objectId"}, {bson.TypeBoolean, "bool"}, {bson.TypeDateTime, "date"},
+	{bson.TypeNull, "null"}, {bson.TypeRegex, "regex"}, {bson.TypeDBPointer, "dbPointer"},
+	{bson.TypeJavaScript, "javascript"}, {bson.TypeSymbol, "symbol"}, {bson.TypeCodeWithScope, "javascriptWithScope"},
+	{bson.TypeInt32, "int"}, {bson.TypeTimestamp, "timestamp"}, {bson.TypeInt64, "long"},
+	{bson.TypeDecimal128, "decimal"}, {bson.TypeMinKey, "minKey"}, {bson.TypeMaxKey, "maxKey"},
+	{bson.TypeBinary, "uuid"},
+}
+
+// kindSet is a set of kinds. Its bit otherKind is a type typeNames hasn't,
+// which every set has, so that such a value is sent as it is.
+type kindSet uint32
+
+const (
+	uuidKind  = len(typeNames) - 1
+	otherKind = len(typeNames)
+	allKinds  = ^kindSet(0)
+)
+
+// kindOfType is the kind of each BSON type but uuid's.
+var kindOfType = func() (out [256]int) {
+	for i := range out {
+		out[i] = otherKind
+	}
+	for i, k := range typeNames[:uuidKind] {
+		out[k.t] = i
+	}
+	return out
+}()
+
+func kindOf(v bson.RawValue) int {
+	if v.Type == bson.TypeBinary {
+		if sub, data, ok := v.BinaryOK(); ok && isUUID(sub, data) {
+			return uuidKind
+		}
+	}
+	return kindOfType[v.Type]
+}
+
+type declaredType struct {
+	t     arrow.DataType
+	takes kindSet
+}
+
+// declaredTypes are the types fieldType declares, each with the kinds of
+// the values a field so declared takes: those that discovery, having seen
+// them beside the kinds that alone it declares as that type, still declares
+// as it. Whichever kinds discovery saw, that's the same set, but for nulls
+// alone, declared as text, which takes every kind, as text does.
+var declaredTypes = func() (out []declaredType) {
+	var own [][]string
+	for _, k := range typeNames {
+		t := fieldType([]string{k.name})
+		i := slices.IndexFunc(out, func(d declaredType) bool { return arrow.TypeEqual(d.t, t) })
+		if i < 0 {
+			i = len(out)
+			out, own = append(out, declaredType{t: t, takes: 1 << otherKind}), append(own, nil)
+		}
+		own[i] = append(own[i], k.name)
+	}
+	for i := range out {
+		for j, k := range typeNames {
+			if arrow.TypeEqual(fieldType(append(slices.Clip(own[i]), k.name)), out[i].t) {
+				out[i].takes |= 1 << j
+			}
+		}
+	}
+	return out
+}()
+
+// takes are the kinds of the values a field declared t takes. A decimal
+// takes what discovery's does, whatever its precision and scale; a type
+// discovery doesn't declare takes every kind.
+func takes(t arrow.DataType) kindSet {
+	for _, d := range declaredTypes {
+		if arrow.TypeEqual(t, d.t) || arrow.IsDecimal(t.ID()) && arrow.IsDecimal(d.t.ID()) {
+			return d.takes
+		}
+	}
+	return allKinds
+}
 
 func kindType(t string) arrow.DataType {
 	switch t {

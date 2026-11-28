@@ -48,7 +48,7 @@ The oplog keeps changes for as long as its size, or `oplogMinRetentionHours`, le
 
 Documents have no schema, so discovery reads every document of each collection and declares each top-level field with the BSON types its values have. Every other field is nullable, and a field that's missing and one that's null are both null.
 
-OpenETL runs discovery at the start of every sync, so its read is part of each sync's time. It's an aggregation on the server, which MongoDB runs on one thread. A collection of more than `chunkDocuments` documents is read in up to 32 `_id` ranges, as a read splits it, an aggregation each, where the server bounds each range's scan: on MongoDB 5.0 or later, by the `_id` index, and for a clustered collection, which has none, by its clustered scan, on 6.0.17 or a later 6.0, 7.0.13 or a later 7.0, and 7.3 or later. Elsewhere each range would scan the whole collection, so the collection is one aggregation. Up to `discoveryConnections` aggregations run at once, 4 by default, over every collection's ranges and the collections read whole. More finish sooner, and take more of the server's cores while they run; 1 reads each collection in one aggregation, one collection at a time. `sampleSize` reads that many random documents of each collection instead, which takes the server little time, and can miss rare fields, as the end of this section says. `packed` reads no documents: see [Packed documents](#packed-documents).
+OpenETL runs discovery at the start of every sync, so its read is part of each sync's time. It's an aggregation on the server, which MongoDB runs on one thread. A collection of more than `chunkDocuments` documents is read in up to 32 `_id` ranges, as a read splits it, an aggregation each, where the server bounds each range's scan: on MongoDB 5.0 or later, by the `_id` index, and for a clustered collection, which has none, by its clustered scan, on 6.0.17 or a later 6.0, 7.0.13 or a later 7.0, and 7.3 or later. Elsewhere each range would scan the whole collection, so the collection is one aggregation. Up to `discoveryConnections` aggregations run at once, 4 by default, over every collection's ranges and the collections read whole. More finish sooner, and take more of the server's cores while they run; 1 reads each collection in one aggregation, one collection at a time. `sampleSize` reads that many random documents of each collection instead, which takes the server little time, and can miss rare fields and types, as the end of this section says. `packed` reads no documents: see [Packed documents](#packed-documents).
 
 `_id` is the first column, a string that isn't nullable. Its text is different for every two `_id`s a collection can hold, whatever their types, and the same in every sync mode, so that a destination that merges by key keeps each document apart:
 
@@ -76,11 +76,27 @@ Canonical Extended JSON never spells 24 bare hexadecimal digits, so an ObjectId 
 | types that declare differently, such as `string` and `int`, or `double` and `decimal` | string | each value as above |
 | only `null` or `undefined` | string | null |
 
-Each value is sent as text, and OpenETL parses it into the column's declared type. A value that doesn't fit is quarantined: a date before year 1 or after 9999, and a decimal that's `NaN` or infinite, or that `decimal(38, 9)` doesn't hold exactly, with more than 9 digits after the point or 29 before it. A long in a field with doubles loses the digits a double doesn't keep. Nested documents and arrays are relaxed Extended JSON, which tags ObjectIds, decimals, binaries, dates and the other types JSON hasn't, but spells an `int` and a `long` alike, as a JSON integer, and a `double` as a number with a point, such as `1.0`. `packed` keeps every type, in canonical Extended JSON.
+Each value is sent as text, and OpenETL parses it into the column's declared type. Before it's sent, a read checks the BSON type of each top-level value against its column's declared type, which takes the types that discovery, having seen them as well, would still declare the column as:
 
-A document with a field the run didn't declare fails the read with a retryable error that names the field, and the next attempt's discovery declares it. A CDC read leaves out such a field when no document of the collection has it any more, as a change from before the field was removed can, since discovery wouldn't declare it. For a field whose name has a `.` or starts with `$`, it asks with `$getField`, which takes the name as it is, and which needs MongoDB 5.0 or later.
+| Declared as | Takes |
+|---|---|
+| 64-bit integer | `int`, `long` |
+| 64-bit float | `int`, `long`, `double` |
+| `decimal(38, 9)` | `int`, `long`, `decimal` |
+| boolean | `bool` |
+| timestamp | `date` |
+| UUID | `binData` of subtype 4 and 16 bytes |
+| binary | other `binData` |
+| JSON | `object`, `array`, `regex`, `timestamp`, `javascript`, `javascriptWithScope`, `dbPointer`, `minKey`, `maxKey` |
+| string | every type |
 
-With `sampleSize`, the next discovery can miss the field again, and the read fails again, until a sample has a document with it. Nothing carries the field from the failed read to the next discovery: OpenETL gives discovery the config alone, the source keeps nothing between calls, and it only reads from MongoDB. The error says so: set `sampleSize` to 0, or read the collection `packed`.
+Every column takes `null` and `undefined`, and a missing field. A nested document or array is one JSON value, whatever it holds, so only top-level fields are checked. A value of another type, such as a `string` written into a field of integers after discovery ran, fails the read with a retryable error that names the collection, the field, its declared type and the value's BSON type, but not the value, and the next attempt's discovery declares the type that takes it, string in that case. That changes the column's type in the stream, which by default the destination refuses, and OpenETL holds the column where it can, as [Schema changes](https://github.com/openetl-io/openetl/blob/main/docs/pipelines/schema-changes.md) explains. A read whose request doesn't give the columns' types checks none.
+
+A value of a type its column takes that still doesn't fit is quarantined: a date before year 1 or after 9999, and a decimal that's `NaN` or infinite, or that `decimal(38, 9)` doesn't hold exactly, with more than 9 digits after the point or 29 before it. A long in a field with doubles loses the digits a double doesn't keep. Nested documents and arrays are relaxed Extended JSON, which tags ObjectIds, decimals, binaries, dates and the other types JSON hasn't, but spells an `int` and a `long` alike, as a JSON integer, and a `double` as a number with a point, such as `1.0`. `packed` keeps every type, in canonical Extended JSON.
+
+A document with a field the run didn't declare fails the read with a retryable error that names the field, and the next attempt's discovery declares it. A CDC read leaves out such a field when no document of the collection has it any more, as a change from before the field was removed can, since discovery wouldn't declare it. In the same way, it sends a value of a type its column doesn't take when no document has a value of that type in the field any more, rather than failing a read that the next discovery would fail again: OpenETL parses its text into the column's type, as it does any value's, and quarantines it where it doesn't parse. A delete leaves out a field the run didn't declare and a value its column doesn't take, whatever the other documents have, since its values only say what it deleted. To ask whether a document has a field whose name has a `.` or starts with `$`, or a value's type in a field of such a name or an empty one, it uses `$getField`, which takes the name as it is, and which needs MongoDB 5.0 or later.
+
+With `sampleSize`, the next discovery can miss the field again, and the read fails again, until a sample has a document with it. Nothing carries the field from the failed read to the next discovery: OpenETL gives discovery the config alone, the source keeps nothing between calls, and it only reads from MongoDB. The error says so: set `sampleSize` to 0, or read the collection `packed`. A value of a type its column doesn't take, which a sample can miss again just as well, doesn't fail a read with `sampleSize`: the read sends its text, which OpenETL parses into the column's type, as it does any value's, and quarantines where it doesn't parse.
 
 ### Packed documents
 
@@ -91,7 +107,7 @@ With `packed: true`, every stream has two columns:
 | `_id` | string | the `_id`, as above |
 | `data` | JSON | the whole document, `_id` included, in canonical Extended JSON, which keeps every type: `{"_id":{"$numberInt":"1"},"at":{"$date":{"$numberLong":"1767225600000"}}}` |
 
-Discovery reads no documents, and a read never fails on a new field, so collections whose fields vary without bound work. All three sync modes work: an incremental read's `cursor` is a top-level field of the documents, which needn't be a column. A CDC delete's `data` is the deleted document where the collection keeps pre-images, and null otherwise.
+Discovery reads no documents, and a read never fails on a new field or a value's type, so collections whose fields vary without bound work. All three sync modes work: an incremental read's `cursor` is a top-level field of the documents, which needn't be a column. A CDC delete's `data` is the deleted document where the collection keeps pre-images, and null otherwise.
 
 ### Set it up
 

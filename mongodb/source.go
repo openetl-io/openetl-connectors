@@ -325,26 +325,31 @@ func rangesBounded(v serverVersion, clustered bool) bool {
 	return false
 }
 
-// rangeTypes are the BSON types of each top-level field's values in the
-// documents of a collection whose _ids are from lo and below hi, nil for no
-// bound, or in sampleSize of them. A binary's length, then its subtype,
-// orders it, which finds the UUIDs.
-func (s *Source) rangeTypes(ctx context.Context, coll *mongo.Collection, lo, hi *value) (map[string][]string, error) {
+// typeExpr is the BSON type of expression v's value as $type names it, with
+// "uuid" for a 16-byte binary of subtype 4: a binary's length, then its
+// subtype, orders it, which finds the UUIDs.
+func typeExpr(v any) bson.D {
 	var zeros, ones [16]byte
 	for i := range ones {
 		ones[i] = 0xff
 	}
-	typ := bson.D{{Key: "$let", Value: bson.D{
-		{Key: "vars", Value: bson.D{{Key: "t", Value: bson.D{{Key: "$type", Value: "$f.v"}}}}},
+	return bson.D{{Key: "$let", Value: bson.D{
+		{Key: "vars", Value: bson.D{{Key: "t", Value: bson.D{{Key: "$type", Value: v}}}}},
 		{Key: "in", Value: bson.D{{Key: "$cond", Value: bson.A{
 			bson.D{{Key: "$and", Value: bson.A{
 				bson.D{{Key: "$eq", Value: bson.A{"$$t", "binData"}}},
-				bson.D{{Key: "$gte", Value: bson.A{"$f.v", bson.Binary{Subtype: bson.TypeBinaryUUID, Data: zeros[:]}}}},
-				bson.D{{Key: "$lte", Value: bson.A{"$f.v", bson.Binary{Subtype: bson.TypeBinaryUUID, Data: ones[:]}}}},
+				bson.D{{Key: "$gte", Value: bson.A{v, bson.Binary{Subtype: bson.TypeBinaryUUID, Data: zeros[:]}}}},
+				bson.D{{Key: "$lte", Value: bson.A{v, bson.Binary{Subtype: bson.TypeBinaryUUID, Data: ones[:]}}}},
 			}}},
 			"uuid", "$$t",
 		}}}},
 	}}}
+}
+
+// rangeTypes are the BSON types of each top-level field's values, as
+// typeExpr names them, in the documents of a collection whose _ids are from
+// lo and below hi, nil for no bound, or in sampleSize of them.
+func (s *Source) rangeTypes(ctx context.Context, coll *mongo.Collection, lo, hi *value) (map[string][]string, error) {
 	var pipeline mongo.Pipeline
 	switch {
 	case s.cfg.SampleSize > 0:
@@ -355,7 +360,7 @@ func (s *Source) rangeTypes(ctx context.Context, coll *mongo.Collection, lo, hi 
 	pipeline = append(pipeline,
 		bson.D{{Key: "$project", Value: bson.D{{Key: "_id", Value: 0}, {Key: "f", Value: bson.D{{Key: "$objectToArray", Value: "$$ROOT"}}}}}},
 		bson.D{{Key: "$unwind", Value: "$f"}},
-		bson.D{{Key: "$group", Value: bson.D{{Key: "_id", Value: "$f.k"}, {Key: "t", Value: bson.D{{Key: "$addToSet", Value: typ}}}}}},
+		bson.D{{Key: "$group", Value: bson.D{{Key: "_id", Value: "$f.k"}, {Key: "t", Value: bson.D{{Key: "$addToSet", Value: typeExpr("$f.v")}}}}}},
 	)
 	cur, err := coll.Aggregate(ctx, pipeline, options.Aggregate().SetAllowDiskUse(true))
 	if err != nil {
@@ -720,8 +725,9 @@ func (q seq) decimal() decimal128.Num {
 // and seq. With the run's columns, every batch has each of them, and a
 // document with another field fails the read, retryably, so the next
 // attempt's discovery declares it; without, every batch has the columns it
-// starts with, and those documents bring since. Packed, a batch is _id and
-// data.
+// starts with, and those documents bring since. With the run's types, a
+// value of a type its column doesn't take fails the read too (unfit).
+// Packed, a batch is _id and data.
 type batcher struct {
 	docstore.Batch
 	stream   string
@@ -730,10 +736,20 @@ type batcher struct {
 	packed   bool
 	// Discovery's sample size; 0: it reads every document.
 	sampled int
-	// For a field the run doesn't declare: whether the collection's
-	// documents no longer have it, so that the next discovery won't declare
-	// it either, and the row leaves it out. Nil: none are.
-	gone func(field string) (bool, error)
+	// The run's type of each column, by its index, and the kinds of values
+	// it takes; a column past them, or without a type, takes every kind.
+	types []arrow.DataType
+	takes []kindSet
+	// For a field the run doesn't declare, typ "", or a value of type typ,
+	// as typeExpr names it, that the field's declared type doesn't take:
+	// whether the collection's documents no longer have the field, or no
+	// longer have such a value in it, so that the next discovery won't
+	// declare it either. Nil: none are.
+	gone func(field, typ string) (bool, error)
+	// add's, kept for the next document's: each element's column, and its
+	// value.
+	at   []int
+	vals []bson.RawValue
 }
 
 // controlNames are the names of a cdc batch's control columns, which the
@@ -751,6 +767,16 @@ func (s *Source) newBatcher(cs source.ConfiguredStream, columns []string, change
 			b.Column(c)
 		}
 	}
+	if cs.Schema != nil && !b.packed {
+		b.types, b.takes = make([]arrow.DataType, len(b.Names)), make([]kindSet, len(b.Names))
+		for i, n := range b.Names {
+			b.takes[i] = allKinds
+			if f := cs.Schema.FieldIndices(n); len(f) == 1 {
+				b.types[i] = cs.Schema.Field(f[0]).Type
+				b.takes[i] = takes(b.types[i])
+			}
+		}
+	}
 	return b
 }
 
@@ -766,18 +792,23 @@ func (b *batcher) add(doc bson.Raw, op string, q seq) error {
 	}
 	// Each element's column, or -1 to leave it out, settled before any is
 	// added, so that a failure leaves the batch as it was.
-	at := make([]int, len(elems))
-	for j, e := range elems {
-		k := e.Key()
+	at, vals := b.at[:0], b.vals[:0]
+	for _, e := range elems {
+		k, v := e.Key(), e.Value()
 		i, ok := b.Index[k]
 		switch {
 		case ok:
+			if i < len(b.takes) && b.takes[i]&(1<<kindOf(v)) == 0 {
+				if i, err = b.unfit(k, i, v, op); err != nil {
+					return err
+				}
+			}
 		case op == source.OpDelete:
 			i = -1
 		case b.declared:
 			gone := false
 			if b.gone != nil {
-				if gone, err = b.gone(k); err != nil {
+				if gone, err = b.gone(k, ""); err != nil {
 					return err
 				}
 			}
@@ -788,18 +819,19 @@ func (b *batcher) add(doc bson.Raw, op string, q seq) error {
 		default:
 			i = b.Column(k)
 		}
-		at[j] = i
+		at, vals = append(at, i), append(vals, v)
 	}
+	b.at, b.vals = at, vals
 	set := make([]bool, len(b.Cols))
-	for j, e := range elems {
+	for j, v := range vals {
 		i := at[j]
 		if i < 0 || set[i] {
 			continue
 		}
 		set[i] = true
-		t, ok := text(e.Value())
-		if e.Key() == "_id" {
-			t, ok = keyText(e.Value()), true
+		t, ok := text(v)
+		if b.Names[i] == "_id" {
+			t, ok = keyText(v), true
 		}
 		if ok {
 			b.Cols[i].Append(t)
@@ -813,6 +845,8 @@ func (b *batcher) add(doc bson.Raw, op string, q seq) error {
 			b.Cols[i].AppendNull()
 		}
 	}
+	// So as not to keep the document.
+	clear(vals)
 	b.end(op, q)
 	return nil
 }
@@ -828,6 +862,36 @@ func (b *batcher) newField(k string) error {
 		err = fmt.Errorf("%w, but discovery reads a sample of %d documents, which can miss it again: set sampleSize to 0 to read every document, or packed to read documents whole", err, b.sampled)
 	}
 	return sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_TRANSIENT, err)
+}
+
+// unfit is where a value of field k goes whose type its column, i, doesn't
+// take, as discovery would have declared the field as another type had it
+// seen the value: it fails the read, retryably, so that the next attempt's
+// discovery declares the type that takes it, as for a new field. Where that
+// discovery mightn't see the value either, as a sample can miss it, or
+// won't, as no document has such a value any more, which a cdc change from
+// before can find, it goes to i as text, which the engine parses as it
+// does any value's, and quarantines or holds where it doesn't parse. A
+// delete's is left out, -1, as its values only say what it
+// deleted.
+func (b *batcher) unfit(k string, i int, v bson.RawValue, op string) (int, error) {
+	switch {
+	case op == source.OpDelete:
+		return -1, nil
+	case b.sampled > 0:
+		return i, nil
+	}
+	typ := typeNames[kindOf(v)].name
+	if b.gone != nil {
+		if gone, err := b.gone(k, typ); err != nil || gone {
+			return i, err
+		}
+	}
+	declared := b.types[i].String()
+	if e, ok := b.types[i].(arrow.ExtensionType); ok {
+		declared = e.ExtensionName()
+	}
+	return i, sdk.WithCode(protocolv1.ErrorCode_ERROR_CODE_TRANSIENT, fmt.Errorf("mongodb: %s's field %q is declared %s, and a document has a %s value there, which it doesn't take; the read starts again so that discovery declares a type that does", b.stream, k, declared, typ))
 }
 
 // addPacked appends a packed row: data is the document in canonical
