@@ -185,12 +185,19 @@ The log then carries each updated or deleted row's old values in full, large val
 
 ### Delivery
 
-Full refresh and CDC streams replay exactly: a read resumed from a checkpoint yields the same rows in the same order, apart from the CDC snapshots below. OpenETL counts incremental streams as ones that may repeat rows, because of the rows at the cursor's last value, and the destination's capabilities decide what guarantee that leaves.
+Full refresh and CDC streams replay exactly: a read resumed from a checkpoint yields the same rows in the same order, apart from a CDC snapshot's chunks that the checkpoint doesn't cover, which the resumed read takes again as the table is then. OpenETL counts incremental streams as ones that may repeat rows, because of the rows at the cursor's last value, and the destination's capabilities decide what guarantee that leaves.
 
-A CDC snapshot reads each chunk of a table as the table is then, while the log brings every change after the stream's position in it. A row inserted after that position, or moved to a new key, comes from the log alone, even where a chunk reads it, if the log sent all of its columns. The log doesn't send generated columns, columns a publication's column list leaves out, or, under the default replica identity, a [large value](#large-values-in-updates) that a key change left as it was. A chunk that reads such a row sends it too, as an insert. Two kinds of row also reach an append differently, while a merge keeps the latest version of each:
+A CDC snapshot reads a table in chunks in key order, each as the table is when the chunk is read, while the log brings the table's changes. A row's history starts at the chunk that reads it. An append gets the row as that chunk read it, as an insert, then each change after the chunk, once and in order, from the log:
 
-- **A row that was in the table at the stream's position and changes before its chunk is read.** The chunk sends the row as it reads it, as an insert, after the log's change, so an append gets the change and then the chunk's insert of the same version. The source sends no row for the version from before the change, so that version never arrives. Such a row deleted before its chunk is read arrives as its delete alone.
-- **A row inserted while the snapshot is read, with a key the snapshot hadn't reached, before the checkpoint a read resumes from part-way through the snapshot.** The resumed read reads it again in a chunk, so an append gets it twice.
+- **Changes to a row the snapshot hasn't reached aren't sent.** The chunk that reads the row later has them, so the row's versions from before that chunk never arrive, and a row inserted and deleted before its chunk is read never arrives at all.
+- **A change the chunk's reading already has isn't sent either,** though the log brings it after the chunk was read.
+- **A read resumed part-way through the snapshot goes on from where the checkpoint's chunks ended,** so no row arrives twice, whatever changed before or since.
+
+A chunk reads each row whole, generated columns, columns a publication's column list leaves out, and [large values](#large-values-in-updates) among them; the changes after it arrive as the log sends them. A merge ends with each row's latest version.
+
+This holds for transactions that commit with any `synchronous_commit` but `off`; the default is `on`. One that commits with it `off` shortly before a chunk is read, while its commit isn't written to the log yet, can reach an append twice: in the chunk's row, and again as its change.
+
+The log can send a transaction before the server shows it to new snapshots, as when a synchronous standby hasn't confirmed it yet. A chunk that would read a key such a transaction changed, and a resume point past it, wait until new snapshots see it. After 10 seconds, the read fails with `TRANSIENT` and starts again from the last checkpoint.
 
 A read that OpenETL gives an end stops there. OpenETL does this when it reads a writer lane's part of an epoch again on [several workers](https://github.com/openetl-io/openetl/blob/main/docs/pipelines/workers.md), so the second read returns what the first did. The end is a resume point the first read sent, or, where the stream's read completed in that epoch, as a scheduled pipeline's does in its last one, where it completed.
 

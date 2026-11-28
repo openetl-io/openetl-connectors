@@ -372,7 +372,9 @@ func (c *cutCapture) checkpointed() string {
 	for _, b := range c.batches[c.stream][c.cut:] {
 		b.Release()
 	}
-	c.batches[c.stream] = c.batches[c.stream][:c.cut]
+	if c.batches != nil {
+		c.batches[c.stream] = c.batches[c.stream][:c.cut]
+	}
 	return c.state
 }
 
