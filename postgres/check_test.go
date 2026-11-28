@@ -230,6 +230,13 @@ func TestDestinationPreflightDedupeIndex(t *testing.T) {
 	e.exec("CREATE TABLE $schema.unowned_overwrite (id bigint, _openetl_id uuid)")
 	e.exec("GRANT INSERT, DELETE ON $schema.unowned_overwrite TO " + role)
 
+	e.exec("CREATE TABLE $schema.unowned_narrow (id bigint, _openetl_id uuid)")
+	e.exec("GRANT INSERT, DELETE ON $schema.unowned_narrow TO " + role)
+
+	e.exec("CREATE TABLE $schema.owned_overwrite (id bigint, _openetl_id uuid)")
+	e.exec("ALTER TABLE $schema.owned_overwrite OWNER TO " + role)
+	e.exec("REVOKE TRUNCATE ON $schema.owned_overwrite FROM " + role)
+
 	e.exec("CREATE TABLE $schema.unowned_nonleading_idx (id bigint, _openetl_id uuid)")
 	e.exec("CREATE INDEX unowned_nonleading_idx_id ON $schema.unowned_nonleading_idx (id, _openetl_id)")
 	e.exec("GRANT SELECT, INSERT ON $schema.unowned_nonleading_idx TO " + role)
@@ -260,6 +267,34 @@ func TestDestinationPreflightDedupeIndex(t *testing.T) {
 		"stream.owned-no-idx.write":           "passed",
 		"stream.unowned-overwrite.write":      "warning table_not_owned",
 		"stream.unowned-nonleading-idx.write": "failed table_not_owned",
+	})
+
+	// An overwrite of a table the user doesn't own copies its rows in; with
+	// overwriteTruncate, one of a table it owns but may not truncate
+	// deletes them if it copies, and the item says so; a table it doesn't
+	// own fails or warns as it does without.
+	ow := slices.IndexFunc(dpf.Items, func(it check.Item) bool { return it.Name == "stream.unowned-overwrite.write" })
+	if ow < 0 || !strings.Contains(dpf.Items[ow].Rendered().Message, "copies the read's rows into it") {
+		t.Errorf("the unowned overwrite's item doesn't say it copies: %+v", dpf.Items)
+	}
+	truncating, err := NewDestination(fmt.Appendf(nil, `{"dsn": %q, "schema": %q, "overwriteTruncate": true}`, u.String(), e.schema))
+	if err != nil {
+		t.Fatal(err)
+	}
+	connectortest.ExpectItems(t, "truncating overwrite preflight", check.Run(t.Context(), truncating.Preflight(destination.PreflightRequest{
+		Streams: []destination.Stream{
+			{Name: "owned_overwrite", Mode: destination.Overwrite},
+			{Name: "owned_no_idx", Mode: destination.Overwrite},
+			{Name: "unowned_overwrite", Mode: destination.Overwrite},
+			{Name: "unowned_narrow", Mode: destination.Overwrite},
+		},
+		Schemas: map[string]*arrow.Schema{"unowned_narrow": arrow.NewSchema([]arrow.Field{idField, rowID, nameField}, nil)},
+	})), map[string]string{
+		"schema.create":                  "passed",
+		"stream.owned-overwrite.write":   "warning privilege_missing",
+		"stream.owned-no-idx.write":      "passed",
+		"stream.unowned-overwrite.write": "warning table_not_owned",
+		"stream.unowned-narrow.write":    "failed table_not_owned",
 	})
 
 	i := slices.IndexFunc(dpf.Items, func(it check.Item) bool { return it.Name == "stream.unowned-no-idx.write" })

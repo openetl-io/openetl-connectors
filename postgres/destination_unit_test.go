@@ -50,3 +50,53 @@ func TestPatchSharedHeldColumn(t *testing.T) {
 		}
 	}
 }
+
+// An overwrite swaps when it's exact unless the config says not to, and
+// deletes rather than truncates unless it says to.
+func TestOverwriteConfig(t *testing.T) {
+	for _, tc := range []struct {
+		config         string
+		swap, truncate bool
+	}{
+		{`{"dsn": "postgres://h/db"}`, true, false},
+		{`{"dsn": "postgres://h/db", "overwriteSwap": false, "overwriteTruncate": true}`, false, true},
+	} {
+		d, err := NewDestination([]byte(tc.config))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if d.cfg.OverwriteSwap != tc.swap || d.cfg.OverwriteTruncate != tc.truncate {
+			t.Errorf("%s: swap %v, truncate %v", tc.config, d.cfg.OverwriteSwap, d.cfg.OverwriteTruncate)
+		}
+	}
+}
+
+// A read's columns follow its target's order, then their own, and take its
+// collations.
+func TestReadColumnsFollowTheTarget(t *testing.T) {
+	cols := []column{{name: "c", typ: "text"}, {name: "new", typ: "text"}, {name: "a", typ: "bigint"}, {name: "other", typ: "text"}}
+	target := []column{{name: "a", typ: "bigint"}, {name: "b", typ: "text"}, {name: "c", typ: "text", collation: `pg_catalog."C"`}}
+	var got []string
+	for _, c := range inOrderOf(cols, target) {
+		got = append(got, c.name)
+	}
+	if strings.Join(got, ",") != "a,c,new,other" {
+		t.Errorf("order %v", got)
+	}
+	if def := columnDef(column{name: "c", typ: "text", collation: `pg_catalog."C"`}); def != `"c" text COLLATE pg_catalog."C"` {
+		t.Errorf("columnDef: %s", def)
+	}
+}
+
+func TestSwapHelpers(t *testing.T) {
+	opts := []string{"fillfactor=90", "autovacuum_vacuum_scale_factor=0.05"}
+	if got := options(opts, "toast."); got != "toast.fillfactor = '90', toast.autovacuum_vacuum_scale_factor = '0.05'" {
+		t.Errorf("options: %s", got)
+	}
+	if got := strings.Join(optionNames(opts, ""), ","); got != "fillfactor,autovacuum_vacuum_scale_factor" {
+		t.Errorf("optionNames: %s", got)
+	}
+	if got := differs(`{"a": 1, "b": [2], "c": "x"}`, `{"a": 1, "b": [3], "c": "y"}`); got != "b, c" {
+		t.Errorf("differs: %s", got)
+	}
+}
